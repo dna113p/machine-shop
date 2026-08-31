@@ -8,3 +8,9 @@ harnesses, or the global `~/.machines` installation directory.
 
 Each Machine should remain a small, readable TypeScript file built from the
 runtime's `agent`, `human`, `operation`, and `final` primitives.
+
+Run the permanent smoke Machine directly from this repository:
+
+```bash
+/home/user/projects/machines/machine run ./smoke.ts "Hello from Dev Machines."
+```
