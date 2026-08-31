@@ -15,10 +15,12 @@ how to build and verify definitions while preserving the runtime boundary.
 
 ## Smoke test
 
-Run the permanent smoke Machine directly from this repository:
+Install the permanent smoke Machine as an instant runtime health check:
 
 ```bash
-/home/user/projects/machines/machine run ./smoke.ts "Hello from Dev Machines."
+mkdir -p ~/.machines
+ln -s /home/user/projects/dev-machines/smoke.ts ~/.machines/smoke.ts
+machine run smoke "Hello from Dev Machines."
 ```
 
 ## Worktree task
