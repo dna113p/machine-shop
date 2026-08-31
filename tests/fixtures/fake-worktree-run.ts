@@ -6,6 +6,11 @@ import { pathToFileURL } from "node:url";
 
 import worktreeTask from "../../worktree-task.ts";
 
+interface AgentRequest {
+  readonly prompt: string;
+  readonly cwd?: string;
+}
+
 const {
   agent,
   final,
@@ -22,7 +27,7 @@ const definition = worktreeTask(
 let agentRuns = 0;
 
 const result = await run(definition, {
-  agent: (request) => {
+  agent: (request: AgentRequest) => {
     agentRuns += 1;
 
     if (agentRuns === 1) {
