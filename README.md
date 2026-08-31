@@ -29,7 +29,7 @@ ln -s /home/user/projects/dev-machines/worktree-task.ts ~/.machines/worktree-tas
 From a clean Git checkout on a branch:
 
 ```bash
-/home/user/projects/machines/machine run worktree-task "Describe the task"
+machine run worktree-task "Describe the task"
 ```
 
 The Machine creates a temporary branch and worktree from the current `HEAD`,
