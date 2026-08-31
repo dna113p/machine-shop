@@ -1,17 +1,19 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
-import {
+import worktreeTask from "../../worktree-task.ts";
+
+const {
   agent,
   final,
   human,
   machine,
   operation,
   run,
-} from "../../../machines/src/index.ts";
-import worktreeTask from "../../worktree-task.ts";
+} = await import(pathToFileURL(machinesRuntime()).href);
 
 const definition = worktreeTask(
   { agent, final, human, machine, operation },
@@ -52,6 +54,18 @@ const result = await run(definition, {
 
 console.log(`Agent runs: ${agentRuns}`);
 console.log(`--> ${String(result.value)}`);
+
+function machinesRuntime(): string {
+  const projectDirectory = resolve(import.meta.dirname, "../..");
+  const commonGitDirectory = execFileSync(
+    "git",
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    { cwd: projectDirectory, encoding: "utf8" },
+  ).trim();
+
+  // A linked worktree may not share the primary checkout's sibling layout.
+  return resolve(dirname(commonGitDirectory), "../machines/src/index.ts");
+}
 
 function git(directory: string, ...args: string[]): void {
   execFileSync("git", args, { cwd: directory, stdio: "ignore" });

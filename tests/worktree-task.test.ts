@@ -8,6 +8,7 @@ import { test } from "node:test";
 
 const fakeRun = resolve("tests/fixtures/fake-worktree-run.ts");
 const humanPrompt = "Suggestions:\n- approve\n> ";
+const humanPromptTimeoutMs = 10_000;
 
 test("the worktree Machine implements, reviews, merges, cleans up, and finishes", () => {
   const repository = createRepository();
@@ -60,6 +61,13 @@ test("free-form feedback is revised, committed, approved, and cleaned up", async
     await waitForHumanPrompt(child.stdout, () => stdout, exited, 1);
     child.stdin.write(`${feedback}\n`);
     await waitForHumanPrompt(child.stdout, () => stdout, exited, 2);
+
+    const createdWorktree = /^Created (.+) from [0-9a-f]+\.$/mu.exec(stdout);
+    assert.ok(createdWorktree, stdout);
+    const worktreeDirectory = createdWorktree[1];
+    const worktreeBranch = git(worktreeDirectory, "branch", "--show-current");
+    const worktreeBranchTipBeforeApproval = git(worktreeDirectory, "rev-parse", "HEAD");
+
     child.stdin.end("approve\n");
 
     assert.equal(await exited, 0, stderr);
@@ -67,6 +75,7 @@ test("free-form feedback is revised, committed, approved, and cleaned up", async
       readFileSync(join(repository, "result.txt"), "utf8"),
       "implemented\nrevised\n",
     );
+    assert.equal(git(repository, "rev-parse", "HEAD"), worktreeBranchTipBeforeApproval);
     assert.equal(git(repository, "rev-parse", "HEAD~2"), baseCommit);
     assert.equal(git(repository, "rev-list", "--count", `${baseCommit}..HEAD`), "2");
     assert.equal(
@@ -75,13 +84,15 @@ test("free-form feedback is revised, committed, approved, and cleaned up", async
     );
     assert.equal(git(repository, "status", "--porcelain"), "");
     assert.equal(git(repository, "branch", "--format=%(refname:short)"), "main");
+    assert.equal(git(repository, "branch", "--list", worktreeBranch), "");
     assert.equal(worktreeCount(repository), 1);
     assert.equal(outputCount(stdout, humanPrompt), 2);
     assert.match(stdout, /Agent runs: 3/u);
 
     const removedWorktree = /^Removed (.+)\.$/mu.exec(stdout);
     assert.ok(removedWorktree, stdout);
-    assert.equal(existsSync(removedWorktree[1]), false);
+    assert.equal(removedWorktree[1], worktreeDirectory);
+    assert.equal(existsSync(worktreeDirectory), false);
     assert.ok(stdout.indexOf(removedWorktree[0]) < stdout.indexOf("--> done"), stdout);
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
@@ -119,15 +130,24 @@ async function waitForHumanPrompt(
   exited: Promise<number | null>,
   occurrence: number,
 ): Promise<void> {
-  while (outputCount(stdout(), humanPrompt) < occurrence) {
-    await Promise.race([
-      once(output, "data"),
-      exited.then((status) => {
-        throw new Error(
-          `Fake runner exited with status ${String(status)} before Human prompt ${occurrence}`,
-        );
-      }),
-    ]);
+  const timeout = AbortSignal.timeout(humanPromptTimeoutMs);
+
+  try {
+    while (outputCount(stdout(), humanPrompt) < occurrence) {
+      await Promise.race([
+        once(output, "data", { signal: timeout }),
+        exited.then((status) => {
+          throw new Error(
+            `Fake runner exited with status ${String(status)} before Human prompt ${occurrence}`,
+          );
+        }),
+      ]);
+    }
+  } catch (cause) {
+    if (timeout.aborted) {
+      throw new Error(`Timed out waiting for Human prompt ${occurrence}`, { cause });
+    }
+    throw cause;
   }
 }
 
