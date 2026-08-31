@@ -9,6 +9,10 @@ harnesses, or the global `~/.machines` installation directory.
 Each Machine should remain a small, readable TypeScript file built from the
 runtime's `agent`, `human`, `operation`, and `final` primitives.
 
+The repository also contains a model-discoverable
+[`machine-builder`](./skills/machine-builder/SKILL.md) skill that teaches agents
+how to build and verify definitions while preserving the runtime boundary.
+
 ## Smoke test
 
 Run the permanent smoke Machine directly from this repository:
