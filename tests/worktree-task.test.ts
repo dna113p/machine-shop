@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -8,16 +8,9 @@ import { test } from "node:test";
 const fakeRun = resolve("tests/fixtures/fake-worktree-run.ts");
 
 test("the worktree Machine implements, reviews, merges, cleans up, and finishes", () => {
-  const repository = mkdtempSync(join(tmpdir(), "dev-machines-test-"));
+  const repository = createRepository();
 
   try {
-    git(repository, "init", "-b", "main");
-    git(repository, "config", "user.name", "Dev Machines Test");
-    git(repository, "config", "user.email", "dev-machines@example.invalid");
-    writeFileSync(join(repository, "README.md"), "# Test repository\n");
-    git(repository, "add", "README.md");
-    git(repository, "commit", "-m", "Initial commit");
-
     const result = spawnSync(process.execPath, [fakeRun], {
       cwd: repository,
       encoding: "utf8",
@@ -34,6 +27,38 @@ test("the worktree Machine implements, reviews, merges, cleans up, and finishes"
     rmSync(repository, { force: true, recursive: true });
   }
 });
+
+test("the worktree Machine refuses a dirty source checkout without creating work", () => {
+  const repository = createRepository();
+
+  try {
+    writeFileSync(join(repository, "uncommitted.txt"), "leave me alone\n");
+
+    const result = spawnSync(process.execPath, [fakeRun], {
+      cwd: repository,
+      encoding: "utf8",
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /source checkout must be clean/u);
+    assert.equal(git(repository, "branch", "--format=%(refname:short)"), "main");
+    assert.equal(worktreeCount(repository), 1);
+    assert.equal(existsSync(join(repository, "result.txt")), false);
+  } finally {
+    rmSync(repository, { force: true, recursive: true });
+  }
+});
+
+function createRepository(): string {
+  const repository = mkdtempSync(join(tmpdir(), "dev-machines-test-"));
+  git(repository, "init", "-b", "main");
+  git(repository, "config", "user.name", "Dev Machines Test");
+  git(repository, "config", "user.email", "dev-machines@example.invalid");
+  writeFileSync(join(repository, "README.md"), "# Test repository\n");
+  git(repository, "add", "README.md");
+  git(repository, "commit", "-m", "Initial commit");
+  return repository;
+}
 
 function worktreeCount(repository: string): number {
   return git(repository, "worktree", "list", "--porcelain")
