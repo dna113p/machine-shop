@@ -1,5 +1,7 @@
 import type { MachinePrimitives } from "../machines/src/index.ts";
 
+export const description = "Prints an input through one Operation as a quick runtime check.";
+
 export default function smoke(
   { final, machine, operation }: MachinePrimitives,
   input: string,

@@ -5,6 +5,8 @@ import { join } from "node:path";
 
 import type { MachinePrimitives } from "../machines/src/index.ts";
 
+export const description = "Implements in an isolated worktree, reviews the result, then asks before merging.";
+
 export default function worktreeTask(
   { agent, final, human, machine, operation }: MachinePrimitives,
   input: string,

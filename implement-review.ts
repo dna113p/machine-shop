@@ -1,5 +1,7 @@
 import type { MachinePrimitives } from "../machines/src/index.ts";
 
+export const description = "Implements directly in the current directory, then waits for approval or feedback.";
+
 export default function implementReview(
   { agent, final, human, machine }: MachinePrimitives,
   input: string,

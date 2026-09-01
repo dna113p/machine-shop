@@ -1,6 +1,6 @@
 ---
 name: machine-builder
-description: Build or edit TypeScript workflow definitions for the Machines runtime. Use when creating a Machine, choosing among Agent/Human/Operation states, expressing workflow transitions, or testing and installing a Machine definition. Do not use for unrelated XState applications or agent-harness implementation.
+description: Build, edit, or describe TypeScript workflow definitions for the Machines runtime. Use when creating a Machine, adding its discovery description, choosing among Agent/Human/Operation states, expressing workflow transitions, or testing and installing a Machine definition. Do not use for unrelated XState applications or agent-harness implementation.
 ---
 
 # Build Machines
@@ -56,6 +56,8 @@ Default-export one factory receiving `MachinePrimitives` and the command input:
 ```ts
 import type { MachinePrimitives } from "../machines/src/index.ts";
 
+export const description = "Explains when to choose this Machine and what it does.";
+
 export default function example(
   { final, machine, operation }: MachinePrimitives,
   input: string,
@@ -72,6 +74,12 @@ export default function example(
   });
 }
 ```
+
+Export one `description` string that fits on one line and tells a caller when or
+why to choose the Machine. `machine list` is the discovery surface for humans and
+Agents; keep the description concrete enough to select the right workflow.
+Listing imports the module, so keep top-level evaluation side-effect free and put
+all work inside the factory and its states.
 
 Keep the definition in one TypeScript file while that remains readable. Extract
 a helper only after a real second use or a genuinely distracting implementation
@@ -116,13 +124,14 @@ Approval authorizes the next transition; it does not imply completion. Reach
 Verification is complete when all applicable checks below pass:
 
 1. Type-check the Machine against the current runtime interface.
-2. Run it by exact path before adding discovery or installation behavior.
-3. Test Agent states with a fake `AgentRunner` that records each request and
+2. Confirm `machine list` shows its name, description, and resolved path.
+3. Run it by exact path before adding discovery or installation behavior.
+4. Test Agent states with a fake `AgentRunner` that records each request and
    returns only declared outcomes.
-4. Test filesystem or Git Operations in a disposable directory or repository.
-5. Prove the full transition sequence, including that failure cannot reach the
+5. Test filesystem or Git Operations in a disposable directory or repository.
+6. Prove the full transition sequence, including that failure cannot reach the
    final state.
-6. Run one real harness and Human-input proof for workflows intended for
+7. Run one real harness and Human-input proof for workflows intended for
    interactive use.
 
 Install a proven shared definition by symlinking that individual file into
