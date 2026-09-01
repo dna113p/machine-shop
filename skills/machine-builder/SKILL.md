@@ -75,9 +75,10 @@ export default function example(
 }
 ```
 
-Export one `description` string that fits on one line and tells a caller when or
-why to choose the Machine. `machine list` is the discovery surface for humans and
-Agents; keep the description concrete enough to select the right workflow.
+Every Machine must export one `description` string that fits on one line and tells
+a caller when or why to choose it. Both `machine list` and `machine run` enforce
+this contract. `machine list` is the discovery surface for humans and Agents; keep
+the description concrete enough to select the right workflow.
 Listing imports the module, so keep top-level evaluation side-effect free and put
 all work inside the factory and its states.
 
