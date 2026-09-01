@@ -21,6 +21,9 @@ export default function worktreeTask(
   let baseCommit = "";
   let sourceBranch = "";
   let feedback = "";
+  let reviewDetails = "No review details were returned.";
+  let reviewSummary = "Review completed.";
+  let revisions = 0;
 
   return machine({
     initial: "createWorktree",
@@ -60,21 +63,38 @@ export default function worktreeTask(
           `Review the implementation of this task: ${task}`,
           `Inspect the committed changes since ${baseCommit}.`,
           "Do not modify the worktree. Report concrete issues and finish with the reviewed outcome.",
+          'Include a short summary in the outcome, for example: MACHINES_EVENT {"type":"reviewed","summary":"4 P2 and 2 P3 findings"}',
         ].join("\n"),
-        { reviewed: "humanReview" },
+        {
+          reviewed: {
+            actions: ({ event }) => {
+              reviewDetails = eventText(event, "message")
+                ?? "No review details were returned.";
+              reviewSummary = eventText(event, "summary")
+                ?? "Review completed; use details to inspect the report.";
+            },
+            target: "humanReview",
+          },
+        },
         { cwd: worktreeDirectory },
       ),
 
       humanReview: human(
-        [
-          `Review the implementation in ${worktreeDirectory}.`,
-          'Enter "approve" to merge it, or enter feedback for another Agent revision.',
+        () => [
+          "Review needed.",
+          `Automated review${revisions === 0 ? "" : " (before revision)"}: ${reviewSummary}`,
+          `Worktree: ${worktreeDirectory}`,
+          'Enter "details" to show the report, "approve" to merge, or type revision feedback.',
         ].join("\n"),
         {
           submitted: [
             {
               guard: ({ event }) => response(event).trim().toLowerCase() === "approve",
               target: "merge",
+            },
+            {
+              guard: ({ event }) => response(event).trim().toLowerCase() === "details",
+              target: "showReview",
             },
             {
               actions: ({ event }) => {
@@ -84,7 +104,15 @@ export default function worktreeTask(
             },
           ],
         },
-        { suggestions: ["approve"] },
+        { suggestions: ["approve", "details"] },
+      ),
+
+      showReview: operation(
+        () => {
+          console.log(`\nAutomated review\n\n${reviewDetails}\n`);
+          return { type: "shown" };
+        },
+        { shown: "humanReview" },
       ),
 
       revise: agent(
@@ -94,7 +122,14 @@ export default function worktreeTask(
           feedback,
           "Run the relevant checks, commit all changes, and leave the worktree clean.",
         ].join("\n"),
-        { completed: "humanReview" },
+        {
+          completed: {
+            actions: () => {
+              revisions += 1;
+            },
+            target: "humanReview",
+          },
+        },
         { cwd: worktreeDirectory },
       ),
 
@@ -175,4 +210,11 @@ function response(event: unknown): string {
     return event.value;
   }
   throw new Error("Human review returned invalid input");
+}
+
+function eventText(event: unknown, key: string): string | undefined {
+  if (event === null || typeof event !== "object") return undefined;
+
+  const value = (event as Record<string, unknown>)[key];
+  return typeof value === "string" ? value : undefined;
 }

@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 
 const fakeRun = resolve("tests/fixtures/fake-worktree-run.ts");
-const humanPrompt = "Suggestions:\n- approve\n> ";
+const humanPrompt = "Suggestions:\n- approve\n- details\n> ";
 const humanPromptTimeoutMs = 10_000;
 
 test("the worktree Machine implements, reviews, merges, cleans up, and finishes", () => {
@@ -25,8 +25,53 @@ test("the worktree Machine implements, reviews, merges, cleans up, and finishes"
     assert.equal(git(repository, "branch", "--format=%(refname:short)"), "main");
     assert.equal(worktreeCount(repository), 1);
     assert.match(result.stdout, /Agent runs: 2/u);
+    assert.match(result.stdout, /1 P2 finding/u);
+    assert.doesNotMatch(result.stdout, /Fake review detail/u);
     assert.match(result.stdout, /--> done/u);
   } finally {
+    rmSync(repository, { force: true, recursive: true });
+  }
+});
+
+test("review details are shown only when requested", async () => {
+  const repository = createRepository();
+  const child = spawn(process.execPath, [fakeRun], {
+    cwd: repository,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+
+  const exited = new Promise<number | null>((resolveExit, rejectExit) => {
+    child.once("error", rejectExit);
+    child.once("close", (status) => resolveExit(status));
+  });
+
+  try {
+    await waitForHumanPrompt(child.stdout, () => stdout, exited, 1);
+    child.stdin.write("details\n");
+    await waitForHumanPrompt(child.stdout, () => stdout, exited, 2);
+    child.stdin.end("approve\n");
+
+    assert.equal(await exited, 0, stderr);
+    assert.match(stdout, /Fake review detail for the implementation/u);
+    assert.equal(outputCount(stdout, humanPrompt), 2);
+    assert.match(stdout, /Agent runs: 2/u);
+    assert.match(stdout, /--> done/u);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill();
+      await exited.catch(() => undefined);
+    }
     rmSync(repository, { force: true, recursive: true });
   }
 });

@@ -42,6 +42,8 @@ The Machine creates a temporary branch and worktree from the current `HEAD`,
 runs implementation and one advisory Agent review there, and asks for human
 approval or free-form revision feedback. Approval fast-forwards the original
 branch, removes the worktree and temporary branch, and then reaches `done`.
+The Human gate shows a compact automated-review summary. Enter `details` to print
+the full report, `approve` to merge, or any other text as revision feedback.
 
 Run the automated disposable-repository proof with:
 

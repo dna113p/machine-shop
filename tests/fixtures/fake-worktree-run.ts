@@ -41,7 +41,11 @@ const result = await run(definition, {
 
     if (agentRuns === 2) {
       assert.match(request.prompt, /Review the implementation/u);
-      return { type: "reviewed" };
+      return {
+        type: "reviewed",
+        summary: "1 P2 finding",
+        message: "P2 — Fake review detail for the implementation.",
+      };
     }
 
     assert.equal(agentRuns, 3);
