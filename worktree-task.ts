@@ -42,7 +42,10 @@ export default function worktreeTask(
             worktreeDirectory,
             baseCommit,
           );
-          console.log(`Created ${worktreeDirectory} from ${baseCommit}.`);
+          announce(
+            `↳ worktree ${worktreeDirectory} · ${baseCommit.slice(0, 7)}`,
+            `Created ${worktreeDirectory} from ${baseCommit}.`,
+          );
           return { type: "created" };
         },
         { created: "implement" },
@@ -150,7 +153,10 @@ export default function worktreeTask(
             );
           }
           git(sourceDirectory, "merge", "--ff-only", worktreeBranch);
-          console.log(`Merged ${worktreeBranch} into ${sourceBranch}.`);
+          announce(
+            `↳ merged ${worktreeBranch} → ${sourceBranch}`,
+            `Merged ${worktreeBranch} into ${sourceBranch}.`,
+          );
           return { type: "merged" };
         },
         { merged: "cleanup" },
@@ -160,7 +166,10 @@ export default function worktreeTask(
         () => {
           git(sourceDirectory, "worktree", "remove", worktreeDirectory);
           git(sourceDirectory, "branch", "-d", worktreeBranch);
-          console.log(`Removed ${worktreeDirectory}.`);
+          announce(
+            `↳ removed ${worktreeDirectory}`,
+            `Removed ${worktreeDirectory}.`,
+          );
           return { type: "cleaned" };
         },
         { cleaned: "done" },
@@ -217,4 +226,8 @@ function eventText(event: unknown, key: string): string | undefined {
 
   const value = (event as Record<string, unknown>)[key];
   return typeof value === "string" ? value : undefined;
+}
+
+function announce(interactive: string, plain: string): void {
+  console.log(process.stdout.isTTY ? `  ${interactive}` : plain);
 }

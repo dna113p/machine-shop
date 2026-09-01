@@ -44,6 +44,8 @@ approval or free-form revision feedback. Approval fast-forwards the original
 branch, removes the worktree and temporary branch, and then reaches `done`.
 The Human gate shows a compact automated-review summary. Enter `details` to print
 the full report, `approve` to merge, or any other text as revision feedback.
+Interactive worktree creation, merge, and cleanup messages are short indented notes;
+redirected output retains their complete machine-readable wording.
 
 Run the automated disposable-repository proof with:
 
