@@ -47,6 +47,18 @@ the full report, `approve` to merge, or any other text as revision feedback.
 Interactive worktree creation, merge, and cleanup messages are short indented notes;
 redirected output retains their complete machine-readable wording.
 
+## Implement and review
+
+For a deliberately smaller workflow that edits the current directory directly:
+
+```bash
+machine run implement-review "Describe the task"
+```
+
+It runs one Agent implementation and then asks for Human review. Enter `approve`
+to finish, or enter unrestricted feedback to run another implementation pass.
+It does not create a worktree, commit, merge, or clean up changes.
+
 Run the automated disposable-repository proof with:
 
 ```bash
