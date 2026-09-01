@@ -49,10 +49,11 @@ A Human is an input source, not a permanent approval role. Branch on the
 submitted value when the policy needs approval, feedback, selection, or another
 human-supplied result.
 
-In an interactive terminal, `suggestions` become arrow-key choices and Machines
-adds `Other…` for unrestricted input. Each suggestion is submitted exactly as
-written, so use values the transition logic can recognize and do not add your own
-`Other` suggestion. In pipes and CI, suggestions remain plain prompt text.
+Choose the Human input mode deliberately: omit options for free-form input, use
+`suggestions` for shortcuts plus automatic `Other…`, or use `choices` for a
+restricted selector without `Other…`. Each value is submitted exactly as written,
+so use strings the transition logic recognizes. Pipes and CI also enforce
+restricted choices.
 
 ## Implement one definition
 
