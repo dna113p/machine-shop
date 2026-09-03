@@ -13,6 +13,28 @@ The repository also contains a model-discoverable
 [`machine-builder`](./skills/machine-builder/SKILL.md) skill that teaches agents
 how to build and verify definitions while preserving the runtime boundary.
 
+## Choose an Agent for one run
+
+List the Agent presets resolved from `~/.machines/agents.ts` and the nearest project
+`.machines/agents.ts`:
+
+```bash
+machine agents
+```
+
+To use another configured preset for a Machine role, alias it only for that invocation:
+
+```bash
+machine run worktree-task \
+  --agent default=strongPi \
+  -- "Describe the task"
+```
+
+The current Dev Machines use the unnamed `default` role. The launcher validates both the
+role and preset before creating a worktree or making another workflow change. Coding Agents
+can discover the same information through `machine list` and `machine agents`; they should
+select from configured presets rather than inventing inline harness or model options.
+
 ## Smoke test
 
 Install the permanent smoke Machine as an instant runtime health check:

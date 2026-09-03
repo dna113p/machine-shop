@@ -124,9 +124,36 @@ const implement = agent(
 Role names describe workflow needs, not providers. Put Pi directories, models, ACP
 commands, and other harness choices in `~/.machines/agents.ts` or the nearest project
 `.machines/agents.ts`. Those files default-export a function that receives installed
-adapter constructors and returns named `AgentRunner` functions. A project binding replaces
-a global binding with the same name. Do not modify a user's bindings unless the task asks
-for that setup.
+adapter constructors and returns named presets:
+
+```ts
+export default ({ acpAgent }) => ({
+  strongPi: {
+    description: "Strong Pi implementer for difficult changes",
+    harness: "pi-acp",
+    model: "gpt-5.6-sol",
+    thinking: "high",
+    runner: acpAgent("npx", ["-y", "pi-acp"], {
+      harness: "pi-acp",
+      env: { PI_CODING_AGENT_DIR: "/home/user/.agents/strong" },
+    }),
+  },
+});
+```
+
+`description` and `runner` are required. `harness`, `model`, and `thinking` are optional
+discovery labels. A project preset replaces a global preset with the same name. A preset
+whose name matches a role binds automatically. Do not modify a user's presets unless the
+task asks for that setup.
+
+For one invocation, a caller may bind a Machine role to another configured preset:
+
+```bash
+machine run worktree-task --agent strongImplementer=strongPi -- "Implement the change"
+```
+
+This is a role-to-preset alias, not Machine input and not inline provider configuration.
+The launcher validates the role and preset before any Operation runs.
 
 Use XState guards and transition actions directly for small policy decisions.
 Keep provider selection, ACP mechanics, Pi configuration, and agent-profile
@@ -154,15 +181,34 @@ Approval authorizes the next transition; it does not imply completion. Reach
 Verification is complete when all applicable checks below pass:
 
 1. Type-check the Machine against the current runtime interface.
-2. Confirm `machine list` shows its name, description, and resolved path.
-3. Run it by exact path before adding discovery or installation behavior.
-4. Test Agent states with named fake `AgentRunner` bindings that record each request and
+2. Confirm `machine list` shows its name, description, resolved path, and missing roles.
+3. Run `machine agents` to inspect the resolved presets and their source files.
+4. Run it by exact path before adding discovery or installation behavior.
+5. Test Agent states with named fake `AgentRunner` bindings that record each request and
    return only declared outcomes. Prove every named role is available before Operations run.
-5. Test filesystem or Git Operations in a disposable directory or repository.
-6. Prove the full transition sequence, including that failure cannot reach the
+6. When supporting caller selection, prove `--agent role=preset` uses the selected preset
+   and rejects unknown roles and presets before Operations run.
+7. Test filesystem or Git Operations in a disposable directory or repository.
+8. Prove the full transition sequence, including that failure cannot reach the
    final state.
-7. Run one real harness and Human-input proof for workflows intended for
+9. Run one real harness and Human-input proof for workflows intended for
    interactive use.
+
+## Discover and invoke existing Machines
+
+When acting as the caller rather than the author, do not guess Machine names, roles, or
+Agent presets:
+
+```bash
+machine list
+machine agents
+```
+
+Choose a Machine from its description. Use its exact declared role names and an available
+preset name when a one-run override is useful. Then launch with `machine run`. Do not pass
+model, thinking, environment, or harness fields on the command line; those belong in the
+selected preset. The CLI invocation currently blocks until the Machine finishes or needs
+terminal input. Do not claim it is an async background launch or a resumable Pi tool.
 
 Install a proven shared definition by symlinking that individual file into
 `~/.machines/`. Keep `~/.machines` as a shared installation directory rather
