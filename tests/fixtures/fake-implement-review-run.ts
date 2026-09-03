@@ -11,21 +11,23 @@ const definition = implementReview(
 );
 
 const result = await run(definition, {
-  agent: (request) => {
-    agentRuns += 1;
-    assert.equal(request.cwd, process.cwd());
-    assert.deepEqual(request.outcomes, ["completed"]);
-    assert.match(request.prompt, /Add the smallest useful example/u);
+  agents: {
+    default: (request) => {
+      agentRuns += 1;
+      assert.equal(request.cwd, process.cwd());
+      assert.deepEqual(request.outcomes, ["completed"]);
+      assert.match(request.prompt, /Add the smallest useful example/u);
 
-    if (agentRuns === 1) {
-      assert.doesNotMatch(request.prompt, /review feedback/u);
-    } else {
-      assert.equal(agentRuns, 2);
-      assert.ok(expectedFeedback);
-      assert.ok(request.prompt.includes(expectedFeedback));
-    }
+      if (agentRuns === 1) {
+        assert.doesNotMatch(request.prompt, /review feedback/u);
+      } else {
+        assert.equal(agentRuns, 2);
+        assert.ok(expectedFeedback);
+        assert.ok(request.prompt.includes(expectedFeedback));
+      }
 
-    return { type: "completed" };
+      return { type: "completed" };
+    },
   },
 });
 

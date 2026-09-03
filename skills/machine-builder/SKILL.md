@@ -105,6 +105,29 @@ revise: agent(
 ),
 ```
 
+When a Machine needs distinct Agent roles, declare each dependency with a one-line
+description and select it with `using`:
+
+```ts
+export const agentRoles = {
+  fastImplementer: "Handles routine implementation quickly",
+  strongImplementer: "Handles escalated implementation work",
+};
+
+const implement = agent(
+  "Implement the change",
+  { completed: "done" },
+  { using: "fastImplementer", cwd: worktreeDirectory },
+);
+```
+
+Role names describe workflow needs, not providers. Put Pi directories, models, ACP
+commands, and other harness choices in `~/.machines/agents.ts` or the nearest project
+`.machines/agents.ts`. Those files default-export a function that receives installed
+adapter constructors and returns named `AgentRunner` functions. A project binding replaces
+a global binding with the same name. Do not modify a user's bindings unless the task asks
+for that setup.
+
 Use XState guards and transition actions directly for small policy decisions.
 Keep provider selection, ACP mechanics, Pi configuration, and agent-profile
 directories in the Agent runner binding rather than the Machine definition.
@@ -133,8 +156,8 @@ Verification is complete when all applicable checks below pass:
 1. Type-check the Machine against the current runtime interface.
 2. Confirm `machine list` shows its name, description, and resolved path.
 3. Run it by exact path before adding discovery or installation behavior.
-4. Test Agent states with a fake `AgentRunner` that records each request and
-   returns only declared outcomes.
+4. Test Agent states with named fake `AgentRunner` bindings that record each request and
+   return only declared outcomes. Prove every named role is available before Operations run.
 5. Test filesystem or Git Operations in a disposable directory or repository.
 6. Prove the full transition sequence, including that failure cannot reach the
    final state.

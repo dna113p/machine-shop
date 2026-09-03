@@ -27,37 +27,39 @@ const definition = worktreeTask(
 let agentRuns = 0;
 
 const result = await run(definition, {
-  agent: (request: AgentRequest) => {
-    agentRuns += 1;
+  agents: {
+    default: (request: AgentRequest) => {
+      agentRuns += 1;
 
-    if (agentRuns === 1) {
-      assert.match(request.prompt, /Create result\.txt/u);
+      if (agentRuns === 1) {
+        assert.match(request.prompt, /Create result\.txt/u);
+        assert.ok(request.cwd);
+        writeFileSync(join(request.cwd, "result.txt"), "implemented\n");
+        git(request.cwd, "add", "result.txt");
+        git(request.cwd, "commit", "-m", "Implement task");
+        return { type: "completed" };
+      }
+
+      if (agentRuns === 2) {
+        assert.match(request.prompt, /Review the implementation/u);
+        return {
+          type: "reviewed",
+          summary: "1 P2 finding",
+          message: "P2 — Fake review detail for the implementation.",
+        };
+      }
+
+      assert.equal(agentRuns, 3);
+      const feedback = process.env.FAKE_REVISION_FEEDBACK;
+      assert.ok(feedback);
+      assert.match(request.prompt, /Continue this task/u);
+      assert.ok(request.prompt.includes(feedback));
       assert.ok(request.cwd);
-      writeFileSync(join(request.cwd, "result.txt"), "implemented\n");
+      writeFileSync(join(request.cwd, "result.txt"), "implemented\nrevised\n");
       git(request.cwd, "add", "result.txt");
-      git(request.cwd, "commit", "-m", "Implement task");
+      git(request.cwd, "commit", "-m", "Revise task");
       return { type: "completed" };
-    }
-
-    if (agentRuns === 2) {
-      assert.match(request.prompt, /Review the implementation/u);
-      return {
-        type: "reviewed",
-        summary: "1 P2 finding",
-        message: "P2 — Fake review detail for the implementation.",
-      };
-    }
-
-    assert.equal(agentRuns, 3);
-    const feedback = process.env.FAKE_REVISION_FEEDBACK;
-    assert.ok(feedback);
-    assert.match(request.prompt, /Continue this task/u);
-    assert.ok(request.prompt.includes(feedback));
-    assert.ok(request.cwd);
-    writeFileSync(join(request.cwd, "result.txt"), "implemented\nrevised\n");
-    git(request.cwd, "add", "result.txt");
-    git(request.cwd, "commit", "-m", "Revise task");
-    return { type: "completed" };
+    },
   },
 });
 
