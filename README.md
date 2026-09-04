@@ -49,6 +49,10 @@ shows `input needed`. Ask for status if useful, then answer naturally—for exam
 it` or `Have it fix keyboard focus first`. Pi routes the clear response to the exact waiting
 run. The Machine, not the extension, still owns revision, merge, cleanup, and completion.
 
+When no existing Machine fits, Pi handles a one-off normally. For a reusable workflow, it
+proposes a short state sequence and asks before creating a project-local Machine. Installing
+that definition globally remains an explicit Human choice.
+
 ## Smoke test
 
 Install the permanent smoke Machine as an instant runtime health check:

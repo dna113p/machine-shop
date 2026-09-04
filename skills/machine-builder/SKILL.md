@@ -1,12 +1,21 @@
 ---
 name: machine-builder
-description: Build, edit, or describe TypeScript workflow definitions for the Machines runtime. Use when creating a Machine, adding its discovery description, choosing among Agent/Human/Operation states, expressing workflow transitions, or testing and installing a Machine definition. Do not use for unrelated XState applications or agent-harness implementation.
+description: Build, edit, or describe TypeScript workflow definitions for the Machines runtime. Use when creating a Machine, when no existing Machine fits a reusable multi-step workflow, when adding its discovery description, choosing among Agent/Human/Operation states, expressing workflow transitions, or testing and installing a Machine definition. Do not use for unrelated XState applications or agent-harness implementation.
 ---
 
 # Build Machines
 
 Build the smallest readable state machine that completes the requested workflow.
 Keep workflow policy in the Machine file and keep the Machines runtime generic.
+
+## Confirm new workflow policy
+
+Proceed immediately when the Human explicitly asked to create or edit a Machine. When you
+independently recognize a possible new Machine, first inspect the available Machines. If none
+fits and the workflow is reusable, show the Human a short state sequence and ask whether to
+create it. Handle a one-off task normally. After confirmation, create the Machine in the
+project's `.machines/` directory; use the global `~/.machines/` directory only when the Human
+explicitly requests a global installation.
 
 ## Start from the current interface
 
