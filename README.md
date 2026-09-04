@@ -35,6 +35,20 @@ role and preset before creating a worktree or making another workflow change. Co
 can discover the same information through `machine list` and `machine agents`; they should
 select from configured presets rather than inventing inline harness or model options.
 
+## Launch from Pi
+
+With the Machines Pi extension installed, ask Pi naturally:
+
+```text
+Use the worktree-task Machine to add the empty state and its tests.
+```
+
+Pi discovers Machines and Agent presets, starts the run asynchronously, and remains available
+for conversation. When the Machine needs Human input, Pi shows a notification and the widget
+shows `input needed`. Ask for status if useful, then answer naturally—for example, `Approve
+it` or `Have it fix keyboard focus first`. Pi routes the clear response to the exact waiting
+run. The Machine, not the extension, still owns revision, merge, cleanup, and completion.
+
 ## Smoke test
 
 Install the permanent smoke Machine as an instant runtime health check:

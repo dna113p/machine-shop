@@ -197,7 +197,17 @@ Verification is complete when all applicable checks below pass:
 ## Discover and invoke existing Machines
 
 When acting as the caller rather than the author, do not guess Machine names, roles, or
-Agent presets:
+Agent presets. In Pi with the Machines extension loaded, use `machine_list` and
+`machine_agents`. Start the selected workflow with `machine_start`; it returns a run id while
+the Machine continues asynchronously. Keep the conversation available and call
+`machine_status` only when its state is relevant.
+
+When a notification says a Machine needs input, discuss the result with the Human as needed.
+After their answer is clear, call `machine_respond` with the exact waiting run id. Preserve
+their answer as written. An approval, revision loop, merge, cleanup, or terminal condition is
+Machine policy; reaching a Human request does not transfer that authority to Pi.
+
+Outside Pi, discover through the CLI:
 
 ```bash
 machine list
@@ -205,10 +215,10 @@ machine agents
 ```
 
 Choose a Machine from its description. Use its exact declared role names and an available
-preset name when a one-run override is useful. Then launch with `machine run`. Do not pass
-model, thinking, environment, or harness fields on the command line; those belong in the
-selected preset. The CLI invocation currently blocks until the Machine finishes or needs
-terminal input. Do not claim it is an async background launch or a resumable Pi tool.
+preset name when a one-run override is useful. Then launch with `machine run`. The CLI blocks
+until the Machine finishes or needs terminal input; only `machine_start` in Pi is async. Model,
+thinking, environment, and harness fields belong in the selected preset rather than either
+invocation.
 
 Install a proven shared definition by symlinking that individual file into
 `~/.machines/`. Keep `~/.machines` as a shared installation directory rather
