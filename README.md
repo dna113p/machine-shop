@@ -82,8 +82,9 @@ The Machine creates a temporary branch and worktree from the current `HEAD`,
 runs implementation and one advisory Agent review there, and asks for human
 approval or free-form revision feedback. Approval fast-forwards the original
 branch, removes the worktree and temporary branch, and then reaches `done`.
-The Human gate shows a compact automated-review summary. Enter `details` to print
-the full report, `approve` to merge, or any other text as revision feedback.
+The Human gate shows a compact automated-review summary. Choose `details` to put
+the full report in the next Human prompt, `approve` to merge, or enter revision
+feedback.
 Interactive worktree creation, merge, and cleanup messages are short indented notes;
 redirected output retains their complete machine-readable wording.
 

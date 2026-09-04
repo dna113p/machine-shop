@@ -25,6 +25,7 @@ export default function worktreeTask(
   let feedback = "";
   let reviewDetails = "No review details were returned.";
   let reviewSummary = "Review completed.";
+  let showReviewDetails = false;
   let revisions = 0;
 
   return machine({
@@ -77,6 +78,7 @@ export default function worktreeTask(
                 ?? "No review details were returned.";
               reviewSummary = eventText(event, "summary")
                 ?? "Review completed; use details to inspect the report.";
+              showReviewDetails = false;
             },
             target: "humanReview",
           },
@@ -89,6 +91,9 @@ export default function worktreeTask(
           "Review needed.",
           `Automated review${revisions === 0 ? "" : " (before revision)"}: ${reviewSummary}`,
           `Worktree: ${worktreeDirectory}`,
+          ...(showReviewDetails
+            ? ["", "Automated review report:", reviewDetails]
+            : []),
           'Enter "details" to show the report, "approve" to merge, or type revision feedback.',
         ].join("\n"),
         {
@@ -104,6 +109,7 @@ export default function worktreeTask(
             {
               actions: ({ event }) => {
                 feedback = response(event);
+                showReviewDetails = false;
               },
               target: "revise",
             },
@@ -114,7 +120,7 @@ export default function worktreeTask(
 
       showReview: operation(
         () => {
-          console.log(`\nAutomated review\n\n${reviewDetails}\n`);
+          showReviewDetails = true;
           return { type: "shown" };
         },
         { shown: "humanReview" },

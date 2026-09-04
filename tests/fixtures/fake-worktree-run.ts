@@ -11,6 +11,10 @@ interface AgentRequest {
   readonly cwd?: string;
 }
 
+interface HumanRequest {
+  readonly prompt: string;
+}
+
 const {
   agent,
   final,
@@ -25,6 +29,8 @@ const definition = worktreeTask(
   "Create result.txt",
 );
 let agentRuns = 0;
+
+const humanResponses = process.env.FAKE_HUMAN_RESPONSES?.split("\n");
 
 const result = await run(definition, {
   agents: {
@@ -61,6 +67,16 @@ const result = await run(definition, {
       return { type: "completed" };
     },
   },
+  ...(humanResponses === undefined
+    ? {}
+    : {
+      human: (request: HumanRequest) => {
+        console.log(`Human request: ${JSON.stringify(request.prompt)}`);
+        const answer = humanResponses.shift();
+        assert.notEqual(answer, undefined, "A fake Human response is required");
+        return answer as string;
+      },
+    }),
 });
 
 console.log(`Agent runs: ${agentRuns}`);

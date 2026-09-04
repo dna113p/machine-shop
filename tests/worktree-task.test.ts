@@ -76,6 +76,30 @@ test("review details are shown only when requested", async () => {
   }
 });
 
+test("review details are included in the next Human request", () => {
+  const repository = createRepository();
+
+  try {
+    const result = spawnSync(process.execPath, [fakeRun], {
+      cwd: repository,
+      encoding: "utf8",
+      env: { ...process.env, FAKE_HUMAN_RESPONSES: "details\napprove" },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const requests = result.stdout
+      .split("\n")
+      .filter((line) => line.startsWith("Human request: "))
+      .map((line) => JSON.parse(line.slice("Human request: ".length)) as string);
+
+    assert.equal(requests.length, 2);
+    assert.doesNotMatch(requests[0], /Fake review detail/u);
+    assert.match(requests[1], /Fake review detail for the implementation/u);
+  } finally {
+    rmSync(repository, { force: true, recursive: true });
+  }
+});
+
 test("free-form feedback is revised, committed, approved, and cleaned up", async () => {
   const repository = createRepository();
   const baseCommit = git(repository, "rev-parse", "HEAD");
