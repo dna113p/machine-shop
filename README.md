@@ -44,10 +44,10 @@ Use the worktree-task Machine to add the empty state and its tests.
 ```
 
 Pi discovers Machines and Agent presets, starts the run asynchronously, and remains available
-for conversation. When the Machine needs Human input, Pi shows a notification and the widget
-shows `input needed`. Ask for status if useful, then answer naturally—for example, `Approve
-it` or `Have it fix keyboard focus first`. Pi routes the clear response to the exact waiting
-run. The Machine, not the extension, still owns revision, merge, cleanup, and completion.
+for conversation. When the Machine needs Human input, Pi opens a native selector. Selecting
+`approve` or another suggestion sends it directly to the exact waiting run; `Other…` opens
+direct feedback input. Cancel the dialog when you want to inspect or discuss the result with
+Pi first. The Machine, not the extension, still owns revision, merge, cleanup, and completion.
 
 When no existing Machine fits, Pi handles a one-off normally. For a reusable workflow, it
 proposes a short state sequence and asks before creating a project-local Machine. Installing

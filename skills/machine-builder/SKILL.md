@@ -211,10 +211,11 @@ Agent presets. In Pi with the Machines extension loaded, use `machine_list` and
 the Machine continues asynchronously. Keep the conversation available and call
 `machine_status` only when its state is relevant.
 
-When a notification says a Machine needs input, discuss the result with the Human as needed.
-After their answer is clear, call `machine_respond` with the exact waiting run id. Preserve
-their answer as written. An approval, revision loop, merge, cleanup, or terminal condition is
-Machine policy; reaching a Human request does not transfer that authority to Pi.
+Pi presents Machine choices and free-form input directly to the Human and sends their response
+to the exact waiting run. A canceled dialog leaves the Machine waiting. If the Human then
+answers in conversation, call `machine_respond` with that run id and preserve the answer as
+written. An approval, revision loop, merge, cleanup, or terminal condition is Machine policy;
+reaching a Human request does not transfer that authority to Pi.
 
 Outside Pi, discover through the CLI:
 
