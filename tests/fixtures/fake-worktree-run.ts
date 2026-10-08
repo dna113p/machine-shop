@@ -84,6 +84,20 @@ console.log(`--> ${String(result.value)}`);
 
 function machinesRuntime(): string {
   const projectDirectory = resolve(import.meta.dirname, "../..");
+  const options = { cwd: projectDirectory, encoding: "utf8" as const };
+  const commonGitDirectory = execFileSync(
+    "git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], options,
+  ).trim();
+  const configuredWorktree = execFileSync(
+    "git", ["--git-dir", commonGitDirectory, "config", "--local", "--default", "", "--get", "core.worktree"], options,
+  ).trim();
+
+  // Absorbed submodules explicitly configure their main checkout relative to
+  // the common Git directory. worktree list does not honor this for its first row.
+  if (configuredWorktree) {
+    return resolve(commonGitDirectory, configuredWorktree, "../machines/src/index.ts");
+  }
+
   const worktrees = execFileSync(
     "git",
     ["worktree", "list", "--porcelain", "-z"],
@@ -92,8 +106,8 @@ function machinesRuntime(): string {
   const primary = worktrees.split("\0").find((field) => field.startsWith("worktree "));
   assert.ok(primary, "Git must identify the primary Dev Machines checkout");
 
-  // Use Git's checkout path, not its object-storage layout: a submodule can keep
-  // its Git directory under the umbrella, and a linked worktree can live elsewhere.
+  // Ordinary repositories identify their primary checkout in the first record.
+  // A linked checkout can live elsewhere, without its own Machines sibling.
   return resolve(primary.slice("worktree ".length), "../machines/src/index.ts");
 }
 
