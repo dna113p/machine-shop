@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import worktreeTask from "../../worktree-task.ts";
@@ -84,14 +84,17 @@ console.log(`--> ${String(result.value)}`);
 
 function machinesRuntime(): string {
   const projectDirectory = resolve(import.meta.dirname, "../..");
-  const commonGitDirectory = execFileSync(
+  const worktrees = execFileSync(
     "git",
-    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ["worktree", "list", "--porcelain", "-z"],
     { cwd: projectDirectory, encoding: "utf8" },
-  ).trim();
+  );
+  const primary = worktrees.split("\0").find((field) => field.startsWith("worktree "));
+  assert.ok(primary, "Git must identify the primary Dev Machines checkout");
 
-  // A linked worktree may not share the primary checkout's sibling layout.
-  return resolve(dirname(commonGitDirectory), "../machines/src/index.ts");
+  // Use Git's checkout path, not its object-storage layout: a submodule can keep
+  // its Git directory under the umbrella, and a linked worktree can live elsewhere.
+  return resolve(primary.slice("worktree ".length), "../machines/src/index.ts");
 }
 
 function git(directory: string, ...args: string[]): void {
