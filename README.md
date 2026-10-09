@@ -141,9 +141,9 @@ instruction-following and task-solving quality are not established by these test
 [ticket-task.ts](ticket-task.ts) is a current workflow at the repository root. It
 is not one of the ten defaults and the selective installer does not install it;
 run it from source or wrap it in a project Machine that supplies trusted paths
-and commands. It takes one local ticket for one Git repository and carries it,
-unattended, from an isolated worktree to a delivered branch, patch, or draft
-pull request:
+and commands. It takes one local ticket for one Git repository and carries it
+from an isolated worktree to a delivered branch, patch, or draft pull request,
+stopping for a person only when the work is stuck:
 
 ```sh
 machine run /absolute/dev-machines/ticket-task.ts \
@@ -156,11 +156,42 @@ branch after the required checks pass and the reviewer approves. With
 `"output": "pr"` it also pushes that branch and opens a pull request with `gh`.
 Use it only where the assignment authorizes those effects. It never merges,
 tags, force-pushes, or pushes any other ref, and never modifies the source
-checkout's working tree, index, or current branch. There is no Human state. It
-ends `delivered` or `blocked`, and its output is always exactly
-`{ "action": "hold", "summary": "..." }` so a Machines Dispatch ticket stays open
-until a person merges. See the [catalog](docs/catalog.md#ticket-delivery) for the
-input contract, evidence, and limits.
+checkout's working tree, index, or current branch.
+
+A ticket run can now wait for a person. Failed checks and review findings are
+repaired within `maxRepairs`, which defaults to 3 here (0-3 accepted). When that
+budget is exhausted, or triage, the implementer, or the reviewer reports a
+blocker or a read-only stage edits the worktree, the run enters the Human state
+`decide` instead of ending. Its prompt gives the ticket, the reason, the repair
+rounds used, the worktree, and the branch, and offers exactly four choices:
+
+- `more rounds`: restart the repair budget and send the standing findings back
+  to the implementer. It can be chosen every time the budget runs out.
+- `hand off`: end `handedOff` with the worktree and branch kept, uncommitted,
+  for another workflow or a person.
+- `archive`: save the whole candidate, ignored files included, as
+  `candidate.patch` in the evidence directory, then remove the worktree and
+  delete the branch; ends `abandoned`. Nothing is removed unless a checkout of
+  what the patch holds matches the worktree byte for byte, so a file that Git's
+  line-ending conversion or a filter would alter is saved as it is, and a
+  candidate that cannot be rebuilt that way, or does not differ from its base
+  commit, ends `blocked` with nothing removed.
+- `discard`: remove the worktree and delete the branch without saving anything;
+  ends `abandoned`. Nothing is removed until a second Human state,
+  `confirmDiscard`, is answered `confirm discard`; `go back` returns to the
+  decision unchanged.
+
+Failures while preparing the worktree, committing, or delivering still end
+`blocked` without asking. `"resume": true` starts a new run in the uncommitted
+worktree a `hand off` left behind: it skips triage and setup, and goes straight
+to the checks, review, commit, and delivery with a fresh repair budget.
+
+The run ends `delivered`, `handedOff`, `abandoned`, or `blocked`, and its output
+is always exactly `{ "action": "hold", "summary": "..." }` so a Machines Dispatch
+ticket stays open until a person merges or closes it. The workflow never
+relaunches itself or another Machine and never edits a ticket. See the
+[catalog](docs/catalog.md#ticket-delivery) for the input contract, evidence, and
+limits.
 
 ## Earlier workflows retained
 

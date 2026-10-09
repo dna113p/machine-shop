@@ -46,6 +46,9 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
   let lastChecksPassed: boolean | null = null;
   let accepted = false;
   let repairs = 0;
+  let renewed = 0;
+  let standing: string | undefined;
+  let retired = false;
   let reason = "";
   let result: Record<string, unknown> | undefined;
   const workspace = assignment.workspace;
@@ -150,9 +153,14 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
   }
 
   function decision(stage: string, event: Event): void {
-    if (event.value !== "approve" && event.value !== "reject") throw new Error("Invalid Human decision");
+    choice(stage, event, ["approve", "reject"]);
+  }
+  /** Records one of the restricted choices a definition offered in its own Human state. */
+  function choice(stage: string, event: Event, allowed: readonly string[]): string {
+    if (typeof event.value !== "string" || !allowed.includes(event.value)) throw new Error("Invalid Human decision");
     decisions.push({ stage, response: event.value });
     writeFileSync(join(directory, `human-${decisions.length}.json`), JSON.stringify(decisions.at(-1)), { flag: "wx", mode: 0o600 });
+    return event.value;
   }
 
   function prompt(instruction: string): string {
@@ -185,11 +193,19 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
   }
   function repair(): Event {
     if (repairs >= assignment.maxRepairs) {
+      standing = reason;
       reason = `Repair budget exhausted (${assignment.maxRepairs}). ${reason}`;
       return { type: "exhausted" };
     }
     repairs += 1;
     return { type: "retry" };
+  }
+  /** For a definition whose Human grants another budget: the count restarts and the findings that exhausted the last one stand as the feedback. */
+  function renew(): void {
+    renewed += repairs;
+    repairs = 0;
+    if (standing !== undefined) reason = standing;
+    standing = undefined;
   }
   function block(why: string): Event {
     reason = why;
@@ -201,9 +217,19 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     reason = "The checkout no longer matches passing verification; rerun checks on the current candidate.";
     return false;
   }
+  const drifted = () => lastChecksPassed === true && !accepted && policy.git !== "none" && verifiedSnapshot !== fingerprint(workspace);
+  /**
+   * For a definition that removes its own workspace or keeps one it cannot vouch for: settles once, ahead of finish, whether the
+   * checkout still matches verification. One that cannot be fingerprinted any more, as with a nested repository, does not.
+   */
+  function retire(): void {
+    if (retired) return;
+    try { if (drifted()) lastChecksPassed = false; } catch { lastChecksPassed = false; }
+    retired = true;
+  }
   function finish(outcome: Outcome): Event {
     if (!directory) throw new Error("Evidence is not initialized");
-    if (lastChecksPassed === true && !accepted && policy.git !== "none" && verifiedSnapshot !== fingerprint(workspace)) lastChecksPassed = false;
+    if (!retired && drifted()) lastChecksPassed = false;
     if (outcome === "completed" && policy.checks) {
       if (lastChecksPassed !== true) {
         outcome = "blocked";
@@ -212,7 +238,7 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     }
     result = {
       schemaVersion: 1, workflow: name, outcome, workspace, task: assignment.task,
-      startedAt, finishedAt: new Date().toISOString(), repairs, agentInvocations: reports.length,
+      startedAt, finishedAt: new Date().toISOString(), repairs: renewed + repairs, agentInvocations: reports.length,
       checksPassed: lastChecksPassed, reason: outcome === "completed" ? "" : reason || (outcome === "rejected" ? "Human rejected the candidate" : "Work did not satisfy its completion conditions"),
       checks: evidence, agents: reports, decisions, report: join(directory, "result.json"),
     };
@@ -220,8 +246,9 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     console.log(`Dev Machines result: ${join(directory, "result.json")}`);
     return { type: outcome };
   }
-  return { start, open, check, checks, regression, capture, decision, prompt, seal, unchanged, review, repair, block, accept, finish,
+  return { start, open, check, checks, regression, capture, decision, choice, prompt, seal, unchanged, review, repair, renew, block, accept, retire, finish,
     workspace, output: () => result,
+    status: () => ({ reason, repairs, totalRepairs: renewed + repairs, maxRepairs: assignment.maxRepairs }),
     humanPrompt: (decision: string) => `${decision}\n\n${reports.at(-1)?.summary ?? ""}\nWorkspace: ${workspace}\nEvidence: ${directory}\nApprove only this candidate, not publication or deployment.`,
   };
 }
