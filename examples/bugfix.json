@@ -1,0 +1,25 @@
+{
+  "task": "Fix empty-input behavior without changing other cases. The regression should assert an empty collection is returned.",
+  "workspace": "/absolute/project",
+  "checks": [
+    {
+      "name": "tests",
+      "command": [
+        "npm",
+        "test"
+      ],
+      "timeoutMs": 120000
+    }
+  ],
+  "maxRepairs": 1,
+  "regression": {
+    "name": "empty-input-regression",
+    "command": [
+      "node",
+      "--test",
+      "tests/empty-input.test.js"
+    ],
+    "failureExitCode": 1,
+    "failureIncludes": "empty input returns an empty collection"
+  }
+}

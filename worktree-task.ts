@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { MachinePrimitives } from "../machines/src/index.ts";
+import type { MachinePrimitives } from "@dna113p/machines";
 
 export const description = "Implements in an isolated worktree, reviews the result, then asks before merging.";
 

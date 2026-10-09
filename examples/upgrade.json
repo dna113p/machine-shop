@@ -1,0 +1,15 @@
+{
+  "task": "Assess an explicitly named dependency and target version supplied by the orchestrator; request approval before changing it.",
+  "workspace": "/absolute/project",
+  "checks": [
+    {
+      "name": "tests",
+      "command": [
+        "npm",
+        "test"
+      ],
+      "timeoutMs": 120000
+    }
+  ],
+  "maxRepairs": 1
+}

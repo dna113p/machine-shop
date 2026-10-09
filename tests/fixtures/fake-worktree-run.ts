@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import worktreeTask from "../../worktree-task.ts";
 
@@ -83,6 +83,8 @@ console.log(`Agent runs: ${agentRuns}`);
 console.log(`--> ${String(result.value)}`);
 
 function machinesRuntime(): string {
+  try { return fileURLToPath(import.meta.resolve("@dna113p/machines")); }
+  catch { /* Test-only checkout/worktree fallback below. */ }
   const projectDirectory = resolve(import.meta.dirname, "../..");
   const options = { cwd: projectDirectory, encoding: "utf8" as const };
   const commonGitDirectory = execFileSync(

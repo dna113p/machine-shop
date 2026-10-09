@@ -1,0 +1,15 @@
+{
+  "task": "Assess the explicitly specified release candidate and draft its checklist and release notes. Do not publish.",
+  "workspace": "/absolute/project",
+  "checks": [
+    {
+      "name": "tests",
+      "command": [
+        "npm",
+        "test"
+      ],
+      "timeoutMs": 120000
+    }
+  ],
+  "maxRepairs": 1
+}

@@ -1,4 +1,4 @@
-import type { MachinePrimitives } from "../machines/src/index.ts";
+import type { MachinePrimitives } from "@dna113p/machines";
 
 export const description = "Prints an input through one Operation as a quick runtime check.";
 

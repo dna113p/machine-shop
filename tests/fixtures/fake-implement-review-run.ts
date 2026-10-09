@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 
-import { agent, final, human, machine, operation, run } from "../../../machines/src/index.ts";
+import { runtime } from "../runtime.ts";
+const { agent, final, human, machine, operation, run } = runtime;
 import implementReview from "../../implement-review.ts";
 
 let agentRuns = 0;

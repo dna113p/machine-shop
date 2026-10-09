@@ -1,4 +1,4 @@
-import type { MachinePrimitives } from "../machines/src/index.ts";
+import type { MachinePrimitives } from "@dna113p/machines";
 
 export const description = "Implements directly in the current directory, then waits for approval or feedback.";
 

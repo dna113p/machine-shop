@@ -1,0 +1,15 @@
+{
+  "task": "Implement the requested behavior, with acceptance criteria and scope supplied by the orchestrator.",
+  "workspace": "/absolute/project",
+  "checks": [
+    {
+      "name": "tests",
+      "command": [
+        "npm",
+        "test"
+      ],
+      "timeoutMs": 120000
+    }
+  ],
+  "maxRepairs": 1
+}

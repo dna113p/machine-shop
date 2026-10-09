@@ -1,0 +1,4 @@
+{
+  "task": "Review the current diff for concrete correctness and regression risks. Cite file/line evidence; leave files unchanged.",
+  "workspace": "/absolute/project"
+}

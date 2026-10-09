@@ -1,0 +1,15 @@
+{
+  "task": "Verify the selected project checks. Replace these example commands with actual project commands.",
+  "workspace": "/absolute/project",
+  "checks": [
+    {
+      "name": "tests",
+      "command": [
+        "npm",
+        "test"
+      ],
+      "timeoutMs": 120000
+    }
+  ],
+  "maxRepairs": 1
+}
