@@ -193,6 +193,34 @@ relaunches itself or another Machine and never edits a ticket. See the
 [catalog](docs/catalog.md#ticket-delivery) for the input contract, evidence, and
 limits.
 
+## ChatGPT thread
+
+[chatgpt-thread.ts](chatgpt-thread.ts) is a root workflow that keeps one ChatGPT
+web chat going through Human replies. It is not one of the ten defaults and the
+selective installer does not install it; run it from source. Its input is text:
+
+```sh
+# Start a fresh chat for a task in the current directory:
+machine run /absolute/dev-machines/chatgpt-thread.ts "Add a health endpoint"
+
+# Or adopt an existing conversation; nothing is sent until you reply:
+machine run /absolute/dev-machines/chatgpt-thread.ts "https://chatgpt.com/c/<id>"
+```
+
+After each rig-bridge handoff a Human state shows its reason and summary and the
+conversation URL. Any reply is sent to the chat unchanged; `done` ends the run,
+whose output is the conversation URL and the last handoff reason and summary. A
+reply that fails comes back to the Human state with the error and the reply
+quoted, and is never resent automatically.
+
+It needs the `chatgpt-web` Agent, a running rig-bridge, and a signed-in
+automation browser profile. **It types into your own ChatGPT account**: the task
+and every reply are submitted as you, in a real browser, and count against that
+account. Run it only where that is intended. The package
+`@dna113p/machines/chatgpt-web` must resolve from this checkout for replies to
+be sent. See the [catalog](docs/catalog.md#chatgpt-thread) for states,
+requirements, and limits.
+
 ## Earlier workflows retained
 
 The existing root definitions remain unchanged in behavior for compatibility:

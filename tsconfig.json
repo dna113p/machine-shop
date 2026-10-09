@@ -7,8 +7,9 @@
     "types": ["node"],
     "typeRoots": ["./node_modules/@types", "../machines/node_modules/@types"],
     "paths": {
-      "@dna113p/machines": ["./node_modules/@dna113p/machines/dist/src/index.d.ts", "../machines/src/index.ts"]
+      "@dna113p/machines": ["./node_modules/@dna113p/machines/dist/src/index.d.ts", "../machines/src/index.ts"],
+      "@dna113p/machines/chatgpt-web": ["./node_modules/@dna113p/machines/dist/src/chatgpt-web.d.ts", "../machines/src/chatgpt-web.ts"]
     }
   },
-  "include": ["defaults/**/*.ts", "ticket-task.ts"]
+  "include": ["defaults/**/*.ts", "ticket-task.ts", "chatgpt-thread.ts"]
 }

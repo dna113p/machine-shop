@@ -344,6 +344,52 @@ hook altered stays on the local branch, undelivered. Like the defaults, this is 
 harness's and user's permissions, and `pr` mode publishes the change, so accept
 tickets and repository settings only from a trusted source.
 
+## ChatGPT thread
+
+[chatgpt-thread](../chatgpt-thread.ts) is a separate root workflow, not one of
+the ten defaults: it is not in `defaults/`, the installer does not copy it, and
+it does not use the shared helper, so it runs no checks and writes no
+`.machine-runs` receipt. It keeps one ChatGPT web chat going by sending each
+Human reply back to the same conversation.
+
+Requirements: the `chatgpt-web` Agent (a built-in runner of the Machines
+runtime, declared in `agentRoles`), a running rig-bridge, and a signed-in
+automation browser profile. **It types into the user's own ChatGPT account**:
+the task and every reply are submitted in a real browser as that user and count
+against that account. Replies are sent with `chatGptWebContinue` from
+`@dna113p/machines/chatgpt-web`, loaded on the first reply, so that package must
+resolve from the definition's location.
+
+The input is a string, and the launch directory is the chat's working directory:
+
+- A `https://chatgpt.com/.../c/<id>` URL, alone and without credentials, adopts
+  that conversation. No Agent runs and nothing is sent before the first reply.
+- Any other non-empty text is a task for a fresh chat. Empty or non-text input
+  is rejected before any state runs.
+
+| State | Work |
+| --- | --- |
+| `start` | Fresh task only: the `chatgpt-web` Agent starts a chat in the launch directory and returns `completed`, `needs_input`, `blocked`, or `failed`. The event's `conversation` and `handoff.threadId` are kept; an event without a conversation URL fails the run |
+| `reply` | Human: shows the latest handoff reason and summary, or that an adopted chat is paired and waiting for a message, and the conversation URL. Suggests `done`; any other text is a reply |
+| `send` | Operation: one `chatGptWebContinue` call with the conversation, the reply text unchanged, the launch directory as `cwd`, and the saved rig-bridge thread id when there is one. The returned handoff becomes the latest; then back to `reply` |
+| `done` | Final, after `done` (trimmed, any case) |
+
+Every Agent outcome leads to `reply`, including `failed`: the handoff reason is
+reported to the person, not acted on. The output is
+`{ "conversation", "reason", "summary" }` with the last handoff's reason and
+summary, both `null` for an adopted chat that received no handoff.
+
+If a continuation throws, the run returns to `reply` showing the error text and
+the unsent or uncertain reply quoted. It is never resent automatically: the
+person checks the conversation and decides whether to type it again. An adopted
+chat has no saved thread id, so its handoffs are matched by the launch
+directory's rig-bridge workspace alone.
+
+Limits: there is no bound on the number of replies, and a run waits in `reply`
+until it is answered. Only rig-bridge handoffs are read, never the assistant's
+messages. The workflow cannot tell whether the chat finished what was asked;
+`reason` and `summary` are the chat's own report.
+
 ## Boundaries and validation
 
 Fingerprint guards include HEAD, branch, index, and the contents/modes of tracked
@@ -360,5 +406,7 @@ repair budgets, stale verification, source-integrity guards, malformed inputs,
 command errors, and result retrieval. `npm run smoke:install` covers selective
 installation, conflicts, relocation, discovery, and the real CLI. Ticket delivery
 is tested the same way for each output mode, with a local bare repository as the
-remote and a recording `gh` stand-in; no network or real `gh` is used. These tests
+remote and a recording `gh` stand-in; no network or real `gh` is used. The
+ChatGPT thread is tested with a fake `chatgpt-web` runner and an injected
+continue function; no browser, rig-bridge, or ChatGPT account is used. These tests
 do not prove that a live model follows the instructions or solves a software task.
