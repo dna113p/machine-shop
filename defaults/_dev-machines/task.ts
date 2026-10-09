@@ -30,7 +30,8 @@ interface Evidence {
 }
 interface AgentReport { stage: string; outcome: string; summary: string }
 type Outcome = "completed" | "blocked" | "rejected";
-interface Policy { checks?: boolean; git: "clean" | "snapshot" | "none"; regression?: boolean }
+/** evidenceRoot keeps evidence outside the workspace, for a workspace the workflow creates or removes itself. */
+interface Policy { checks?: boolean; git: "clean" | "snapshot" | "none"; regression?: boolean; evidenceRoot?: string }
 
 /** Mechanical input/evidence helpers. Each definition owns its state graph. */
 export function taskRun(name: string, input: unknown, policy: Policy) {
@@ -43,6 +44,7 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
   let snapshot = "";
   let verifiedSnapshot: string | undefined;
   let lastChecksPassed: boolean | null = null;
+  let accepted = false;
   let repairs = 0;
   let reason = "";
   let result: Record<string, unknown> | undefined;
@@ -61,7 +63,15 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
       snapshot = fingerprint(workspace);
     }
     // No writes, subprocesses, or discovery effects occur until this Operation runs.
-    let parent = workspace;
+    open();
+    return { type: "started" };
+  }
+
+  /** Returns the evidence directory, creating it once; callable ahead of start when the workspace does not exist yet. */
+  function open(): string {
+    if (directory) return directory;
+    let parent = policy.evidenceRoot ?? workspace;
+    if (policy.evidenceRoot) mkdirSync(parent, { recursive: true });
     for (const part of [".machine-runs", "dev-machines"]) {
       parent = join(parent, part);
       if (existsSync(parent)) {
@@ -73,7 +83,7 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     mkdirSync(directory, { mode: 0o700 });
     startedAt = new Date().toISOString();
     writeFileSync(join(directory, "started.json"), JSON.stringify({ workflow: name, workspace, startedAt }), { flag: "wx", mode: 0o600 });
-    return { type: "started" };
+    return directory;
   }
 
   function check(command: Check, phase: string, red = false): boolean {
@@ -126,14 +136,17 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     return { type: passed ? "passed" : "failed" };
   }
 
-  function capture(stage: string, event: Event): void {
-    if (typeof event.summary !== "string" || !event.summary.trim() || event.summary.length > 16_000) {
+  function capture(stage: string, event: Event): string {
+    // A capturing runner returns the Agent's prose as message; accept it when the summary field was left out.
+    const summary = typeof event.summary === "string" && event.summary.trim() ? event.summary : event.message;
+    if (typeof summary !== "string" || !summary.trim() || summary.length > 16_000) {
       throw new Error(`Agent ${stage} must return a non-empty summary of at most 16000 characters`);
     }
-    const report = { stage, outcome: event.type, summary: event.summary.trim() };
+    const report = { stage, outcome: event.type, summary: summary.trim() };
     reports.push(report);
     writeFileSync(join(directory, `agent-${reports.length}.json`), JSON.stringify(report, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     if (event.type === "blocked" || event.type === "revise") reason = report.summary;
+    return report.summary;
   }
 
   function decision(stage: string, event: Event): void {
@@ -178,9 +191,19 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     repairs += 1;
     return { type: "retry" };
   }
+  function block(why: string): Event {
+    reason = why;
+    return { type: "blocked" };
+  }
+  /** Gate for a workflow that commits the verified candidate itself; afterwards its own HEAD movement is not drift. */
+  function accept(): boolean {
+    if (lastChecksPassed === true && verifiedSnapshot === fingerprint(workspace)) return accepted = true;
+    reason = "The checkout no longer matches passing verification; rerun checks on the current candidate.";
+    return false;
+  }
   function finish(outcome: Outcome): Event {
     if (!directory) throw new Error("Evidence is not initialized");
-    if (lastChecksPassed === true && policy.git !== "none" && verifiedSnapshot !== fingerprint(workspace)) lastChecksPassed = false;
+    if (lastChecksPassed === true && !accepted && policy.git !== "none" && verifiedSnapshot !== fingerprint(workspace)) lastChecksPassed = false;
     if (outcome === "completed" && policy.checks) {
       if (lastChecksPassed !== true) {
         outcome = "blocked";
@@ -197,7 +220,7 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     console.log(`Dev Machines result: ${join(directory, "result.json")}`);
     return { type: outcome };
   }
-  return { start, checks, regression, capture, decision, prompt, seal, unchanged, review, repair, finish,
+  return { start, open, check, checks, regression, capture, decision, prompt, seal, unchanged, review, repair, block, accept, finish,
     workspace, output: () => result,
     humanPrompt: (decision: string) => `${decision}\n\n${reports.at(-1)?.summary ?? ""}\nWorkspace: ${workspace}\nEvidence: ${directory}\nApprove only this candidate, not publication or deployment.`,
   };
@@ -241,7 +264,7 @@ function parseAssignment(input: unknown, policy: Policy): Assignment {
   if (!policy.checks && checks.length > 0) throw new Error("This read-only workflow does not run checks; use verify-checks separately");
   return { task, workspace: resolve(workspace), checks, maxRepairs, ...(regression ? { regression } : {}) };
 }
-function parseCheck(value: unknown, name: string): Check {
+export function parseCheck(value: unknown, name: string): Check {
   const data = object(value, name, ["name", "command", "timeoutMs"]);
   if (!Array.isArray(data.command) || data.command.length === 0 || data.command.length > 100 || data.command.some(x => typeof x !== "string" || x.includes("\0"))) {
     throw new Error(`${name}.command must be a non-empty executable/argv string array`);
@@ -250,12 +273,12 @@ function parseCheck(value: unknown, name: string): Check {
   return { name: text(data.name, `${name}.name`), command: [...data.command] as string[],
     timeoutMs: integer(data.timeoutMs ?? 60_000, `${name}.timeoutMs`, 1, 600_000) };
 }
-function object(value: unknown, name: string, keys: string[]): Record<string, unknown> {
+export function object(value: unknown, name: string, keys: string[]): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${name} must be an object`);
   for (const key of Object.keys(value)) if (!keys.includes(key)) throw new Error(`Unknown ${name} field: ${key}`);
   return value as Record<string, unknown>;
 }
-function text(value: unknown, name: string): string {
+export function text(value: unknown, name: string): string {
   if (typeof value !== "string" || !value.trim() || value.includes("\0")) throw new Error(`${name} must be a non-empty string`);
   return value;
 }

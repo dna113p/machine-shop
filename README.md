@@ -136,6 +136,32 @@ Human rejection, stale candidate protection, installation conflicts, relocation,
 and CLI failure exits. No paid model or production operation is needed. Live-model
 instruction-following and task-solving quality are not established by these tests.
 
+## Ticket delivery
+
+[ticket-task.ts](ticket-task.ts) is a current workflow at the repository root. It
+is not one of the ten defaults and the selective installer does not install it;
+run it from source or wrap it in a project Machine that supplies trusted paths
+and commands. It takes one local ticket for one Git repository and carries it,
+unattended, from an isolated worktree to a delivered branch, patch, or draft
+pull request:
+
+```sh
+machine run /absolute/dev-machines/ticket-task.ts \
+  --agent investigator=codex --agent implementer=default --agent reviewer=codex \
+  --input-file /absolute/ticket.json
+```
+
+Unlike the ten defaults, **it commits**: one commit on a new `ticket/<slug>`
+branch after the required checks pass and the reviewer approves. With
+`"output": "pr"` it also pushes that branch and opens a pull request with `gh`.
+Use it only where the assignment authorizes those effects. It never merges,
+tags, force-pushes, or pushes any other ref, and never modifies the source
+checkout's working tree, index, or current branch. There is no Human state. It
+ends `delivered` or `blocked`, and its output is always exactly
+`{ "action": "hold", "summary": "..." }` so a Machines Dispatch ticket stays open
+until a person merges. See the [catalog](docs/catalog.md#ticket-delivery) for the
+input contract, evidence, and limits.
+
 ## Earlier workflows retained
 
 The existing root definitions remain unchanged in behavior for compatibility:

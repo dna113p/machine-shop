@@ -340,3 +340,15 @@ test("documented JSON examples match their selected input contracts", () => {
     assert.doesNotThrow(() => modules[name].default(runtime, data));
   }
 });
+
+test("a captured Agent message stands in for a missing summary, and an absent report still fails", async context => {
+  const cwd = repo(context);
+  const result = await execute("review-code", input(cwd, { checks: [] }), {
+    reviewer: () => ({ type: "reviewed", message: "Findings written as prose" }),
+  });
+  assert.equal(result.output.agents[0].summary, "Findings written as prose");
+  await assert.rejects(
+    execute("review-code", input(cwd, { checks: [] }), { reviewer: () => ({ type: "reviewed", summary: " " }) }),
+    /must return a non-empty summary/u,
+  );
+});

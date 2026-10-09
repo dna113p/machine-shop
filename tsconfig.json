@@ -10,5 +10,5 @@
       "@dna113p/machines": ["./node_modules/@dna113p/machines/dist/src/index.d.ts", "../machines/src/index.ts"]
     }
   },
-  "include": ["defaults/**/*.ts"]
+  "include": ["defaults/**/*.ts", "ticket-task.ts"]
 }

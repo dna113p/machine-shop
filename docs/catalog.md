@@ -141,6 +141,117 @@ as proof that review or Human approval was accepted; also inspect `outcome`.
 Unexpected failures can leave `started.json`, Agent summaries, and check logs
 without a final receipt. These workflows do not resume, undo, or roll back work.
 
+## Ticket delivery
+
+[ticket-task](../ticket-task.ts) is a separate root workflow, not one of the ten
+defaults: it is not in `defaults/`, the installer does not copy it, and it is the
+only workflow here built on the shared helper that commits or publishes. It
+reuses the helper for evidence, checks, fingerprints, review, and the repair
+budget. Required Agent roles are `investigator`, `implementer`, and `reviewer`;
+the default repair budget allows at most 5 Agent calls, and `maxRepairs: 0` uses 3.
+
+```json
+{
+  "ticket": { "id": "PROJ-12", "title": "Add the empty state", "body": "Scope and acceptance criteria." },
+  "repository": {
+    "name": "widgets",
+    "path": "/absolute/widgets",
+    "base": "main",
+    "setup": [{ "name": "install", "command": ["npm", "ci"], "timeoutMs": 300000 }],
+    "checks": [{ "name": "tests", "command": ["npm", "test"], "timeoutMs": 120000 }],
+    "output": "pr",
+    "remote": "origin",
+    "draft": true
+  },
+  "worktreeRoot": "/absolute/worktrees",
+  "evidenceRoot": "/absolute/project",
+  "maxRepairs": 1
+}
+```
+
+The input is an object or JSON string, fully validated at construction with no
+filesystem or subprocess effects. Unknown fields are rejected at every level
+except inside `ticket`, where tracker fields such as `source` or `metadata` are
+ignored. `ticket.id` and `ticket.title` are required; `body` is optional.
+`repository.name` is one path segment and `repository.path` is the absolute
+checkout root. `base` is a branch or ref and defaults to the checkout's current
+HEAD commit. `setup` is optional and `checks` needs 1–20 entries; both use the
+check shape and limits under [Common input](#common-input). `output` is `pr`,
+`branch`, or `patch`. `remote` (default `origin`) and `draft` (default `true`)
+matter only for `pr`. `worktreeRoot` and `evidenceRoot` are absolute and must be
+outside `repository.path`, and `evidenceRoot` must also be outside the worktree,
+so run files never appear in the source checkout or the commit.
+
+The slug is the lowercased ticket id with every character outside `[a-z0-9._-]`
+replaced by `-`; an id that leaves no letter or digit, or a name Git cannot use,
+is rejected. The branch is `ticket/<slug>` and the worktree is
+`<worktreeRoot>/<repository.name>--<slug>`.
+
+| State | Work |
+| --- | --- |
+| `prepare` | Resolve the base commit, `git worktree add -b` the branch, and run `setup` in the worktree |
+| `start` | Open the helper's run on the worktree, which must be clean |
+| `triage` | The investigator returns `ready` with a short plan or `blocked` with what is missing; an unchanged-worktree guard follows |
+| `change` | The implementer edits the worktree and leaves the changes uncommitted |
+| `verify` | The required checks; a failure goes to the repair budget |
+| `review` | The reviewer returns `approved`, `revise`, or `blocked`, sealed by the unchanged-checkout guard |
+| `commit` | One commit of everything except `.machine-runs`, even if an Agent staged it: subject is the ticket title, body is `Ticket: <id>` |
+| `deliver` | `branch`: nothing more. `patch`: `git format-patch` for base..HEAD into the evidence directory. `pr`: `git push --no-follow-tags <remote URL>` of the approved commit to `refs/heads/ticket/<slug>` alone, then `gh pr create --repo <host/owner/repository>` |
+
+Operations do all Git, command, and publishing work. `revise` and failed checks
+return to `change` within `maxRepairs`, and every retry passes through the real
+checks and the review again. The commit happens only for an approved candidate
+that still matches its passing checks. Commit hooks run, and the result is then
+compared with that candidate: the commit must have the approved tree, the base
+as its only parent, the ticket's subject and exact `Ticket:` line, and a clean
+worktree, and the ticket branch must still point at it. The push sends that
+commit to the ticket branch only and ignores `push.followTags`, so no tag is
+published. The push goes to the remote's configured URL, not its name, and the
+pull request is opened in the repository that URL names, regardless of `GH_REPO`,
+a separate `pushurl`, or other remotes (Git `insteadOf` aliases still apply); a remote whose URL
+does not name a hosted owner/repository blocks before anything is pushed. `--draft` is passed unless `draft` is
+false, and `--base` only when `repository.base` names a branch. The Operation
+writes the pull request body from the ticket id and title, the check results,
+and the reviewer's summary. Push and `gh` each have a two-minute timeout.
+
+A run ends `blocked`, changing nothing further, when: the base does not resolve;
+the branch or worktree directory already exists; a setup command fails or
+leaves tracked or unignored files behind; triage or the implementer reports a
+blocker; a read-only stage edits the worktree; the repair budget is exhausted;
+there is nothing to commit; an Agent committed or moved HEAD or the branch
+itself; a commit hook rejects the commit or changes its content or message; the
+commit, patch, push, or `gh` step fails; or the worktree cannot be removed after
+delivery. A failed Git or `gh` step saves its output as a log in the evidence
+directory.
+
+Final states are `delivered` and `blocked`. Either way the Machine output is
+exactly `{ "action": "hold", "summary": "<text>" }` with no other field, the
+strict shape Machines Dispatch accepts for a ticket that must stay open until a
+person merges. The one-line summary names the branch, commit, and pull request
+URL or patch path on success, or the reason when blocked, then the worktree if
+it was kept and the evidence directory. Read the final state, not the action, to
+tell success from a blocker. `delivered` means the worktree was removed and the
+branch kept; `blocked` keeps a created worktree for inspection. A worktree that
+cannot be removed, for example because it holds unignored nested `.machine-runs`
+evidence, ends `blocked` with a reason naming the branch, commit, and pull
+request or patch already produced. Invalid input, a `repository.path` that is
+not a checkout root, a worktree or evidence root that resolves into the
+repository through a symlink, and unexpected exceptions are runtime failures.
+
+Evidence is written to `<evidenceRoot>/.machine-runs/dev-machines/<id>/`, outside
+the repository and the commit: the helper's `started.json`, check and setup
+logs, Agent reports, and `result.json`, plus `delivery.json` with the ticket id,
+repository name and path, branch, base commit, commit hash, output mode, pull
+request URL or patch paths, worktree path, and whether the worktree was removed.
+
+Limits: there is no resume. A second run of the same ticket is blocked while its
+`ticket/<slug>` branch exists; delete the branch and any kept worktree to retry.
+Two ids that differ only in case or punctuation share a slug. A `gh` failure
+after a successful push leaves the pushed branch on the remote. A commit that a
+hook altered stays on the local branch, undelivered. Like the defaults, this is not a sandbox: Agents and commands run with the
+harness's and user's permissions, and `pr` mode publishes the change, so accept
+tickets and repository settings only from a trusted source.
+
 ## Boundaries and validation
 
 Fingerprint guards include HEAD, branch, index, and the contents/modes of tracked
@@ -155,5 +266,7 @@ fake Agent runners, real commands, and temporary Git repositories. Tests exercis
 all ten success paths, failure and rejection paths, red/green requirements,
 repair budgets, stale verification, source-integrity guards, malformed inputs,
 command errors, and result retrieval. `npm run smoke:install` covers selective
-installation, conflicts, relocation, discovery, and the real CLI. These tests do
-not prove that a live model follows the instructions or solves a software task.
+installation, conflicts, relocation, discovery, and the real CLI. Ticket delivery
+is tested the same way for each output mode, with a local bare repository as the
+remote and a recording `gh` stand-in; no network or real `gh` is used. These tests
+do not prove that a live model follows the instructions or solves a software task.
