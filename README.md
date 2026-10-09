@@ -49,9 +49,14 @@ for conversation. When the Machine needs Human input, Pi opens a native selector
 direct feedback input. Cancel the dialog when you want to inspect or discuss the result with
 Pi first. The Machine, not the extension, still owns revision, merge, cleanup, and completion.
 
-When no existing Machine fits, Pi handles a one-off normally. For a reusable workflow, it
-proposes a short state sequence and asks before creating a project-local Machine. Installing
-that definition globally remains an explicit Human choice.
+The extension also directs Pi to discover Machines before delegated or multi-step work,
+without requiring the user to name one. Reuse a suitable definition, or create a scoped
+Machine when sequencing, checks, or Human decisions help even a one-off task. Small edits
+and single commands remain direct. A missing runtime or no safe fit should produce an
+explicit fallback, not silent bypass or extra model spending. Authoring stays within the
+user's task; global installation remains a separate Human choice. A worker already inside
+a Machine should complete its assigned state rather than recursively delegate it again.
+See the runtime's [agent defaults](../machines/docs/integrations.md#agent-defaults).
 
 ## Smoke test
 
