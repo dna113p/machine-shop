@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import { runtime } from "./runtime.ts";
 
 const mod = await import(pathToFileURL(resolve("ticket-task.ts")).href);
-const branch = "ticket/proj-12";
+const branch = "ticket/proj-12-add-a-greeting";
 const url = "https://example.invalid/acme/widgets/pull/7";
 const hosted = "https://example.invalid/acme/widgets";
 const slug = "example.invalid/acme/widgets";
@@ -36,10 +36,24 @@ const input = (f: Fixture, repository = {}, extra = {}) => ({
 /** A local bare repository stands in for the remote; nothing leaves the machine. */
 function remote(f: Fixture) {
   const bare = join(f.root, "remote.git");
-  git(f.root, "init", "-q", "--bare", bare);
+  git(f.root, "init", "-q", "--bare", "-b", "main", bare);
   // The remote names a hosted repository, as gh needs; Git itself is redirected to the local bare one.
   git(f.repo, "remote", "add", "origin", `${hosted}.git`); git(f.repo, "config", `url.${bare}.insteadOf`, `${hosted}.git`);
-  return () => git(bare, "for-each-ref", "--format=%(refname) %(objectname)");
+  // The base is published, as a pull request needs; what a run pushed is whatever the remote holds beyond that.
+  git(f.repo, "push", "-q", "origin", "main");
+  const refs = () => git(bare, "for-each-ref", "--format=%(refname) %(objectname)").split("\n").filter(Boolean);
+  const published = refs();
+  return () => refs().filter(ref => !published.includes(ref)).join("\n");
+}
+/** A recording git placed first on PATH that passes every call on to the real one. */
+function recordGit(context: TestContext, f: Fixture) {
+  const real = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  const bin = join(f.root, "git-bin"); mkdirSync(bin);
+  writeFileSync(join(bin, "git"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${bin}/calls"\nexec "${real}" "$@"\n`, { mode: 0o755 });
+  const path = process.env.PATH;
+  process.env.PATH = `${bin}${delimiter}${path}`;
+  context.after(() => { process.env.PATH = path; });
+  return () => readFileSync(join(bin, "calls"), "utf8").trimEnd().split("\n");
 }
 /** A recording gh placed first on PATH; the real gh is never started. */
 function fakeGh(context: TestContext, f: Fixture, exitCode = 0) {
@@ -175,15 +189,15 @@ for (const output of ["branch", "patch", "pr"]) {
     if (output !== "pr") { assert.equal(pushed(), ""); assert.equal(gh(), undefined); return; }
     assert.equal(pushed(), `refs/heads/${branch} ${commit}`);
     const body = join(run.directory, "pull-request.md");
-    assert.deepEqual(gh(), ["pr", "create", "--repo", slug, "--draft", "--head", branch, "--title", "Add a greeting", "--body-file", body]);
-    assert.equal(readFileSync(body, "utf8"), "Ticket: PROJ-12\n\nAdd a greeting\n\n## Checks\n\n- tests: passed\n\n## Review\n\nGreeting matches the ticket\n\n");
+    assert.deepEqual(gh(), ["pr", "create", "--repo", slug, "--draft", "--base", "main", "--head", branch, "--title", "Add a greeting", "--body-file", body]);
+    assert.equal(readFileSync(body, "utf8"), "Add a greeting\n\n## Summary\n\nWrite hello to greeting.txt.\n\n## Checks\n\n- tests: passed\n\n## Review\n\nGreeting matches the ticket\n\nTicket: PROJ-12\n");
     assert.ok(result.output.summary.includes(`pull request ${url}`));
   });
 }
 
 test("an explicit branch base starts the worktree there and becomes the pull request base", async context => {
   const f = fixture(context); remote(f); const gh = fakeGh(context, f);
-  git(f.repo, "branch", "release"); writeFileSync(join(f.repo, "code.txt"), "newer"); git(f.repo, "commit", "-qam", "newer"); f.head = git(f.repo, "rev-parse", "HEAD");
+  git(f.repo, "branch", "release"); git(f.repo, "push", "-q", "origin", "release"); writeFileSync(join(f.repo, "code.txt"), "newer"); git(f.repo, "commit", "-qam", "newer"); f.head = git(f.repo, "rev-parse", "HEAD");
   const result = await execute(input(f, { output: "pr", base: "release", draft: false }));
   assert.equal(result.state, "delivered");
   assert.equal(git(f.repo, "rev-parse", `${branch}^`), git(f.repo, "rev-parse", "release")); assert.equal(evidence(f).delivery.baseCommit, git(f.repo, "rev-parse", "release"));
@@ -191,10 +205,39 @@ test("an explicit branch base starts the worktree there and becomes the pull req
   assert.equal(readFileSync(join(f.repo, "code.txt"), "utf8"), "newer");
 });
 
-test("a base that is a commit rather than a branch is not passed to gh", async context => {
+test("a base that is a commit rather than a branch opens the pull request against the remote's default branch by name", async context => {
   const f = fixture(context); remote(f); const gh = fakeGh(context, f);
   const result = await execute(input(f, { output: "pr", base: f.head }));
-  assert.equal(result.state, "delivered"); assert.equal(gh()!.includes("--base"), false);
+  assert.equal(result.state, "delivered"); assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "main", "--head", branch]);
+});
+
+test("gh is given the checked base by name, so a configured gh-merge-base cannot turn the pull request elsewhere", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
+  // release is ahead of main on the remote; gh would take it from this configuration if it were left to choose the base.
+  git(f.repo, "checkout", "-q", "-b", "release"); git(f.repo, "commit", "-q", "--allow-empty", "-m", "released"); git(f.repo, "push", "-q", "origin", "release");
+  git(f.repo, "checkout", "-q", "main"); git(f.repo, "config", `branch.${branch}.gh-merge-base`, "release");
+  const result = await execute(input(f, { output: "pr" }), {
+    implementer: request => { git(request.cwd, "config", "branch.main.gh-merge-base", "release"); return implement(request); },
+  });
+  assert.equal(result.state, "delivered"); untouched(f);
+  assert.equal(git(f.repo, "config", "--get", `branch.${branch}.gh-merge-base`), "release");
+  assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head);
+  assert.deepEqual(pushed().split("\n"), [`refs/heads/release ${git(f.repo, "rev-parse", "release")}`, `refs/heads/${branch} ${git(f.repo, "rev-parse", branch)}`]);
+  assert.deepEqual(gh()!.slice(0, 9), ["pr", "create", "--repo", slug, "--draft", "--base", "main", "--head", branch]);
+});
+
+test("the default branch gh is given is the one the remote names, and a remote that names none blocks before any Agent", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const bare = join(f.root, "remote.git");
+  git(f.repo, "push", "-q", "origin", "main:trunk"); git(bare, "symbolic-ref", "HEAD", "refs/heads/trunk");
+  const result = await execute(input(f, { output: "pr" }));
+  assert.equal(result.state, "delivered"); assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "trunk", "--head", branch]);
+  const before = pushed(); rmSync(join(f.root, "bin", "args"));
+  // A detached HEAD on the remote still has a commit to compare with, but no branch for gh to be given.
+  git(bare, "update-ref", "--no-deref", "HEAD", f.head); const second = { ...f, evidence: join(f.root, "evidence-2") };
+  const unnamed = await execute({ ...input(second, { output: "pr" }), ticket: { id: "PROJ-13", title: "Add a farewell" } }, { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
+  assert.equal(unnamed.state, "blocked"); assert.deepEqual(unnamed.states, ["prepare", "failure", "blocked"]); untouched(f);
+  held(second, unnamed, /^Blocked: Remote origin does not say which branch is its default, so the pull request base cannot be named\. Set repository\.base to a branch; nothing was changed\. Evidence: /u);
+  assert.equal(pushed(), before); assert.equal(gh(), undefined); assert.equal(git(f.repo, "branch", "--list", "ticket/proj-13*"), "");
 });
 
 test("setup commands run in the worktree before any Agent and are kept as evidence", async context => {
@@ -224,16 +267,27 @@ for (const [label, code, reason] of [
   });
 }
 
-for (const [label, occupy] of [
-  ["branch", (f: Fixture) => git(f.repo, "branch", branch)],
-  ["worktree directory", (f: Fixture) => mkdirSync(f.worktree, { recursive: true })],
+/** A branch as a run of the ticket with this id slug leaves it: named for the ticket and carrying its record. */
+const recordedBranch = (f: Fixture, name: string, ticket = "proj-12") => { git(f.repo, "branch", name); git(f.repo, "config", `branch.${name}.ticket`, ticket); };
+/** What a run says of a branch that neither a record, a ticket commit, nor its name gives to one ticket. */
+const unsettled = (name: string, ticket = "proj-12") => `no record of its ticket, and its name does not say where the id ends: it may be this ticket's, or that of a ticket whose id goes on after ${ticket}-. `
+  + `Nothing was changed. Record whose it is with git config branch.${name}.ticket <id-slug> (${ticket} for this ticket), then run again.`;
+const literal = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+for (const [label, occupy, found] of [
+  ["branch a run of this ticket made", (f: Fixture) => recordedBranch(f, branch), `Branch ${branch} already exists in ${"<repo>"} for this ticket; nothing was changed.`],
+  ["branch named before branches carried a title or a record", (f: Fixture) => git(f.repo, "branch", "ticket/proj-12"), `Branch ticket/proj-12 already exists in ${"<repo>"} for this ticket; nothing was changed.`],
+  ["branch a run of this ticket made under an earlier title", (f: Fixture) => recordedBranch(f, "ticket/proj-12-an-earlier-title"), `Branch ticket/proj-12-an-earlier-title already exists in ${"<repo>"} for this ticket; nothing was changed.`],
+  ["branch of the name this run would take that has no record", (f: Fixture) => git(f.repo, "branch", branch), `Branch ${branch} already exists in ${"<repo>"} with ${unsettled(branch)}`],
+  ["branch named for this ticket under an earlier title that has no record", (f: Fixture) => git(f.repo, "branch", "ticket/proj-12-an-earlier-title"),
+    `Branch ticket/proj-12-an-earlier-title already exists in ${"<repo>"} with ${unsettled("ticket/proj-12-an-earlier-title")}`],
+  ["worktree directory", (f: Fixture) => mkdirSync(f.worktree, { recursive: true }), "Worktree directory"],
 ] as const) {
   test(`an existing ${label} blocks without changing anything`, async context => {
     const f = fixture(context); occupy(f);
     const branches = git(f.repo, "branch", "--format=%(refname:short) %(objectname)");
     const result = await execute(input(f, { setup: [command("process.exit(1)")] }), { investigator: () => assert.fail() });
     assert.equal(result.state, "blocked"); untouched(f);
-    const run = held(f, result, /already exists/u);
+    const run = held(f, result, /already exists/u); assert.ok(result.output.summary.startsWith(`Blocked: ${found.replace("<repo>", f.repo)} `));
     assert.doesNotMatch(result.output.summary, /Worktree kept/u);
     assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.result.checks.length], [false, false, null, 0]);
     assert.equal(git(f.repo, "branch", "--format=%(refname:short) %(objectname)"), branches);
@@ -570,10 +624,15 @@ test("discard then go back returns to the decision with the worktree, branch, an
 
 test("discard removes the worktree and branch only after it is confirmed, and saves no patch", async context => {
   const f = fixture(context); let unconfirmed = false;
-  const human = person("discard", () => { unconfirmed = existsSync(join(f.worktree, "greeting.txt")) && git(f.repo, "rev-parse", branch) === f.head; return "confirm discard"; });
+  const human = person("discard", () => {
+    unconfirmed = existsSync(join(f.worktree, "greeting.txt")) && git(f.repo, "rev-parse", branch) === f.head && git(f.repo, "config", "--local", "--get", `branch.${branch}.ticket`) === "proj-12";
+    return "confirm discard";
+  });
   const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => ok("revise", "Handle the empty case") }, human);
   assert.ok(unconfirmed); assert.deepEqual(result.states.slice(-5), ["decide", "confirmDiscard", "remove", "abandon", "abandoned"]);
   const run = abandoned(f, result, "discard");
+  // The ticket record goes with the branch.
+  assert.doesNotMatch(git(f.repo, "config", "--local", "--list"), /^branch\./mu);
   assert.equal(run.delivery.patch, undefined); assert.equal(existsSync(join(run.directory, "candidate.patch")), false);
   assert.ok(result.output.summary.includes(`Decision: discard. Worktree and ${branch} removed without saving the candidate. Evidence: `));
   assert.deepEqual(run.result.decisions.map((made: any) => made.response), ["discard", "confirm discard"]);
@@ -624,13 +683,20 @@ test("a resumed run whose review asks for changes repairs within a fresh budget"
   assert.equal(evidence(again).result.repairs, 1); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello again");
 });
 
-const linked = (f: Fixture) => git(f.repo, "worktree", "add", "-q", "-b", branch, f.worktree);
+/** The worktree and recorded branch an earlier run of the ticket left, without a candidate. */
+const linked = (f: Fixture) => { git(f.repo, "worktree", "add", "-q", "-b", branch, f.worktree); git(f.repo, "config", `branch.${branch}.ticket`, "proj-12"); };
+const noRecord = (name: string, ticket = "proj-12") => new RegExp(`^Blocked: Cannot resume: HEAD in .+ is on ${name}, which has ${literal(unsettled(name, ticket))} Evidence: `, "u");
 for (const [label, arrange, reason] of [
   ["a missing worktree", () => {}, /worktree directory .+ does not exist; nothing was changed/u],
   ["a directory that is not a Git worktree", (f: Fixture) => { mkdirSync(f.worktree, { recursive: true }); writeFileSync(join(f.worktree, "greeting.txt"), "hello\n"); }, /is not a Git worktree of .+; nothing was changed/u],
   ["a checkout of another repository", (f: Fixture) => { mkdirSync(f.worktree, { recursive: true }); git(f.worktree, "init", "-q", "-b", branch); }, /is not a Git worktree of .+; nothing was changed/u],
-  ["a worktree whose HEAD left the ticket branch", (f: Fixture) => { linked(f); git(f.worktree, "checkout", "-q", "--detach"); }, /HEAD in .+ is not the branch ticket\/proj-12; nothing was changed/u],
-  ["a worktree on another branch", (f: Fixture) => { git(f.repo, "branch", branch); git(f.repo, "worktree", "add", "-q", "-b", "other", f.worktree); }, /HEAD in .+ is not the branch ticket\/proj-12; nothing was changed/u],
+  ["a worktree whose HEAD left the ticket branch", (f: Fixture) => { linked(f); git(f.worktree, "checkout", "-q", "--detach"); }, /HEAD in .+ is not on a branch of this ticket, ticket\/proj-12 or ticket\/proj-12-<title>; nothing was changed/u],
+  ["a worktree on another branch", (f: Fixture) => { git(f.repo, "branch", branch); git(f.repo, "worktree", "add", "-q", "-b", "other", f.worktree); }, /HEAD in .+ is not on a branch of this ticket, .+; nothing was changed/u],
+  ["a worktree on the branch of a ticket whose id only starts the same", (f: Fixture) => { git(f.repo, "worktree", "add", "-q", "-b", "ticket/proj-120-add-a-greeting", f.worktree); }, /HEAD in .+ is not on a branch of this ticket, .+; nothing was changed/u],
+  ["a worktree on a branch recorded for another ticket", (f: Fixture) => { linked(f); git(f.repo, "config", `branch.${branch}.ticket`, "proj"); }, /HEAD in .+ is on ticket\/proj-12-add-a-greeting, which belongs to ticket proj; nothing was changed/u],
+  ["a worktree on a branch recorded for this ticket under a name that is not the ticket's", (f: Fixture) => { git(f.repo, "branch", branch); git(f.repo, "worktree", "add", "-q", "-b", "other", f.worktree); git(f.repo, "config", "branch.other.ticket", "proj-12"); }, /HEAD in .+ is not on a branch of this ticket, .+; nothing was changed/u],
+  ["a worktree on a branch of this ticket's name that has no record", (f: Fixture) => { git(f.repo, "worktree", "add", "-q", "-b", branch, f.worktree); }, noRecord(branch)],
+  ["a worktree on the unrecorded branch of a ticket whose id extends this one with a '-'", (f: Fixture) => { git(f.repo, "worktree", "add", "-q", "-b", "ticket/proj-12-1", f.worktree); }, noRecord("ticket/proj-12-1")],
   ["a ticket branch that already holds a commit", (f: Fixture) => { linked(f); implement({ cwd: f.worktree }); git(f.worktree, "add", "."); git(f.worktree, "commit", "-qm", "earlier commit"); }, /does not point at the base commit .+; nothing was changed/u],
   ["a base that moved since the worktree was made", (f: Fixture) => { linked(f); git(f.repo, "commit", "-q", "--allow-empty", "-m", "later"); f.head = git(f.repo, "rev-parse", "HEAD"); }, /does not point at the base commit .+; nothing was changed/u],
 ] as const) {
@@ -712,7 +778,7 @@ test("a hook that moves the ticket branch off the approved commit blocks before 
   const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
   mkdirSync(join(f.repo, ".git/hooks"), { recursive: true });
   writeFileSync(join(f.repo, ".git/hooks/post-commit"), `#!/bin/sh\ngit checkout -q --detach && git branch -f ${branch} ${f.head}\n`, { mode: 0o755 });
-  const run = blocked(f, await execute(input(f, { output: "pr" })), /moved HEAD or ticket\/proj-12 away from the approved commit/u);
+  const run = blocked(f, await execute(input(f, { output: "pr" })), /moved HEAD or ticket\/proj-12-add-a-greeting away from the approved commit/u);
   assert.equal(pushed(), ""); assert.equal(gh(), undefined); assert.equal(run.delivery.commit, null);
 });
 
@@ -730,9 +796,10 @@ test("the pull request is opened in the pushed repository whatever GH_REPO says,
 
 test("a remote that names no hosted repository blocks pr delivery before pushing", async context => {
   const f = fixture(context); const gh = fakeGh(context, f);
-  const bare = join(f.root, "remote.git"); git(f.root, "init", "-q", "--bare", bare); git(f.repo, "remote", "add", "origin", bare);
+  const bare = join(f.root, "remote.git"); git(f.root, "init", "-q", "--bare", "-b", "main", bare); git(f.repo, "remote", "add", "origin", bare);
+  git(f.repo, "push", "-q", "origin", "main");
   blocked(f, await execute(input(f, { output: "pr" })), /does not name a hosted owner\/repository/u, 1);
-  assert.equal(git(bare, "for-each-ref"), ""); assert.equal(gh(), undefined);
+  assert.equal(git(bare, "for-each-ref", "--format=%(refname)"), "refs/heads/main"); assert.equal(gh(), undefined);
 });
 
 test("remote URLs resolve to the hosted repository gh must use, and local paths do not", () => {
@@ -754,6 +821,35 @@ test("a separate pushurl cannot send the commit to a different repository than t
   assert.equal(pushed(), `refs/heads/${branch} ${git(f.repo, "rev-parse", branch)}`); assert.equal(git(other, "for-each-ref"), "");
 });
 
+test("a remote reconfigured after the base was checked gets neither the push nor the pull request", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
+  // A second repository that would take the push just as well, and holds the same published base.
+  const other = join(f.root, "other.git"); git(f.root, "init", "-q", "--bare", "-b", "main", other); git(f.repo, "push", "-q", other, "main");
+  const elsewhere = "https://example.invalid/acme/elsewhere.git"; git(f.repo, "config", `url.${other}.insteadOf`, elsewhere);
+  const result = await execute(input(f, { output: "pr" }), {
+    implementer: request => { git(request.cwd, "remote", "set-url", "origin", elsewhere); git(request.cwd, "remote", "add", "upstream", elsewhere); return implement(request); },
+  });
+  assert.equal(result.state, "delivered"); assert.equal(git(f.repo, "config", "--get", "remote.origin.url"), elsewhere);
+  const commit = git(f.repo, "rev-parse", branch);
+  assert.equal(pushed(), `refs/heads/${branch} ${commit}`); assert.equal(git(other, "for-each-ref", "--format=%(refname)"), "refs/heads/main");
+  assert.deepEqual(gh()!.slice(0, 4), ["pr", "create", "--repo", slug]);
+});
+
+for (const [base, forget] of [["release", ["branch", "-D", "release"]], ["origin/release", ["update-ref", "-d", "refs/remotes/origin/release"]]] as const) {
+  test(`a pull request base given as ${base} stays the branch that was checked when that ref is gone before delivery`, async context => {
+    const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
+    // release is ahead of main on the remote, so a pull request against the default branch would carry its commit.
+    git(f.repo, "checkout", "-q", "-b", "release"); git(f.repo, "commit", "-q", "--allow-empty", "-m", "released"); git(f.repo, "push", "-q", "origin", "release");
+    const release = git(f.repo, "rev-parse", "release"); git(f.repo, "checkout", "-q", "main");
+    const result = await execute(input(f, { output: "pr", base }), { implementer: request => { git(request.cwd, ...forget); return implement(request); } });
+    assert.equal(result.state, "delivered"); untouched(f);
+    assert.throws(() => git(f.repo, "rev-parse", "--verify", "--quiet", `${base}^{commit}`));
+    const commit = git(f.repo, "rev-parse", branch); assert.equal(git(f.repo, "rev-parse", `${branch}^`), release);
+    assert.deepEqual(pushed().split("\n"), [`refs/heads/release ${release}`, `refs/heads/${branch} ${commit}`]);
+    assert.deepEqual(gh()!.slice(0, 9), ["pr", "create", "--repo", slug, "--draft", "--base", "release", "--head", branch]);
+  });
+}
+
 test("pr delivery pushes no tag even when Git is configured to follow tags", async context => {
   const f = fixture(context); const pushed = remote(f); fakeGh(context, f);
   git(f.repo, "config", "push.followTags", "true"); git(f.repo, "tag", "-am", "release", "v1");
@@ -762,11 +858,13 @@ test("pr delivery pushes no tag even when Git is configured to follow tags", asy
 });
 
 test("a failing push blocks, keeps the committed local branch, and never starts gh", async context => {
-  const f = fixture(context); const gh = fakeGh(context, f);
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
+  // The remote answers the question prepare asks about the base and then refuses the push.
+  mkdirSync(join(f.root, "remote.git/hooks"), { recursive: true }); writeFileSync(join(f.root, "remote.git/hooks/pre-receive"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
   const result = await execute(input(f, { output: "pr" }));
   const run = blocked(f, result, /git push failed; inspect .+git-push\.log/u, 1);
   assert.equal(run.delivery.commit, git(f.repo, "rev-parse", branch)); assert.equal(run.delivery.prUrl, undefined);
-  assert.match(readFileSync(join(run.directory, "git-push.log"), "utf8"), /origin/u); assert.equal(gh(), undefined);
+  assert.match(readFileSync(join(run.directory, "git-push.log"), "utf8"), /pre-receive hook declined/u); assert.equal(pushed(), ""); assert.equal(gh(), undefined);
 });
 
 test("a failing gh blocks after the push and keeps the local branch", async context => {
@@ -825,10 +923,334 @@ for (const [label, change] of [
   });
 }
 
-test("the slug replaces characters outside its alphabet and names the branch and worktree", async context => {
+test("the id slug replaces characters outside its alphabet and names the branch, ahead of the title, and the worktree", async context => {
   const f = fixture(context);
   const result = await execute({ ...input(f), ticket: { id: "Bug #7/a", title: "  Tidy\n the  greeting " } });
   assert.equal(result.state, "delivered");
-  assert.deepEqual([evidence(f).delivery.branch, evidence(f).delivery.worktree], ["ticket/bug--7-a", join(f.root, "worktrees", "widgets--bug--7-a")]);
-  assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", "ticket/bug--7-a"), "Tidy the greeting\nTicket: Bug #7/a");
+  assert.deepEqual([evidence(f).delivery.branch, evidence(f).delivery.worktree], ["ticket/bug--7-a-tidy-the-greeting", join(f.root, "worktrees", "widgets--bug--7-a")]);
+  assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", "ticket/bug--7-a-tidy-the-greeting"), "Tidy the greeting\nTicket: Bug #7/a");
 });
+
+test("the title slug is lowercase runs of letters and digits joined by '-', cut to 48 characters at a '-'", () => {
+  for (const [title, slug] of [
+    ["Add a greeting", "add-a-greeting"],
+    ["Gate GitHub issue intake on a trusted author", "gate-github-issue-intake-on-a-trusted-author"],
+    ["  --Fix: `foo()` / bar_baz (v2.1)!  ", "fix-foo-bar-baz-v2-1"],
+    ["¡¿…?!", ""], ["日本語", ""],
+    ["a".repeat(48), "a".repeat(48)],
+    // The cut falls inside "publication", so the slug ends at the word before it.
+    ["Make ticket branches, pull request text, and publication safer to read and trust", "make-ticket-branches-pull-request-text-and"],
+    // Here the 48th character ends a word, which is kept whole.
+    [`${"abc ".repeat(11)}abcd efgh`, `${"abc-".repeat(11)}abcd`],
+    [`${"abc ".repeat(11)}abcde fgh`, "abc-".repeat(11).slice(0, -1)],
+    // A first word past the limit has no '-' to cut at, so nothing remains.
+    ["x".repeat(60), ""], [`${"x".repeat(49)} greeting`, ""], [`${"x".repeat(48)} greeting`, "x".repeat(48)],
+  ] as const) {
+    assert.equal(mod.titleSlug(title), slug, title);
+    assert.ok(slug.length <= 48); assert.doesNotMatch(slug, /^-|-$|--/u);
+  }
+});
+
+for (const [label, title, named] of [
+  ["a long title is cut at a word", "Make ticket branches, pull request text, and publication safer to read and trust", "ticket/proj-12-make-ticket-branches-pull-request-text-and"],
+  ["a title with no usable characters leaves the id alone", "¡¿…?!", "ticket/proj-12"],
+  ["a title whose first word is too long to cut at a '-' leaves the id alone", `${"x".repeat(60)} greeting`, "ticket/proj-12"],
+] as const) {
+  test(`${label} in the branch name`, async context => {
+    const f = fixture(context);
+    const result = await execute({ ...input(f), ticket: { id: "PROJ-12", title } });
+    assert.equal(result.state, "delivered"); untouched(f);
+    assert.deepEqual([evidence(f).delivery.branch, evidence(f).delivery.worktree], [named, f.worktree]);
+    assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), `main\n${named}`);
+    assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", named), `${title}\nTicket: PROJ-12`);
+  });
+}
+
+test("a ticket is not blocked by the branches of a ticket whose id only starts with its own", async context => {
+  const f = fixture(context);
+  const others = ["ticket/proj-10-add-a-greeting", "ticket/proj-12", "ticket/proj-12-add-a-greeting", "ticket/proj-1.5-add-a-greeting", "ticket/proj-1x"];
+  for (const name of others) git(f.repo, "branch", name);
+  const result = await execute({ ...input(f), ticket: { id: "PROJ-1", title: "Add a greeting" } });
+  assert.equal(result.state, "delivered"); untouched(f);
+  assert.equal(evidence(f).delivery.branch, "ticket/proj-1-add-a-greeting");
+  assert.equal(git(f.repo, "show", "--name-only", "--format=", "ticket/proj-1-add-a-greeting"), "greeting.txt");
+  for (const name of others) assert.equal(git(f.repo, "rev-parse", name), f.head);
+});
+
+const record = (f: Fixture, name: string) => git(f.repo, "config", "--local", "--get", `branch.${name}.ticket`);
+const next = (f: Fixture, run: number) => ({ ...f, evidence: join(f.root, `evidence-${run}`) });
+
+test("tickets whose ids differ by a '-' extension keep separate branches, told apart by the id slug recorded with each", async context => {
+  const f = fixture(context);
+  const first = await execute({ ...input(f), ticket: { id: "PROJ", title: "12 tidy" } });
+  assert.equal(first.state, "delivered"); assert.equal(record(f, "ticket/proj-12-tidy"), "proj");
+  // By name alone, ticket/proj-12-tidy would read as PROJ-12 titled "tidy".
+  const second = await execute(input(next(f, 2)));
+  assert.equal(second.state, "delivered"); assert.equal(evidence(next(f, 2)).delivery.branch, branch); assert.equal(record(f, branch), "proj-12");
+  for (const [run, ticket, found] of [[3, { id: "PROJ", title: "Add a greeting" }, "ticket/proj-12-tidy"], [4, { id: "PROJ-12", title: "Tidy" }, branch]] as const) {
+    const again = await execute({ ...input(next(f, run)), ticket }, { investigator: () => assert.fail() });
+    assert.equal(again.state, "blocked");
+    held(next(f, run), again, new RegExp(`^Blocked: Branch ${found} already exists in .+ for this ticket; nothing was changed`, "u"));
+  }
+  assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), `main\n${branch}\nticket/proj-12-tidy`); untouched(f);
+});
+
+test("a ticket whose id and title spell the name of another ticket's branch is blocked, and that branch is left alone", async context => {
+  const f = fixture(context);
+  assert.equal((await execute(input(f))).state, "delivered"); const commit = git(f.repo, "rev-parse", branch);
+  const result = await execute({ ...input(next(f, 2)), ticket: { id: "PROJ", title: "12: add a greeting" } }, { investigator: () => assert.fail() });
+  assert.equal(result.state, "blocked"); untouched(f);
+  held(next(f, 2), result, /^Blocked: Branch ticket\/proj-12-add-a-greeting already exists in .+ for ticket proj-12, whose id and title spell the name this ticket would take; nothing was changed/u);
+  assert.equal(git(f.repo, "branch", "--format=%(refname:short) %(objectname)"), `main ${f.head}\n${branch} ${commit}`);
+  assert.equal(existsSync(join(f.root, "worktrees", "widgets--proj")), false);
+});
+
+test("a branch without a record that may be this ticket's under an earlier title blocks it, and a ticket with a shorter id, until its record says whose it is", async context => {
+  const f = fixture(context); const agents = { investigator: () => assert.fail() };
+  // Made by hand: PROJ-12 under an earlier title, or PROJ titled "12 an earlier title".
+  const earlier = "ticket/proj-12-an-earlier-title"; git(f.repo, "branch", earlier);
+  const refs = () => git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"); const before = refs();
+  for (const [run, id, ticket] of [[1, "PROJ-12", "proj-12"], [2, "PROJ", "proj"]] as const) {
+    const result = await execute({ ...input(next(f, run)), ticket: { id, title: "Add a greeting" } }, agents);
+    assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["prepare", "failure", "blocked"]); untouched(f);
+    assert.ok(result.output.summary.startsWith(`Blocked: Branch ${earlier} already exists in ${f.repo} with ${unsettled(earlier, ticket)} Evidence: `), result.output.summary);
+    assert.equal(refs(), before); assert.equal(existsSync(join(f.root, "worktrees")), false); assert.throws(() => record(f, earlier));
+  }
+  // Recorded for PROJ-12, it blocks that ticket as its own branch and no longer concerns PROJ.
+  git(f.repo, "config", `branch.${earlier}.ticket`, "proj-12");
+  const own = await execute(input(next(f, 3)), agents);
+  held(next(f, 3), own, /^Blocked: Branch ticket\/proj-12-an-earlier-title already exists in .+ for this ticket; nothing was changed\. Deliver or delete it/u);
+  const shorter = await execute({ ...input(next(f, 4)), ticket: { id: "PROJ", title: "Add a greeting" } });
+  assert.equal(shorter.state, "delivered"); untouched(f);
+  assert.equal(evidence(next(f, 4)).delivery.branch, "ticket/proj-add-a-greeting"); assert.equal(record(f, "ticket/proj-add-a-greeting"), "proj");
+  assert.equal(git(f.repo, "rev-parse", earlier), f.head);
+});
+
+test("branches without a record that may be those of tickets with longer ids block a ticket one by one, until each record says whose it is", async context => {
+  const f = fixture(context); const ticket = { id: "PROJ", title: "Add a greeting" };
+  // None holds a ticket commit. For PROJ each may be its own: titled "12", "12 1", or "12 add a greeting".
+  const others = [["ticket/proj-12", "proj-12"], ["ticket/proj-12-1", "proj-12-1"], ["ticket/proj-12-add-a-greeting", "proj-12"]] as const;
+  for (const [name] of others) git(f.repo, "branch", name);
+  for (const [index, [name, whose]] of others.entries()) {
+    const result = await execute({ ...input(next(f, index)), ticket }, { investigator: () => assert.fail() });
+    assert.equal(result.state, "blocked"); untouched(f);
+    assert.ok(result.output.summary.startsWith(`Blocked: Branch ${name} already exists in ${f.repo} with ${unsettled(name, "proj")} Evidence: `), result.output.summary);
+    assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), ["main", ...others.map(([other]) => other)].join("\n"));
+    git(f.repo, "config", `branch.${name}.ticket`, whose);
+  }
+  const result = await execute({ ...input(next(f, 3)), ticket });
+  assert.equal(result.state, "delivered"); untouched(f);
+  assert.equal(evidence(next(f, 3)).delivery.branch, "ticket/proj-add-a-greeting");
+  for (const [name] of others) assert.equal(git(f.repo, "rev-parse", name), f.head);
+});
+
+for (const [name, made] of [["ticket/proj-12", "before branches carried a title or a record"], [branch, "by a run whose record did not come along"]] as const) {
+  test(`a delivered ${name} without a record, made ${made}, is told by the ticket commit it holds and blocks that ticket alone`, async context => {
+    const f = fixture(context);
+    assert.equal((await execute(input(f))).state, "delivered");
+    if (name !== branch) git(f.repo, "branch", "-m", branch, name);
+    git(f.repo, "config", "--unset", `branch.${name}.ticket`); assert.throws(() => record(f, name));
+    const commit = git(f.repo, "rev-parse", name); assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", name), "Add a greeting\nTicket: PROJ-12");
+    const own = await execute({ ...input(next(f, 2)), ticket: { id: "PROJ-12", title: "A later title" } }, { investigator: () => assert.fail() });
+    held(next(f, 2), own, new RegExp(`^Blocked: Branch ${name} already exists in .+ for this ticket; nothing was changed`, "u"));
+    // By its name the branch could be PROJ's under a title starting with 12; the commit says it is PROJ-12's, so only the name itself is taken.
+    const same = await execute({ ...input(next(f, 3)), ticket: { id: "PROJ", title: name === branch ? "12: add a greeting" : "12" } }, { investigator: () => assert.fail() });
+    held(next(f, 3), same, new RegExp(`^Blocked: Branch ${name} already exists in .+ for ticket proj-12, whose id and title spell the name this ticket would take; nothing was changed`, "u"));
+    const shorter = await execute({ ...input(next(f, 4)), ticket: { id: "PROJ", title: "Tidy" } });
+    assert.equal(shorter.state, "delivered"); untouched(f);
+    assert.equal(evidence(next(f, 4)).delivery.branch, "ticket/proj-tidy"); assert.equal(git(f.repo, "rev-parse", name), commit);
+  });
+}
+
+test("a commit that names a ticket does not give that ticket a branch its id and title would not name", async context => {
+  const f = fixture(context);
+  // The base itself is the merged commit of PROJ-12, and a branch cut from it by hand holds that commit without being that ticket's.
+  git(f.repo, "commit", "-q", "--allow-empty", "-m", "Add a greeting", "-m", "Ticket: PROJ-12"); f.head = git(f.repo, "rev-parse", "HEAD");
+  const cut = "ticket/proj-12-tidy"; git(f.repo, "branch", cut);
+  const result = await execute({ ...input(f), ticket: { id: "PROJ-12", title: "A later title" } }, { investigator: () => assert.fail() });
+  assert.equal(result.state, "blocked"); untouched(f);
+  assert.ok(result.output.summary.startsWith(`Blocked: Branch ${cut} already exists in ${f.repo} with ${unsettled(cut)} Evidence: `), result.output.summary);
+});
+
+test("a ticket retitled after its run is blocked by the branch that run made, and resumes on it", async context => {
+  const f = fixture(context); const earlier = "ticket/proj-12-an-earlier-title";
+  const ticket = { id: "PROJ-12", title: "An earlier title" };
+  const first = await execute({ ...input(f, {}, { maxRepairs: 0 }), ticket }, { reviewer: () => ok("revise", "Handle the empty case") }, person("hand off"));
+  assert.equal(first.state, "handedOff"); assert.equal(record(f, earlier), "proj-12"); assert.equal(git(f.worktree, "symbolic-ref", "--short", "HEAD"), earlier);
+  const second = await execute(input(next(f, 2)), { investigator: () => assert.fail() });
+  held(next(f, 2), second, /^Blocked: Branch ticket\/proj-12-an-earlier-title already exists in .+ for this ticket; nothing was changed/u);
+  const resumed = await execute(input(next(f, 3), {}, { resume: true }), { investigator: () => assert.fail(), implementer: () => assert.fail() });
+  assert.equal(resumed.state, "delivered"); untouched(f);
+  assert.equal(evidence(next(f, 3)).delivery.branch, earlier); assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), `main\n${earlier}`);
+  assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", earlier), "Add a greeting\nTicket: PROJ-12"); assert.equal(git(f.repo, "show", `${earlier}:greeting.txt`), "hello");
+});
+
+test("a resumed run does not adopt an unrecorded branch that could be that of a ticket with a longer id, until its record says whose it is", async context => {
+  const f = fixture(context); const ticket = { id: "PROJ", title: "Add a greeting" };
+  const worktree = join(f.root, "worktrees", "widgets--proj");
+  // In PROJ's own worktree directory: PROJ-12's branch from before branches carried a title, then one that is PROJ-12 titled "tidy" or PROJ titled "12 tidy".
+  git(f.repo, "worktree", "add", "-q", "-b", "ticket/proj-12", worktree); git(f.repo, "branch", "ticket/proj-12-tidy"); implement({ cwd: worktree });
+  const agents = { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() };
+  for (const [run, name] of [[1, "ticket/proj-12"], [2, "ticket/proj-12-tidy"]] as const) {
+    git(worktree, "checkout", "-q", name);
+    const refs = git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)");
+    const result = await execute({ ...input(next(f, run), {}, { resume: true }), ticket }, agents);
+    assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["prepare", "failure", "blocked"]); untouched(f);
+    assert.match(result.output.summary, noRecord(name, "proj")); assert.ok(result.output.summary.includes(`HEAD in ${worktree} is on ${name}, `));
+    assert.equal(git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"), refs); assert.equal(readFileSync(join(worktree, "greeting.txt"), "utf8"), "hello\n");
+  }
+  git(f.repo, "config", "branch.ticket/proj-12-tidy.ticket", "proj");
+  const resumed = await execute({ ...input(next(f, 3), {}, { resume: true }), ticket }, { investigator: () => assert.fail(), implementer: () => assert.fail() });
+  assert.equal(resumed.state, "delivered"); untouched(f);
+  assert.equal(evidence(next(f, 3)).delivery.branch, "ticket/proj-12-tidy"); assert.equal(git(f.repo, "show", "--name-only", "--format=", "ticket/proj-12-tidy"), "greeting.txt");
+  assert.equal(git(f.repo, "rev-parse", "ticket/proj-12"), f.head);
+});
+
+for (const [name, made] of [["ticket/proj-12", "before branches carried a title or a record"], ["ticket/proj-12-an-earlier-title", "by a run under an earlier title"]] as const) {
+  test(`a resumed run adopts ${name}, the branch its worktree is on, made ${made}, instead of naming one from the title`, async context => {
+    const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
+    git(f.repo, "worktree", "add", "-q", "-b", name, f.worktree); implement({ cwd: f.worktree });
+    if (name !== "ticket/proj-12") git(f.repo, "config", `branch.${name}.ticket`, "proj-12");
+    const result = await execute(input(f, { output: "pr" }, { resume: true }), { investigator: () => assert.fail(), implementer: () => assert.fail() });
+    assert.equal(result.state, "delivered"); untouched(f);
+    const commit = git(f.repo, "rev-parse", name);
+    const run = held(f, result, new RegExp(`^Delivered ${name} at ${commit}, pull request `, "u"));
+    assert.deepEqual([run.delivery.branch, run.delivery.resumed, run.delivery.commit], [name, true, commit]);
+    assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), `main\n${name}`);
+    assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", name), "Add a greeting\nTicket: PROJ-12");
+    assert.equal(pushed(), `refs/heads/${name} ${commit}`); assert.deepEqual(gh()!.slice(5, 9), ["--base", "main", "--head", name]);
+  });
+}
+
+for (const [label, body, summary] of [
+  ["no body", undefined, undefined],
+  ["a body that is only its heading", "# Add a greeting\n\n", undefined],
+  ["a heading and several paragraphs", "\n# Add a greeting\n\n## Why\n\nWrite hello to greeting.txt,\nand nothing else.\n\nA second paragraph.\n\n## Acceptance criteria\n\n- A file.\n", "Write hello to greeting.txt,\nand nothing else."],
+  ["a heading straight after its first paragraph", "# Add a greeting\nWrite hello to greeting.txt,\nand nothing else.\n## Acceptance criteria\n- A file.\n\n### Notes\nNone.\n", "Write hello to greeting.txt,\nand nothing else."],
+] as const) {
+  test(`the pull request body for a ticket with ${label} ${summary ? "summarizes its first paragraph" : "has no Summary section"}`, async context => {
+    const f = fixture(context); remote(f); fakeGh(context, f);
+    const result = await execute({ ...input(f, { output: "pr" }), ticket: { id: "PROJ-12", title: "Add a greeting", ...(body === undefined ? {} : { body }) } });
+    assert.equal(result.state, "delivered");
+    assert.equal(readFileSync(join(evidence(f).directory, "pull-request.md"), "utf8"),
+      `Add a greeting\n\n${summary ? `## Summary\n\n${summary}\n\n` : ""}## Checks\n\n- tests: passed\n\n## Review\n\nGreeting matches the ticket\n\nTicket: PROJ-12\n`);
+  });
+}
+
+const report = (outcome: string, summary: string) => ({ type: outcome, message: JSON.stringify({ outcome, summary }, null, 2) });
+
+test("a review returned as a JSON object is written as prose in the pull request body and the stage report", async context => {
+  const f = fixture(context); remote(f); fakeGh(context, f);
+  const result = await execute(input(f, { output: "pr" }), { reviewer: () => report("approved", "Greeting matches the ticket.\n\nNo findings.") });
+  assert.equal(result.state, "delivered");
+  const run = evidence(f);
+  assert.equal(readFileSync(join(run.directory, "pull-request.md"), "utf8"),
+    "Add a greeting\n\n## Summary\n\nWrite hello to greeting.txt.\n\n## Checks\n\n- tests: passed\n\n## Review\n\nGreeting matches the ticket.\n\nNo findings.\n\nTicket: PROJ-12\n");
+  const stage = { stage: "review", outcome: "approved", summary: "Greeting matches the ticket.\n\nNo findings." };
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "agent-3.json"), "utf8")), stage); assert.deepEqual(run.result.agents[2], stage);
+});
+
+test("a review that is a JSON object without a summary never reaches the pull request body", async context => {
+  const f = fixture(context); remote(f); fakeGh(context, f);
+  const result = await execute(input(f, { output: "pr" }), { reviewer: () => ({ type: "approved", message: '{"outcome":"approved","findings":[]}' }) });
+  assert.equal(result.state, "delivered");
+  const body = readFileSync(join(evidence(f).directory, "pull-request.md"), "utf8");
+  assert.match(body, /## Review\n\nThe reviewer approved this change without a written summary; its report is kept with the run evidence\.\n\nTicket: PROJ-12\n$/u);
+  assert.doesNotMatch(body, /[{}]|findings/u);
+  assert.equal(evidence(f).result.agents[2].summary, '{"outcome":"approved","findings":[]}');
+});
+
+test("review findings returned as a JSON object reach the implementer and the Human as prose", async context => {
+  const f = fixture(context); const human = person("hand off"); const prompts: string[] = [];
+  const result = await execute(input(f, {}, { maxRepairs: 1 }), {
+    implementer: request => { prompts.push(request.prompt); return implement(request); }, reviewer: () => report("revise", "Handle the empty case"),
+  }, human);
+  const run = handedOff(f, result, /budget exhausted \(1\)\. Handle the empty case/u, human);
+  assert.ok(prompts[1]!.endsWith("Current failure/feedback: Handle the empty case"));
+  assert.equal(run.delivery.reason, "Repair budget exhausted (1). Handle the empty case");
+  assert.ok(result.output.summary.startsWith(`Handed off on ${branch}: Repair budget exhausted (1). Handle the empty case. Decision: hand off.`));
+  assert.deepEqual(run.result.agents.filter((agent: any) => agent.stage === "review").map((agent: any) => agent.summary), ["Handle the empty case", "Handle the empty case"]);
+});
+
+/** Local commits on the base that the remote has never been sent. */
+function ahead(f: Fixture, commits: number) {
+  for (let made = 0; made < commits; made++) git(f.repo, "commit", "-q", "--allow-empty", "-m", `unpublished ${made}`);
+  f.head = git(f.repo, "rev-parse", "HEAD");
+}
+
+for (const [commits, count] of [[1, /Base HEAD has 1 unpublished local commit that is not in the default branch main on origin, /u], [2, /Base HEAD has 2 unpublished local commits that are not in the default branch main on origin, /u]] as const) {
+  test(`a pr run whose base is ${commits} ahead of the remote blocks before any Agent and publishes nothing`, async context => {
+    const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); ahead(f, commits);
+    // The remote-tracking ref claims the base is published; only the remote itself knows.
+    git(f.repo, "update-ref", "refs/remotes/origin/main", f.head);
+    const refs = git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)");
+    // A resumed run would push as well, so it is asked the same question before its worktree is even looked for.
+    const result = await execute(input(f, { output: "pr" }, { resume: commits === 2 }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
+    assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["prepare", "failure", "blocked"]); untouched(f);
+    const run = held(f, result, count);
+    assert.match(result.output.summary, /and the pull request would carry them\. The base must be pushed first; nothing was changed\. Evidence: /u);
+    assert.deepEqual([run.delivery.outcome, run.delivery.worktreeCreated, run.delivery.commit, run.result.agentInvocations], ["blocked", false, null, 0]);
+    assert.equal(git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"), refs); assert.equal(existsSync(f.worktree), false);
+    assert.equal(pushed(), ""); assert.equal(gh(), undefined);
+  });
+}
+
+test("a named pull request base is compared with that branch on the remote, and must exist there", async context => {
+  const f = fixture(context); const pushed = remote(f); fakeGh(context, f);
+  git(f.repo, "branch", "release"); git(f.repo, "push", "-q", "origin", "release");
+  git(f.repo, "checkout", "-q", "release"); ahead(f, 3); git(f.repo, "checkout", "-q", "main"); f.head = git(f.repo, "rev-parse", "HEAD");
+  const published = pushed();
+  const agents = { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() };
+  const behind = await execute(input(f, { output: "pr", base: "release" }), agents);
+  held(f, behind, /^Blocked: Base release has 3 unpublished local commits that are not in release on origin, .+ must be pushed first/u);
+  git(f.repo, "branch", "local-only");
+  const missing = await execute(input({ ...f, evidence: join(f.root, "evidence-missing") }, { output: "pr", base: "local-only" }), agents);
+  assert.match(missing.output.summary, /^Blocked: The pull request base local-only on origin does not exist, so the base cannot be shown to be published\. Push it first/u);
+  assert.deepEqual([behind.states, missing.states], [["prepare", "failure", "blocked"], ["prepare", "failure", "blocked"]]);
+  assert.equal(pushed(), published); assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), "local-only\nmain\nrelease"); untouched(f);
+});
+
+test("a pr run whose remote cannot be reached blocks before any Agent with the saved log", async context => {
+  const f = fixture(context); const gh = fakeGh(context, f);
+  git(f.repo, "remote", "add", "origin", join(f.root, "no-such-remote.git"));
+  const result = await execute(input(f, { output: "pr" }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
+  assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["prepare", "failure", "blocked"]); untouched(f);
+  const run = held(f, result, /^Blocked: Remote origin could not be reached to check that the base is published; nothing was changed; inspect .+git-ls-remote\.log/u);
+  assert.match(readFileSync(join(run.directory, "git-ls-remote.log"), "utf8"), /no-such-remote\.git/u);
+  assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), "main"); assert.equal(existsSync(f.worktree), false); assert.equal(gh(), undefined);
+});
+
+test("a pr run proceeds when its base is on the remote, also behind a tip the repository never fetched", async context => {
+  const f = fixture(context); const pushed = remote(f); fakeGh(context, f);
+  const other = join(f.root, "other"); git(f.root, "clone", "-q", join(f.root, "remote.git"), other);
+  git(other, "-c", "user.email=fixture@example.invalid", "-c", "user.name=Fixture", "commit", "-q", "--allow-empty", "-m", "published by someone else");
+  git(other, "push", "-q", "origin", "main");
+  const tip = git(other, "rev-parse", "HEAD");
+  assert.throws(() => git(f.repo, "cat-file", "-e", tip));
+  const refs = git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)");
+  const result = await execute(input(f, { output: "pr" }));
+  assert.equal(result.state, "delivered"); untouched(f);
+  const commit = git(f.repo, "rev-parse", branch);
+  assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head);
+  assert.deepEqual(pushed().split("\n"), [`refs/heads/main ${tip}`, `refs/heads/${branch} ${commit}`]);
+  // Reading the remote's tip moved no local ref and left no FETCH_HEAD behind.
+  assert.equal(git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"), `${refs.replace("refs/remotes", `refs/heads/${branch} ${commit}\nrefs/remotes`)}`);
+  assert.equal(existsSync(join(f.repo, ".git/FETCH_HEAD")), false);
+});
+
+for (const output of ["branch", "patch", "pr"]) {
+  test(`${output} delivery ${output === "pr" ? "asks the remote about the base before anything else" : "never queries the remote, whatever the base holds"}`, async context => {
+    const f = fixture(context); const pushed = remote(f); ahead(f, 2); const calls = recordGit(context, f);
+    const result = await execute(input(f, { output }));
+    const network = calls().filter(call => /^(?:ls-remote|fetch|push|pull|clone|remote)\b/u.test(call));
+    assert.ok(calls().some(call => call.startsWith("rev-parse --verify --quiet HEAD^{commit}")));
+    assert.equal(pushed(), "");
+    if (output === "pr") {
+      assert.equal(result.state, "blocked");
+      assert.deepEqual(network, [`ls-remote --symref ${hosted}.git HEAD`]); assert.equal(calls().some(call => call.startsWith("worktree add")), false);
+      return;
+    }
+    assert.equal(result.state, "delivered"); assert.deepEqual(network, []);
+    assert.equal(git(f.repo, "rev-list", "--count", `origin/main..${branch}`), "3");
+  });
+}

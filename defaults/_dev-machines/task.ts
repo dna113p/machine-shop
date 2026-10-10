@@ -141,7 +141,10 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
 
   function capture(stage: string, event: Event): string {
     // A capturing runner returns the Agent's prose as message; accept it when the summary field was left out.
-    const summary = typeof event.summary === "string" && event.summary.trim() ? event.summary : event.message;
+    const captured = typeof event.summary === "string" && event.summary.trim() ? event.summary : event.message;
+    // A runner can also hand back the Agent's whole event as JSON text; the prose is then its summary field.
+    const wrapped = typeof captured === "string" ? jsonObject(captured)?.summary : undefined;
+    const summary = typeof wrapped === "string" && wrapped.trim() ? wrapped : captured;
     if (typeof summary !== "string" || !summary.trim() || summary.length > 16_000) {
       throw new Error(`Agent ${stage} must return a non-empty summary of at most 16000 characters`);
     }
@@ -308,6 +311,11 @@ export function object(value: unknown, name: string, keys: string[]): Record<str
 export function text(value: unknown, name: string): string {
   if (typeof value !== "string" || !value.trim() || value.includes("\0")) throw new Error(`${name} must be a non-empty string`);
   return value;
+}
+/** The object a text holds when all of it is one JSON object; undefined for prose and any other JSON value. */
+export function jsonObject(value: string): Record<string, unknown> | undefined {
+  if (!value.trimStart().startsWith("{")) return undefined;
+  try { return JSON.parse(value) as Record<string, unknown>; } catch { return undefined; }
 }
 function integer(value: unknown, name: string, min: number, max: number): number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) throw new Error(`${name} must be an integer from ${min} to ${max}`);

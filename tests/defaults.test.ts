@@ -352,3 +352,15 @@ test("a captured Agent message stands in for a missing summary, and an absent re
     /must return a non-empty summary/u,
   );
 });
+
+test("a report captured as a JSON object yields its summary, and any other text is kept as written", async context => {
+  for (const [message, summary] of [
+    [JSON.stringify({ outcome: "reviewed", summary: "Findings inside a report" }, null, 2), "Findings inside a report"],
+    ['{"outcome":"reviewed","summary":" "}', '{"outcome":"reviewed","summary":" "}'],
+    ["{braces} open this prose, which is not JSON", "{braces} open this prose, which is not JSON"],
+    ['The report was {"summary":"quoted"}', 'The report was {"summary":"quoted"}'],
+  ] as const) {
+    const result = await execute("review-code", input(repo(context), { checks: [] }), { reviewer: () => ({ type: "reviewed", message }) });
+    assert.equal(result.output.agents[0].summary, summary);
+  }
+});

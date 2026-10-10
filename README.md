@@ -151,9 +151,11 @@ machine run /absolute/dev-machines/ticket-task.ts \
   --input-file /absolute/ticket.json
 ```
 
-Unlike the ten defaults, **it commits**: one commit on a new `ticket/<slug>`
-branch after the required checks pass and the reviewer approves. With
-`"output": "pr"` it also pushes that branch and opens a pull request with `gh`.
+Unlike the ten defaults, **it commits**: one commit on a new
+`ticket/<id-slug>-<title-slug>` branch after the required checks pass and the
+reviewer approves. With `"output": "pr"` it also pushes that branch and opens a
+pull request with `gh`, after checking with the remote that the base is already
+published there.
 Use it only where the assignment authorizes those effects. It never merges,
 tags, force-pushes, or pushes any other ref, and never modifies the source
 checkout's working tree, index, or current branch.

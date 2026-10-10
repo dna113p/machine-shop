@@ -188,21 +188,80 @@ outside `repository.path`, and `evidenceRoot` must also be outside the worktree,
 so run files never appear in the source checkout or the commit. `maxRepairs`
 (0-3, default 3) and the boolean `resume` (default `false`) are optional.
 
-The slug is the lowercased ticket id with every character outside `[a-z0-9._-]`
-replaced by `-`; an id that leaves no letter or digit, or a name Git cannot use,
-is rejected. The branch is `ticket/<slug>` and the worktree is
-`<worktreeRoot>/<repository.name>--<slug>`.
+The id slug is the lowercased ticket id with every character outside
+`[a-z0-9._-]` replaced by `-`; an id that leaves no letter or digit, or a name
+Git cannot use, is rejected. The title slug is the ticket title lowercased, with
+every run of characters outside `[a-z0-9]` replaced by one `-`, without a leading
+or trailing `-`, and cut to at most 48 characters at a `-`: a cut that would fall
+inside a word goes back to the `-` before it, and a first word longer than 48
+characters has no such `-` and leaves nothing. The branch is
+`ticket/<id-slug>-<title-slug>`, for example
+`ticket/org-1-gate-github-issue-intake-on-a-trusted-author`, or `ticket/<id-slug>`
+when the title leaves no title slug. The worktree is
+`<worktreeRoot>/<repository.name>--<id-slug>`, without the title.
+
+A local branch is named for a ticket when its name is exactly `ticket/<id-slug>`
+or starts with `ticket/<id-slug>-`: after the id slug comes either the end of the
+name or the `-` that starts a title slug. A `ticket/org-10-...` branch is
+therefore not named for `org-1`, nor is `ticket/org-1.5-...` or `ticket/org-1x`.
+A name cannot tell a title from the rest of a longer id, though: with ids `org`
+and `org-1`, `ticket/org-1-fix` is named for both, as `org` titled "1 fix" and as
+`org-1` titled "fix". So when `prepare` creates a branch it records the id slug
+with it, in the repository's own Git configuration as `branch.<branch>.ticket`,
+which Git carries through a branch rename and removes with the branch.
+
+A branch belongs to a ticket when it is named for it and was made for it. A run
+reads what a branch was made for from the first of these that says:
+
+1. The record: a branch recorded for `org-1` never belongs to `org`, whatever
+   its name.
+2. The ticket commit at its tip: this workflow's commit has the ticket title as
+   subject and a `Ticket: <id>` line, and it counts only when that id and title
+   give exactly the branch's name, as `ticket/<id-slug>` or
+   `ticket/<id-slug>-<title-slug>`. That tells a delivered branch made before
+   branches carried a record, or fetched into a clone the record did not reach.
+   A branch cut from a base that happens to end in another ticket's commit is
+   not taken for that ticket's, because its name differs.
+3. The name being exactly the running ticket's `ticket/<id-slug>`: every branch
+   was named so before branches carried a title. This settles the branch for
+   that ticket only. For a ticket with a shorter id, such as `org` looking at
+   `ticket/org-1`, the same name may be its own under the title "1".
+
+A branch named for the ticket that none of these settles has unresolved
+ownership: an unrecorded `ticket/org-1-fix` without a ticket commit may be the
+branch of `org-1` under an earlier title, or of `org` titled "1 fix". The
+workflow does not guess. It treats such a branch as possibly the ticket's, so it
+neither starts a run beside it nor resumes on it, and the message asks for the
+record: `git config branch.<branch>.ticket <id-slug>`, with the id slug of the
+ticket the branch is for. Recorded for another ticket, the branch no longer
+concerns this one.
+
+`prepare` blocks, changing nothing and naming the branch found, in three cases:
+
+- A branch that belongs to the ticket exists, whichever naming or title produced
+  it, so a retitled ticket cannot start a second branch.
+- A branch named for the ticket has unresolved ownership. This is how an
+  unrecorded branch under an earlier title still blocks, and it also holds a
+  ticket back while an unrecorded branch of a longer id, such as an undelivered
+  `ticket/org-1` seen from ticket `org`, has not been recorded.
+- The name this run would take belongs to another ticket whose id and title
+  spell the same name; that branch is left alone.
+
+Two tickets whose ids differ by a `-` extension therefore never share a branch:
+their recorded and delivered branches do not block each other, and no run
+starts beside or resumes on an unresolved one until its record says whose it
+is.
 
 | State | Work |
 | --- | --- |
-| `prepare` | Resolve the base commit, `git worktree add -b` the branch, and run `setup` in the worktree; with `resume`, adopt the existing worktree instead and go straight to `verify` |
+| `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch instead and go straight to `verify` |
 | `start` | Open the helper's run on the worktree, which must be clean |
 | `triage` | The investigator returns `ready` with a short plan or `blocked` with what is missing; an unchanged-worktree guard follows |
 | `change` | The implementer edits the worktree and leaves the changes uncommitted |
 | `verify` | The required checks; a failure goes to the repair budget |
 | `review` | The reviewer returns `approved`, `revise`, or `blocked`, sealed by the unchanged-checkout guard |
 | `commit` | One commit of everything except `.machine-runs`, even if an Agent staged it: subject is the ticket title, body is `Ticket: <id>` |
-| `deliver` | `branch`: nothing more. `patch`: `git format-patch` for base..HEAD into the evidence directory. `pr`: `git push --no-follow-tags <remote URL>` of the approved commit to `refs/heads/ticket/<slug>` alone, then `gh pr create --repo <host/owner/repository>` |
+| `deliver` | `branch`: nothing more. `patch`: `git format-patch` for base..HEAD into the evidence directory. `pr`: `git push --no-follow-tags <remote URL>` of the approved commit to the ticket branch alone, then `gh pr create --repo <host/owner/repository>` |
 | `decide` | Human: stuck work waits for one of `more rounds`, `hand off`, `archive`, or `discard` |
 | `confirmDiscard` | Human: `confirm discard` or `go back`, asked before a discard removes anything |
 | `archive`, `remove` | Write `candidate.patch`; `git worktree remove --force` and `git branch -D` for this run's own worktree and branch |
@@ -217,11 +276,53 @@ worktree, and the ticket branch must still point at it. The push sends that
 commit to the ticket branch only and ignores `push.followTags`, so no tag is
 published. The push goes to the remote's configured URL, not its name, and the
 pull request is opened in the repository that URL names, regardless of `GH_REPO`,
-a separate `pushurl`, or other remotes (Git `insteadOf` aliases still apply); a remote whose URL
-does not name a hosted owner/repository blocks before anything is pushed. `--draft` is passed unless `draft` is
-false, and `--base` only when `repository.base` names a branch. The Operation
-writes the pull request body from the ticket id and title, the check results,
-and the reviewer's summary. Push and `gh` each have a two-minute timeout.
+a separate `pushurl`, or other remotes (Git `insteadOf` aliases still apply). In
+`pr` mode that URL is read once, in `prepare`, for the published-base check
+below, and the push and `gh` use the value read then: a remote that is given
+another URL while the run is under way, as an Agent can do, receives neither.
+A URL that does not name a hosted owner/repository blocks before anything is pushed. `--draft` is passed unless `draft` is
+false, and `--base` always: the branch `repository.base` names, a local branch
+or the branch behind `<remote>/<branch>`, or else the remote's default branch
+by name, as the remote reported it. That branch is also decided once, in
+`prepare`, and `gh` gets the base that was compared with the remote there.
+`gh` is never left to choose one, since it would read
+`branch.<name>.gh-merge-base` from Git configuration before the default branch;
+neither that setting nor deleting or adding a local ref during the run can turn
+the pull request toward a branch that was never checked. Push and `gh` each
+have a two-minute timeout.
+
+The Operation writes the pull request body, in this order: the ticket title on
+the first line; `## Summary` with the first paragraph of the ticket body below
+its leading headings, ended by a blank line or the next heading, a section left
+out when the body has no such text;
+`## Checks` with one `- <name>: passed` line per required check; `## Review`
+with the reviewer's summary; and `Ticket: <id>` as the last line. The commit
+message is separate and unchanged. A reviewer whose report arrives as a JSON
+object, as a capturing runner can return it, contributes that object's
+non-empty string `summary`: the shared helper unwraps it for every workflow, so
+the stage report, the blocking reason, and the next prompt carry prose too,
+while a summary that is not such an object is kept exactly as written. A review
+that is still a JSON object after that is never written to the body; a fixed
+sentence stands in for it and the report stays in the run evidence.
+
+A push carries every commit the remote lacks, so a base that is ahead of the
+remote would put commits nobody asked to publish into the pull request. For
+`output: "pr"` only, `prepare` therefore asks the remote itself, with
+`git ls-remote` on the URL the push will use, for the pull request's base
+branch: the branch `repository.base` names, or the remote's default branch
+(`ls-remote --symref` gives its name) when the base is a commit, a tag, or
+left out. Local remote-tracking refs are not trusted, since they
+only record the last fetch. The resolved base commit must be that remote commit
+or an ancestor of it. When the remote's tip is not in the local repository, it
+is fetched by URL with `--no-tags --no-write-fetch-head`, which stores the
+commits and moves no local ref. The run ends `blocked` before any worktree,
+branch, or Agent when the base has commits the remote branch lacks (the message
+gives their number and says the base must be pushed first), when the base
+branch does not exist on the remote, when the base names no branch and the
+remote does not say which branch is its default, or when the remote cannot be
+reached or its tip fetched (the Git output is saved as a log). The check, like the push,
+has a two-minute timeout and also runs for a resumed `pr` run. `branch` and
+`patch` runs make no network call.
 
 Stuck work goes to the Human state `decide` instead of ending. That covers
 triage returning `blocked`, triage having edited files, the implementer returning
@@ -279,8 +380,14 @@ may wait, belongs to whichever surface runs the Machine.
 With `"resume": true`, `prepare` adopts the existing worktree instead of
 creating one, for the candidate a `hand off` left. It requires all of: the
 worktree directory exists and is a Git worktree of `repository.path`; its `HEAD`
-is the symbolic ref `refs/heads/ticket/<slug>`; and that branch still points at
-the resolved base commit, so nothing was committed on it. If any of these fails
+is a symbolic ref to a branch that belongs to this ticket by the rule above; and
+that branch still points at the resolved base commit, so nothing was committed
+on it. The run continues on the branch the worktree is on and does not compute
+a name from the current title, so a candidate started under an earlier title, or
+as `ticket/<id-slug>` before branches carried one, is delivered on that branch.
+A worktree on a branch whose ownership is unresolved, or that belongs to another
+ticket, is not adopted; for the first the message gives the `git config` command
+that records it. If any of these fails
 the run ends `blocked` with a message naming the condition, changing nothing.
 Setup commands are not run again and triage is skipped: a resumed run goes
 straight to `verify`, then review, commit, and deliver as usual, with a fresh
@@ -290,7 +397,8 @@ explicitly, or leave the source checkout's HEAD where it was. Without `resume`,
 an existing branch or worktree directory still blocks.
 
 A run ends `blocked` without asking, changing nothing further, when: the base
-does not resolve; the branch or worktree directory already exists; a resume
+does not resolve; in `pr` mode the base is not published or the remote cannot be
+asked; a branch of the ticket or the worktree directory already exists; a resume
 precondition fails; a setup command fails or leaves tracked or unignored files
 behind; there is nothing to commit; an Agent committed or moved HEAD or the
 branch itself; a commit hook rejects the commit or changes its content or
@@ -336,9 +444,16 @@ Limits: a run waiting in a Human state keeps its worktree and branch until it is
 answered. `resume` adopts only an uncommitted candidate on the ticket's own
 worktree and branch; it does not restore an archived patch or continue a
 branch that already holds a commit. Without `resume`, a second run of the same
-ticket is blocked while its `ticket/<slug>` branch exists; resume it, or delete
+ticket is blocked while any branch of that ticket exists; resume it, or delete
 the branch and any kept worktree to retry from scratch.
-Two ids that differ only in case or punctuation share a slug. A `gh` failure
+Two ids that differ only in case or punctuation share an id slug. The ticket
+record is local Git configuration: it does not travel with a push or a clone,
+so a ticket branch checked out in another clone has no record there. One that
+holds its ticket commit is still told by that commit; one without it, unless it
+is named exactly `ticket/<id-slug>`, has unresolved ownership, which blocks a new
+run of the ticket and cannot be resumed until it is recorded. The
+published-base check reads the remote once, in `prepare`; it does not see a base
+branch that moves on the remote while the run is under way. A `gh` failure
 after a successful push leaves the pushed branch on the remote. A commit that a
 hook altered stays on the local branch, undelivered. Like the defaults, this is not a sandbox: Agents and commands run with the
 harness's and user's permissions, and `pr` mode publishes the change, so accept
