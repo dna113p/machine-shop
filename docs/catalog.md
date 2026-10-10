@@ -264,7 +264,7 @@ is.
 | `deliver` | `branch`: nothing more. `patch`: `git format-patch` for base..HEAD into the evidence directory. `pr`: `git push --no-follow-tags <remote URL>` of the approved commit to the ticket branch alone, then `gh pr create --repo <host/owner/repository>` |
 | `decide` | Human: stuck work waits for one of `more rounds`, `hand off`, `archive`, or `discard` |
 | `confirmDiscard` | Human: `confirm discard` or `go back`, asked before a discard removes anything |
-| `archive`, `remove` | Write `candidate.patch`; `git worktree remove --force` and `git branch -D` for this run's own worktree and branch |
+| `archive`, `remove` | Commit the candidate and keep that commit as the branch `archive/<slug>`; `git worktree remove --force` and `git branch -D` for this run's own worktree and ticket branch |
 
 Operations do all Git, command, and publishing work. `revise` and failed checks
 return to `change` within `maxRepairs`, and every retry passes through the real
@@ -336,54 +336,67 @@ It offers exactly these restricted choices:
 | --- | --- | --- |
 | `more rounds` | The used repair count returns to zero and the run goes back to `change`; the implementer is briefed with the standing findings as in any repair. It can be chosen again every time the budget runs out | continues |
 | `hand off` | Nothing is touched: the worktree and the branch stay, uncommitted, for another workflow or a person to work in | `handedOff` |
-| `archive` | The whole candidate, including untracked and ignored files and excluding `.machine-runs`, is written as `candidate.patch` in the evidence directory; then the worktree is removed and the branch deleted | `abandoned` |
-| `discard` | After confirmation, the worktree is removed and the branch deleted without saving a patch | `abandoned` |
+| `archive` | What delivery would have committed, tracked and untracked files without ignored files or `.machine-runs`, is committed and kept as the branch `archive/<slug>`; then the worktree is removed and the ticket branch deleted | `abandoned` |
+| `discard` | After confirmation, the worktree is removed and the branch deleted without saving the candidate | `abandoned` |
 
-`archive` builds the patch against the base commit in a scratch index, so the
-worktree and its index are not modified, and it applies to the base commit with
-`git apply`. Before anything is removed it checks out what it is about to save
-into a scratch directory beside the evidence and compares that with the
-worktree itself, byte for byte, then checks that the patch rebuilds exactly
-that from the base commit. Git's line-ending conversion and clean filters change
-a file on its way into a commit, and a checkout does not always give the same
-bytes back. Where it does, the patch holds the file as Git would commit it;
-where it does not, the patch holds the file's own bytes, unconverted and
-unfiltered, so a filter that redacts content does not redact it here. If even
-those do not check out identically, as with mixed or missing CRLF endings under
-`eol=crlf`, or the path is neither a regular file nor a symbolic link, nothing
-is removed and the run ends `blocked` naming the paths. A patch carries file
-bytes, the executable bit, and link targets; empty directories, other
-permissions, and timestamps are not part of a candidate. The comparison needs
-room for a second copy of the candidate while it runs.
+`archive` saves exactly what delivery would have committed, as a commit Git
+already knows how to store. `<slug>` is whatever follows `ticket/` in this run's
+branch name, so `ticket/proj-12-add-a-greeting` is archived as
+`archive/proj-12-add-a-greeting`. If that branch already exists the run ends
+`blocked` before anything is staged. Otherwise the candidate is staged as
+`commit` stages it, `git add --all` and then `.machine-runs` unstaged, and
+committed in the worktree with `--no-verify`, subject `Archive: <ticket title>`
+and body `Ticket: <id>`, so a commit hook that refuses the commit does not
+prevent the archive. The archive branch is created at that commit, on top of
+the base commit and of anything an Agent committed on the ticket branch itself;
+when nothing is left to stage above such a commit, the archive branch points at
+it. Only then is the worktree removed and the ticket branch deleted. The
+workflow never deletes an archive branch, and never pushes one.
 
-Unlike the commit, the patch also carries
-ignored files, because removing the worktree deletes them; an ignored
-dependency or build directory therefore makes it large, and the patch can hold
-whatever local secrets such files contain. For the same reason it reads files
-the worktree's index marks assume-unchanged or skip-worktree and files outside
-a sparse checkout's patterns; a path a sparse checkout left out of the worktree
-is not recorded as a deletion. If the patch cannot be written,
-nothing is removed and the run ends `blocked`. That includes a candidate that
-does not differ from the base commit, since `git apply` rejects an empty patch,
-and a candidate holding a nested Git repository, whose files a patch cannot
-carry. `discard` first enters a second Human state,
+Ignored files are not archived, exactly as they are not delivered: removing the
+worktree deletes them, so copy out an ignored file you want before choosing
+`archive`. The same holds for anything else `git add --all` does not record as
+it is on disk: a file the index marks assume-unchanged or skip-worktree keeps
+its committed content, a nested Git repository is recorded by its commit id
+without its files, and line-ending conversion and clean filters apply as in any
+commit. Nothing is removed, and the run ends `blocked`, when the candidate does
+not differ from its base commit, so that there is nothing to archive and
+`discard` is the choice that removes it; when the candidate cannot be staged or
+committed or the branch cannot be created; when `HEAD` is not a commit of the
+staged tree on top of what `HEAD` was before, as after a `post-commit` hook
+that resets or amends it, which `--no-verify` does not skip; when the commit's
+subject is not `Archive: <ticket title>` or its body has no `Ticket: <id>`
+line, as after a `prepare-commit-msg` hook that rewrites them, which
+`--no-verify` does not skip either, though a hook may add lines of its own; or
+when the worktree is not clean after the archive commit, ignoring
+`.machine-runs`. In the last three cases no archive branch is made: the archive
+commit is on the ticket branch, or in the worktree's reflog if a hook moved
+`HEAD` off it.
+`discard` first enters a second Human state,
 `confirmDiscard`, whose prompt names the worktree and branch that will be
 deleted and says that the candidate will not be saved. Its restricted choices
 are `confirm discard` and `go back`; `go back` returns to `decide` with nothing
-changed, and no other path removes a candidate without a patch. Removal runs
+changed, and no other path removes a candidate without an archive. Removal runs
 `git worktree remove --force` and `git branch -D` from `repository.path`, only
-on this run's own worktree and branch; if either fails the run ends `blocked`
-with the saved log. The workflow builds these steps from the public Human
-primitive with restricted choices. How they are presented, and how long a run
-may wait, belongs to whichever surface runs the Machine.
+on this run's own worktree and ticket branch; if either fails the run ends
+`blocked` with the saved log. The workflow builds these steps from the public
+Human primitive with restricted choices. How they are presented, and how long a
+run may wait, belongs to whichever surface runs the Machine.
 
 With `"resume": true`, `prepare` adopts the existing worktree instead of
 creating one, for the candidate a `hand off` left. It requires all of: the
 worktree directory exists and is a Git worktree of `repository.path`; its `HEAD`
 is a symbolic ref to a branch that belongs to this ticket by the rule above; and
-that branch still points at the resolved base commit, so nothing was committed
-on it. The run continues on the branch the worktree is on and does not compute
-a name from the current title, so a candidate started under an earlier title, or
+that branch points at the resolved base commit or at an ancestor of it, so
+nothing was committed on it. The base branch may therefore have moved forward
+while the ticket was stuck: the commit the ticket branch points at is this
+run's base commit for the commit guard, the delivered commit's parent, the
+patch range, `delivery.json`, and, in `pr` mode, the check that the base is
+published. Nothing is rebased, so the delivered branch starts from that older
+commit. A branch that holds commits the base does not, or that shares no
+history with it, is not adopted. The run continues on the branch the worktree
+is on and does not compute a name from the current title, so a candidate
+started under an earlier title, or
 as `ticket/<id-slug>` before branches carried one, is delivered on that branch.
 A worktree on a branch whose ownership is unresolved, or that belongs to another
 ticket, is not adopted; for the first the message gives the `git config` command
@@ -392,8 +405,9 @@ the run ends `blocked` with a message naming the condition, changing nothing.
 Setup commands are not run again and triage is skipped: a resumed run goes
 straight to `verify`, then review, commit, and deliver as usual, with a fresh
 repair budget and the normal repair loop if review asks for changes. The base
-must resolve to the same commit as in the first run, so name `repository.base`
-explicitly, or leave the source checkout's HEAD where it was. Without `resume`,
+must resolve to the commit the first run started from or to a descendant of it,
+so name `repository.base` explicitly, or leave the source checkout on the branch
+it was on. Without `resume`,
 an existing branch or worktree directory still blocks.
 
 A run ends `blocked` without asking, changing nothing further, when: the base
@@ -403,8 +417,8 @@ precondition fails; a setup command fails or leaves tracked or unignored files
 behind; there is nothing to commit; an Agent committed or moved HEAD or the
 branch itself; a commit hook rejects the commit or changes its content or
 message; the commit, patch, push, or `gh` step fails; the worktree cannot be
-removed after delivery; or, after a decision, the candidate patch cannot be
-written or the worktree or branch cannot be removed. A failed Git or `gh` step
+removed after delivery; or, after a decision, the candidate cannot be archived
+or the worktree or branch cannot be removed. A failed Git or `gh` step
 saves its output as a log in the evidence directory.
 
 Final states are `delivered`, `handedOff`, `abandoned`, and `blocked`. In every
@@ -414,12 +428,13 @@ that must stay open until a person merges or closes it. The workflow never
 relaunches itself, launches another Machine, or edits or closes a ticket file.
 The one-line summary names the branch, commit, and pull request URL or patch
 path on success, or the reason otherwise; then the decision if one was made, the
-`candidate.patch` path after `archive`, the worktree if it was kept (always for
-`handedOff`, and for `blocked` once it exists), and the evidence directory. Read
+archive branch and its commit after `archive`, the worktree if it was kept
+(always for `handedOff`, and for `blocked` once it exists), and the evidence
+directory. Read
 the final state, not the action, to tell the endings apart. `delivered` means
 the worktree was removed and the branch kept; `handedOff` and `blocked` keep the
 worktree and branch for inspection or further work; `abandoned` means both are
-gone. A worktree that
+gone, with the candidate on its archive branch after `archive`. A worktree that
 cannot be removed, for example because it holds unignored nested `.machine-runs`
 evidence, ends `blocked` with a reason naming the branch, commit, and pull
 request or patch already produced. Invalid input, a `repository.path` that is
@@ -434,17 +449,20 @@ commit, commit hash, output mode, pull request URL or patch paths, worktree
 path, and whether the worktree was removed. Its `outcome` is `delivered`,
 `handed-off`, `abandoned`, or `blocked`. It records `decision` when one was made
 (the last choice at `decide`, so `discard` for a confirmed discard and
-`more rounds` for a run that went on to deliver), `patch` when `candidate.patch`
-was written, and `resumed` for a resumed run, whose `worktreeCreated` is false.
+`more rounds` for a run that went on to deliver), `archive` as
+`{ "branch", "commit" }` when the archive branch was created, and `resumed` for
+a resumed run, whose `worktreeCreated` is false and whose `baseCommit` is the
+commit its branch was on.
 `result.json` keeps the helper's vocabulary: its `outcome` is `blocked` for
 `handedOff` and `abandoned`, its `repairs` counts every round across budgets,
 and its `decisions` list every Human answer.
 
 Limits: a run waiting in a Human state keeps its worktree and branch until it is
 answered. `resume` adopts only an uncommitted candidate on the ticket's own
-worktree and branch; it does not restore an archived patch or continue a
-branch that already holds a commit. Without `resume`, a second run of the same
-ticket is blocked while any branch of that ticket exists; resume it, or delete
+worktree and branch; it does not restore an archive branch, continue a branch
+that already holds a commit, or rebase a candidate onto a base that moved.
+Without `resume`, a second run of the same ticket is blocked while any branch
+of that ticket exists; resume it, or delete
 the branch and any kept worktree to retry from scratch.
 Two ids that differ only in case or punctuation share an id slug. The ticket
 record is local Git configuration: it does not travel with a push or a clone,

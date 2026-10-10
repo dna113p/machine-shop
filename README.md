@@ -171,13 +171,13 @@ rounds used, the worktree, and the branch, and offers exactly four choices:
   to the implementer. It can be chosen every time the budget runs out.
 - `hand off`: end `handedOff` with the worktree and branch kept, uncommitted,
   for another workflow or a person.
-- `archive`: save the whole candidate, ignored files included, as
-  `candidate.patch` in the evidence directory, then remove the worktree and
-  delete the branch; ends `abandoned`. Nothing is removed unless a checkout of
-  what the patch holds matches the worktree byte for byte, so a file that Git's
-  line-ending conversion or a filter would alter is saved as it is, and a
-  candidate that cannot be rebuilt that way, or does not differ from its base
-  commit, ends `blocked` with nothing removed.
+- `archive`: commit what delivery would have committed and keep that commit as
+  the branch `archive/<slug>`, where `<slug>` is what follows `ticket/` in the
+  ticket branch name, then remove the worktree and delete the ticket branch;
+  ends `abandoned`. Ignored files are not kept, exactly as they are not
+  delivered. An archive branch that already exists, or a candidate that does
+  not differ from its base commit, ends `blocked` with nothing removed. The
+  workflow never deletes an archive branch.
 - `discard`: remove the worktree and delete the branch without saving anything;
   ends `abandoned`. Nothing is removed until a second Human state,
   `confirmDiscard`, is answered `confirm discard`; `go back` returns to the
@@ -186,7 +186,10 @@ rounds used, the worktree, and the branch, and offers exactly four choices:
 Failures while preparing the worktree, committing, or delivering still end
 `blocked` without asking. `"resume": true` starts a new run in the uncommitted
 worktree a `hand off` left behind: it skips triage and setup, and goes straight
-to the checks, review, commit, and delivery with a fresh repair budget.
+to the checks, review, commit, and delivery with a fresh repair budget. The
+base branch may have moved forward in the meantime: the ticket branch must point
+at the base commit or an ancestor of it, with no commit of its own, and the run
+delivers on the commit the branch is on without rebasing.
 
 The run ends `delivered`, `handedOff`, `abandoned`, or `blocked`, and its output
 is always exactly `{ "action": "hold", "summary": "..." }` so a Machines Dispatch

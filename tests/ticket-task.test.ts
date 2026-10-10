@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -9,6 +9,7 @@ import { runtime } from "./runtime.ts";
 
 const mod = await import(pathToFileURL(resolve("ticket-task.ts")).href);
 const branch = "ticket/proj-12-add-a-greeting";
+const archiveBranch = "archive/proj-12-add-a-greeting";
 const url = "https://example.invalid/acme/widgets/pull/7";
 const hosted = "https://example.invalid/acme/widgets";
 const slug = "example.invalid/acme/widgets";
@@ -128,15 +129,15 @@ function handedOff(f: Fixture, result: { state: unknown; output: any; states: st
   assert.deepEqual([run.result.outcome, run.delivery.outcome, run.delivery.decision], ["blocked", "handed-off", "hand off"]); assert.match(run.delivery.reason, reason);
   assert.equal(git(f.repo, "rev-parse", branch), f.head); assert.equal(git(f.worktree, "symbolic-ref", "HEAD"), `refs/heads/${branch}`);
   assert.ok(result.output.summary.includes(`Decision: hand off. Worktree kept at ${f.worktree}. Evidence: `));
-  assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.delivery.patch], [true, false, null, undefined]);
+  assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.delivery.archive], [true, false, null, undefined]);
   return run;
 }
-/** An abandoned run leaves neither its worktree nor its branch, and the source checkout as it was. */
+/** An abandoned run leaves neither its worktree nor its branch, and the source checkout as it was; an archive leaves its own branch beside it. */
 function abandoned(f: Fixture, result: { state: unknown; output: any; states: string[] }, decision: string) {
   assert.equal(result.state, "abandoned"); assert.deepEqual(result.states.slice(-3), ["remove", "abandon", "abandoned"]);
   const run = held(f, result, /^Abandoned: /u); untouched(f);
   assert.equal(existsSync(f.worktree), false); assert.equal(git(f.repo, "worktree", "list").split("\n").length, 1);
-  assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), "main");
+  assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), decision === "archive" ? `${archiveBranch}\nmain` : "main");
   assert.deepEqual([run.result.outcome, run.delivery.outcome, run.delivery.decision], ["blocked", "abandoned", decision]);
   assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit], [true, true, null]);
   assert.ok(result.output.summary.includes(`Decision: ${decision}.`)); assert.doesNotMatch(result.output.summary, /Worktree kept/u);
@@ -422,10 +423,10 @@ test("hand off leaves the worktree, the branch, and the uncommitted candidate as
   const run = handedOff(f, result, /budget exhausted \(0\)\. Handle the empty case/u, human);
   assert.deepEqual(candidate(f.worktree), before); assert.equal(candidate(f.worktree).status, "M code.txt\n?? greeting.txt");
   assert.equal(git(f.repo, "rev-list", "--count", `main..${branch}`), "0"); assert.equal(git(f.repo, "worktree", "list").split("\n").length, 2);
-  assert.equal(existsSync(join(run.directory, "candidate.patch")), false);
+  assert.equal(run.delivery.archive, undefined); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
 });
 
-test("archive saves the whole candidate as a patch that applies to the base commit, then removes the worktree and branch", async context => {
+test("archive leaves the tracked and untracked candidate on archive/<slug>, with the worktree and ticket branch gone", async context => {
   const f = fixture(context);
   writeFileSync(join(f.repo, "obsolete.txt"), "remove me\n"); git(f.repo, "add", "."); git(f.repo, "commit", "-qm", "obsolete"); f.head = git(f.repo, "rev-parse", "HEAD");
   let before: ReturnType<typeof candidate> | undefined;
@@ -440,171 +441,168 @@ test("archive saves the whole candidate as a patch that applies to the base comm
     },
     reviewer: () => ok("revise", "Handle the empty case"),
   }, human);
-  const run = abandoned(f, result, "archive");
+  abandoned(f, result, "archive");
   assert.deepEqual(result.states.slice(-5), ["decide", "archive", "remove", "abandon", "abandoned"]);
-  const patch = join(run.directory, "candidate.patch");
-  assert.equal(run.delivery.patch, patch); assert.match(run.delivery.reason, /budget exhausted \(0\)\. Handle the empty case/u);
-  assert.ok(result.output.summary.includes(`Decision: archive. Candidate saved as ${patch}. Worktree and ${branch} removed. Evidence: `));
-  assert.deepEqual(readdirSync(run.directory).filter(name => name.endsWith(".index")), []);
-  assert.doesNotMatch(readFileSync(patch, "latin1"), /machine-runs/u);
-  // A fresh clone at the base commit stands in for whoever picks the patch up later.
-  const replay = join(f.root, "replay"); git(f.root, "clone", "-q", f.repo, replay); git(replay, "checkout", "-q", "--detach", f.head);
-  git(replay, "apply", patch);
-  assert.deepEqual(candidate(replay), before);
   assert.equal(before!.status, "M code.txt\n D obsolete.txt\n?? bin/tool.sh\n?? greeting.txt\n?? logo.bin");
+  // The archive is one commit on the base, holding what the ticket commit would have.
+  assert.equal(git(f.repo, "rev-parse", `${archiveBranch}^`), f.head);
+  assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", archiveBranch), "Archive: Add a greeting\nTicket: PROJ-12");
+  assert.equal(git(f.repo, "diff", "--name-status", "--no-renames", f.head, archiveBranch), "A\tbin/tool.sh\nM\tcode.txt\nA\tgreeting.txt\nA\tlogo.bin\nD\tobsolete.txt");
+  // A fresh clone on the archive branch stands in for whoever picks the candidate up later.
+  const restored = join(f.root, "restored"); git(f.root, "clone", "-q", "--branch", archiveBranch, f.repo, restored);
+  assert.deepEqual(candidate(restored), { status: "", files: before!.files });
 });
 
-test("archive carries ignored files, which removing the worktree would otherwise delete", async context => {
+test("archive leaves ignored files out of the archive commit, as delivery leaves them out of the ticket commit, and the decision says so", async context => {
   const f = fixture(context);
   writeFileSync(join(f.repo, ".gitignore"), "*.log\nbuild/\n"); git(f.repo, "add", "."); git(f.repo, "commit", "-qm", "ignore"); f.head = git(f.repo, "rev-parse", "HEAD");
-  let before: ReturnType<typeof candidate> | undefined;
-  const human = person(() => { before = candidate(f.worktree, true); return "archive"; });
+  let before = "";
+  const human = person(() => { before = candidate(f.worktree, true).status; return "archive"; });
   const result = await execute(input(f, {}, { maxRepairs: 0 }), {
     implementer: request => {
       writeFileSync(join(request.cwd, "debug.log"), "what the implementer learned\n");
       mkdirSync(join(request.cwd, "build")); writeFileSync(join(request.cwd, "build/out.bin"), Buffer.from([0, 255, 1, 0]), { mode: 0o755 });
-      mkdirSync(join(request.cwd, ".machine-runs")); writeFileSync(join(request.cwd, ".machine-runs/nested.log"), "evidence\n");
       return implement(request);
     },
     reviewer: () => ok("revise", "Handle the empty case"),
   }, human);
-  const run = abandoned(f, result, "archive");
-  assert.equal(before!.status, "?? greeting.txt\n!! build/out.bin\n!! debug.log");
-  assert.deepEqual(before!.files.map(([name]) => name), [".gitignore", "build/out.bin", "code.txt", "debug.log", "greeting.txt"]);
-  const patch = join(run.directory, "candidate.patch");
-  assert.doesNotMatch(readFileSync(patch, "latin1"), /machine-runs/u);
-  const replay = join(f.root, "replay"); git(f.root, "clone", "-q", f.repo, replay); git(replay, "checkout", "-q", "--detach", f.head);
-  git(replay, "apply", patch);
-  assert.deepEqual(candidate(replay, true), before);
+  abandoned(f, result, "archive");
+  assert.equal(before, "?? greeting.txt\n!! build/out.bin\n!! debug.log");
+  assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", archiveBranch), ".gitignore\ncode.txt\ngreeting.txt");
+  assert.ok(human.requests[0]!.prompt.includes(`archive: commit the candidate as delivery would have and keep that commit as the branch ${archiveBranch}, then remove the worktree and delete ${branch}. Ignored files are not kept.`));
 });
 
-for (const [label, edit, status] of [
-  ["files the index was told to assume unchanged or to skip", (cwd: string) => {
-    git(cwd, "update-index", "--assume-unchanged", "local/assumed.txt", "local/both.txt", "local/gone.txt");
-    git(cwd, "update-index", "--skip-worktree", "local/skipped.txt", "local/both.txt", "local/kept.txt");
-    for (const name of ["assumed", "skipped", "both"]) writeFileSync(join(cwd, `local/${name}.txt`), "new\n");
-    rmSync(join(cwd, "local/gone.txt")); rmSync(join(cwd, "local/kept.txt"));
-    // Git itself reports none of this, so neither would a patch built from the worktree's index as it is.
-    assert.equal(git(cwd, "status", "--porcelain"), "");
-  }, "M local/assumed.txt\n M local/both.txt\n D local/gone.txt\n M local/skipped.txt\n?? greeting.txt"],
-  ["files outside a sparse checkout's patterns", (cwd: string) => {
-    git(cwd, "sparse-checkout", "set", "--no-cone", "/*", "!/local/"); assert.equal(existsSync(join(cwd, "local")), false);
-    mkdirSync(join(cwd, "local")); writeFileSync(join(cwd, "local/assumed.txt"), "new\n"); writeFileSync(join(cwd, "local/untracked.txt"), "new\n");
-  }, "M local/assumed.txt\n?? greeting.txt\n?? local/untracked.txt"],
-] as const) {
-  test(`archive carries ${label}, which removing the worktree would otherwise delete`, async context => {
-    const f = fixture(context); mkdirSync(join(f.repo, "local"));
-    for (const name of ["assumed", "skipped", "both", "gone", "kept"]) writeFileSync(join(f.repo, `local/${name}.txt`), "old\n");
-    git(f.repo, "add", "."); git(f.repo, "commit", "-qm", "local"); f.head = git(f.repo, "rev-parse", "HEAD");
+test("a candidate that does not differ from its base is not archived, and nothing is removed", async context => {
+  const f = fixture(context);
+  writeFileSync(join(f.repo, ".gitignore"), "*.log\n"); git(f.repo, "add", "."); git(f.repo, "commit", "-qm", "ignore"); f.head = git(f.repo, "rev-parse", "HEAD");
+  // An ignored file is no difference: delivery would not have committed it either.
+  const human = person(() => { writeFileSync(join(f.worktree, "debug.log"), "what the investigator learned\n"); return "archive"; });
+  const result = await execute(input(f), { investigator: () => ok("blocked", "The ticket names no file"), implementer: () => assert.fail(), reviewer: () => assert.fail() }, human);
+  const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: the candidate does not differ from its base commit ${f.head}, so there is nothing to archive; discard removes it`, "u"));
+  assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
+  assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.doesNotMatch(result.output.summary, /archived on/u);
+  assert.equal(candidate(f.worktree, true).status, "!! debug.log"); assert.equal(git(f.worktree, "diff", "--cached", "--name-only"), "");
+  assert.equal(git(f.repo, "rev-parse", branch), f.head); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
+});
+
+test("an existing archive branch blocks the archive before anything is staged, and nothing is removed", async context => {
+  const f = fixture(context); git(f.repo, "branch", archiveBranch);
+  let before: ReturnType<typeof candidate> | undefined; let index = "";
+  const human = person(() => { before = candidate(f.worktree); index = git(f.worktree, "ls-files", "--stage"); return "archive"; });
+  const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => ok("revise", "Handle the empty case") }, human);
+  const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: branch ${archiveBranch} already exists in .+, and nothing was staged`, "u"));
+  assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
+  assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]);
+  assert.deepEqual(candidate(f.worktree), before); assert.equal(before!.status, "?? greeting.txt"); assert.equal(git(f.worktree, "ls-files", "--stage"), index);
+  assert.equal(git(f.repo, "rev-parse", archiveBranch), f.head); assert.equal(git(f.repo, "rev-parse", branch), f.head);
+});
+
+test("a failing commit hook does not prevent the archive", async context => {
+  const f = fixture(context);
+  mkdirSync(join(f.repo, ".git/hooks"), { recursive: true });
+  for (const hook of ["pre-commit", "commit-msg"]) writeFileSync(join(f.repo, ".git/hooks", hook), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  assert.throws(() => git(f.repo, "commit", "-q", "--allow-empty", "-m", "refused by the hooks"));
+  const result = await execute(input(f, { checks: [command("process.exit(1)")] }, { maxRepairs: 0 }), { reviewer: () => assert.fail() }, person("archive"));
+  abandoned(f, result, "archive");
+  assert.equal(git(f.repo, "rev-parse", `${archiveBranch}^`), f.head);
+  assert.equal(git(f.repo, "show", "--name-only", "--format=%s", archiveBranch), "Archive: Add a greeting\n\ngreeting.txt");
+});
+
+test("delivery.json and the summary name the archive branch and its commit", async context => {
+  const f = fixture(context);
+  const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => ok("revise", "Handle the empty case") }, person("archive"));
+  const run = abandoned(f, result, "archive"); const commit = git(f.repo, "rev-parse", archiveBranch);
+  assert.deepEqual(run.delivery, {
+    schemaVersion: 1, outcome: "abandoned", reason: "Repair budget exhausted (0). Handle the empty case", decision: "archive",
+    ticket: "PROJ-12", repository: { name: "widgets", path: f.repo }, branch, baseCommit: f.head, commit: null, output: "branch",
+    archive: { branch: archiveBranch, commit }, worktree: f.worktree, worktreeCreated: true, worktreeRemoved: true,
+  });
+  assert.ok(result.output.summary.includes(`Decision: archive. Candidate archived on ${archiveBranch} at ${commit}. Worktree and ${branch} removed. Evidence: `));
+  // The archive commit is the workflow's own: the candidate it holds is the one the checks passed on.
+  assert.equal(run.result.checksPassed, true);
+  assert.deepEqual(readdirSync(run.directory).filter(name => /patch|index|checkout/u.test(name)), []);
+});
+
+for (const further of [false, true]) {
+  test(`archive keeps a commit an Agent made on the ticket branch, ${further ? "below the archive commit of what is still uncommitted" : "as it is when nothing else is uncommitted"}`, async context => {
+    const f = fixture(context);
     const result = await execute(input(f, {}, { maxRepairs: 0 }), {
-      implementer: request => { edit(request.cwd); return implement(request); }, reviewer: () => ok("revise", "Handle the empty case"),
+      implementer: request => {
+        implement(request); git(request.cwd, "add", "."); git(request.cwd, "commit", "-qm", "agent commit");
+        if (further) writeFileSync(join(request.cwd, "code.txt"), "new");
+        return ok();
+      },
+      reviewer: () => ok("revise", "Handle the empty case"),
     }, person("archive"));
     const run = abandoned(f, result, "archive");
-    const replay = join(f.root, "replay"); git(f.root, "clone", "-q", f.repo, replay); git(replay, "checkout", "-q", "--detach", f.head);
-    git(replay, "apply", run.delivery.patch);
-    assert.equal(git(replay, "status", "--porcelain", "--untracked-files=all"), status);
-    // A file the checkout left out is not a deletion.
-    assert.equal(readFileSync(join(replay, "local/kept.txt"), "utf8"), "old\n"); assert.equal(readFileSync(join(replay, "local/assumed.txt"), "utf8"), "new\n");
+    assert.equal(git(f.repo, "log", "--format=%s", `${f.head}..${archiveBranch}`), further ? "Archive: Add a greeting\nagent commit" : "agent commit");
+    assert.equal(git(f.repo, "show", `${archiveBranch}:greeting.txt`), "hello"); assert.equal(git(f.repo, "show", `${archiveBranch}:code.txt`), further ? "new" : "old");
+    assert.deepEqual(run.delivery.archive, { branch: archiveBranch, commit: git(f.repo, "rev-parse", archiveBranch) });
   });
 }
 
-/** A base whose attributes make Git convert line endings and run a clean filter, so its trees do not hold the bytes of the files. */
-function converting(f: Fixture) {
-  writeFileSync(join(f.repo, ".gitattributes"), "* text=auto\n*.bat text eol=crlf\n*.secret filter=redact\n"); writeFileSync(join(f.repo, "run.bat"), "echo one\r\n");
-  git(f.repo, "config", "filter.redact.clean", "sed 's/token=.*/token=REDACTED/'");
-  git(f.repo, "add", "."); git(f.repo, "commit", "-qm", "attributes"); f.head = git(f.repo, "rev-parse", "HEAD");
-  assert.equal(git(f.repo, "cat-file", "-p", "HEAD:run.bat"), "echo one");
-}
-
-test("archive reproduces byte for byte the files whose line endings or content Git would change on the way into a patch", async context => {
-  const f = fixture(context); converting(f);
-  let before: ReturnType<typeof candidate> | undefined;
-  const human = person(() => { before = candidate(f.worktree); return "archive"; });
-  const result = await execute(input(f, {}, { maxRepairs: 0 }), {
-    implementer: request => {
-      const write = (name: string, bytes: string) => writeFileSync(join(request.cwd, name), bytes);
-      assert.equal(readFileSync(join(request.cwd, "run.bat"), "utf8"), "echo one\r\n");
-      write("run.bat", "echo one\r\necho two\r\n"); write("code.txt", "new\r\nlines\r\n"); write("notes.txt", "one\r\ntwo\r\n");
-      write("mixed.txt", "one\r\ntwo\n"); write("api.secret", "token=abc\n"); symlinkSync("notes.txt", join(request.cwd, "alias"));
-      return implement(request);
-    },
-    reviewer: () => ok("revise", "Handle the empty case"),
-  }, human);
-  const run = abandoned(f, result, "archive");
-  assert.equal(before!.status, "M code.txt\n M run.bat\n?? alias\n?? api.secret\n?? greeting.txt\n?? mixed.txt\n?? notes.txt");
-  assert.deepEqual(readdirSync(run.directory).filter(name => name.startsWith("candidate.") || name.endsWith(".index")), ["candidate.patch"]);
-  // A conversion that a checkout undoes stays as Git records it; a file it would not give back is saved as it is.
-  const patch = readFileSync(run.delivery.patch, "latin1");
-  assert.match(patch, /\+echo two\n/u); assert.match(patch, /\+lines\r\n/u); assert.match(patch, /\+two\r\n/u); assert.match(patch, /\+one\r\n\+two\n/u);
-  assert.match(patch, /\+token=abc\n/u); assert.doesNotMatch(patch, /REDACTED/u);
-  // Whoever applies it has the filter configured, as this repository does, or does not, as a fresh clone.
-  for (const configured of [false, true]) {
-    const replay = join(f.root, `replay-${configured}`); git(f.root, "clone", "-q", f.repo, replay); git(replay, "checkout", "-q", "--detach", f.head);
-    if (configured) git(replay, "config", "filter.redact.clean", git(f.repo, "config", "filter.redact.clean"));
-    git(replay, "apply", run.delivery.patch);
-    assert.deepEqual(candidate(replay), before); assert.equal(readlinkSync(join(replay, "alias")), "notes.txt");
-  }
-});
-
-for (const [label, spoil, name] of [
-  ["line endings that a checkout rewrites", (cwd: string) => writeFileSync(join(cwd, "run.bat"), "echo one\r\necho two\n"), "run.bat"],
-  ["line endings that Git does not count as a change", (cwd: string) => writeFileSync(join(cwd, "run.bat"), "echo one\n"), "run.bat"],
-  ["a path that is neither a file nor a symbolic link", (cwd: string) => { execFileSync("mkfifo", [join(cwd, "queue")]); }, "queue"],
-] as const) {
-  test(`a candidate with ${label} cannot be rebuilt from a patch, so archive ends blocked with nothing removed`, async context => {
-    const f = fixture(context); converting(f);
-    let before: unknown;
-    const human = person(() => { before = candidate(f.worktree); return "archive"; });
-    const result = await execute(input(f, {}, { maxRepairs: 0 }), {
-      implementer: request => { spoil(request.cwd); return implement(request); }, reviewer: () => ok("revise", "Handle the empty case"),
-    }, human);
-    const run = blocked(f, result, new RegExp(`candidate patch could not be written, so nothing was removed: a patch cannot give back ${name} byte for byte`, "u"));
-    assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
-    assert.deepEqual([run.delivery.decision, run.delivery.patch], ["archive", undefined]);
-    assert.deepEqual(readdirSync(run.directory).filter(name => name.startsWith("candidate.") || name.endsWith(".index")), []);
-    assert.deepEqual(candidate(f.worktree), before); assert.equal(git(f.repo, "rev-parse", branch), f.head);
-    assert.equal(statSync(join(f.worktree, name)).isFile(), name !== "queue");
-  });
-}
-
-test("a candidate that does not differ from its base has no patch that applies, so archive ends blocked with nothing removed", async context => {
-  const f = fixture(context); const human = person("archive");
-  const result = await execute(input(f), { investigator: () => ok("blocked", "The ticket names no file"), implementer: () => assert.fail(), reviewer: () => assert.fail() }, human);
-  const run = blocked(f, result, /candidate patch could not be written, so nothing was removed: the candidate does not differ from the base commit/u);
+test("a worktree that is not clean after the archive commit ends blocked with nothing removed and no archive branch", async context => {
+  const f = fixture(context);
+  // --no-verify skips the hooks that can refuse a commit; this one runs after it.
+  mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks/post-commit"), "#!/bin/sh\necho late > late.txt\n", { mode: 0o755 });
+  const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => ok("revise", "Handle the empty case") }, person("archive"));
+  const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: the worktree is not clean after the archive commit, so ${archiveBranch} would not hold all of the candidate`, "u"), 1);
   assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
-  assert.deepEqual([run.delivery.decision, run.delivery.patch], ["archive", undefined]);
-  assert.deepEqual(readdirSync(run.directory).filter(name => name.startsWith("candidate.") || name.endsWith(".index")), []);
-  assert.equal(candidate(f.worktree, true).status, ""); assert.equal(git(f.repo, "rev-parse", branch), f.head);
+  assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
+  assert.equal(git(f.repo, "log", "-1", "--format=%s", branch), "Archive: Add a greeting");
+  assert.equal(readFileSync(join(f.worktree, "late.txt"), "utf8"), "late\n"); assert.equal(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), "hello\n");
 });
 
-// With passing checks the helper can no longer fingerprint the kept worktree at the end; the run still ends blocked rather than failing.
-for (const [checks, check] of [["failing", command("process.exit(1)")], ["passing", command()]] as const) {
-  test(`a nested repository, whose files a patch cannot carry, ends archive blocked with nothing removed after ${checks} checks`, async context => {
+test("a hook that resets HEAD off the archive commit and leaves a clean worktree ends blocked with nothing removed and no archive branch", async context => {
+  const f = fixture(context);
+  mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks/post-commit"), "#!/bin/sh\ngit reset --quiet --hard HEAD~1\n", { mode: 0o755 });
+  const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => ok("revise", "Handle the empty case") }, person("archive"));
+  const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: a commit hook or Git configuration moved HEAD off the archive commit or changed what it holds, so ${archiveBranch} would not hold the candidate; HEAD is at ${f.head}`, "u"));
+  assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
+  assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
+  // The reset left nothing for the clean check to see: the worktree is on the base without the candidate.
+  assert.equal(git(f.worktree, "status", "--porcelain"), ""); assert.equal(git(f.repo, "rev-parse", branch), f.head); assert.ok(!existsSync(join(f.worktree, "greeting.txt")));
+  // The archive commit is still where the hook left it, since the worktree and its reflog were kept.
+  assert.equal(git(f.worktree, "log", "-1", "--format=%s", "HEAD@{1}"), "Archive: Add a greeting"); assert.equal(git(f.worktree, "show", "HEAD@{1}:greeting.txt"), "hello");
+});
+
+for (const [changed, script] of [
+  ["subject", 'sed -i "1s/.*/Rewritten/" "$1"'],
+  ["ticket", 'sed -i "s/^Ticket: PROJ-12$/Ticket: PROJ-123/" "$1"'],
+] as const) {
+  test(`a hook that rewrites the archive commit's ${changed} ends blocked with nothing removed and no archive branch`, async context => {
     const f = fixture(context);
-    const human = person(() => {
-      const nested = join(f.worktree, "vendor"); git(f.worktree, "init", "-q", nested); writeFileSync(join(nested, "lib.txt"), "vendored\n");
-      git(nested, "add", "."); git(nested, "-c", "user.email=fixture@example.invalid", "-c", "user.name=Fixture", "commit", "-qm", "vendored");
-      return "archive";
-    });
-    const result = await execute(input(f, { checks: [check] }, { maxRepairs: 0 }), { reviewer: () => checks === "passing" ? ok("revise", "Handle the empty case") : assert.fail() }, human);
-    const run = blocked(f, result, /candidate patch could not be written, so nothing was removed: a patch cannot carry the files of the nested Git repository vendor\./u);
-    assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]); assert.equal(run.result.checksPassed, false);
-    assert.deepEqual(readdirSync(run.directory).filter(name => name.startsWith("candidate.") || name.endsWith(".index")), []);
-    assert.equal(readFileSync(join(f.worktree, "vendor/lib.txt"), "utf8"), "vendored\n"); assert.equal(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), "hello\n");
-    assert.equal(git(f.repo, "rev-parse", branch), f.head);
+    // --no-verify skips commit-msg, not the hook that prepares the message.
+    mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks/prepare-commit-msg"), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+    const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => ok("revise", "Handle the empty case") }, person("archive"));
+    const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: a commit hook or Git configuration changed the archive commit's message, so ${archiveBranch} would not name the ticket; HEAD is at [0-9a-f]{40}, which holds the candidate`, "u"), 1);
+    assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
+    assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
+    // The candidate is whole in the commit the hook reworded, on the ticket branch that was kept.
+    assert.equal(git(f.worktree, "status", "--porcelain"), ""); assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head);
+    assert.equal(git(f.repo, "log", "-1", "--format=%B", branch), changed === "subject" ? "Rewritten\n\nTicket: PROJ-12" : "Archive: Add a greeting\n\nTicket: PROJ-123");
+    assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello"); assert.equal(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), "hello\n");
   });
 }
 
-test("a candidate that cannot be written as a patch ends blocked with nothing removed", async context => {
+test("a hook that adds to the archive commit's message without changing its subject or ticket does not prevent the archive", async context => {
+  const f = fixture(context);
+  mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks/prepare-commit-msg"), '#!/bin/sh\nprintf "\\nPrepared-by: hook\\n" >> "$1"\n', { mode: 0o755 });
+  const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => ok("revise", "Handle the empty case") }, person("archive"));
+  abandoned(f, result, "archive");
+  assert.equal(git(f.repo, "log", "-1", "--format=%B", archiveBranch), "Archive: Add a greeting\n\nTicket: PROJ-12\n\nPrepared-by: hook");
+});
+
+test("a candidate that cannot be staged ends blocked with nothing removed", async context => {
   const f = fixture(context);
   // Git refuses to add an embedded repository that has no commit.
   const human = person(() => { git(f.worktree, "init", "-q", "embedded"); return "archive"; });
   const result = await execute(input(f, { checks: [command("process.exit(1)")] }, { maxRepairs: 0 }), { reviewer: () => assert.fail() }, human);
-  const run = blocked(f, result, /candidate patch could not be written, so nothing was removed; inspect .+git-add\.log/u);
+  const run = blocked(f, result, /candidate could not be archived, so nothing was removed; inspect .+git-add\.log/u);
   assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
-  assert.deepEqual([run.delivery.decision, run.delivery.patch], ["archive", undefined]); assert.ok(existsSync(join(run.directory, "git-add.log")));
-  assert.deepEqual(readdirSync(run.directory).filter(name => name.startsWith("candidate.") || name.endsWith(".index")), []);
+  assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.ok(existsSync(join(run.directory, "git-add.log")));
   assert.equal(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), "hello\n"); assert.equal(git(f.repo, "rev-parse", branch), f.head);
+  assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
 });
 
 test("discard then go back returns to the decision with the worktree, branch, and candidate as they were", async context => {
@@ -619,10 +617,10 @@ test("discard then go back returns to the decision with the worktree, branch, an
   for (const part of [f.worktree, branch, "will not be saved"]) assert.ok(confirm!.prompt.includes(part), part);
   assert.deepEqual([second!.prompt, second!.choices], [first!.prompt, first!.choices]);
   assert.deepEqual(run.result.decisions.map((made: any) => `${made.stage}: ${made.response}`), ["decide: discard", "confirmDiscard: go back", "decide: hand off"]);
-  assert.equal(existsSync(join(run.directory, "candidate.patch")), false);
+  assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
 });
 
-test("discard removes the worktree and branch only after it is confirmed, and saves no patch", async context => {
+test("discard removes the worktree and branch only after it is confirmed, and archives nothing", async context => {
   const f = fixture(context); let unconfirmed = false;
   const human = person("discard", () => {
     unconfirmed = existsSync(join(f.worktree, "greeting.txt")) && git(f.repo, "rev-parse", branch) === f.head && git(f.repo, "config", "--local", "--get", `branch.${branch}.ticket`) === "proj-12";
@@ -633,7 +631,7 @@ test("discard removes the worktree and branch only after it is confirmed, and sa
   const run = abandoned(f, result, "discard");
   // The ticket record goes with the branch.
   assert.doesNotMatch(git(f.repo, "config", "--local", "--list"), /^branch\./mu);
-  assert.equal(run.delivery.patch, undefined); assert.equal(existsSync(join(run.directory, "candidate.patch")), false);
+  assert.equal(run.delivery.archive, undefined); assert.doesNotMatch(result.output.summary, /archived/u);
   assert.ok(result.output.summary.includes(`Decision: discard. Worktree and ${branch} removed without saving the candidate. Evidence: `));
   assert.deepEqual(run.result.decisions.map((made: any) => made.response), ["discard", "confirm discard"]);
 });
@@ -683,6 +681,29 @@ test("a resumed run whose review asks for changes repairs within a fresh budget"
   assert.equal(evidence(again).result.repairs, 1); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello again");
 });
 
+for (const output of ["branch", "pr"] as const) {
+  test(`a resumed run whose branch is behind a base that moved forward verifies, is approved, and delivers a ${output === "pr" ? "pull request" : "branch"} on the older commit, without rebasing`, async context => {
+    const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const again = await handOff(f);
+    // Someone commits to the base branch while the ticket is stuck. The remote does not have that commit, only the one the candidate was made from.
+    const older = f.head; writeFileSync(join(f.repo, "later.txt"), "later\n"); git(f.repo, "add", "."); git(f.repo, "commit", "-qm", "later"); f.head = git(f.repo, "rev-parse", "HEAD");
+    const result = await execute(input(again, { output }, { resume: true }), {
+      investigator: () => assert.fail(), implementer: () => assert.fail(),
+      reviewer: request => { assert.deepEqual(readdirSync(request.cwd).sort(), [".git", "code.txt", "greeting.txt"]); return ok("approved", "Greeting matches the ticket"); },
+    });
+    assert.equal(result.state, "delivered");
+    assert.deepEqual(result.states, ["prepare", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
+    const commit = git(f.repo, "rev-parse", branch);
+    const run = held(again, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
+    assert.equal(git(f.repo, "rev-parse", `${branch}^`), older); assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.txt");
+    assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", branch), "code.txt\ngreeting.txt");
+    assert.deepEqual([run.delivery.baseCommit, run.delivery.commit, run.delivery.resumed, run.delivery.worktreeRemoved], [older, commit, true, true]);
+    assert.deepEqual([run.result.outcome, run.result.checksPassed, run.result.checks.map((check: any) => check.phase)], ["completed", true, ["verify"]]);
+    if (output !== "pr") { assert.equal(pushed(), ""); assert.equal(gh(), undefined); return; }
+    // The pull request base was checked against the commit the branch is on, so the unpublished later commit neither blocks the run nor is pushed.
+    assert.equal(pushed(), `refs/heads/${branch} ${commit}`); assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "main", "--head", branch]);
+  });
+}
+
 /** The worktree and recorded branch an earlier run of the ticket left, without a candidate. */
 const linked = (f: Fixture) => { git(f.repo, "worktree", "add", "-q", "-b", branch, f.worktree); git(f.repo, "config", `branch.${branch}.ticket`, "proj-12"); };
 const noRecord = (name: string, ticket = "proj-12") => new RegExp(`^Blocked: Cannot resume: HEAD in .+ is on ${name}, which has ${literal(unsettled(name, ticket))} Evidence: `, "u");
@@ -697,8 +718,15 @@ for (const [label, arrange, reason] of [
   ["a worktree on a branch recorded for this ticket under a name that is not the ticket's", (f: Fixture) => { git(f.repo, "branch", branch); git(f.repo, "worktree", "add", "-q", "-b", "other", f.worktree); git(f.repo, "config", "branch.other.ticket", "proj-12"); }, /HEAD in .+ is not on a branch of this ticket, .+; nothing was changed/u],
   ["a worktree on a branch of this ticket's name that has no record", (f: Fixture) => { git(f.repo, "worktree", "add", "-q", "-b", branch, f.worktree); }, noRecord(branch)],
   ["a worktree on the unrecorded branch of a ticket whose id extends this one with a '-'", (f: Fixture) => { git(f.repo, "worktree", "add", "-q", "-b", "ticket/proj-12-1", f.worktree); }, noRecord("ticket/proj-12-1")],
-  ["a ticket branch that already holds a commit", (f: Fixture) => { linked(f); implement({ cwd: f.worktree }); git(f.worktree, "add", "."); git(f.worktree, "commit", "-qm", "earlier commit"); }, /does not point at the base commit .+; nothing was changed/u],
-  ["a base that moved since the worktree was made", (f: Fixture) => { linked(f); git(f.repo, "commit", "-q", "--allow-empty", "-m", "later"); f.head = git(f.repo, "rev-parse", "HEAD"); }, /does not point at the base commit .+; nothing was changed/u],
+  ["a ticket branch that holds a commit of its own", (f: Fixture) => { linked(f); implement({ cwd: f.worktree }); git(f.worktree, "add", "."); git(f.worktree, "commit", "-qm", "earlier commit"); },
+    /ticket\/proj-12-add-a-greeting holds 1 commit that is not in the base commit .+; only an uncommitted candidate is resumed, and nothing was changed/u],
+  ["a ticket branch that holds commits of its own behind a base that moved forward", (f: Fixture) => {
+    linked(f); for (const subject of ["earlier commit", "another"]) git(f.worktree, "commit", "-q", "--allow-empty", "-m", subject);
+    git(f.repo, "commit", "-q", "--allow-empty", "-m", "later"); f.head = git(f.repo, "rev-parse", "HEAD");
+  }, /ticket\/proj-12-add-a-greeting holds 2 commits that are not in the base commit .+; only an uncommitted candidate is resumed, and nothing was changed/u],
+  ["a ticket branch that points somewhere unrelated to the base", (f: Fixture) => {
+    linked(f); git(f.worktree, "reset", "-q", "--hard", git(f.repo, "commit-tree", "-m", "unrelated", git(f.repo, "rev-parse", "HEAD^{tree}")));
+  }, /ticket\/proj-12-add-a-greeting shares no history with the base commit .+; nothing was changed/u],
 ] as const) {
   test(`resume with ${label} blocks without changing anything`, async context => {
     const f = fixture(context); arrange(f);
@@ -1183,14 +1211,16 @@ for (const [commits, count] of [[1, /Base HEAD has 1 unpublished local commit th
     const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); ahead(f, commits);
     // The remote-tracking ref claims the base is published; only the remote itself knows.
     git(f.repo, "update-ref", "refs/remotes/origin/main", f.head);
+    // A resumed run would push as well, so it is asked the same question about the commit its branch is on, and its worktree is left as it was.
+    if (commits === 2) linked(f);
     const refs = git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)");
-    // A resumed run would push as well, so it is asked the same question before its worktree is even looked for.
     const result = await execute(input(f, { output: "pr" }, { resume: commits === 2 }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
     assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["prepare", "failure", "blocked"]); untouched(f);
     const run = held(f, result, count);
     assert.match(result.output.summary, /and the pull request would carry them\. The base must be pushed first; nothing was changed\. Evidence: /u);
     assert.deepEqual([run.delivery.outcome, run.delivery.worktreeCreated, run.delivery.commit, run.result.agentInvocations], ["blocked", false, null, 0]);
-    assert.equal(git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"), refs); assert.equal(existsSync(f.worktree), false);
+    assert.equal(git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"), refs); assert.equal(existsSync(f.worktree), commits === 2);
+    assert.doesNotMatch(result.output.summary, /Worktree kept/u); assert.equal(run.delivery.resumed, undefined);
     assert.equal(pushed(), ""); assert.equal(gh(), undefined);
   });
 }

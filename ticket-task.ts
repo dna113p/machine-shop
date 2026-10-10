@@ -1,6 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Event, MachinePrimitives } from "@dna113p/machines";
 import { taskRun, parseCheck, object, text, jsonObject } from "./defaults/_dev-machines/task.ts";
@@ -13,8 +12,6 @@ export const agentRoles = {
 };
 
 const publishTimeoutMs = 120_000;
-// An archive also carries ignored files, which can be a whole dependency directory, and checks itself against a second copy of the candidate.
-const archiveTimeoutMs = 120_000;
 const decisions = ["more rounds", "hand off", "archive", "discard"] as const;
 const confirmations = ["confirm discard", "go back"] as const;
 
@@ -30,7 +27,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let removed = false;
   let decision = "";
   let discardConfirmed = false;
-  let patch = "";
+  let archived: { branch: string; commit: string } | undefined;
   let reviewSummary = "";
   let prUrl = "";
   // Where prepare found the base published: the remote's URL and the pull request base branch there, its default branch by name when the base names none.
@@ -41,8 +38,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let held: { action: "hold"; summary: string } | undefined;
 
   /** A failed Git or gh step blocks with its output saved as evidence rather than copied into the ticket summary. */
-  function attempt(file: string, args: string[], cwd: string, timeout?: number, failure = `${file} ${args[0]} failed`, env?: Record<string, string>, input?: string) {
-    const done = run(file, args, cwd, timeout, env, input);
+  function attempt(file: string, args: string[], cwd: string, timeout?: number, failure = `${file} ${args[0]} failed`) {
+    const done = run(file, args, cwd, timeout);
     if (!done.ok) {
       const log = join(work.open(), `${file}-${args[0]}.log`);
       writeFileSync(log, `${file} ${args.join(" ")}\n${done.stdout}\n${done.detail}\n`, { flag: "wx", mode: 0o600 });
@@ -80,8 +77,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const base = run("git", ["rev-parse", "--verify", "--quiet", `${repository.base ?? "HEAD"}^{commit}`], repository.path);
     if (!base.ok) return work.block(`Base ${repository.base ?? "HEAD"} does not resolve to a commit in ${repository.path}.`);
     baseCommit = base.stdout;
+    // A resumed run's base is the commit its branch is on, so the branch is read before the remote is asked about the base.
+    if (resume && adopt().type === "blocked") return { type: "blocked" };
     if (repository.output === "pr" && !published()) return { type: "blocked" };
-    if (resume) return adopt();
+    if (resume) {
+      adopted = true;
+      return { type: "resumed" };
+    }
     const owners = new Map(git(repository.path, "for-each-ref", "--format=%(refname)", "refs/heads/ticket/").split("\n")
       .map(ref => ref.slice("refs/heads/".length)).filter(fits).map(name => [name, owner(name)]));
     const first = (whose: string) => [...owners].find(([, slug]) => slug === whose)?.[0];
@@ -158,10 +160,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (!whose) return work.block(`Cannot resume: HEAD in ${worktree} is on ${current}, which has ${unresolved(current)}`);
     if (whose !== ticket.slug) return work.block(`Cannot resume: HEAD in ${worktree} is on ${current}, which belongs to ticket ${whose}; nothing was changed.`);
     branch = current;
-    if (run("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`], repository.path).stdout !== baseCommit) {
-      return work.block(`Cannot resume: ${branch} does not point at the base commit ${baseCommit}, so something was committed on it or the base moved; nothing was changed.`);
+    const tip = run("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`], repository.path).stdout;
+    // The base may have gone on while the ticket was stuck. The candidate stays on the commit it was made from, which this run takes as its base; nothing is rebased.
+    if (!tip || !run("git", ["merge-base", "--is-ancestor", tip, baseCommit], repository.path).ok) {
+      if (!tip || !run("git", ["merge-base", tip, baseCommit], repository.path).ok) {
+        return work.block(`Cannot resume: ${branch} shares no history with the base commit ${baseCommit}; nothing was changed.`);
+      }
+      const own = git(repository.path, "rev-list", "--count", `${baseCommit}..${tip}`);
+      return work.block(`Cannot resume: ${branch} holds ${own} commit${own === "1" ? " that is" : "s that are"} not in the base commit ${baseCommit}, `
+        + "so something was committed on it or the base moved back; only an uncommitted candidate is resumed, and nothing was changed.");
     }
-    adopted = true;
+    baseCommit = tip;
     return { type: "resumed" };
   }
 
@@ -232,6 +241,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: "delivered" };
   }
 
+  /** Where an archive keeps the candidate: this run's branch name with archive/ in place of ticket/. */
+  const archiveBranch = () => `archive/${branch.slice("ticket/".length)}`;
   const stuckPrompt = () => {
     const { reason, repairs, totalRepairs, maxRepairs } = work.status();
     return [
@@ -242,7 +253,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       [
         "more rounds: restart the repair budget and send the standing findings back to the implementer.",
         "hand off: stop here and keep the worktree and branch exactly as they are, with nothing committed, for another workflow or a person.",
-        "archive: save the whole candidate, ignored files included, as candidate.patch in the evidence directory, then remove the worktree and delete the branch.",
+        `archive: commit the candidate as delivery would have and keep that commit as the branch ${archiveBranch()}, then remove the worktree and delete ${branch}. Ignored files are not kept.`,
         "discard: remove the worktree and delete the branch without saving the candidate; asks for confirmation first.",
       ].join("\n"),
     ].join("\n\n");
@@ -250,91 +261,49 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const discardPrompt = () => [
     `Discard the candidate for ticket ${ticket.id}: ${ticket.title}?`,
     `This removes the worktree ${worktree} and deletes the branch ${branch} in ${repository.path}.`,
-    "The candidate will not be saved: no patch is written, and its uncommitted and committed work on that branch is lost.",
+    "The candidate will not be saved: no archive branch is made, and its uncommitted and committed work on that branch is lost.",
   ].join("\n\n");
 
-  /** Writes the whole candidate against the base commit from a scratch index, so the worktree and its own index stay as they are. */
+  /** Saves what delivery would have committed as a commit on a branch of its own, which outlives the worktree and the ticket branch. */
   function archive(): Event {
-    const directory = work.open();
-    const file = join(directory, "candidate.patch");
-    const candidate = { GIT_INDEX_FILE: join(directory, "candidate.index") };
-    const replay = { GIT_INDEX_FILE: join(directory, "replay.index") };
-    const copy = join(directory, "candidate.checkout");
-    const failure = "The candidate patch could not be written, so nothing was removed";
-    const step = (env: Record<string, string>, ...args: string[]) => attempt("git", args, worktree, archiveTimeoutMs, failure, env);
-    const unmark = (flag: string, paths: string[]) => paths.length === 0
-      || attempt("git", ["update-index", flag, "-z", "--stdin"], worktree, archiveTimeoutMs, failure, candidate, paths.join("\0")).ok;
-    if (existsSync(file) || existsSync(copy)) return work.block(`${failure}: ${file} or ${copy} already exists.`);
-    try {
-      // Starting from the worktree's index keeps the paths a sparse checkout left out of the worktree as they are.
-      const staged = step({}, "rev-parse", "--path-format=absolute", "--git-path", "index");
-      if (!staged.ok) return { type: "blocked" };
-      if (existsSync(staged.stdout)) copyFileSync(staged.stdout, candidate.GIT_INDEX_FILE);
-      // That index can also tell add to trust an entry instead of reading its file: assume-unchanged (a lowercase tag) and
-      // skip-worktree (S or s). Removing the worktree deletes those files too, so the copy drops both marks wherever a file is present.
-      const entries = step(candidate, "ls-files", "-v", "-z");
-      if (!entries.ok) return { type: "blocked" };
-      const marked = (tag: RegExp) => entries.stdout.split("\0").filter(entry => tag.test(entry[0] ?? "")).map(entry => entry.slice(2));
-      const present = (path: string) => lstatSync(join(worktree, path), { throwIfNoEntry: false }) !== undefined;
-      if (!unmark("--no-assume-unchanged", marked(/[a-z]/u)) || !unmark("--no-skip-worktree", marked(/s/iu).filter(present))) return { type: "blocked" };
-      // Unlike commit, the add is forced and reaches outside a sparse checkout's patterns: ignored files and files there are deleted with the worktree too.
-      if (!step(candidate, "add", "--all", "--force", "--sparse").ok || !step(candidate, "reset", "--quiet", "--", ".machine-runs").ok) return { type: "blocked" };
-      // A patch records a nested repository as a bare commit id; its files would be deleted with the worktree.
-      const changes = step(candidate, "diff", "--cached", "--raw", "--no-renames", baseCommit);
-      if (!changes.ok) return { type: "blocked" };
-      const nested = changes.stdout.split("\n").filter(line => /^:\d{6} 160000 /u.test(line)).map(line => line.slice(line.indexOf("\t") + 1));
-      if (nested.length) return work.block(`${failure}: a patch cannot carry the files of the nested Git repository ${nested.join(", ")}.`);
-      // The index holds what line-ending conversion and clean filters made of each file, and a checkout gives back what Git makes of that.
-      // So the candidate is checked out beside the evidence and compared with the worktree itself, byte for byte.
-      const listed = step(candidate, "ls-files", "--stage", "-z");
-      if (!listed.ok) return { type: "blocked" };
-      const modes = new Map(listed.stdout.split("\0").filter(Boolean).map(entry => [entry.slice(entry.indexOf("\t") + 1), entry.slice(0, 6)]));
-      const unlike = () => {
-        rmSync(copy, { recursive: true, force: true });
-        if (!step(candidate, "checkout-index", "--all", `--prefix=${copy}/`).ok) return undefined;
-        const [kept, rebuilt] = [contents(worktree), existsSync(copy) ? contents(copy) : new Map<string, string>()];
-        // checkout-index leaves out what the sparse checkout left out of the worktree, so those paths are absent on both sides.
-        return [...new Set([...kept.keys(), ...rebuilt.keys()])].sort().filter(path => kept.get(path) !== rebuilt.get(path));
-      };
-      let lost = unlike();
-      // Where conversion loses a file's bytes, the patch takes the file as it is instead; the second checkout then has to return exactly that.
-      const exact = (lost ?? []).filter(path => /^100/u.test(modes.get(path) ?? "") && lstatSync(join(worktree, path), { throwIfNoEntry: false })?.isFile());
-      for (const path of exact) {
-        const blob = step({}, "hash-object", "-w", "--no-filters", "--", path);
-        if (!blob.ok || !step(candidate, "update-index", "--cacheinfo", `${modes.get(path)},${blob.stdout},${path}`).ok) return { type: "blocked" };
-      }
-      if (exact.length) lost = unlike();
-      if (!lost) return { type: "blocked" };
-      if (lost.length) {
-        return work.block(`${failure}: a patch cannot give back ${lost.slice(0, 5).join(", ")}${lost.length > 5 ? ` and ${lost.length - 5} more` : ""} byte for byte. `
-          + "Git writes something else there on checkout, as line-ending conversion and filters can, or cannot record the path at all.");
-      }
-      const tree = step(candidate, "write-tree");
-      const base = step({}, "rev-parse", "--verify", "--quiet", `${baseCommit}^{tree}`);
-      if (!tree.ok || !base.ok) return { type: "blocked" };
-      // git apply rejects an empty patch, and removal without a patch belongs to a confirmed discard alone.
-      if (tree.stdout === base.stdout) return work.block(`${failure}: the candidate does not differ from the base commit ${baseCommit}, and an empty patch does not apply.`);
-      if (!step(candidate, "diff", "--cached", "--binary", "--full-index", "--no-color", "--no-ext-diff", "--no-textconv",
-        "--src-prefix=a/", "--dst-prefix=b/", `--output=${file}`, baseCommit).ok) return { type: "blocked" };
-      // Nothing is removed on the strength of a patch that does not rebuild that checked candidate from the base commit.
-      if (!step(replay, "read-tree", baseCommit).ok || !step(replay, "apply", "--cached", "--whitespace=nowarn", file).ok) return { type: "blocked" };
-      const rebuilt = step(replay, "write-tree");
-      if (!rebuilt.ok) return { type: "blocked" };
-      if (rebuilt.stdout !== tree.stdout) return work.block(`${failure}: applying it to ${baseCommit} does not reproduce the candidate.`);
-      chmodSync(file, 0o600);
-      patch = file;
-      return { type: "archived" };
-    } catch (error) {
-      return work.block(`${failure}: ${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      rmSync(candidate.GIT_INDEX_FILE, { force: true }); rmSync(replay.GIT_INDEX_FILE, { force: true }); rmSync(copy, { recursive: true, force: true });
-      if (!patch && existsSync(file) && statSync(file).isFile()) rmSync(file);
+    const name = archiveBranch();
+    const failure = "The candidate could not be archived, so nothing was removed";
+    if (run("git", ["show-ref", "--verify", "--quiet", `refs/heads/${name}`], repository.path).ok) {
+      return work.block(`${failure}: branch ${name} already exists in ${repository.path}, and nothing was staged.`);
     }
+    // Whether the candidate still matches its checks is settled here; the archive commit is this workflow's own and is not drift.
+    work.retire();
+    // Staged as commit stages it, so ignored files stay out here as they would have there.
+    if (!attempt("git", ["add", "--all"], worktree, undefined, failure).ok || !attempt("git", ["reset", "--quiet", "--", ".machine-runs"], worktree, undefined, failure).ok) return { type: "blocked" };
+    const head = () => git(worktree, "rev-parse", "HEAD");
+    const parent = head();
+    if (run("git", ["diff", "--cached", "--quiet"], worktree).ok) {
+      // Removal without anything saved belongs to a confirmed discard alone. Commits an Agent made on the branch are a candidate, archived as they are.
+      if (parent === baseCommit) return work.block(`${failure}: the candidate does not differ from its base commit ${baseCommit}, so there is nothing to archive; discard removes it.`);
+    } else {
+      const tree = git(worktree, "write-tree"); const title = `Archive: ${ticket.title}`;
+      if (!attempt("git", ["commit", "--quiet", "--no-verify", "-m", title, "-m", `Ticket: ${ticket.id}`], worktree, undefined, failure).ok) return { type: "blocked" };
+      // --no-verify skips only the hooks that can refuse a commit. One that runs after it can reset HEAD and leave a clean worktree without the candidate.
+      const [origin, subject, ...body] = git(worktree, "log", "-1", "--no-show-signature", "--format=%T %P%n%s%n%b").split("\n");
+      if (origin !== `${tree} ${parent}`) {
+        return work.block(`${failure}: a commit hook or Git configuration moved HEAD off the archive commit or changed what it holds, so ${name} would not hold the candidate; HEAD is at ${head()}.`);
+      }
+      // One that prepares the message still runs too, and the archive is found again by its subject and its ticket.
+      if (subject !== title || !body.some(line => flat(line) === flat(`Ticket: ${ticket.id}`))) {
+        return work.block(`${failure}: a commit hook or Git configuration changed the archive commit's message, so ${name} would not name the ticket; HEAD is at ${head()}, which holds the candidate.`);
+      }
+    }
+    // Whatever the commit left behind would be deleted with the worktree.
+    if (pending() !== "") return work.block(`${failure}: the worktree is not clean after the archive commit, so ${name} would not hold all of the candidate.`);
+    const commit = head();
+    if (!attempt("git", ["branch", name, commit], worktree, undefined, failure).ok) return { type: "blocked" };
+    archived = { branch: name, commit };
+    return { type: "archived" };
   }
 
   /** Removes this run's own worktree and branch, and nothing else, once the candidate is archived or a Human confirmed losing it. */
   function remove(): Event {
-    if (!patch && !discardConfirmed) throw new Error("The worktree and branch are removed only after an archive or a confirmed discard");
+    if (!archived && !discardConfirmed) throw new Error("The worktree and branch are removed only after an archive or a confirmed discard");
     work.retire();
     if (!attempt("git", ["worktree", "remove", "--force", worktree], repository.path).ok) return { type: "blocked" };
     removed = true;
@@ -360,15 +329,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       schemaVersion: 1, outcome, ...(finished ? {} : { reason }), ...(decision ? { decision } : {}),
       ticket: ticket.id, repository: { name: repository.name, path: repository.path }, branch,
       baseCommit: baseCommit || null, commit: commitHash || null, output: repository.output,
-      ...(prUrl ? { prUrl } : {}), ...(patches.length ? { patches } : {}), ...(patch ? { patch } : {}),
+      ...(prUrl ? { prUrl } : {}), ...(patches.length ? { patches } : {}), ...(archived ? { archive: archived } : {}),
       worktree, ...(adopted ? { resumed: true } : {}), worktreeCreated: created, worktreeRemoved: removed,
     }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     const brief = flat(reason).replace(/^(.{600}).+$/u, "$1…").replace(/[^.!?…]$/u, "$&.");
     held = { action: "hold", summary: [
       { delivered: `Delivered ${result}.`, blocked: `Blocked: ${brief}`, "handed-off": `Handed off on ${branch}: ${brief}`, abandoned: `Abandoned: ${brief}` }[outcome],
       ...(decision ? [`Decision: ${decision}.`] : []),
-      ...(patch ? [`Candidate saved as ${patch}.`] : []),
-      ...(outcome === "abandoned" ? [`Worktree and ${branch} removed${patch ? "" : " without saving the candidate"}.`] : []),
+      ...(archived ? [`Candidate archived on ${archived.branch} at ${archived.commit}.`] : []),
+      ...(outcome === "abandoned" ? [`Worktree and ${branch} removed${archived ? "" : " without saving the candidate"}.`] : []),
       ...((created || adopted) && !removed ? [`Worktree kept at ${worktree}.`] : []),
       `Evidence: ${directory}`,
     ].join(" ") };
@@ -518,22 +487,6 @@ export function hostedRepository(url: string): string | undefined {
   const parts = path.replace(/^\/+|\/+$/gu, "").replace(/\.git$/u, "").split("/");
   return host && parts.length === 2 && parts.every(part => /^[\w.-]+$/u.test(part)) ? `${host}/${parts.join("/")}` : undefined;
 }
-/** What a patch can carry of each path below a checkout: a file's bytes and executable bit, or a link's target. Git's own directory and run evidence are left out. */
-function contents(root: string): Map<string, string> {
-  const found = new Map<string, string>();
-  const walk = (directory: string) => {
-    for (const entry of readdirSync(join(root, directory), { withFileTypes: true })) {
-      const path = directory ? `${directory}/${entry.name}` : entry.name;
-      if (path === ".git" || path === ".machine-runs") continue;
-      if (entry.isDirectory()) walk(path);
-      else if (entry.isSymbolicLink()) found.set(path, `link ${readlinkSync(join(root, path))}`);
-      else if (!entry.isFile()) found.set(path, "special");
-      else found.set(path, `file ${statSync(join(root, path)).mode & 0o100} ${createHash("sha256").update(readFileSync(join(root, path))).digest("hex")}`);
-    }
-  };
-  walk("");
-  return found;
-}
 /** Resolves symlinks in the part of a path that already exists. */
 function real(path: string): string {
   if (existsSync(path)) return realpathSync(path);
@@ -541,11 +494,10 @@ function real(path: string): string {
   return parent === path ? path : join(real(parent), basename(path));
 }
 const flat = (value: string) => value.replace(/\s+/gu, " ").trim();
-function run(file: string, args: string[], cwd: string, timeout = 30_000, env: Record<string, string> = {}, input?: string) {
+function run(file: string, args: string[], cwd: string, timeout = 30_000) {
   const done = spawnSync(file, args, {
-    cwd, encoding: "utf8", shell: false, timeout, killSignal: "SIGKILL", maxBuffer: 8 * 1024 * 1024,
-    ...(input === undefined ? { stdio: ["ignore", "pipe", "pipe"] } : { input }),
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GH_PROMPT_DISABLED: "1", GH_REPO: undefined, ...env },
+    cwd, encoding: "utf8", shell: false, timeout, killSignal: "SIGKILL", maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GH_PROMPT_DISABLED: "1", GH_REPO: undefined },
   });
   return { ok: !done.error && done.status === 0, stdout: (done.stdout ?? "").trim(), detail: done.error?.message ?? (done.stderr ?? "").trim() };
 }
