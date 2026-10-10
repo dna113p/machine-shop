@@ -86,7 +86,7 @@ async function execute(assignment: unknown, agents = {}, human: (request: Ask) =
   return { state: result.value, output: result.output as any, states };
 }
 function evidence(f: Fixture) {
-  const runs = join(f.evidence, ".machine-runs/dev-machines");
+  const runs = join(f.evidence, ".machine-runs/machine-shop");
   const [id, ...others] = readdirSync(runs); assert.deepEqual(others, []);
   const read = (name: string) => JSON.parse(readFileSync(join(runs, id!, name), "utf8"));
   return { directory: join(runs, id!), result: read("result.json"), delivery: read("delivery.json") };

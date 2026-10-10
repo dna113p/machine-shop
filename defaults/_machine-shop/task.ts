@@ -75,7 +75,7 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     if (directory) return directory;
     let parent = policy.evidenceRoot ?? workspace;
     if (policy.evidenceRoot) mkdirSync(parent, { recursive: true });
-    for (const part of [".machine-runs", "dev-machines"]) {
+    for (const part of [".machine-runs", "machine-shop"]) {
       parent = join(parent, part);
       if (existsSync(parent)) {
         const stat = lstatSync(parent);
@@ -246,7 +246,7 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
       checks: evidence, agents: reports, decisions, report: join(directory, "result.json"),
     };
     writeFileSync(join(directory, "result.json"), JSON.stringify(result, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-    console.log(`Dev Machines result: ${join(directory, "result.json")}`);
+    console.log(`Machine Shop result: ${join(directory, "result.json")}`);
     return { type: outcome };
   }
   return { start, open, check, checks, regression, capture, decision, choice, prompt, seal, unchanged, review, repair, renew, block, accept, retire, finish,

@@ -1,5 +1,5 @@
 import type { Event, MachinePrimitives } from "@dna113p/machines";
-import { taskRun, resultStates } from "./_dev-machines/task.ts";
+import { taskRun, resultStates } from "./_machine-shop/task.ts";
 
 export const description = "Investigate a bug, architecture question, or technical choice, challenge its evidence, and return a bounded report.";
 export const agentRoles = { investigator: "Investigates the scoped question without editing", reviewer: "Challenges unsupported conclusions and missing alternatives" };

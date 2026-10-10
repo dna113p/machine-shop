@@ -225,10 +225,10 @@ function outputCount(output: string, value: string): number {
 }
 
 function createRepository(): string {
-  const repository = mkdtempSync(join(tmpdir(), "dev-machines-test-"));
+  const repository = mkdtempSync(join(tmpdir(), "machine-shop-test-"));
   git(repository, "init", "-b", "main");
-  git(repository, "config", "user.name", "Dev Machines Test");
-  git(repository, "config", "user.email", "dev-machines@example.invalid");
+  git(repository, "config", "user.name", "Machine Shop Test");
+  git(repository, "config", "user.email", "machine-shop@example.invalid");
   writeFileSync(join(repository, "README.md"), "# Test repository\n");
   git(repository, "add", "README.md");
   git(repository, "commit", "-m", "Initial commit");

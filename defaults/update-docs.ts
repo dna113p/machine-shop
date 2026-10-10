@@ -1,5 +1,5 @@
 import type { Event, MachinePrimitives } from "@dna113p/machines";
-import { taskRun, resultStates } from "./_dev-machines/task.ts";
+import { taskRun, resultStates } from "./_machine-shop/task.ts";
 
 export const description = "Update documentation or examples, run explicit validation, and check factual consistency.";
 export const agentRoles = { writer: "Performs the scoped change", reviewer: "Reviews evidence and the resulting change without editing" };

@@ -1,5 +1,5 @@
 import type { Event, MachinePrimitives } from "@dna113p/machines";
-import { taskRun, resultStates } from "./_dev-machines/task.ts";
+import { taskRun, resultStates } from "./_machine-shop/task.ts";
 
 export const description = "Establish a green baseline, add focused regression/coverage tests, then verify and review.";
 export const agentRoles = { tester: "Performs the scoped change", reviewer: "Reviews evidence and the resulting change without editing" };

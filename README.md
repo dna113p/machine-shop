@@ -1,13 +1,13 @@
-# Dev Machines
+# Machine Shop
 
 A selective starter library of **ten software-task Machines**: implementation,
 bug fixing, refactoring, tests, review, investigation, documentation, dependency
 upgrades, release preparation, and model-free verification.
 
-This is the independent `dev-machines` Git repository in Machines Org, expanded
-rather than duplicated. It owns reusable workflow policy, not the Machines runtime,
-Agent harnesses, scheduling, or the global `~/.machines` directory. The new defaults
-are portable TypeScript definitions with explicit states, real check gates,
+This is the independent `machine-shop` Git repository in Machines Org. It owns
+reusable workflow policy, not the Machines runtime, Agent harnesses, scheduling,
+or the global `~/.machines` directory. The defaults are portable TypeScript
+definitions with explicit states, real check gates,
 bounded repairs, and retrievable JSON evidence.
 
 ## Choose a workflow
@@ -48,7 +48,7 @@ node scripts/install.mjs --target /absolute/project \
 ```
 
 The installer copies selected definitions as `.machines/dev-<name>.ts`, plus the
-small relative helper at `.machines/_dev-machines/task.ts`. Copies work after moving
+small relative helper at `.machines/_machine-shop/task.ts`. Copies work after moving
 the project and can be adapted locally. The `dev-` prefix avoids clobbering project
 names. Identical reinstalls are no-ops; customized/conflicting files are refused
 before normal writes. There is no force-overwrite option, automatic update,
@@ -106,7 +106,7 @@ A Machine that ends in `blocked` is not a successfully fulfilled software task.
 Direct source execution also works without copying the defaults:
 
 ```sh
-machine run /absolute/dev-machines/defaults/verify-checks.ts \
+machine run /absolute/machine-shop/defaults/verify-checks.ts \
   --input-file /absolute/assignment.json
 ```
 
@@ -125,7 +125,7 @@ npm run check
 npm run smoke:install
 ```
 
-From the umbrella, `npm run verify -- dev-machines` runs the verification Machine
+From the umbrella, `npm run verify -- machine-shop` runs the verification Machine
 and retains a check receipt. In a standalone checkout, install this repository's
 development dependencies first. For runtime changes not yet published, use a built
 Machines tarball rather than assuming the registry has the local version.
@@ -138,7 +138,7 @@ instruction-following and task-solving quality are not established by these test
 
 ## Ticket delivery
 
-[ticket-task.ts](ticket-task.ts) is a current workflow at the repository root. It
+[ticket-task.ts](ticket-task.ts) is a workflow at the repository root. It
 is not one of the ten defaults and the selective installer does not install it;
 run it from source or wrap it in a project Machine that supplies trusted paths
 and commands. It takes one local ticket for one Git repository and carries it
@@ -146,7 +146,7 @@ from an isolated worktree to a delivered branch, patch, or draft pull request,
 stopping for a person only when the work is stuck:
 
 ```sh
-machine run /absolute/dev-machines/ticket-task.ts \
+machine run /absolute/machine-shop/ticket-task.ts \
   --agent investigator=codex --agent implementer=default --agent reviewer=codex \
   --input-file /absolute/ticket.json
 ```
@@ -160,7 +160,7 @@ Use it only where the assignment authorizes those effects. It never merges,
 tags, force-pushes, or pushes any other ref, and never modifies the source
 checkout's working tree, index, or current branch.
 
-A ticket run can now wait for a person. Failed checks and review findings are
+A ticket run can wait for a person. Failed checks and review findings are
 repaired within `maxRepairs`, which defaults to 3 here (0-3 accepted). When that
 budget is exhausted, or triage, the implementer, or the reviewer reports a
 blocker or a read-only stage edits the worktree, the run enters the Human state
@@ -206,10 +206,10 @@ selective installer does not install it; run it from source. Its input is text:
 
 ```sh
 # Start a fresh chat for a task in the current directory:
-machine run /absolute/dev-machines/chatgpt-thread.ts "Add a health endpoint"
+machine run /absolute/machine-shop/chatgpt-thread.ts "Add a health endpoint"
 
 # Or adopt an existing conversation; nothing is sent until you reply:
-machine run /absolute/dev-machines/chatgpt-thread.ts "https://chatgpt.com/c/<id>"
+machine run /absolute/machine-shop/chatgpt-thread.ts "https://chatgpt.com/c/<id>"
 ```
 
 After each rig-bridge handoff a Human state shows its reason and summary and the
@@ -226,9 +226,9 @@ account. Run it only where that is intended. The package
 be sent. See the [catalog](docs/catalog.md#chatgpt-thread) for states,
 requirements, and limits.
 
-## Earlier workflows retained
+## Other root workflows
 
-The existing root definitions remain unchanged in behavior for compatibility:
+Three more root definitions take plain text input:
 
 - [smoke.ts](smoke.ts): one instant no-model Operation, accepting text input.
 - [implement-review.ts](implement-review.ts): direct editing and a Human feedback
@@ -238,6 +238,6 @@ The existing root definitions remain unchanged in behavior for compatibility:
   use only within an assignment authorizing those effects. It requires a clean
   source branch. `details` expands review findings; free-form feedback revises.
 
-Existing global symlinks to these files remain valid. They are not silently
-replaced by the new defaults, and the selective installer does not install them.
-New editing defaults leave their changes uncommitted in the supplied checkout.
+The selective installer does not install them; global `~/.machines` symlinks may
+point at these files. Unlike `worktree-task`, the editing defaults leave their
+changes uncommitted in the supplied checkout.

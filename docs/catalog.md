@@ -39,7 +39,7 @@ Production migrations and publishing are deliberately not generic defaults.
 
 ## Common input
 
-The new defaults accept a JSON object through MCP/Pi, `--input-file`, or a JSON
+The defaults accept a JSON object through MCP/Pi, `--input-file`, or a JSON
 string as CLI positional input. They do not accept an unstructured task string.
 
 ```json
@@ -119,7 +119,7 @@ continuity is not added by this library; adapt Human states through the owning
 Machine when a richer discussion is needed.
 
 Every normally terminated default returns JSON Machine output and saves a unique
-receipt at `.machine-runs/dev-machines/<id>/result.json`. The output includes
+receipt at `.machine-runs/machine-shop/<id>/result.json`. The output includes
 `outcome`, `checksPassed`, repairs, invocation count, check exit codes/log paths,
 stage summaries, explicit Human decisions, and its own `report` path. Workers
 receive the exact evidence directory, so reviews need not guess which run to inspect.
@@ -152,7 +152,7 @@ budget. Required Agent roles are `investigator`, `implementer`, and `reviewer`;
 default allows at most 9 Agent calls before a person is asked, and
 `maxRepairs: 0` at most 3; each `more rounds` decision allows one more
 implementer pass and review plus `maxRepairs` further repairs. A ticket run can
-now wait for a person: stuck work stops in a Human state rather than ending.
+wait for a person: stuck work stops in a Human state rather than ending.
 
 ```json
 {
@@ -441,7 +441,7 @@ request or patch already produced. Invalid input, a `repository.path` that is
 not a checkout root, a worktree or evidence root that resolves into the
 repository through a symlink, and unexpected exceptions are runtime failures.
 
-Evidence is written to `<evidenceRoot>/.machine-runs/dev-machines/<id>/`, outside
+Evidence is written to `<evidenceRoot>/.machine-runs/machine-shop/<id>/`, outside
 the repository and the commit: the helper's `started.json`, check and setup
 logs, Agent reports, each Human answer as `human-<n>.json`, and `result.json`,
 plus `delivery.json` with the ticket id, repository name and path, branch, base

@@ -1,5 +1,5 @@
 import type { Event, MachinePrimitives } from "@dna113p/machines";
-import { taskRun, resultStates } from "./_dev-machines/task.ts";
+import { taskRun, resultStates } from "./_machine-shop/task.ts";
 
 export const description = "Check the baseline, assess an upgrade, obtain Human approval, then update, verify, and review without publishing.";
 export const agentRoles = { analyst: "Assesses compatibility and proposes the bounded upgrade", implementer: "Updates the approved dependency and affected code", reviewer: "Reviews compatibility and upgrade scope without editing" };

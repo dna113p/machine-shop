@@ -33,7 +33,7 @@ async function execute(name: string, assignment: unknown, agents = {}, options =
   return { state: result.value, output: result.output as any, states };
 }
 function receipts(cwd: string) {
-  const directory = join(cwd, ".machine-runs/dev-machines");
+  const directory = join(cwd, ".machine-runs/machine-shop");
   return readdirSync(directory).map(id => JSON.parse(readFileSync(join(directory, id, "result.json"), "utf8")));
 }
 

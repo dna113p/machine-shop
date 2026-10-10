@@ -18,7 +18,7 @@ export function install({ target, workflows, dryRun = false, allowShadowing = fa
   const selected = [...new Set(workflows)];
   for (const name of selected) if (!available.includes(name)) throw new Error(`Unknown workflow: ${name}`);
   const catalog = join(project, ".machines");
-  const support = join(catalog, "_dev-machines");
+  const support = join(catalog, "_machine-shop");
   for (const directory of [catalog, support]) {
     const stat = maybeStat(directory);
     if (stat && (stat.isSymbolicLink() || !stat.isDirectory())) throw new Error(`Refusing unsafe directory: ${directory}`);
@@ -31,7 +31,7 @@ export function install({ target, workflows, dryRun = false, allowShadowing = fa
     }
   }
   // The shared helper has no index.ts, so discovery does not mistake it for a Machine.
-  const copies = [{ source: join(root, "defaults/_dev-machines/task.ts"), destination: join(support, "task.ts") }];
+  const copies = [{ source: join(root, "defaults/_machine-shop/task.ts"), destination: join(support, "task.ts") }];
   for (const name of selected) {
     const alternate = join(catalog, `dev-${name}`);
     if (maybeStat(alternate)) throw new Error(`Refusing to shadow an existing alternate definition: ${alternate}`);

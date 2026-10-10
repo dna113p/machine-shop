@@ -106,7 +106,7 @@ function machinesRuntime(): string {
     { cwd: projectDirectory, encoding: "utf8" },
   );
   const primary = worktrees.split("\0").find((field) => field.startsWith("worktree "));
-  assert.ok(primary, "Git must identify the primary Dev Machines checkout");
+  assert.ok(primary, "Git must identify the primary Machine Shop checkout");
 
   // Ordinary repositories identify their primary checkout in the first record.
   // A linked checkout can live elsewhere, without its own Machines sibling.

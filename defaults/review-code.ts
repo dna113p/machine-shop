@@ -1,5 +1,5 @@
 import type { Event, MachinePrimitives } from "@dna113p/machines";
-import { taskRun, resultStates } from "./_dev-machines/task.ts";
+import { taskRun, resultStates } from "./_machine-shop/task.ts";
 
 export const description = "Review code or an existing diff without source edits and return evidence-backed findings.";
 export const agentRoles = { reviewer: "Reviews the specified code without changing the checkout" };

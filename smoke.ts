@@ -11,7 +11,7 @@ export default function smoke(
     states: {
       run: operation(
         () => {
-          console.log(input || "Dev Machines is connected.");
+          console.log(input || "Machine Shop is connected.");
           return { type: "completed" };
         },
         { completed: "done" },

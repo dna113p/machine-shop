@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Event, MachinePrimitives } from "@dna113p/machines";
-import { taskRun, parseCheck, object, text, jsonObject } from "./defaults/_dev-machines/task.ts";
+import { taskRun, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
 
 export const description = "Carry one local ticket for one Git repository from an isolated worktree through triage, implementation, checks, and review to a delivered branch, patch, or draft pull request; a stuck run waits for a Human decision.";
 export const agentRoles = {

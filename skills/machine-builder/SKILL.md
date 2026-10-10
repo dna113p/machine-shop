@@ -1,9 +1,9 @@
 ---
 name: machine-builder
-description: Select and adapt Dev Machines software-task defaults, or build a project-specific Machine when no existing workflow fits. Use the runtime machine-builder and project-setup skills when available.
+description: Select and adapt Machine Shop software-task defaults, or build a project-specific Machine when no existing workflow fits. Use the runtime machine-builder and project-setup skills when available.
 ---
 
-# Build with Dev Machines
+# Build with Machine Shop
 
 The project orchestrator starts with [the catalog](../../docs/catalog.md), reads
 candidate sources and project commands, and selects a useful subset. This library

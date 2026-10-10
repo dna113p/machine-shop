@@ -1,5 +1,5 @@
 import type { Event, MachinePrimitives } from "@dna113p/machines";
-import { taskRun, resultStates } from "./_dev-machines/task.ts";
+import { taskRun, resultStates } from "./_machine-shop/task.ts";
 
 export const description = "Verify a clean release candidate, prepare an evidence-backed checklist, and request Human sign-off; never publish.";
 export const agentRoles = { reviewer: "Assesses release readiness and drafts a release checklist without source edits" };

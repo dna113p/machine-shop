@@ -1,5 +1,5 @@
 import type { Event, MachinePrimitives } from "@dna113p/machines";
-import { taskRun, resultStates } from "./_dev-machines/task.ts";
+import { taskRun, resultStates } from "./_machine-shop/task.ts";
 
 export const description = "Prove a specific regression fails, repair it, prove it passes, then run required checks and review.";
 export const agentRoles = { tester: "Writes a focused reproducing regression test", implementer: "Repairs the demonstrated bug", reviewer: "Reviews the fix and regression evidence without editing" };

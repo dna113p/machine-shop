@@ -18,8 +18,8 @@ export default function worktreeTask(
 
   const id = randomUUID();
   const sourceDirectory = process.cwd();
-  const worktreeDirectory = join(tmpdir(), `dev-machines-${id}`);
-  const worktreeBranch = `dev-machines/${id}`;
+  const worktreeDirectory = join(tmpdir(), `machine-shop-${id}`);
+  const worktreeBranch = `machine-shop/${id}`;
   let baseCommit = "";
   let sourceBranch = "";
   let feedback = "";

@@ -39,7 +39,7 @@ test("selective installation preserves instructions and existing definitions", c
   writeFileSync(join(project, ".machines/README.md"), "Existing routes");
   writeFileSync(join(project, ".machines/custom.ts"), "Existing custom Machine");
   install({ target: project, workflows: ["verify-checks", "review-code", "verify-checks"] });
-  assert.deepEqual(readdirSync(join(project, ".machines")).sort(), ["README.md", "_dev-machines", "custom.ts", "dev-review-code.ts", "dev-verify-checks.ts"]);
+  assert.deepEqual(readdirSync(join(project, ".machines")).sort(), ["README.md", "_machine-shop", "custom.ts", "dev-review-code.ts", "dev-verify-checks.ts"]);
   assert.equal(readFileSync(join(project, "AGENTS.md"), "utf8"), "Existing project policy");
   assert.equal(readFileSync(join(project, ".machines/README.md"), "utf8"), "Existing routes");
   assert.equal(existsSync(join(project, ".machines/agents.ts")), false);
@@ -65,13 +65,13 @@ test("customized definitions block the whole install before other new files", co
 test("customized helper is never silently upgraded", context => {
   const { project } = fixture(context);
   install({ target: project, workflows: ["review-code"] });
-  const custom = join(project, ".machines/_dev-machines/task.ts");
+  const custom = join(project, ".machines/_machine-shop/task.ts");
   writeFileSync(custom, "Custom helper");
   assert.throws(() => install({ target: project, workflows: ["verify-checks"] }), /overwrite customized/u);
   assert.equal(existsSync(join(project, ".machines/dev-verify-checks.ts")), false);
 });
 
-for (const path of [".machines", ".machines/_dev-machines", ".machines/dev-verify-checks.ts"]) {
+for (const path of [".machines", ".machines/_machine-shop", ".machines/dev-verify-checks.ts"]) {
   test(`installer rejects a symlink destination at ${path}`, context => {
     const { project, base } = fixture(context);
     if (path !== ".machines") mkdirSync(join(project, ".machines"));
@@ -86,7 +86,7 @@ test("directory-form Machines cannot be silently shadowed by file-form defaults"
   mkdirSync(join(project, ".machines/dev-verify-checks"), { recursive: true });
   writeFileSync(join(project, ".machines/dev-verify-checks/index.ts"), "existing");
   assert.throws(() => install({ target: project, workflows: ["verify-checks"] }), /alternate definition/u);
-  assert.equal(existsSync(join(project, ".machines/_dev-machines")), false);
+  assert.equal(existsSync(join(project, ".machines/_machine-shop")), false);
 });
 
 test("an inherited project catalog requires a deliberate shadowing decision", context => {
