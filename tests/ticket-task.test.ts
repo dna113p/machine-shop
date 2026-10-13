@@ -180,6 +180,20 @@ function handedOff(f: Fixture, result: { state: unknown; output: any; states: st
 }
 /** The park note's fixed next step. */
 const nextStep = "Add the answer to the ticket body, then run the ticket again with resume: true; the run continues from the kept worktree with fresh budgets.";
+/** How a stop for the owner counts the reviewer's questions. */
+const counted = (count: number) => `${count} open question${count === 1 ? "" : "s"}`;
+const asked = [
+  { text: "Should the greeting be localized? (confirmed)", where: "greeting.txt:1" },
+  { text: "Is a trailing newline wanted?", where: "greeting.txt:2" },
+];
+const askedAgain = [
+  { text: "Should the greeting be localized? (confirmed again through a live engine)", where: "greeting.txt:1" },
+  { text: "Should the greeting end with a newline?", where: "greeting.txt:2" },
+];
+const discussions = (questions: { text: string; where: string }[]) => questions.map(question => ({ severity: "discussion", ...question }));
+const openQuestions = /^Answer the open questions?:$/u;
+/** One numbered line per question with where it was raised, in the reviewer's order. */
+const questionLines = (questions: { text: string; where: string }[]) => questions.map((question, index) => `${index + 1}. ${question.text} (${question.where})`);
 /** Parking never asks a Human or changes the candidate; its note and hold share the same brief. */
 function parked(f: Fixture, result: { state: unknown; output: any; states: string[] }, reason: RegExp, human: { requests: Ask[] }) {
   assert.equal(result.state, "parked"); assert.deepEqual(result.states.slice(-3), ["stuck", "park", "parked"]);
@@ -194,10 +208,25 @@ function parked(f: Fixture, result: { state: unknown; output: any; states: strin
   assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
   assert.ok(result.output.summary.includes(`Worktree kept at ${f.worktree}. Evidence: `));
   const note = readFileSync(join(run.directory, "park.txt"), "utf8");
-  // What is needed can be several lines, as a falsified ticket's questions are; the hold stays one line and still carries each of them.
+  // Falsify parks carry every need in the hold; review questions carry a count and the first question.
   const needs: string[] = run.delivery.park.needs.split("\n");
-  assert.ok(result.output.summary.startsWith(`Parked on ${branch}: ${note.split("\n")[0]} Needs: ${needs[0]}`));
-  for (const need of needs) assert.ok(result.output.summary.includes(need), need);
+  const questions: { text: string; where: string }[] = run.delivery.park.questions ?? [];
+  if (questions.length) {
+    // Open owner questions are the exception: the receipt and the note number every one, and the hold counts them and gives only the first.
+    assert.equal(needs.length, questions.length + 1);
+    for (const [index, question] of questions.entries()) {
+      assert.ok(needs[index + 1]!.startsWith(`${index + 1}. `));
+      const where = question.where.replace(/\s+/gu, " ").trim();
+      assert.ok(needs[index + 1]!.endsWith(where ? ` (${where})` : ""), question.where);
+    }
+    const first = questions[0]!.text.replace(/\s+/gu, " ").trim();
+    const firstBrief = first.length > 600 ? `${first.slice(0, 600)}…` : first;
+    const where = questions[0]!.where.replace(/\s+/gu, " ").trim();
+    assert.ok(result.output.summary.startsWith(`Parked on ${branch}: ${note.split("\n")[0]} Needs: ${counted(questions.length)}; the first: ${firstBrief}${where ? ` (${where})` : ""} Worktree kept at `));
+  } else {
+    assert.ok(result.output.summary.startsWith(`Parked on ${branch}: ${note.split("\n")[0]} Needs: ${needs[0]}`));
+    for (const need of needs) assert.ok(result.output.summary.includes(need), need);
+  }
   assert.ok(note.includes(`Needs: ${run.delivery.park.needs}\n`)); assert.ok(note.includes(run.delivery.park.next));
   assert.ok(note.includes(`Worktree: ${f.worktree}\nBranch: ${branch}\nEvidence: ${run.directory}`));
   assert.ok(note.includes(`Stopped in ${result.states.at(-4)}.`));
@@ -345,29 +374,113 @@ test("unchanged blocker texts with nothing new stop a repair as not converging",
   }
 });
 
-test("a discussion repeated in the next review asks the owner to settle the question", async context => {
+test("two questions both reworded in the next review go to the owner together, each on its own numbered line", async context => {
   const f = fixture(context); const human = person("hand off"); let edits = 0; let reviews = 0;
   const result = await execute(input(f), {
-    implementer: request => { if (++edits === 2) assert.match(request.prompt, /Discussion: Should the greeting be localized\?/u); return implement(request); },
-    reviewer: () => review("approved", "Owner question", {
-      findings: [{ severity: "discussion", text: ++reviews === 1 ? "Should the greeting be localized?" : "  SHOULD THE GREETING BE LOCALIZED?  ", where: "greeting.txt:1" }], newSinceLastRound: "none",
+    // A first review with questions still gives the implementer one round with them.
+    implementer: request => {
+      if (++edits === 2) for (const question of asked) assert.ok(request.prompt.includes(`Discussion: ${question.text} (${question.where})`), question.text);
+      return implement(request);
+    },
+    reviewer: () => review("approved", "Owner questions", { findings: discussions(++reviews === 1 ? asked : askedAgain), newSinceLastRound: "none" }),
+  }, human);
+  const lines = questionLines(askedAgain);
+  // The prompt and the receipt carry the reason as written, one question to a line; the hold flattens it.
+  const run = handedOff(f, result, new RegExp(`${counted(2)}:\\s${lines.map(literal).join("\\s")}`, "u"), human);
+  assert.deepEqual([edits, reviews], [2, 2]);
+  assert.deepEqual(run.delivery.reason.split("\n").slice(1), lines);
+  assert.ok(human.requests[0]!.prompt.includes(`${counted(2)}:\n${lines.join("\n")}\n`));
+  for (const question of asked) assert.equal(run.delivery.reason.includes(question.text), false, question.text);
+});
+
+test("a park on open questions numbers every one in the note and the receipt, and its hold counts them and gives the first", async context => {
+  const f = fixture(context); const human = person(); let reviews = 0;
+  const result = await execute(input(f, {}, { stuck: "park" }), {
+    reviewer: () => review("approved", "Owner questions", { findings: discussions(++reviews === 1 ? asked : askedAgain), newSinceLastRound: "none" }),
+  }, human);
+  const run = parked(f, result, /confirmed again through a live engine/u, human); assert.equal(reviews, 2);
+  const lines = questionLines(askedAgain);
+  assert.deepEqual(run.delivery.park.questions, askedAgain);
+  const [reason, needs]: string[][] = [run.delivery.reason.split("\n"), run.delivery.park.needs.split("\n")];
+  assert.match(reason[0]!, /\b2 open questions:$/u); assert.deepEqual(reason.slice(1), lines);
+  assert.match(needs[0]!, openQuestions); assert.deepEqual(needs.slice(1), lines);
+  const note = readFileSync(join(run.directory, "park.txt"), "utf8");
+  assert.ok(note.includes(`Needs: ${needs[0]}\n${lines.join("\n")}\nWorktree: ${f.worktree}\n`));
+  assert.equal(result.output.summary,
+    `Parked on ${branch}: ${note.split("\n")[0]} Needs: 2 open questions; the first: ${askedAgain[0]!.text} (${askedAgain[0]!.where}) Worktree kept at ${f.worktree}. Evidence: ${run.directory}`);
+});
+
+test("a different question in the next review parks with that question alone", async context => {
+  const f = fixture(context); const human = person(); let edits = 0; let reviews = 0;
+  const [first, second] = [{ text: "Should the greeting be localized?", where: "greeting.txt:1" }, { text: "Is a trailing newline wanted?", where: "greeting.txt:2" }];
+  const result = await execute(input(f, {}, { stuck: "park" }), {
+    implementer: request => { edits++; return implement(request); },
+    reviewer: () => review("approved", "Owner question", { findings: discussions([++reviews === 1 ? first : second]), newSinceLastRound: "A new question" }),
+  }, human);
+  const run = parked(f, result, /Is a trailing newline wanted\?/u, human); assert.deepEqual([edits, reviews], [2, 2]);
+  assert.deepEqual(run.delivery.park.questions, [second]);
+  const [reason, needs]: string[][] = [run.delivery.reason.split("\n"), run.delivery.park.needs.split("\n")];
+  assert.match(reason[0]!, /\b1 open question:$/u); assert.deepEqual(reason.slice(1), questionLines([second]));
+  assert.match(needs[0]!, openQuestions); assert.deepEqual(needs.slice(1), questionLines([second]));
+  const note = readFileSync(join(run.directory, "park.txt"), "utf8");
+  assert.equal(result.output.summary,
+    `Parked on ${branch}: ${note.split("\n")[0]} Needs: 1 open question; the first: ${second.text} (${second.where}) Worktree kept at ${f.worktree}. Evidence: ${run.directory}`);
+  for (const text of [run.delivery.reason, run.delivery.park.needs, note, result.output.summary]) assert.equal(text.includes(first.text), false);
+});
+
+test("each long open question is cut at 600 characters separately while a short question stays whole", async context => {
+  const f = fixture(context); const human = person(); let reviews = 0;
+  // A line break inside a question must not break the one-line-per-question list.
+  const long = { text: `Should the greeting be localized for every locale the product ships in?\n${"More context. ".repeat(50)}`.trim(), where: "greeting.txt:1" };
+  const rest = [
+    { text: `Is a trailing newline wanted? ${"It matters to the diff. ".repeat(20)}`.trim(), where: "greeting.txt:2" },
+    { text: `Which locale is the default? ${"The deployment serves several regions. ".repeat(20)}`.trim(), where: "greeting.txt:3" },
+  ];
+  const result = await execute(input(f, {}, { stuck: "park" }), {
+    reviewer: () => review("approved", "Owner questions", { findings: discussions(++reviews === 1 ? rest : [long, ...rest]), newSinceLastRound: "none" }),
+  }, human);
+  const run = parked(f, result, /Should the greeting be localized/u, human); assert.equal(reviews, 2);
+  assert.deepEqual(run.delivery.park.questions, [long, ...rest]);
+  const whole = long.text.replace(/\s+/gu, " "); const cut = `${whole.slice(0, 600)}…`;
+  assert.ok(whole.length > 600); assert.ok(rest[0]!.text.length < 600); assert.ok(rest[1]!.text.length > 600);
+  // Each long question has its own cap; the short question between them stays whole.
+  assert.deepEqual(run.delivery.park.needs.split("\n").slice(1), [
+    `1. ${cut} (${long.where})`,
+    `2. ${rest[0]!.text} (${rest[0]!.where})`,
+    `3. ${rest[1]!.text.slice(0, 600)}… (${rest[1]!.where})`,
+  ]);
+  assert.equal(readFileSync(join(run.directory, "park.txt"), "utf8").includes(`Needs: ${run.delivery.park.needs}\nWorktree: `), true);
+  // The reason is never cut.
+  assert.deepEqual(run.delivery.reason.split("\n").slice(1), [`1. ${whole} (${long.where})`, ...questionLines(rest).map((line, index) => `${index + 2}. ${line.slice(3)}`)]);
+  assert.ok(result.output.summary.includes(` Needs: 3 open questions; the first: ${cut} (${long.where}) Worktree kept at ${f.worktree}. `));
+});
+
+test("a question first raised beside a blocker goes to the owner when it is still open once the blocker is repaired", async context => {
+  const f = fixture(context); const human = person("hand off"); let edits = 0; let reviews = 0;
+  const result = await execute(input(f), {
+    implementer: request => { edits++; return implement(request); },
+    reviewer: () => ++reviews > 2 ? review() : review("approved", "Question plus repair", {
+      findings: reviews === 1 ? [{ severity: "blocker", text: "Handle empty input", where: "greeting.txt:2" }, ...discussions([asked[0]!])] : discussions([askedAgain[0]!]),
     }),
   }, human);
-  handedOff(f, result, /must settle repeated discussion: "SHOULD THE GREETING BE LOCALIZED\?"/u, human);
+  // The question went back with the blocker for one round, so the next review's wording of it is the owner's to answer.
+  handedOff(f, result, new RegExp(`${counted(1)}:\\s${literal(questionLines([askedAgain[0]!])[0]!)}`, "u"), human);
   assert.deepEqual([edits, reviews], [2, 2]);
 });
 
-for (const cause of ["not converging", "repeated discussion", "malformed report"]) {
+for (const cause of ["not converging", "open questions", "malformed report"]) {
   test(`more rounds restores the last review findings after ${cause}`, async context => {
     const f = fixture(context); const human = person("more rounds"); let edits = 0; let reviews = 0;
     const rounds = cause === "malformed report" ? 1 : 2;
     const discussion = { severity: "discussion", text: "Which locale?", where: "greeting.txt:3" };
-    const needsRepair = cause !== "repeated discussion";
-    const findings = needsRepair ? [{ severity: "blocker", text: "Handle empty input", where: "greeting.txt:2" }, discussion] : [discussion];
+    const needsRepair = cause !== "open questions";
+    // The owner's questions are whatever the last review asked, reworded and added to since the round before.
+    const open = [{ text: "Which locale should the greeting use?", where: "greeting.txt:3" }, { text: "Is the greeting capitalised?", where: "greeting.txt:4" }];
+    const findings = () => needsRepair ? [{ severity: "blocker", text: "Handle empty input", where: "greeting.txt:2" }, discussion] : reviews === 1 ? [discussion] : discussions(open);
     const feedback = [
       "Latest review",
-      ...(needsRepair ? [`Unmet criterion: ${criterion} (greeting.txt:1)`, "Blocker: Handle empty input (greeting.txt:2)"] : []),
-      "Discussion: Which locale? (greeting.txt:3)",
+      ...(needsRepair ? [`Unmet criterion: ${criterion} (greeting.txt:1)`, "Blocker: Handle empty input (greeting.txt:2)", "Discussion: Which locale? (greeting.txt:3)"]
+        : open.map(question => `Discussion: ${question.text} (${question.where})`)),
     ].join("\n");
     const result = await execute(input(f), {
       implementer: request => {
@@ -375,13 +488,14 @@ for (const cause of ["not converging", "repeated discussion", "malformed report"
         return implement(request);
       },
       reviewer: () => ++reviews > rounds ? review() : review("approved", "Latest review", {
-        criteria: [{ text: "Reviewer paraphrase", met: !needsRepair, evidence: "greeting.txt:1" }], findings,
+        criteria: [{ text: "Reviewer paraphrase", met: !needsRepair, evidence: "greeting.txt:1" }], findings: findings(),
         newSinceLastRound: cause === "malformed report" ? undefined : "none",
       }),
     }, human);
     assert.equal(result.state, "delivered"); assert.deepEqual([edits, reviews, human.requests.length], [rounds + 1, rounds + 1, 1]);
     assert.match(human.requests[0]!.prompt, /send the standing findings back to the implementer/u);
     assert.match(human.requests[0]!.prompt, cause === "malformed report" ? /Malformed review report: newSinceLastRound/u : new RegExp(cause, "u"));
+    if (!needsRepair) assert.ok(human.requests[0]!.prompt.includes(`${counted(2)}:\n${questionLines(open).join("\n")}\n`));
     held(f, result, /^Delivered/u);
   });
 }
@@ -428,7 +542,7 @@ test("unmet criteria alone stop with a reason naming the ticket criteria", async
 });
 
 for (const repair of ["blocker", "unmet criterion"]) {
-  test(`a repeated discussion still repairs while a ${repair} is present`, async context => {
+  test(`an open question still repairs while a ${repair} is present even when reworded`, async context => {
     const f = fixture(context); let edits = 0; let reviews = 0;
     const result = await execute(input(f), {
       implementer: request => { edits++; return implement(request); },
@@ -436,7 +550,7 @@ for (const repair of ["blocker", "unmet criterion"]) {
         if (++reviews === 3) return review();
         return review("approved", "Question plus repair", {
           criteria: [{ text: criterion, met: reviews === 1 || repair === "blocker", evidence: "greeting.txt:1" }],
-          findings: [{ severity: "discussion", text: "Which locale?", where: "greeting.txt:1" },
+          findings: [{ severity: "discussion", text: reviews === 1 ? "Which locale?" : "Which locale should the greeting use?", where: "greeting.txt:1" },
             ...(reviews === 2 && repair === "blocker" ? [{ severity: "blocker", text: "Handle empty input", where: "greeting.txt:2" }] : [])],
         });
       },
@@ -454,7 +568,7 @@ test("a discussion absent from the next review gets a repair when it returns in 
       if (++reviews === 4) return review();
       return review("approved", "Needs another round", {
         findings: [reviews === 2 ? { severity: "blocker", text: "Handle empty input", where: "greeting.txt:2" }
-          : { severity: "discussion", text: "Which locale?", where: "greeting.txt:1" }], newSinceLastRound: "none",
+          : { severity: "discussion", text: reviews === 1 ? "Which locale?" : "Which locale should the greeting use?", where: "greeting.txt:1" }], newSinceLastRound: "none",
       });
     },
   });
@@ -2399,6 +2513,7 @@ for (const policy of ["park", undefined]) {
       assert.equal(candidate(f.worktree).status.includes("greeting.txt"), !early);
       if (early) assert.deepEqual(result.states.filter(isPlanning), upTo(cause.split(" ")[0]!));
       if (cause === "discussion" || cause === "criterion") assert.equal(reviews, 2);
+      if (cause === "discussion") assert.deepEqual(run.delivery.park.questions, [{ text: "Which locale?", where: "greeting.txt:1" }]);
       assert.deepEqual(run.delivery.park.budgets, {
         repairs: { used: 0, max: 0 }, reviewRounds: { used: cause === "discussion" || cause === "criterion" ? 1 : 0, max: cause === "review budget" ? 0 : 2 },
       });
@@ -2651,6 +2766,20 @@ test("the tester and the implementer are told that checks they cannot run are th
   for (const role of ["tester", "implementer"]) assert.match(prompts[role]!, /cannot run them.*still return completed: the workflow runs every required check itself/u, role);
   assert.match(prompts.implementer!, /Scope \(the only paths you may change; the workflow checks them\):\n- greeting\.txt/u);
 });
+
+for (const path of ["docs/catalog.md", "README.md"]) {
+  test(`${path} describes one round for discussions followed by all open owner questions and park.questions`, () => {
+    const prose = readFileSync(resolve(path), "utf8").replace(/\s+/gu, " ");
+    assert.doesNotMatch(prose, /repeated (?:discussion|owner questions|questions)|repeating the question/iu, `${path} still describes escalation by repeated text`);
+    assert.match(prose, /\bone (?:implementation |implementer |repair )?round\b/iu, `${path} must describe the implementer's first round with discussions`);
+    assert.match(prose, /(?:next|following|previous|consecutive) review/iu, `${path} must describe escalation by review position`);
+    assert.match(prose, /\b(?:all|every)\b[^.]{0,160}\b(?:discussion|question)|\b(?:discussion|question)[^.]{0,160}\btogether\b/iu, `${path} must describe taking all current questions to the owner`);
+    assert.match(prose, /park\.questions/u, `${path} must describe the questions array on the park receipt`);
+    assert.match(prose, /numbered/iu, `${path} must describe the numbered questions`);
+    assert.match(prose, /600/iu, `${path} must describe the cap for each question`);
+    assert.match(prose, /\bfirst\b/iu, `${path} must describe the count and first question in the hold summary`);
+  });
+}
 
 test("the catalog and the README describe falsify, plan, and planReview where they described triage", () => {
   const catalog = readFileSync(resolve("docs/catalog.md"), "utf8"); const readme = readFileSync(resolve("README.md"), "utf8");

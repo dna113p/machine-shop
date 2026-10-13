@@ -194,13 +194,16 @@ an optional leading `./`. Evidence includes red check logs and `scope-<n>.json`.
 Reviews report a verdict and evidence for each acceptance criterion, tagged
 findings, and what changed since the previous round. The Machine requires
 repairs for unmet criteria or blocker findings, escalates malformed reports,
-non-converging repairs, and repeated owner questions through the stuck policy, and accepts
+non-converging repairs, and open owner questions through the stuck policy, and accepts
 minor findings without another round. Minor findings from every review are
 kept in `delivery.json` as `reviewNotes` and in a pull request's `## Review notes`
 section, deduplicated by trimmed, case-insensitive text and location. Pull request
 notes occupy one line each and omit empty locations. A reviewer `blocked` event
-needs only its summary. Repeated questions escalate only when no criteria or
-blockers need repair. Full reports are saved as `review-<n>.json` in the evidence directory.
+needs only its summary. Discussions get one implementer round. If the previous
+review also had discussions, every discussion in the next review goes to the owner
+together, whatever its wording, only when no criteria or blockers need repair.
+Discussions after a review without any get a fresh round. Full reports are saved
+as `review-<n>.json` in the evidence directory.
 
 A stuck ticket parks by default (`stuck: "park"`): the run ends `parked`
 immediately, keeping the worktree, branch, and uncommitted candidate unchanged.
@@ -265,6 +268,12 @@ the note's first line and `Needs: ...`, and ends with `Worktree kept at ...`
 and `Evidence: <directory>`. `delivery.json` records `outcome: "parked"`, the
 reason, and `park: { needs, next, budgets: { repairs: { used, max }, reviewRounds:
 { used, max } } }`. `result.json` records cumulative `repairs` and `reviewRounds`.
+For open review questions, `park.questions` is the current review's ordered array
+of `{text, where}`. The reason and `park.needs` list every question on its own
+numbered line with its location; needs cap each question's text separately at 600
+characters plus an ellipsis, keeping its location. The reason stays full. The
+one-line hold uses `Needs: N open questions; the first: <text> (<where>)`, with
+the same cap on that first question. Empty locations omit the parentheses.
 
 The run ends `delivered`, `parked`, `handedOff`, `abandoned`, or `blocked`, and its output
 is always exactly `{ "action": "hold", "summary": "..." }` so a Machines Dispatch

@@ -386,18 +386,19 @@ evidence directory and describes what is new.
    whitespace-only text also means none, as does `none` after trimming,
    lower-casing, and dropping a trailing period. With no blockers, the reason
    names the unmet ticket criteria instead.
-5. A discussion gets one repair round to resolve it or explain why it needs
-   the owner. Repeating the question in the next review, compared after trimming
-   and lower-casing, blocks with the question quoted for `stuck` only when
-   no criteria or blockers need repair. A question absent from the immediately
-   preceding review gets a fresh repair round if it returns.
+5. Discussions get one repair round to resolve them or explain why they need
+   the owner. If the previous review also had discussions, every discussion in
+   the next review goes to the owner together through `stuck`, whatever its
+   wording, only when no criteria or blockers need repair. This depends on review
+   position, not matching text. Discussions after a review without any get a
+   fresh repair round.
 6. All criteria met with no blockers or discussions approves, including a
    reviewer `revise` event containing only minors. Minor notes accumulate across
    review rounds, deduplicated by text and location after trimming and
    lower-casing. The pull request renders each note on one line and omits
    parentheses when its location is empty.
 
-After a Machine block for non-convergence, repeated discussion, or a malformed
+After a Machine block for non-convergence, open owner questions, or a malformed
 report, `more rounds` restores the latest review's available findings as the
 implementer's feedback, including their locations, rather than the stop reason.
 
@@ -523,7 +524,7 @@ Stuck work goes to the `stuck` Operation. This covers falsify returning
 `questions`, malformed planning reports, a second plan review revision, any read-only
 planning stage having edited files, the tester or implementer returning `blocked`,
 the reviewer returning `blocked` or having edited files, review non-convergence,
-repeated owner questions, malformed review reports, either budget exhausting,
+open owner questions, malformed review reports, either budget exhausting,
 and the recoverable rebase stops described above.
 With the default `stuck: "park"`, `park` writes `park.txt` and a delivery receipt
 and ends `parked` immediately, without a Human request, commit, archive, or
@@ -673,8 +674,15 @@ For parking, `delivery.json` also records the `reason` and
 `park: { needs, next, budgets: { repairs: { used, max }, reviewRounds: { used, max } } }`.
 The one-line hold starts `Parked on <branch>: ` followed by the first line of
 `park.txt`, then `Needs: ...`, `Worktree kept at ...`, and ends `Evidence: <directory>`.
-The receipt, note, and summary use the same needs text, with whitespace flattened
-in the single-line summary. Falsification questions are kept in full, one per line
+For open review questions, `park.questions` is the current review's ordered array
+of `{text, where}`. The reason and needs list every question on its own numbered
+line with its location. Needs cap each question's flattened text separately at
+600 characters plus an ellipsis, keeping its location; the list itself is not
+capped. The one-line hold instead uses `Needs: N open questions; the first:
+<text> (<where>)`, with the same cap on the first question. Empty locations omit
+the parentheses. Other stops use the same needs text in the receipt, note, and
+summary, with whitespace flattened in the single-line summary and no
+`park.questions` field. Falsification questions are kept in full, one per line
 in the receipt and note; a second plan review revision uses the reviewer's summary
 in full. Other blockers are capped at 600 characters plus an ellipsis when
 truncated. The full reason remains in the receipt and note.

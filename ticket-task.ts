@@ -55,6 +55,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let plan = "";
   let planRevisions = 0;
   let planningNeeds: string | undefined;
+  let ownerQuestions: { text: string; where: string }[] | undefined;
 
   function scope(stage: "test" | "change"): Event {
     repairing = stage;
@@ -446,16 +447,23 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     ],
   });
   const parkNext = "Add the answer to the ticket body, then run the ticket again with resume: true; the run continues from the kept worktree with fresh budgets.";
+  const questionCount = () => `${ownerQuestions!.length} open question${ownerQuestions!.length === 1 ? "" : "s"}`;
+  const questionText = (question: { text: string; where: string }, cap = Infinity) => {
+    const text = flat(question.text); const where = flat(question.where);
+    return `${text.length > cap ? `${text.slice(0, cap)}…` : text}${where ? ` (${where})` : ""}`;
+  };
+  const questionLines = (cap?: number) => ownerQuestions!.map((question, index) => `${index + 1}. ${questionText(question, cap)}`).join("\n");
   function parkDetails() {
     const { reason, repairs, maxRepairs, reviewRounds, maxReviewRounds } = work.status();
     // Ask for one owner response while preserving the actual question or criterion as context.
     const why = flat(reason);
     const needs = /^(Repair|Review) budget exhausted/u.test(why)
       ? `Explain how to resolve the remaining findings: ${why}`
-      : why.startsWith("Ticket owner must settle repeated discussion: ")
-        ? `Answer the open question: ${why.slice("Ticket owner must settle repeated discussion: ".length)}`
-        : `Clarify how to resolve this blocker: ${why}`;
-    return { needs: planningNeeds ?? needs.replace(/^(.{600}).+$/u, "$1…"), next: parkNext,
+      : `Clarify how to resolve this blocker: ${why}`;
+    return { needs: ownerQuestions
+      ? `Answer the open question${ownerQuestions.length === 1 ? "" : "s"}:\n${questionLines(600)}`
+      : planningNeeds ?? needs.replace(/^(.{600}).+$/u, "$1…"),
+      ...(ownerQuestions ? { questions: ownerQuestions } : {}), next: parkNext,
       budgets: { repairs: { used: repairs, max: maxRepairs }, reviewRounds: { used: reviewRounds, max: maxReviewRounds } } };
   }
   const parkNote = () => brief({
@@ -535,8 +543,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       worktree, ...(adopted ? { resumed: true } : {}), worktreeCreated: created, worktreeRemoved: removed, reviewNotes,
     }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     const reasonBrief = flat(reason).replace(/^(.{600}).+$/u, "$1…").replace(/[^.!?…]$/u, "$&.");
+    const needsBrief = ownerQuestions ? `${questionCount()}; the first: ${questionText(ownerQuestions[0]!, 600)}` : flat(parkDetails().needs);
     held = { action: "hold", summary: [
-      { delivered: `Delivered ${result}.`, blocked: `Blocked: ${reasonBrief}`, "handed-off": `Handed off on ${branch}: ${reasonBrief}`, abandoned: `Abandoned: ${reasonBrief}`, parked: `Parked on ${branch}: ${firstLine(parkNote())} Needs: ${flat(parkDetails().needs)}` }[outcome],
+      { delivered: `Delivered ${result}.`, blocked: `Blocked: ${reasonBrief}`, "handed-off": `Handed off on ${branch}: ${reasonBrief}`, abandoned: `Abandoned: ${reasonBrief}`, parked: `Parked on ${branch}: ${firstLine(parkNote())} Needs: ${needsBrief}` }[outcome],
       ...(decision ? [`Decision: ${decision}.`] : []),
       ...(archived ? [`Candidate archived on ${archived.branch} at ${archived.commit}.`] : []),
       ...(outcome === "abandoned" ? [`Worktree and ${branch} removed${archived ? "" : " without saving the candidate"}.`] : []),
@@ -633,8 +642,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       work.block(feedback);
       return { type: "revise" };
     }
-    const repeated = discussions.filter(finding => prior?.findings.some(old => old.severity === "discussion" && old.text.trim().toLowerCase() === finding.text.trim().toLowerCase()));
-    if (repeated.length) return stop(`Ticket owner must settle repeated discussion: ${repeated.map(finding => JSON.stringify(finding.text.trim())).join("; ")}`);
+    if (discussions.length && prior?.findings.some(finding => finding.severity === "discussion")) {
+      ownerQuestions = discussions.map(({ text, where }) => ({ text, where }));
+      return stop(`Ticket owner must settle ${questionCount()}:\n${questionLines()}`);
+    }
     if (discussions.length) {
       work.block(feedback);
       return { type: "revise" };
@@ -730,6 +741,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           { guard: chose("more rounds"), target: "repairTarget", actions: (args: { event: Event }) => {
             decide(args); work.renew();
             planningNeeds = undefined;
+            ownerQuestions = undefined;
             if (standingReview !== undefined) work.block(standingReview);
             standingReview = undefined;
           } },
