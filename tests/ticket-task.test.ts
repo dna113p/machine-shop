@@ -1952,3 +1952,14 @@ test("more rounds after a failed red returns to the tester, not the implementer"
   assert.deepEqual(result.states.slice(7, 12), ["red", "repairBudget", "stuck", "decide", "repairTarget"]);
   assert.equal(result.states[12], "test");
 });
+
+test("the tester and the implementer are told that checks they cannot run are the workflow's, and the implementer is given the Scope", async context => {
+  const f = fixture(context); const prompts: Record<string, string> = {};
+  const result = await execute(input(f), {
+    tester: request => { prompts.tester = request.prompt; return tester(request); },
+    implementer: request => { prompts.implementer = request.prompt; return implement(request); },
+  });
+  assert.equal(result.state, "delivered");
+  for (const role of ["tester", "implementer"]) assert.match(prompts[role]!, /cannot run them.*still return completed: the workflow runs every required check itself/u, role);
+  assert.match(prompts.implementer!, /Scope \(the only paths you may change; the workflow checks them\):\n- greeting\.txt/u);
+});

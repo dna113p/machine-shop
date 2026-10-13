@@ -15,6 +15,8 @@ export const agentRoles = {
 };
 
 const publishTimeoutMs = 120_000;
+// A sandboxed harness may be unable to start the project's checks at all. That is not a blocker: the checks are the workflow's to run.
+const cannotRun = "Run the checks you can. If your environment cannot run them, as when a sandbox refuses to start processes, say which and why in your summary and still return completed: the workflow runs every required check itself after you return. Return blocked only for something a person must decide or supply.";
 const decisions = ["more rounds", "hand off", "archive", "discard"] as const;
 const confirmations = ["confirm discard", "go back"] as const;
 
@@ -486,6 +488,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         "Write only tests that encode the acceptance criteria below, one or more per criterion, inside the Scope paths below. Do not implement anything and do not change non-test files. The tests must fail now and pass once the ticket is implemented. Leave changes uncommitted.",
         "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
         "Scope:", ...ticket.sections.scope.map(text => `- ${text}`),
+        cannotRun,
       ].join("\n")), {
         completed: { target: "scopeAfterTest", actions: record("test") },
         blocked: { target: "stuck", actions: record("test") },
@@ -501,8 +504,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         "Implement the ticket and its tests, following the triage plan in the stage reports. Keep the change focused. Do not weaken checks or expand scope. Leave your changes uncommitted; the workflow commits and delivers them.",
         ...(redGreen ? ["The tester's tests in the stage reports are the contract; make them pass without weakening or deleting them. If a test is wrong, say so in the summary rather than changing its intent."] : []),
         "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
+        "Scope (the only paths you may change; the workflow checks them):", ...ticket.sections.scope.map(text => `- ${text}`),
         "Forbidden:", ...ticket.sections.forbidden.map(text => `- ${text}`),
         "Resolve discussion findings or explain why they need the ticket owner in your summary.",
+        cannotRun,
       ].join("\n")), {
         completed: { target: "scopeAfterChange", actions: record("change") },
         blocked: { target: "stuck", actions: record("change") },
