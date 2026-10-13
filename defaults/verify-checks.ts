@@ -1,4 +1,4 @@
-import type { Event, MachinePrimitives } from "@dna113p/machines";
+import type { MachinePrimitives } from "@dna113p/machines";
 import { taskRun, resultStates } from "./_machine-shop/task.ts";
 
 export const description = "Run explicit local checks without an Agent and retain real exit codes, logs, and a result receipt.";

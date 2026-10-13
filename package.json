@@ -8,7 +8,8 @@
   "scripts": {
     "test": "node --test tests/*.test.ts",
     "typecheck": "node scripts/typecheck.mjs",
-    "check": "npm run typecheck && npm test",
+    "check": "npm run lint && npm run typecheck && npm test",
+    "lint": "node scripts/lint.mjs",
     "install:project": "node scripts/install.mjs",
     "smoke:install": "node --test tests/install.test.ts"
   },

@@ -71,9 +71,10 @@ dirty checkout and verify its tracked/nonignored contents stay unchanged.
 `checks` must contain 1–20 uniquely named checks for editing, verification, and
 release workflows. Omit it (or use `[]`) for review/investigation; those workflows
 reject nonempty checks rather than silently ignoring them. Check commands are
-executable/argv arrays with no implicit shell. They run in `workspace`, stop at
-the first failure, have a default 60-second timeout (maximum 10 minutes per check),
-and a 1 MiB output buffer. Timeouts, missing executables, and excessive output are
+executable/argv arrays with no implicit shell. They run in `workspace` in the
+given order, every one of them even after a failure, so that one repair round
+sees each failing gate; each has a default 60-second timeout (maximum 10 minutes
+per check) and a 1 MiB output buffer. Timeouts, missing executables, and excessive output are
 failures, not passes. The direct process is killed on timeout; do not use commands
 that detach work or leave daemons/descendants behind.
 

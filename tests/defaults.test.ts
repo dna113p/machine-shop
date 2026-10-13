@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -89,6 +89,22 @@ for (const maxRepairs of [0, 1, 3]) {
     assert.match(result.output.reason, /budget exhausted/iu);
   });
 }
+
+test("every gate runs even after one fails, and the repair prompt names each failure", async context => {
+  const cwd = repo(context); let prompt = "";
+  const checks = [
+    { name: "lint", command: [process.execPath, "-e", "process.exit(1)"] },
+    { name: "types", command: [process.execPath, "-e", "console.log('ok')"] },
+    { name: "tests", command: [process.execPath, "-e", "process.exit(2)"] },
+  ];
+  const result = await execute("implement-task", input(cwd, { maxRepairs: 1, checks }), {
+    implementer: request => { prompt = request.prompt; return ok(); }, reviewer: () => ok("approved"),
+  });
+  assert.equal(result.state, "blocked");
+  assert.deepEqual(result.output.checks.map(c => [c.name, c.passed]), [["lint", false], ["types", true], ["tests", false], ["lint", false], ["types", true], ["tests", false]]);
+  assert.match(prompt, /2 checks did not meet their expected results: lint \(inspect .*1\.log\), tests \(inspect .*3\.log\)/u);
+  assert.match(result.output.reason, /2 checks did not meet/u);
+});
 
 test("a failed check can be repaired only by rerunning it on the changed candidate", async context => {
   const cwd = repo(context); let calls = 0;

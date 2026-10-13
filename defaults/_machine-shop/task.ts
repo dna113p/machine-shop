@@ -113,9 +113,14 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
   }
 
   function checks(phase = "verify"): Event {
-    // Short-circuit on the first failed gate instead of spending more work.
+    // Every gate runs, so one repair round sees every failure instead of the first one alone.
     const before = policy.git === "none" ? undefined : fingerprint(workspace);
-    let passed = assignment.checks.every(command => check(command, phase));
+    const failed = assignment.checks.filter(command => !check(command, phase));
+    let passed = failed.length === 0;
+    if (failed.length > 1) {
+      const logs = evidence.filter(entry => entry.phase === phase && !entry.passed).slice(-failed.length);
+      reason = `${phase}: ${failed.length} checks did not meet their expected results: ${logs.map(entry => `${entry.name} (inspect ${entry.log})`).join(", ")}`;
+    }
     const after = policy.git === "none" ? undefined : fingerprint(workspace);
     if (before !== after) {
       passed = false;

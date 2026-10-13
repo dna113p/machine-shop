@@ -117,8 +117,8 @@ MCP, Pi, presets, and the public package interface.
 
 ## Local development and proof
 
-In the Machines Org checkout, the tests and type checker can reuse the sibling
-Machines development checkout and its installed dependencies:
+In the Machines Org checkout, the linter, type checker, and tests can reuse the
+sibling Machines development checkout and its installed dependencies:
 
 ```sh
 npm run check
@@ -228,16 +228,10 @@ requirements, and limits.
 
 ## Other root workflows
 
-Three more root definitions take plain text input:
+One more root definition takes plain text input: [smoke.ts](smoke.ts), one
+instant no-model Operation. The selective installer does not install it.
 
-- [smoke.ts](smoke.ts): one instant no-model Operation, accepting text input.
-- [implement-review.ts](implement-review.ts): direct editing and a Human feedback
-  loop, accepting text. Its checks are Agent-reported, not independent gates.
-- [worktree-task.ts](worktree-task.ts): isolated implementation, advisory review,
-  Human approval, fast-forward merge, and cleanup. It commits and merges by design;
-  use only within an assignment authorizing those effects. It requires a clean
-  source branch. `details` expands review findings; free-form feedback revises.
-
-The selective installer does not install them; global `~/.machines` symlinks may
-point at these files. Unlike `worktree-task`, the editing defaults leave their
-changes uncommitted in the supplied checkout.
+The earlier `implement-review` and `worktree-task` definitions were removed:
+both left verification to the Agent's own word. `implement-task` runs the
+supplied gates in place, and `ticket-task` owns the worktree, the gates, and
+delivery for isolated work.
