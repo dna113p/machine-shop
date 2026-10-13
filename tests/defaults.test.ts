@@ -428,6 +428,31 @@ test("taskRun resets both independent budgets and records their cumulative count
   assert.equal(receipt.repairs, 2); assert.equal(receipt.reviewRounds, 3);
 });
 
+test("reopen clears the accepted latch so drift counts again, reopen(true) records failed checks, and a baseline alone still establishes nothing", context => {
+  /** A run whose candidate passed verification and was accepted, as a workflow that commits it itself leaves the helper. */
+  const verified = () => {
+    const cwd = repo(context); const work = taskRun("reopen-test", input(cwd), { checks: true, git: "clean" });
+    work.start(); assert.equal(work.checks().type, "passed"); assert.equal(work.accept(), true);
+    return { cwd, work, finish: () => [work.finish("completed").type, work.output()!.checksPassed] };
+  };
+  // As before: once accepted, what the workflow does to its own checkout is not drift.
+  const latched = verified(); writeFileSync(join(latched.cwd, "code.txt"), "moved by the workflow"); assert.deepEqual(latched.finish(), ["completed", true]);
+  // Reopened, the tree that passed is still the tree that passed.
+  const same = verified(); same.work.reopen(); assert.deepEqual(same.finish(), ["completed", true]);
+  // But a change after that is drift again, as it was before the candidate was accepted.
+  const drifted = verified(); drifted.work.reopen(); writeFileSync(join(drifted.cwd, "code.txt"), "edited after the commit was undone"); assert.deepEqual(drifted.finish(), ["blocked", false]);
+  const retired = verified(); retired.work.reopen(); writeFileSync(join(retired.cwd, "code.txt"), "edited after the commit was undone"); retired.work.retire(); assert.deepEqual(retired.finish(), ["blocked", false]);
+  // A failed reverify or setup after the commit: nothing passed on this tree, drifted or not.
+  const failed = verified(); failed.work.reopen(true); assert.deepEqual(failed.finish(), ["blocked", false]);
+  // Verification on the repaired candidate establishes it again.
+  const repaired = verified(); repaired.work.reopen(true); assert.equal(repaired.work.accept(), false);
+  assert.equal(repaired.work.checks().type, "passed"); assert.equal(repaired.work.accept(), true); assert.deepEqual(repaired.finish(), ["completed", true]);
+  // The phases checks already had are untouched: a baseline alone establishes nothing.
+  const cwd = repo(context); const baseline = taskRun("reopen-test", input(cwd), { checks: true, git: "clean" });
+  baseline.start(); assert.equal(baseline.checks("baseline").type, "passed");
+  assert.equal(baseline.finish("blocked").type, "blocked"); assert.equal(baseline.output()!.checksPassed, null);
+});
+
 for (const maxReviewRounds of [0, 5]) {
   test(`defaults accept maxReviewRounds ${maxReviewRounds} while retaining their existing repair budget`, async context => {
     const result = await execute("implement-task", input(repo(context), { maxRepairs: 1, maxReviewRounds }), {

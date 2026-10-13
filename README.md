@@ -235,10 +235,29 @@ choices remain:
 Failures while preparing the worktree, committing, or delivering still end
 `blocked` without asking. `"resume": true` starts a new run in the uncommitted
 worktree a park or `hand off` left behind: it skips `falsify`, `plan`, `planReview`, and setup, and goes straight
-to the checks, review, commit, and delivery with fresh budgets. The
+to the checks, review, commit, rebase, and delivery with fresh budgets. The
 base branch may have moved forward in the meantime: the ticket branch must point
-at the base commit or an ancestor of it, with no commit of its own, and the run
-delivers on the commit the branch is on without rebasing.
+at the base commit or an ancestor of it, with no commit of its own.
+
+After `commit`, the `rebase` Operation resolves the current base in the source
+checkout (its HEAD when no base is named). An unchanged or unresolvable base
+continues to delivery. A forward move replays exactly the ticket commit onto
+the new tip. The same patch runs setup again, then the gates as `reverify`;
+a changed patch is undone on the new tip and goes through verification and a
+fresh review. Failed `reverify` gates return to the normal repair loop. When the
+run changes base, `delivery.json` includes a `rebasedFrom` field, `{ baseCommit, commit }`,
+with the starting base and first approved commit. In `pr` mode the new tip must
+already be published on the recorded pull request base before replay.
+
+For every new stop, the run never stops with the workflow's commit on the ticket
+branch: it undoes that commit and keeps the candidate uncommitted, clearing the
+recorded commit. Conflicts, a base already holding the change, and unpublished
+tips restore the original base and go through `stuck`; a failed setup keeps the
+candidate on the new tip and also goes through `stuck`. Resume alone repeats a
+conflict until someone ports the candidate in the worktree. A rewritten or
+moved-back base ends `blocked` for delivery by hand; `adopt` still refuses resume
+when the branch's base is not an ancestor of the current tip. See the catalog
+for recovery details and conservative stops.
 
 To resume parked work: add the answer to the ticket body, then run the ticket
 again with `resume: true`. The hold summary starts `Parked on <branch>:`, uses

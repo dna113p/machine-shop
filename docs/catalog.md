@@ -139,6 +139,8 @@ specifically throws after saving failed-check evidence, giving CI a nonzero exit
 A baseline alone leaves `checksPassed: null`; only final verification establishes
 it. A later source change invalidates it. Never interpret `checksPassed: true`
 as proof that review or Human approval was accepted; also inspect `outcome`.
+For ticket delivery, undoing the workflow's commit reopens that drift check;
+a failed post-rebase setup or `reverify` also makes `checksPassed` false.
 Unexpected failures can leave `started.json`, Agent summaries, and check logs
 without a final receipt. These workflows do not resume, undo, or roll back work.
 
@@ -151,12 +153,13 @@ reuses the helper for evidence, checks, fingerprints, review, and separate
 budgets. Required Agent roles are `investigator`, `tester`, `implementer`, and
 `reviewer`. Failed red, scope, and green gates use `maxRepairs` (0–3, default 3
 here); review revisions use
-`maxReviewRounds` (0–5, default 2). Neither consumes the other's budget. This
-allows at most 15 Agent calls before the stuck policy applies (one falsify,
+`maxReviewRounds` (0–5, default 2). Neither consumes the other's budget. With a
+stable base this allows at most 15 Agent calls before the stuck policy applies (one falsify,
 up to two plans and two plan reviews, one initial tester pass, up to six implementation passes, and three implementation reviews;
 tester retries share the repair budget with implementation retries). Setting
 both budgets to zero allows at most eight calls, or seven with `redGreen: false`.
-The single permitted plan revision consumes neither budget.
+The single permitted plan revision consumes neither budget. A moved base that
+changes the approved patch adds a fresh review outside these budgets.
 With `stuck: "ask"`, each `more rounds` decision
 renews both budgets and grants another implementation pass. The default
 `stuck: "park"` ends unattended runs immediately with their candidate kept.
@@ -314,6 +317,7 @@ is.
 | `verify` | The required checks; a failure goes to the repair budget |
 | `review`, `reviewResult` | Capture the structured report; the Operation preserves the unchanged-checkout guard and judges criteria, finding severity, and progress to approve, revise, or apply the stuck policy |
 | `commit` | One commit of everything except `.machine-runs`, even if an Agent staged it: subject is the ticket title, body is `Ticket: <id>` |
+| `rebase` | Resolve the current base; replay exactly the approved ticket commit onto a forward tip. Rerun setup, then `reverify` for an equal patch or `verify` and fresh review for a changed patch. Undo the commit before any new stop, repair, or re-review |
 | `deliver` | `branch`: nothing more. `patch`: `git format-patch` for base..HEAD into the evidence directory. `pr`: `git push --no-follow-tags <remote URL>` of the approved commit to the ticket branch alone, then `gh pr create --repo <host/owner/repository>` |
 | `repairBudget`, `repairTarget`, `reviewBudget` | Count gate retries and review revisions separately; gate retries route to the responsible editing stage, review retries to `change`; exhaustion goes to `stuck` |
 | `stuck`, `park` | Select the input policy: `ask` goes to `decide`; `park` writes a note and receipt, keeps the candidate, and ends `parked` |
@@ -423,6 +427,64 @@ neither that setting nor deleting or adding a local ref during the run can turn
 the pull request toward a branch that was never checked. Push and `gh` each
 have a two-minute timeout.
 
+Between `commit` and `deliver`, `rebase` resolves
+`${repository.base ?? "HEAD"}^{commit}` in the source checkout, just as
+`prepare` does. An unchanged tip or a base that no longer resolves continues
+to delivery unchanged, with no `reverify` phase. Otherwise the tip must descend
+from the current `baseCommit`. A base that was rewritten or moved back is not
+replayed onto: `git reset --mixed <baseCommit>` undoes the ticket commit, and
+`failure` ends `blocked` with both commits named and instructions to deliver
+by hand. Resume is not promised here: `adopt` continues to refuse a branch
+whose base is not in the new tip.
+
+For a forward move, the approved commit and its `git patch-id --stable` are
+kept, then `git rebase --no-autostash --no-update-refs --onto <tip> <baseCommit>`
+replays exactly the ticket commit. No rebase or push is forced, and no other
+branch is moved. The result must be exactly one commit above the tip, with
+the tip as its only parent, the ticket title and `Ticket:` line intact, a
+clean worktree, and HEAD still on the ticket branch. In `pr` mode, before
+replay, the new tip must also be on the remote pull request base. This repeats
+the published check with `ls-remote` and a fetch by URL if necessary, using
+only the URL and branch name recorded in `prepare`; configuration is not read
+again. An unpublished tip, missing remote base, or unreachable remote restores
+the uncommitted candidate on the original base and goes through `stuck`, saying
+the base must be pushed first.
+
+Every stop added here obeys one invariant: a run never stops with the workflow's
+commit on the ticket branch. Before a stop, repair, or re-review, the commit is
+undone with a mixed reset, its recorded hash is cleared, and verification is
+reopened. A conflict aborts the rebase and restores the approved candidate
+uncommitted on its original base. The reason names the conflicting paths and
+new tip: resume alone repeats the conflict until a person ports the candidate
+onto the new base in the worktree. A replay leaving no commit similarly restores
+the candidate and stops through `stuck`, saying the base already holds the
+change; resume alone repeats this stop too. A refusing hook, missing patch id,
+unexpected commit count, changed parent or message, moved HEAD, or dirty tree
+after replay conservatively restores the approved candidate on the original
+base and stops through `stuck`. No new Human choices or park instructions are
+needed.
+
+After a valid replay, setup runs again as phase `setup` while the rebased tree
+is still committed and clean, so its unignored outputs can be detected as in
+`prepare`. A failed command or tracked/unignored leftovers undoes the commit
+on the new tip, updates `baseCommit`, marks checks failed, and goes through
+`stuck` naming the command; this is not an implementer repair. If patch ids
+differ, the commit is undone on the new tip and the run returns to `verify`
+and a fresh `review`, which can approve, revise, or block normally. This
+re-review uses neither budget and repeats only if the base moves again.
+If patch ids match, the gates run as phase `reverify`. Passing delivers the
+rebased commit with the new tip as `baseCommit`. Failing undoes the commit on
+that tip, marks checks failed, and goes to `repairBudget`; the implementer sees
+the failed gates before the normal verify/review/commit/rebase sequence. With
+no further base movement that second `rebase` needs no second `reverify`, since
+`verify` checked the candidate on the new base.
+
+A setup command that moves HEAD or switches branches also counts as failed
+checks and conservatively restores the approved candidate on its original base
+through `stuck`; recovery only resets this ticket's branch. The approved and
+replayed diffs are retained as `rebase-<n>.patch`, with numbered Git failure logs
+so repeated attempts in the same run keep distinct evidence.
+
 The Operation writes the pull request body, in this order: the ticket title on
 the first line; `## Summary` with the first paragraph of the ticket body below
 its leading headings, ended by a blank line or the next heading, a section left
@@ -461,7 +523,8 @@ Stuck work goes to the `stuck` Operation. This covers falsify returning
 `questions`, malformed planning reports, a second plan review revision, any read-only
 planning stage having edited files, the tester or implementer returning `blocked`,
 the reviewer returning `blocked` or having edited files, review non-convergence,
-repeated owner questions, malformed review reports, and either budget exhausting.
+repeated owner questions, malformed review reports, either budget exhausting,
+and the recoverable rebase stops described above.
 With the default `stuck: "park"`, `park` writes `park.txt` and a delivery receipt
 and ends `parked` immediately, without a Human request, commit, archive, or
 removal. The worktree, branch, and uncommitted candidate stay exactly as they are.
@@ -534,10 +597,11 @@ is a symbolic ref to a branch that belongs to this ticket by the rule above; and
 that branch points at the resolved base commit or at an ancestor of it, so
 nothing was committed on it. The base branch may therefore have moved forward
 while the ticket was stuck: the commit the ticket branch points at is this
-run's base commit for the commit guard, the delivered commit's parent, the
-patch range, `delivery.json`, and, in `pr` mode, the check that the base is
-published. Nothing is rebased, so the delivered branch starts from that older
-commit. A branch that holds commits the base does not, or that shares no
+run's starting base commit for the commit guard and, in `pr` mode, the initial
+check that the base is published. After approval, `rebase` compares it with the
+current source tip and replays onto a forward move before delivery. The final
+base determines the delivered commit's parent, patch range, and `delivery.json`.
+A branch that holds commits the base does not, or that shares no
 history with it, is not adopted. The run continues on the branch the worktree
 is on and does not compute a name from the current title, so a candidate
 started under an earlier title, or
@@ -547,21 +611,23 @@ ticket, is not adopted; for the first the message gives the `git config` command
 that records it. If any of these fails
 the run ends `blocked` with a message naming the condition, changing nothing.
 Setup commands are not run again and `falsify`, `plan`, and `planReview` are skipped:
-a resumed run goes straight to `scopeAfterChange`, then `verify`, review, commit, and deliver as usual, with fresh
+a resumed run goes straight to `scopeAfterChange`, then `verify`, review, commit, rebase, and deliver as usual, with fresh
 budgets and the normal repair loop if review asks for changes. The base
 must resolve to the commit the first run started from or to a descendant of it,
 so name `repository.base` explicitly, or leave the source checkout on the branch
-it was on. Without `resume`,
+it was on. Even after a post-rebase setup failure, resume does not rerun setup
+unless the base moves again; resolve the setup problem in the kept worktree
+before resuming. Without `resume`,
 an existing branch or worktree directory still blocks.
 
 A run ends `blocked` without asking, changing nothing further, when: required
 ticket sections or list entries are missing; the base
 does not resolve; in `pr` mode the base is not published or the remote cannot be
 asked; a branch of the ticket or the worktree directory already exists; a resume
-precondition fails; a setup command fails or leaves tracked or unignored files
+precondition fails; a setup command during `prepare` fails or leaves tracked or unignored files
 behind; there is nothing to commit; an Agent committed or moved HEAD or the
 branch itself; a commit hook rejects the commit or changes its content or
-message; the commit, patch, push, or `gh` step fails; the worktree cannot be
+message; the base was rewritten or moved back before replay; the commit, patch, push, or `gh` step fails; the worktree cannot be
 removed after delivery; or, after a decision, the candidate cannot be archived
 or the worktree or branch cannot be removed. A failed Git or `gh` step
 saves its output as a log in the evidence directory.
@@ -598,8 +664,11 @@ every output mode (an empty list when there are no minors). Its `outcome` is `de
 (the last choice at `decide`, so `discard` for a confirmed discard and
 `more rounds` for a run that went on to deliver), `archive` as
 `{ "branch", "commit" }` when the archive branch was created, and `resumed` for
-a resumed run, whose `worktreeCreated` is false and whose `baseCommit` is the
-commit its branch was on.
+a resumed run, whose `worktreeCreated` is false. Its `baseCommit` is the final
+base used by the run. Once a valid replay changes the base, every receipt includes
+`rebasedFrom`, shaped as `{ baseCommit, commit }`: the base the run started from and its
+first approved ticket commit. This also survives re-review, repaired `reverify`,
+and later stops in that run; it is not carried between separate resumed runs.
 For parking, `delivery.json` also records the `reason` and
 `park: { needs, next, budgets: { repairs: { used, max }, reviewRounds: { used, max } } }`.
 The one-line hold starts `Parked on <branch>: ` followed by the first line of
@@ -617,7 +686,7 @@ gate retries and `reviewRounds` counts review revisions, each cumulative across 
 Limits: a run waiting in a Human state keeps its worktree and branch until it is
 answered. `resume` adopts only an uncommitted candidate on the ticket's own
 worktree and branch; it does not restore an archive branch, continue a branch
-that already holds a commit, or rebase a candidate onto a base that moved.
+that already holds a commit, or accept a base rewritten away from its history.
 Without `resume`, a second run of the same ticket is blocked while any branch
 of that ticket exists; resume it, or delete
 the branch and any kept worktree to retry from scratch.
@@ -627,8 +696,9 @@ so a ticket branch checked out in another clone has no record there. One that
 holds its ticket commit is still told by that commit; one without it, unless it
 is named exactly `ticket/<id-slug>`, has unresolved ownership, which blocks a new
 run of the ticket and cannot be resumed until it is recorded. The
-published-base check reads the remote once, in `prepare`; it does not see a base
-branch that moves on the remote while the run is under way. A `gh` failure
+published-base check records configuration once, in `prepare`, and asks the
+recorded remote base again before replay onto a newer tip. It is not an atomic
+lock against later remote movement. A `gh` failure
 after a successful push leaves the pushed branch on the remote. A commit that a
 hook altered stays on the local branch, undelivered. Like the defaults, this is not a sandbox: Agents and commands run with the
 harness's and user's permissions, and `pr` mode publishes the change, so accept

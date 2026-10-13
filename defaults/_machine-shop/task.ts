@@ -261,6 +261,11 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     reason = "The checkout no longer matches passing verification; rerun checks on the current candidate.";
     return false;
   }
+  /** Undoing a workflow's commit makes the candidate subject to verification and drift checks again. */
+  function reopen(failed = false): void {
+    accepted = false;
+    if (failed) lastChecksPassed = false;
+  }
   const drifted = () => lastChecksPassed === true && !accepted && policy.git !== "none" && verifiedSnapshot !== fingerprint(workspace);
   /**
    * For a definition that removes its own workspace or keeps one it cannot vouch for: settles once, ahead of finish, whether the
@@ -290,7 +295,7 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     console.log(`Machine Shop result: ${join(directory, "result.json")}`);
     return { type: outcome };
   }
-  return { start, open, check, checks, redCheck, regression, capture, decision, choice, prompt, seal, unchanged, review, repair, reviewRound, renew, block, accept, retire, finish,
+  return { start, open, check, checks, redCheck, regression, capture, decision, choice, prompt, seal, unchanged, review, repair, reviewRound, renew, block, accept, reopen, retire, finish,
     workspace, output: () => result,
     status: () => ({ reason, repairs, totalRepairs: renewed + repairs, maxRepairs: assignment.maxRepairs,
       reviewRounds, totalReviewRounds: renewedReviews + reviewRounds, maxReviewRounds: assignment.maxReviewRounds }),

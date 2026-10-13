@@ -178,6 +178,8 @@ function handedOff(f: Fixture, result: { state: unknown; output: any; states: st
   assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.delivery.archive], [true, false, null, undefined]);
   return run;
 }
+/** The park note's fixed next step. */
+const nextStep = "Add the answer to the ticket body, then run the ticket again with resume: true; the run continues from the kept worktree with fresh budgets.";
 /** Parking never asks a Human or changes the candidate; its note and hold share the same brief. */
 function parked(f: Fixture, result: { state: unknown; output: any; states: string[] }, reason: RegExp, human: { requests: Ask[] }) {
   assert.equal(result.state, "parked"); assert.deepEqual(result.states.slice(-3), ["stuck", "park", "parked"]);
@@ -185,7 +187,7 @@ function parked(f: Fixture, result: { state: unknown; output: any; states: strin
   const run = held(f, result, new RegExp(`^Parked on ${branch}: `, "u")); untouched(f);
   assert.equal(run.result.outcome, "blocked"); assert.equal(run.delivery.outcome, "parked");
   assert.match(run.delivery.reason, reason); assert.match(run.delivery.park.needs, reason);
-  assert.equal(run.delivery.park.next, "Add the answer to the ticket body, then run the ticket again with resume: true; the run continues from the kept worktree with fresh budgets.");
+  assert.equal(run.delivery.park.next, nextStep);
   assert.deepEqual(run.result.decisions, []); assert.equal(run.delivery.decision, undefined);
   assert.equal(git(f.repo, "rev-parse", branch), f.head); assert.equal(git(f.worktree, "symbolic-ref", "HEAD"), `refs/heads/${branch}`);
   assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.delivery.archive], [true, false, null, undefined]);
@@ -559,7 +561,7 @@ for (const output of ["branch", "patch", "pr"]) {
     assert.deepEqual(result.states.slice(0, 4), ["shape", "prepare", "start", "falsify"]);
     // The Operations that follow the three read-only states are the Machine's own; the ticket names only the Agent states and their order.
     assert.deepEqual(result.states.slice(0, result.states.indexOf("test")).filter(isPlanning), ["falsify", "plan", "planReview"]);
-    assert.deepEqual(result.states.slice(result.states.indexOf("test")), ["test", "scopeAfterTest", "red", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
+    assert.deepEqual(result.states.slice(result.states.indexOf("test")), ["test", "scopeAfterTest", "red", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "delivered"]);
     const commit = git(f.repo, "rev-parse", branch);
     const run = held(f, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
     assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", branch), "Add a greeting\nTicket: PROJ-12");
@@ -926,7 +928,7 @@ test("more rounds restarts the budget with the standing findings, and an approva
     reviewer: () => ++reviews < 3 ? review("revise", `Finding ${reviews}`) : review("approved", "Greeting matches the ticket"),
   }, human);
   assert.equal(result.state, "delivered"); assert.deepEqual([prompts.length, reviews, human.requests.length], [3, 3, 1]);
-  assert.deepEqual(result.states.slice(-14), ["reviewBudget", "stuck", "decide", "repairTarget", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
+  assert.deepEqual(result.states.slice(-15), ["reviewBudget", "stuck", "decide", "repairTarget", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "delivered"]);
   assert.ok(human.requests[0]!.prompt.includes("Review budget exhausted (1). Finding 2"));
   // The pass a person granted is briefed exactly as the ordinary repair before it was.
   assert.ok(prompts[1]!.includes("Current failure/feedback: Finding 1")); assert.ok(prompts[2]!.includes("Current failure/feedback: Finding 2"));
@@ -1217,7 +1219,7 @@ test("a resumed run verifies, reviews, and delivers the candidate a handed-off r
     reviewer: request => { assert.equal(request.cwd, f.worktree); assert.equal(readFileSync(join(request.cwd, "greeting.txt"), "utf8"), "hello\n"); return review("approved", "Greeting matches the ticket"); },
   });
   assert.equal(result.state, "delivered");
-  assert.deepEqual(result.states, ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
+  assert.deepEqual(result.states, ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "delivered"]);
   const commit = git(f.repo, "rev-parse", branch);
   const run = held(again, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
   assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head); assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
@@ -1250,28 +1252,517 @@ test("a resumed run whose review asks for changes repairs within a fresh budget"
   assert.equal(evidence(again).result.repairs, 0); assert.equal(evidence(again).result.reviewRounds, 1); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello again");
 });
 
+/** A commit lands on the base in the source checkout, as when someone merges there while the ticket is under review; returns the new tip. */
+function advance(f: Fixture, file = "later.txt", content = "later\n") {
+  writeFileSync(join(f.repo, file), content); git(f.repo, "add", "."); git(f.repo, "commit", "-qm", `base: ${file}`);
+  return f.head = git(f.repo, "rev-parse", "HEAD");
+}
+type Candidate = ReturnType<typeof candidate>;
+const phases = (run: { result: any }): string[] => run.result.checks.map((check: any) => check.phase);
+/** Every ref of the source repository but the ticket branch, the only one a run may move. */
+const others = (f: Fixture) => git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)").split("\n").filter(ref => !ref.startsWith(`refs/heads/${branch} `)).join("\n");
+/** A reason names a commit by its hash, in full or abbreviated. */
+const names = (reason: string, commit: string) => reason.includes(commit.slice(0, 7));
+/** No replay and no push is forced, whatever else a run asks Git. */
+function unforced(calls: string[]) {
+  for (const call of calls.filter(call => /(?:^|\s)(?:rebase|push)(?:\s|$)/u.test(call))) assert.doesNotMatch(call, /(?:^|\s)(?:-f|--force\S*|--no-ff|\+\S+)(?:\s|$)/u);
+}
+const undone = (calls: string[], onto: string) => calls.some(call => new RegExp(`(?:^|\\s)reset\\s(?:.*\\s)?--mixed\\s(?:.*\\s)?${onto}(?:\\s|$)`, "u").test(call));
+const accepted = (states: string[]) => assert.deepEqual(states.slice(0, 3), ["shape", "prepare", "scopeAfterChange"]);
+/**
+ * The invariant: a run never stops with the workflow's commit on the ticket branch. The worktree holds the candidate as uncommitted changes
+ * on that branch, which points at a base commit, the one the run started from or the new tip; no rebase is in progress and no commit is
+ * recorded. `except` names the files the new tip brought, in which the candidate cannot be compared with what was reviewed.
+ */
+function uncommitted(f: Fixture, run: { delivery: any } | undefined, base: string, before: Candidate, except: string[] = []) {
+  const now = candidate(f.worktree); const rest = (files: Candidate["files"]) => files.filter(([name]) => !except.includes(String(name)));
+  assert.equal(now.status, before.status); assert.match(now.status, /greeting\.txt/u); assert.deepEqual(rest(now.files), rest(before.files));
+  assert.equal(git(f.worktree, "diff", "--cached", "--name-only"), "");
+  assert.equal(git(f.worktree, "symbolic-ref", "HEAD"), `refs/heads/${branch}`);
+  assert.deepEqual([git(f.worktree, "rev-parse", "HEAD"), git(f.repo, "rev-parse", branch)], [base, base]);
+  for (const state of ["rebase-merge", "rebase-apply"]) assert.equal(existsSync(git(f.worktree, "rev-parse", "--path-format=absolute", "--git-path", state)), false, state);
+  if (run) assert.deepEqual([run.delivery.commit, run.delivery.baseCommit, run.delivery.worktreeRemoved], [null, base, false]);
+}
+/** A stop that `rebase` adds parks as every other stop does: through `stuck`, without a Human, under the note's fixed next step, naming the state it stopped in. */
+function parkedIn(state: string, f: Fixture, result: { state: unknown; output: any; states: string[] }, reason: RegExp) {
+  assert.equal(result.state, "parked"); assert.deepEqual(result.states.slice(-4), [state, "stuck", "park", "parked"]);
+  assert.equal(result.states.includes("decide"), false); assert.equal(result.states.includes("failure"), false);
+  const run = held(f, result, new RegExp(`^Parked on ${branch}: `, "u"));
+  assert.deepEqual([run.result.outcome, run.delivery.outcome, run.delivery.park.next, run.delivery.decision], ["blocked", "parked", nextStep, undefined]);
+  assert.match(run.delivery.reason, reason);
+  const note = readFileSync(join(run.directory, "park.txt"), "utf8");
+  assert.ok(note.includes(`Stopped in ${state}.`)); assert.ok(note.includes(nextStep));
+  assert.ok(note.includes(`Worktree: ${f.worktree}\nBranch: ${branch}\nEvidence: ${run.directory}`));
+  assert.ok(result.output.summary.includes(`Worktree kept at ${f.worktree}. Evidence: `));
+  return run;
+}
+/** What `rebasedFrom` records: the base the run started from and the commit approved first, the ticket's own commit on that base. */
+function rebasedFrom(f: Fixture, run: { delivery: any }, started: string): string {
+  const from = run.delivery.rebasedFrom ?? {};
+  assert.deepEqual(Object.keys(from).sort(), ["baseCommit", "commit"]); assert.equal(from.baseCommit, started);
+  assert.match(from.commit, /^[0-9a-f]{40,64}$/u); assert.notEqual(from.commit, run.delivery.commit);
+  assert.equal(git(f.repo, "rev-parse", `${from.commit}^`), started);
+  assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", from.commit), "Add a greeting\nTicket: PROJ-12");
+  return from.commit;
+}
+/** The delivered branch holds exactly the ticket commit above a base tip. */
+function onTip(f: Fixture, tip: string) {
+  assert.equal(git(f.repo, "rev-list", "--count", `${tip}..${branch}`), "1"); assert.equal(git(f.repo, "rev-parse", `${branch}^`), tip);
+  assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", branch), "Add a greeting\nTicket: PROJ-12");
+  return git(f.repo, "rev-parse", branch);
+}
+
+for (const output of ["branch", "patch", "pr"] as const) {
+  test(`a base that moved forward under review gets the approved commit replayed onto its tip, set up, and verified again before ${output} delivery`, async context => {
+    const path = process.env.PATH; const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const calls = recordGit(context, f);
+    context.after(() => { process.env.PATH = path; });
+    const started = f.head; let tip = ""; let refs = "";
+    const where = 'const fs = require("fs"); console.log(`later.txt ${fs.existsSync("later.txt")}, greeting.txt ${fs.existsSync("greeting.txt")}`)';
+    const result = await execute(input(f, { output, setup: [command(where, { name: "install" })] }), {
+      reviewer: request => {
+        assert.equal(git(request.cwd, "rev-parse", "HEAD"), started);
+        // Two commits land on the base while the candidate is under review. A pull request base is published, as its owner leaves it.
+        advance(f); tip = advance(f, "latest.txt"); if (output === "pr") git(f.repo, "push", "-q", "origin", "main");
+        refs = others(f); return review();
+      },
+    });
+    assert.equal(result.state, "delivered");
+    assert.deepEqual(result.states.slice(result.states.indexOf("reviewResult")), ["reviewResult", "commit", "rebase", "deliver", "success", "delivered"]);
+    // Exactly the ticket commit lies above the new tip, under the ticket's message, and no other ref moved.
+    const commit = onTip(f, tip); const run = held(f, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
+    assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+    assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", branch), "code.txt\ngreeting.test.txt\ngreeting.txt\nlater.txt\nlatest.txt");
+    assert.equal(others(f), refs);
+    assert.ok(calls().some(call => /(?:^|\s)rebase\s/u.test(call) && call.includes(`--onto ${tip} ${started}`)), "git rebase --onto <tip> <baseCommit>");
+    assert.ok(calls().some(call => /(?:^|\s)patch-id\s(?:.*\s)?--stable(?:\s|$)/u.test(call)), "git patch-id --stable");
+    unforced(calls());
+    // Delivery is of the rebased commit on the tip, and says where the change was approved first.
+    assert.deepEqual([run.delivery.baseCommit, run.delivery.commit, run.delivery.worktreeRemoved], [tip, commit, true]);
+    assert.equal(git(f.repo, "show", `${rebasedFrom(f, run, started)}:greeting.txt`), "hello");
+    // Setup ran again on the rebased tree, and then the gates as their own phase.
+    assert.deepEqual(run.result.checks.map((check: any) => [check.phase, check.name, check.passed]),
+      [["setup", "install", true], ["red", "tests", true], ["verify", "tests", true], ["setup", "install", true], ["reverify", "tests", true]]);
+    assert.match(readFileSync(run.result.checks[3].log, "utf8"), /later\.txt true, greeting\.txt true/u);
+    assert.deepEqual([run.result.outcome, run.result.checksPassed, run.result.repairs, run.result.reviewRounds], ["completed", true, 0, 0]);
+    const network = calls().filter(call => /^(?:ls-remote|fetch)\b/u.test(call));
+    if (output === "patch") {
+      // One patch: the ticket's, not the base's commits with it.
+      assert.deepEqual(run.delivery.patches, [join(run.directory, "0001-Add-a-greeting.patch")]); assert.match(readFileSync(run.delivery.patches[0], "utf8"), /\+hello/u);
+    }
+    if (output !== "pr") { assert.deepEqual(network, []); assert.equal(pushed(), ""); assert.equal(gh(), undefined); return; }
+    // The tip was asked about at the remote prepare checked, whose URL was read once; then the rebased commit was pushed there.
+    assert.ok(network.length >= 2); for (const call of network) assert.ok(call.includes(`${hosted}.git`), call);
+    assert.equal(calls().filter(call => call.startsWith("config --get remote.origin.url")).length, 1);
+    assert.deepEqual(calls().filter(call => call.startsWith("push --no-follow-tags")), [`push --no-follow-tags ${hosted}.git ${commit}:refs/heads/${branch}`]);
+    assert.equal(pushed(), `refs/heads/main ${tip}\nrefs/heads/${branch} ${commit}`);
+    assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "main", "--head", branch]);
+  });
+}
+
+for (const base of [undefined, "main"]) {
+  test(base ? "a named base is resolved by its name, so a source checkout that moves to another branch causes no rebase"
+    : "an omitted base follows the source checkout's HEAD, so the approved commit is replayed onto the branch checked out there", async context => {
+    const f = fixture(context); const started = f.head; let tip = "";
+    const result = await execute(input(f, base ? { base } : {}), {
+      reviewer: () => { git(f.repo, "checkout", "-q", "-b", "next"); tip = advance(f); return review(); },
+    });
+    assert.equal(result.state, "delivered"); assert.deepEqual(result.states.slice(-5), ["commit", "rebase", "deliver", "success", "delivered"]);
+    const run = evidence(f);
+    assert.deepEqual([git(f.repo, "rev-parse", "main"), git(f.repo, "rev-parse", "next"), git(f.repo, "symbolic-ref", "--short", "HEAD")], [started, tip, "next"]);
+    const commit = onTip(f, base ? started : tip);
+    assert.deepEqual([run.delivery.baseCommit, run.delivery.commit, run.result.checksPassed], [base ? started : tip, commit, true]);
+    if (base) { assert.deepEqual(phases(run), ["red", "verify"]); assert.equal(run.delivery.rebasedFrom, undefined); return; }
+    assert.deepEqual(phases(run), ["red", "verify", "reverify"]); rebasedFrom(f, run, started);
+  });
+}
+
+for (const [label, move] of [
+  ["moved back", (f: Fixture) => { git(f.repo, "reset", "-q", "--hard", "HEAD^"); }],
+  ["rewritten", (f: Fixture) => { git(f.repo, "commit", "-q", "--amend", "-m", "base: second.txt, reworded"); }],
+  ["left by a source checkout now on a branch that does not hold it", (f: Fixture) => { git(f.repo, "checkout", "-q", "-b", "sideways", "HEAD^"); git(f.repo, "commit", "-q", "--allow-empty", "-m", "sideways"); }],
+] as const) {
+  test(`a base ${label} under review is not rebased onto: the commit is undone, the run ends blocked for delivery by hand, and a resume is refused`, async context => {
+    const f = fixture(context); const started = advance(f, "second.txt", "second\n"); const calls = recordGit(context, f);
+    let before: Candidate | undefined; let tip = ""; let refs = "";
+    const result = await execute(input(f), {
+      reviewer: request => { before = candidate(request.cwd); move(f); tip = f.head = git(f.repo, "rev-parse", "HEAD"); refs = others(f); return review(); },
+    });
+    // Like other delivery failures it ends by itself, without stuck or a Human.
+    assert.equal(result.state, "blocked"); assert.deepEqual(result.states.slice(-5), ["reviewResult", "commit", "rebase", "failure", "blocked"]);
+    const run = held(f, result, /^Blocked: /u);
+    assert.deepEqual([run.result.outcome, run.delivery.outcome, run.delivery.decision, phases(run)], ["blocked", "blocked", undefined, ["red", "verify"]]);
+    assert.ok(names(run.delivery.reason, started), "the reason names the base the run started from"); assert.ok(names(run.delivery.reason, tip), "the reason names the new tip");
+    assert.match(run.delivery.reason, /by hand/iu); assert.ok(result.output.summary.includes(`Worktree kept at ${f.worktree}.`));
+    uncommitted(f, run, started, before!); assert.equal(others(f), refs); assert.equal(git(f.repo, "status", "--porcelain", "--untracked-files=all"), "");
+    assert.ok(undone(calls(), started), "git reset --mixed <baseCommit>");
+    assert.equal(calls().some(call => /(?:^|\s)rebase\s(?:.*\s)?--onto(?:\s|$)/u.test(call)), false);
+    // Resume is not promised here: the branch's base is not in the new tip, and adopt refuses it as before, changing nothing.
+    const again = next(f, 2);
+    const refused = await execute(input(again, {}, { resume: true }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
+    assert.equal(refused.state, "blocked"); assert.deepEqual(refused.states, ["shape", "prepare", "failure", "blocked"]);
+    held(again, refused, /^Blocked: Cannot resume: ticket\/proj-12-add-a-greeting holds 1 commit that is not in the base commit .+ or the base moved back; only an uncommitted candidate is resumed, and nothing was changed\. Evidence: /u);
+    uncommitted(f, undefined, started, before!); assert.equal(others(f), refs);
+  });
+}
+
+test("a conflict in the replay puts the approved candidate back uncommitted on its original base and parks naming the paths and the tip; a resume alone stops there again until a person ports the candidate", async context => {
+  const f = fixture(context); const started = f.head; const human = person(); let before: Candidate | undefined; let tip = ""; let refs = "";
+  const first = await execute(input(f, {}, { stuck: "park" }), {
+    // The base gains a greeting of its own while this one is under review.
+    reviewer: request => { before = candidate(request.cwd); tip = advance(f, "greeting.txt", "hi\n"); refs = others(f); return review(); },
+  }, human);
+  const stopped = (at: Fixture, result: Awaited<ReturnType<typeof execute>>) => {
+    const run = parkedIn("rebase", at, result, /greeting\.txt/u); untouched(f);
+    assert.ok(names(run.delivery.reason, tip), "the reason names the new tip");
+    // The reason says that running again is not enough.
+    assert.match(run.delivery.reason, /\bresum/iu); assert.match(run.delivery.reason, /\bport/iu);
+    uncommitted(f, run, started, before!); assert.equal(candidate(f.worktree).status, "?? greeting.test.txt\n?? greeting.txt"); assert.equal(others(f), refs);
+    return run;
+  };
+  assert.deepEqual(phases(stopped(f, first)), ["red", "verify"]);
+  // A run with resume: true and nothing else is accepted, reaches the same conflict, and leaves the same candidate.
+  let again = next(f, 2);
+  const second = await execute(input(again, {}, { resume: true, stuck: "park" }), { investigator: () => assert.fail(), implementer: () => assert.fail() }, human);
+  accepted(second.states); stopped(again, second);
+  // A person ports the candidate in the worktree: the branch goes to the tip, and this greeting replaces the one the base brought.
+  git(f.worktree, "reset", "-q", tip); assert.equal(candidate(f.worktree).status, "M greeting.txt\n?? greeting.test.txt");
+  again = next(f, 3);
+  const third = await execute(input(again, {}, { resume: true, stuck: "park" }), { investigator: () => assert.fail(), implementer: () => assert.fail() }, human);
+  assert.equal(third.state, "delivered"); accepted(third.states); assert.deepEqual(third.states.slice(-5), ["commit", "rebase", "deliver", "success", "delivered"]);
+  const commit = onTip(f, tip); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello");
+  assert.deepEqual([phases(evidence(again)), evidence(again).delivery.baseCommit, evidence(again).delivery.commit], [["verify"], tip, commit]);
+  assert.deepEqual(human.requests, []);
+});
+
+test("a conflict met again after more rounds stops again in the same run, and hand off then leaves the candidate uncommitted, as that choice says", async context => {
+  const f = fixture(context); const started = f.head; const human = person("more rounds", "hand off");
+  let before: Candidate | undefined; let tip = ""; const prompts: string[] = [];
+  const result = await execute(input(f), {
+    implementer: request => { prompts.push(request.prompt); return implement(request); },
+    reviewer: request => { before = candidate(request.cwd); tip ||= advance(f, "greeting.txt", "hi\n"); return review(); },
+  }, human);
+  assert.equal(result.state, "handedOff"); assert.deepEqual(result.states.slice(-5), ["rebase", "stuck", "decide", "handOff", "handedOff"]);
+  assert.deepEqual(result.states.filter(state => ["commit", "rebase", "decide", "change", "failure"].includes(state)), ["change", "commit", "rebase", "decide", "change", "commit", "rebase", "decide"]);
+  // The decision is the one every stop asks, and its choices are unchanged.
+  for (const request of human.requests) {
+    assert.deepEqual(request.choices, ["more rounds", "hand off", "archive", "discard"]);
+    assert.match(request.prompt, /Stopped in rebase\./u); assert.match(request.prompt, /greeting\.txt/u); assert.ok(names(request.prompt, tip));
+  }
+  assert.match(prompts[1]!.split("Current failure/feedback: ")[1] ?? "", /greeting\.txt/u);
+  const run = held(f, result, new RegExp(`^Handed off on ${branch}: `, "u")); untouched(f);
+  assert.deepEqual([run.result.outcome, run.delivery.outcome, run.delivery.decision, run.delivery.archive], ["blocked", "handed-off", "hand off", undefined]);
+  assert.ok(result.output.summary.includes(`Decision: hand off. Worktree kept at ${f.worktree}. Evidence: `));
+  uncommitted(f, run, started, before!);
+});
+
+test("a tip that already holds the change leaves nothing to replay: the candidate goes back uncommitted on its original base and the run parks saying so, as a resumed run does again", async context => {
+  const f = fixture(context); const started = f.head; const human = person(); let before: Candidate | undefined; let tip = ""; let refs = "";
+  const first = await execute(input(f, {}, { stuck: "park" }), {
+    reviewer: request => {
+      before = candidate(request.cwd);
+      // The same change reaches the base by another road while this one is under review, after a commit of the base's own.
+      advance(f); writeFileSync(join(f.repo, "greeting.test.txt"), readFileSync(join(request.cwd, "greeting.test.txt")));
+      tip = advance(f, "greeting.txt", "hello\n"); refs = others(f); return review();
+    },
+  }, human);
+  const stopped = (at: Fixture, result: Awaited<ReturnType<typeof execute>>) => {
+    const run = parkedIn("rebase", at, result, /already holds/iu); untouched(f);
+    assert.ok(names(run.delivery.reason, tip), "the reason names the tip");
+    // Nothing of the tip stays behind in the worktree: the candidate is the one that was approved, on the base it was approved on.
+    uncommitted(f, run, started, before!); assert.equal(existsSync(join(f.worktree, "later.txt")), false); assert.equal(others(f), refs);
+  };
+  stopped(f, first);
+  const again = next(f, 2);
+  const second = await execute(input(again, {}, { resume: true, stuck: "park" }), { investigator: () => assert.fail(), implementer: () => assert.fail() }, human);
+  accepted(second.states); stopped(again, second); assert.deepEqual(human.requests, []);
+});
+
+for (const [label, hook, script] of [
+  ["a refusing hook", "pre-rebase", "exit 1"],
+  ["a changed subject", "post-rewrite", 'test "$1" = rebase || exit 0\ngit -c core.hooksPath=/dev/null commit --amend -qm changed'],
+  ["an extra commit", "post-rewrite", 'test "$1" = rebase || exit 0\ngit -c core.hooksPath=/dev/null commit --allow-empty -qm extra'],
+  ["a dirty tracked file", "post-rewrite", 'test "$1" = rebase || exit 0\necho altered > greeting.txt'],
+] as const) {
+  test(`replay with ${label} conservatively restores the approved candidate, and resumes after the hook is removed`, async context => {
+    const f = fixture(context); const started = f.head; let before: Candidate | undefined; let tip = "";
+    const path = join(f.repo, ".git/hooks", hook);
+    const result = await execute(input(f, {}, { stuck: "park" }), {
+      reviewer: request => {
+        before = candidate(request.cwd); tip = advance(f);
+        writeFileSync(path, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+        return review();
+      },
+    });
+    const run = parkedIn("rebase", f, result, /Replay onto/u);
+    uncommitted(f, run, started, before!); untouched(f);
+    assert.ok(names(run.delivery.reason, tip));
+    rmSync(path);
+    const again = next(f, 2);
+    const resumed = await execute(input(again, {}, { resume: true, stuck: "park" }), {
+      investigator: () => assert.fail(), implementer: () => assert.fail(),
+    });
+    assert.equal(resumed.state, "delivered"); accepted(resumed.states); onTip(f, tip);
+    assert.deepEqual(phases(evidence(again)), ["verify", "reverify"]);
+  });
+}
+
+test("setup that switches branches after replay restores only the ticket branch and counts as failed checks", async context => {
+  const f = fixture(context); const started = f.head; let before: Candidate | undefined;
+  git(f.repo, "branch", "other", started);
+  const setup = [command('if (require("fs").existsSync("later.txt")) require("child_process").execFileSync("git", ["checkout", "-q", "other"], { stdio: "ignore" });', { name: "install" })];
+  const result = await execute(input(f, { setup }, { stuck: "park" }), {
+    reviewer: request => { before = candidate(request.cwd); advance(f); return review(); },
+  });
+  const run = parkedIn("rebase", f, result, /setup: install.*moved HEAD/u);
+  uncommitted(f, run, started, before!); untouched(f);
+  assert.equal(run.result.checksPassed, false);
+  assert.equal(git(f.repo, "rev-parse", "other"), started);
+  const again = next(f, 2);
+  const resumed = await execute(input(again, {}, { resume: true, stuck: "park" }), {
+    investigator: () => assert.fail(), implementer: () => assert.fail(),
+  });
+  assert.equal(resumed.state, "delivered"); accepted(resumed.states); onTip(f, f.head);
+});
+
+test("setup leftovers on the new tip fail checks and park uncommitted without asking the implementer to repair them", async context => {
+  const f = fixture(context); let tip = "";
+  const setup = [command('const fs = require("fs"); if (fs.existsSync("later.txt")) fs.writeFileSync("setup-output.txt", "leftover");', { name: "install" })];
+  const result = await execute(input(f, { setup }, { stuck: "park" }), {
+    reviewer: () => { tip = advance(f); return review(); },
+  });
+  const run = parkedIn("rebase", f, result, /setup: install.*unignored/u);
+  assert.deepEqual([run.delivery.baseCommit, run.delivery.commit, run.result.checksPassed], [tip, null, false]);
+  assert.equal(git(f.worktree, "rev-parse", "HEAD"), tip);
+  assert.equal(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), "hello\n");
+  assert.equal(readFileSync(join(f.worktree, "setup-output.txt"), "utf8"), "leftover");
+  assert.equal(result.states.includes("repairBudget"), false);
+  rmSync(join(f.worktree, "setup-output.txt"));
+  const again = next(f, 2);
+  const resumed = await execute(input(again, { setup }, { resume: true, stuck: "park" }), {
+    investigator: () => assert.fail(), implementer: () => assert.fail(),
+  });
+  assert.equal(resumed.state, "delivered"); accepted(resumed.states); onTip(f, tip);
+  assert.deepEqual(phases(evidence(again)), ["verify"]);
+});
+
+const numbered = (changed: Record<number, string> = {}) => Array.from({ length: 10 }, (_, index) => `${changed[index + 1] ?? index + 1}\n`).join("");
+for (const second of ["approves", "asks for a change", "blocks", "edits the checkout"] as const) {
+  test(`a replay whose patch is not the one that was reviewed is undone on the new tip, set up, verified, and reviewed again, where the reviewer ${second}`, async context => {
+    const f = fixture(context); const started = advance(f, "lines.txt", numbered()); const human = person();
+    let tip = ""; let reviews = 0; let edits = 0; let before: Candidate | undefined;
+    const where = 'console.log(require("fs").readFileSync("lines.txt", "utf8").includes("seven") ? "on the new base" : "on the base it started from")';
+    const result = await execute(scoped(input(f, { setup: [command(where, { name: "install" })] }, { stuck: "park" }), "lines.txt"), {
+      implementer: request => {
+        if (++edits === 2) assert.match(request.prompt, /Current failure\/feedback: Greet the new base too/u);
+        if (edits === 1) writeFileSync(join(request.cwd, "lines.txt"), numbered({ 5: "five" }));
+        writeFileSync(join(request.cwd, "greeting.txt"), edits === 1 ? "hello\n" : "hello again\n"); return ok();
+      },
+      reviewer: request => {
+        // The base changes a line two below the ticket's: the replay applies cleanly, but its patch is no longer the one this review read.
+        if (++reviews === 1) { tip = advance(f, "lines.txt", numbered({ 7: "seven" })); return review(); }
+        if (reviews > 2) return review();
+        // The candidate is uncommitted again, now on the new tip, with the base's change beside its own.
+        assert.equal(git(request.cwd, "rev-parse", "HEAD"), tip); assert.equal(git(request.cwd, "symbolic-ref", "HEAD"), `refs/heads/${branch}`);
+        assert.equal(candidate(request.cwd).status, "M lines.txt\n?? greeting.test.txt\n?? greeting.txt");
+        assert.equal(readFileSync(join(request.cwd, "lines.txt"), "utf8"), numbered({ 5: "five", 7: "seven" }));
+        if (second === "edits the checkout") writeFileSync(join(request.cwd, "greeting.txt"), "unreviewed\n");
+        before = candidate(request.cwd);
+        return second === "asks for a change" ? review("revise", "Greet the new base too") : second === "blocks" ? ok("blocked", "The new base contradicts the ticket") : review();
+      },
+    }, human);
+    untouched(f); assert.deepEqual(human.requests, []);
+    const run = evidence(f); const again = ["commit", "rebase", "verify", "sealReview", "review", "reviewResult"];
+    // It is not a stop: the run goes from rebase straight back to verify and a fresh review, and nothing is verified as `reverify`.
+    assert.deepEqual(result.states.slice(result.states.indexOf("commit"), result.states.indexOf("commit") + again.length), again);
+    assert.deepEqual(run.result.checks.slice(0, 5).map((check: any) => [check.phase, check.name, check.passed]),
+      [["setup", "install", true], ["red", "tests", true], ["verify", "tests", true], ["setup", "install", true], ["verify", "tests", true]]);
+    assert.match(readFileSync(run.result.checks[3].log, "utf8"), /on the new base/u); assert.equal(phases(run).includes("reverify"), false);
+    if (second === "blocks" || second === "edits the checkout") {
+      // The fresh review stops the run as any review does, with the candidate uncommitted on the new tip.
+      const stop = parkedIn("reviewResult", f, result, second === "blocks" ? /contradicts the ticket/u : /read-only stage/u); assert.equal(reviews, 2);
+      uncommitted(f, stop, tip, before!);
+      // A reviewer that edits the checkout after the re-review leaves no passing verdict behind, as one that edits before any commit.
+      if (second === "edits the checkout") { assert.equal(stop.result.checksPassed, false); return; }
+      const later = next(f, 2);
+      const resumed = await execute(scoped(input(later, {}, { resume: true, stuck: "park" }), "lines.txt"), { investigator: () => assert.fail(), implementer: () => assert.fail() }, human);
+      assert.equal(resumed.state, "delivered"); accepted(resumed.states); onTip(f, tip); assert.deepEqual(phases(evidence(later)), ["verify"]);
+      return;
+    }
+    assert.equal(result.state, "delivered"); assert.equal(result.states.includes("stuck"), false);
+    assert.deepEqual(result.states.slice(-5), ["commit", "rebase", "deliver", "success", "delivered"]);
+    const revised = second === "asks for a change";
+    assert.deepEqual(result.states.filter(state => ["change", "commit", "rebase", "reviewBudget", "repairBudget"].includes(state)),
+      revised ? ["change", "commit", "rebase", "reviewBudget", "change", "commit", "rebase"] : ["change", "commit", "rebase", "commit", "rebase"]);
+    // The second verdict is the one delivered, on the tip; the receipt keeps the base the run started from and the commit approved first.
+    const commit = onTip(f, tip);
+    assert.equal(git(f.repo, "show", `${branch}:lines.txt`), numbered({ 5: "five", 7: "seven" }).trim()); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), revised ? "hello again" : "hello");
+    assert.deepEqual([run.delivery.outcome, run.delivery.baseCommit, run.delivery.commit], ["delivered", tip, commit]);
+    const first = rebasedFrom(f, run, started);
+    assert.equal(git(f.repo, "show", `${first}:lines.txt`), numbered({ 5: "five" }).trim()); assert.equal(git(f.repo, "show", `${first}:greeting.txt`), "hello");
+    // Reviewing again uses neither budget.
+    assert.deepEqual([reviews, edits, run.result.checksPassed, run.result.repairs, run.result.reviewRounds], revised ? [3, 2, true, 0, 1] : [2, 1, true, 0, 0]);
+  });
+}
+
+const greetsLater = 'const fs = require("fs"); if (fs.existsSync("later.txt") && !fs.readFileSync("greeting.txt", "utf8").includes("later")) { console.log("greeting.txt does not mention later.txt"); process.exit(1); }';
+for (const [label, extra] of [
+  ["is repaired within the budget", {}],
+  ["parks on a spent budget, and a resumed run repairs it", { maxRepairs: 0, stuck: "park" }],
+  ["waits on a spent budget, and more rounds repair it", { maxRepairs: 0 }],
+] as const) {
+  test(`gates that fail on the rebased tree are a gate failure on the new base: the commit is undone there and the failure ${label}`, async context => {
+    const f = fixture(context); const started = f.head; const parks = "stuck" in extra; const asks = "maxRepairs" in extra && !parks;
+    const human = person(...(asks ? ["more rounds"] : [])); const checks = [command(), command(greetsLater, { name: "later-gate" })];
+    let tip = ""; let reviews = 0; let before: Candidate | undefined; const prompts: string[] = [];
+    const agents = {
+      implementer: (request: Request) => {
+        if (prompts.push(request.prompt) === 1) return implement(request);
+        // Back with the implementer: the candidate is uncommitted on the new tip, and the failed gate is named.
+        assert.equal(git(request.cwd, "rev-parse", "HEAD"), tip); assert.equal(candidate(request.cwd).status, "?? greeting.test.txt\n?? greeting.txt");
+        assert.ok(existsSync(join(request.cwd, "later.txt")));
+        assert.match(request.prompt.split("Current failure/feedback: ")[1] ?? "", /later-gate/u);
+        writeFileSync(join(request.cwd, "greeting.txt"), "hello later\n"); return ok();
+      },
+      reviewer: (request: Request) => { if (++reviews === 1) { before = candidate(request.cwd); tip = advance(f); } return review(); },
+    };
+    let at = f; let result = await execute(input(f, { checks }, extra), agents, human);
+    const failed = [["red", "tests", true], ["verify", "tests", true], ["verify", "later-gate", true], ["reverify", "tests", true], ["reverify", "later-gate", false]];
+    const evidenced = (run: { result: any }) => run.result.checks.map((check: any) => [check.phase, check.name, check.passed]);
+    if (parks) {
+      const stop = parkedIn("repairBudget", f, result, /Repair budget exhausted \(0\)\..*later-gate/su); untouched(f);
+      // The tree on the tip did not pass, and the receipt does not say it did.
+      assert.equal(stop.result.checksPassed, false); assert.deepEqual(evidenced(stop), failed); assert.equal(prompts.length, 1);
+      uncommitted(f, stop, tip, before!, ["later.txt"]); assert.equal(readFileSync(join(f.worktree, "later.txt"), "utf8"), "later\n");
+      at = next(f, 2);
+      result = await execute(input(at, { checks }, { resume: true, maxRepairs: 1, stuck: "park" }), { ...agents, investigator: () => assert.fail() }, human);
+      accepted(result.states);
+    }
+    assert.equal(result.state, "delivered"); untouched(f); assert.equal(prompts.length, 2);
+    const run = held(at, result, /^Delivered/u); const commit = onTip(f, tip);
+    assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello later"); assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", branch), "code.txt\ngreeting.test.txt\ngreeting.txt\nlater.txt");
+    assert.deepEqual([run.delivery.baseCommit, run.delivery.commit, run.result.outcome, run.result.checksPassed], [tip, commit, "completed", true]);
+    // The second rebase finds the branch on the tip and goes on to delivery.
+    assert.deepEqual(result.states.slice(-5), ["commit", "rebase", "deliver", "success", "delivered"]);
+    if (parks) { assert.deepEqual(phases(run), ["verify", "verify", "verify", "verify"]); assert.deepEqual(human.requests, []); return; }
+    assert.deepEqual(result.states.slice(result.states.indexOf("commit")), ["commit", "rebase", "repairBudget", ...(asks ? ["stuck", "decide"] : []), "repairTarget", "change",
+      "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "delivered"]);
+    // verify ran the gates on the new base, so they are not run a second time as `reverify`.
+    assert.deepEqual(evidenced(run), [...failed, ["verify", "tests", true], ["verify", "later-gate", true]]);
+    assert.equal(git(f.repo, "show", `${rebasedFrom(f, run, started)}:greeting.txt`), "hello");
+    if (!asks) { assert.deepEqual([run.result.repairs, reviews], [1, 2]); return; }
+    assert.match(human.requests[0]!.prompt, /Stopped in repairBudget\./u); assert.match(human.requests[0]!.prompt, /later-gate/u);
+    assert.ok(human.requests[0]!.prompt.includes("Repair rounds used: 0 of 0.")); assert.equal(run.delivery.decision, "more rounds");
+  });
+}
+
+for (const policy of ["park", "ask"] as const) {
+  test(`a setup command that fails on the new tip is not the implementer's to repair: the commit is undone there and the run ${policy === "park" ? "parks naming the command, and a resumed run delivers on the tip" : "waits for a decision, where archive keeps the candidate on the tip"}`, async context => {
+    const f = fixture(context); const human = person(...(policy === "ask" ? ["archive"] : [])); const calls = recordGit(context, f);
+    let tip = ""; let before: Candidate | undefined; let edits = 0;
+    const setup = [command('process.exit(require("fs").existsSync("later.txt") ? 3 : 0)', { name: "install" })];
+    const result = await execute(input(f, { setup }, { stuck: policy }), {
+      implementer: request => { edits++; return implement(request); },
+      reviewer: request => { before = candidate(request.cwd); tip = advance(f); return review(); },
+    }, human);
+    assert.equal(edits, 1); assert.equal(result.states.includes("repairBudget"), false); assert.ok(undone(calls(), tip), "git reset --mixed <tip>");
+    if (policy === "ask") {
+      assert.deepEqual(result.states.slice(result.states.indexOf("rebase")), ["rebase", "stuck", "decide", "archive", "remove", "abandon", "abandoned"]);
+      assert.match(human.requests[0]!.prompt, /Stopped in rebase\./u); assert.match(human.requests[0]!.prompt, /\binstall\b/u);
+      const run = abandoned(f, result, "archive");
+      // The archive is the candidate as delivery would have committed it, on the tip it was left on.
+      assert.equal(git(f.repo, "rev-parse", `${archiveBranch}^`), tip); assert.equal(git(f.repo, "show", "--name-only", "--format=", archiveBranch), "greeting.test.txt\ngreeting.txt");
+      assert.deepEqual([run.delivery.archive, run.delivery.baseCommit, run.result.checksPassed], [{ branch: archiveBranch, commit: git(f.repo, "rev-parse", archiveBranch) }, tip, false]);
+      return;
+    }
+    const run = parkedIn("rebase", f, result, /\binstall\b/u); untouched(f);
+    // A failed setup on the tip is a failed check: nothing passed on that tree.
+    assert.equal(run.result.checksPassed, false);
+    assert.deepEqual(run.result.checks.map((check: any) => [check.phase, check.name, check.passed]), [["setup", "install", true], ["red", "tests", true], ["verify", "tests", true], ["setup", "install", false]]);
+    uncommitted(f, run, tip, before!, ["later.txt"]); assert.deepEqual(human.requests, []);
+    // A resumed run does not set up again; it verifies and reviews the candidate on the tip and delivers there.
+    const again = next(f, 2);
+    const second = await execute(input(again, { setup }, { resume: true, stuck: "park" }), { investigator: () => assert.fail(), implementer: () => assert.fail() }, human);
+    assert.equal(second.state, "delivered"); accepted(second.states); const commit = onTip(f, tip);
+    assert.deepEqual([phases(evidence(again)), evidence(again).delivery.baseCommit, evidence(again).delivery.commit, evidence(again).result.checksPassed], [["verify"], tip, commit, true]);
+  });
+}
+
+test("a pr run whose base moved to a tip that is not published puts the candidate back on its original base and parks saying the base must be pushed first, asking the remote that prepare recorded", async context => {
+  const path = process.env.PATH; const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const calls = recordGit(context, f);
+  context.after(() => { process.env.PATH = path; });
+  // A second repository that does hold the later commit: a check that read the remote's configuration again would ask it and go on.
+  const other = join(f.root, "other.git"); git(f.root, "init", "-q", "--bare", "-b", "main", other); git(f.repo, "push", "-q", other, "main");
+  const elsewhere = "https://example.invalid/acme/elsewhere.git"; git(f.repo, "config", `url.${other}.insteadOf`, elsewhere);
+  const started = f.head; const human = person(); let before: Candidate | undefined; let tip = ""; let refs = "";
+  const first = await execute(input(f, { output: "pr" }, { stuck: "park" }), {
+    implementer: request => { git(request.cwd, "remote", "set-url", "origin", elsewhere); return implement(request); },
+    reviewer: request => { before = candidate(request.cwd); tip = advance(f); git(f.repo, "push", "-q", other, "main"); refs = others(f); return review(); },
+  }, human);
+  const run = parkedIn("rebase", f, first, /pushed first/iu); untouched(f);
+  uncommitted(f, run, started, before!); assert.equal(others(f), refs);
+  assert.equal(pushed(), ""); assert.equal(gh(), undefined); assert.equal(git(other, "for-each-ref", "--format=%(refname) %(objectname)"), `refs/heads/main ${tip}`);
+  const network = calls().filter(call => /^(?:ls-remote|fetch)\b/u.test(call));
+  assert.ok(network.length >= 2); for (const call of network) assert.ok(call.includes(`${hosted}.git`) && !call.includes(elsewhere), call);
+  assert.equal(calls().filter(call => call.startsWith("config --get remote.origin.url")).length, 1);
+  assert.equal(calls().some(call => call.startsWith("push --no-follow-tags")), false); unforced(calls());
+  // Once the base is pushed, a resumed run rebases, verifies again, and opens the pull request on the tip.
+  git(f.repo, "remote", "set-url", "origin", `${hosted}.git`); git(f.repo, "push", "-q", "origin", "main");
+  const again = next(f, 2);
+  const second = await execute(input(again, { output: "pr" }, { resume: true, stuck: "park" }), { investigator: () => assert.fail(), implementer: () => assert.fail() }, human);
+  assert.equal(second.state, "delivered"); accepted(second.states); const commit = onTip(f, tip);
+  assert.deepEqual([phases(evidence(again)), evidence(again).delivery.baseCommit], [["verify", "reverify"], tip]); rebasedFrom(f, evidence(again), started);
+  assert.equal(pushed(), `refs/heads/main ${tip}\nrefs/heads/${branch} ${commit}`); assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "main", "--head", branch]);
+  assert.deepEqual(human.requests, []);
+});
+
+test("the tip is looked for on the pull request base prepare recorded, the remote's default branch, whatever the local branch is called", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const bare = join(f.root, "remote.git");
+  git(f.repo, "push", "-q", "origin", "main:trunk"); git(bare, "symbolic-ref", "HEAD", "refs/heads/trunk"); const started = f.head; let tip = "";
+  const result = await execute(input(f, { output: "pr" }, { stuck: "park" }), {
+    // The later commit is published on trunk, the pull request base, and not on the remote branch that shares the local one's name.
+    reviewer: () => { tip = advance(f); git(f.repo, "push", "-q", "origin", "main:trunk"); return review(); },
+  });
+  assert.equal(result.state, "delivered"); untouched(f); const commit = onTip(f, tip); rebasedFrom(f, evidence(f), started);
+  assert.equal(pushed(), `refs/heads/${branch} ${commit}\nrefs/heads/trunk ${tip}`); assert.equal(git(bare, "rev-parse", "main"), started);
+  assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "trunk", "--head", branch]);
+});
+
 for (const output of ["branch", "pr"] as const) {
-  test(`a resumed run whose branch is behind a base that moved forward verifies, is approved, and delivers a ${output === "pr" ? "pull request" : "branch"} on the older commit, without rebasing`, async context => {
+  test(`a resumed run whose branch is behind a base that moved forward verifies, is approved, and is rebased onto the later commit before it delivers a ${output === "pr" ? "pull request" : "branch"}`, async context => {
     const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const again = await handOff(f);
-    // Someone commits to the base branch while the ticket is stuck. The remote does not have that commit, only the one the candidate was made from.
-    const older = f.head; writeFileSync(join(f.repo, "later.txt"), "later\n"); git(f.repo, "add", "."); git(f.repo, "commit", "-qm", "later"); f.head = git(f.repo, "rev-parse", "HEAD");
+    // Someone commits to the base branch while the ticket is stuck. A pull request needs that commit on the remote, so it is published first.
+    const older = f.head; advance(f); if (output === "pr") git(f.repo, "push", "-q", "origin", "main");
     const result = await execute(input(again, { output }, { resume: true }), {
       investigator: () => assert.fail(), implementer: () => assert.fail(),
       reviewer: request => { assert.deepEqual(readdirSync(request.cwd).sort(), [".git", "code.txt", "greeting.test.txt", "greeting.txt"]); return review("approved", "Greeting matches the ticket"); },
     });
     assert.equal(result.state, "delivered");
-    assert.deepEqual(result.states, ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
-    const commit = git(f.repo, "rev-parse", branch);
+    assert.deepEqual(result.states, ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "delivered"]);
+    const commit = onTip(f, f.head);
     const run = held(again, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
-    assert.equal(git(f.repo, "rev-parse", `${branch}^`), older); assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
-    assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", branch), "code.txt\ngreeting.test.txt\ngreeting.txt");
-    assert.deepEqual([run.delivery.baseCommit, run.delivery.commit, run.delivery.resumed, run.delivery.worktreeRemoved], [older, commit, true, true]);
-    assert.deepEqual([run.result.outcome, run.result.checksPassed, run.result.checks.map((check: any) => check.phase)], ["completed", true, ["verify"]]);
+    assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+    assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", branch), "code.txt\ngreeting.test.txt\ngreeting.txt\nlater.txt");
+    assert.deepEqual([run.delivery.baseCommit, run.delivery.commit, run.delivery.resumed, run.delivery.worktreeRemoved], [f.head, commit, true, true]);
+    // The base this run started from is the commit its branch was on.
+    rebasedFrom(f, run, older);
+    assert.deepEqual([run.result.outcome, run.result.checksPassed, phases(run)], ["completed", true, ["verify", "reverify"]]);
     if (output !== "pr") { assert.equal(pushed(), ""); assert.equal(gh(), undefined); return; }
-    // The pull request base was checked against the commit the branch is on, so the unpublished later commit neither blocks the run nor is pushed.
-    assert.equal(pushed(), `refs/heads/${branch} ${commit}`); assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "main", "--head", branch]);
+    assert.equal(pushed(), `refs/heads/main ${f.head}\nrefs/heads/${branch} ${commit}`); assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "main", "--head", branch]);
   });
 }
+
+test("a resumed pr run whose branch is behind a later base commit that is not published parks with the candidate uncommitted on the older commit, and pushes nothing", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const again = await handOff(f); const human = person();
+  // The commit the candidate was made from is on the remote, so prepare goes on; the later one is local only.
+  const older = f.head; const tip = advance(f); let before: Candidate | undefined;
+  const result = await execute(input(again, { output: "pr" }, { resume: true, stuck: "park" }), {
+    investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: request => { before = candidate(request.cwd); return review(); },
+  }, human);
+  accepted(result.states);
+  const run = parkedIn("rebase", again, result, /pushed first/iu); untouched(f);
+  uncommitted(f, run, older, before!); assert.deepEqual([run.delivery.resumed, phases(run)], [true, ["verify"]]);
+  assert.equal(pushed(), ""); assert.equal(gh(), undefined); assert.equal(git(f.repo, "rev-parse", "main"), tip); assert.deepEqual(human.requests, []);
+});
 
 /** The worktree and recorded branch an earlier run of the ticket left, without a candidate. */
 const linked = (f: Fixture) => { git(f.repo, "worktree", "add", "-q", "-b", branch, f.worktree); git(f.repo, "config", `branch.${branch}.ticket`, "proj-12"); };
@@ -1441,6 +1932,9 @@ for (const [base, forget] of [["release", ["branch", "-D", "release"]], ["origin
     const result = await execute(input(f, { output: "pr", base }), { implementer: request => { git(request.cwd, ...forget); return implement(request); } });
     assert.equal(result.state, "delivered"); untouched(f);
     assert.throws(() => git(f.repo, "rev-parse", "--verify", "--quiet", `${base}^{commit}`));
+    // rebase has no tip to compare the base commit with, so it goes on to delivery as the candidate was approved, with nothing verified again.
+    assert.deepEqual(result.states.slice(-5), ["commit", "rebase", "deliver", "success", "delivered"]);
+    assert.deepEqual([phases(evidence(f)), evidence(f).delivery.baseCommit, evidence(f).delivery.rebasedFrom], [["red", "verify"], release, undefined]);
     const commit = git(f.repo, "rev-parse", branch); assert.equal(git(f.repo, "rev-parse", `${branch}^`), release);
     assert.deepEqual(pushed().split("\n"), [`refs/heads/release ${release}`, `refs/heads/${branch} ${commit}`]);
     assert.deepEqual(gh()!.slice(0, 9), ["pr", "create", "--repo", slug, "--draft", "--base", "release", "--head", branch]);
@@ -1966,7 +2460,7 @@ test("a parked candidate resumes with fresh budgets and an approving reviewer de
     reviewer: request => { assert.match(request.prompt, /The greeting language is English/u); assert.equal(readFileSync(join(request.cwd, "greeting.txt"), "utf8"), "hello\n"); return review(); },
   }, human);
   assert.equal(result.state, "delivered");
-  assert.deepEqual(result.states, ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
+  assert.deepEqual(result.states, ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "delivered"]);
   const run = held(again, result, /^Delivered/u); untouched(f);
   assert.deepEqual([run.result.repairs, run.result.reviewRounds, run.delivery.resumed, run.delivery.worktreeRemoved], [0, 0, true, true]);
   assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello");
@@ -2168,4 +2662,21 @@ test("the catalog and the README describe falsify, plan, and planReview where th
     assert.doesNotMatch(text, /\btriage/iu, `${name} still describes triage`);
     for (const described of [/\bfalsif/iu, /\bplan\b/iu, /\bplan ?review/iu]) assert.match(text, described, name);
   }
+});
+
+test("the catalog and the README describe rebase, reverify, rebasedFrom, and the invariant that no stop leaves a commit", () => {
+  const catalog = readFileSync(resolve("docs/catalog.md"), "utf8"); const readme = readFileSync(resolve("README.md"), "utf8");
+  const named = catalog.split("\n").filter(line => line.startsWith("| `")).flatMap(line => line.split("|")[1]!.split(",").map(name => name.trim()));
+  assert.ok(named.includes("`rebase`"), "rebase has no row in the state table");
+  for (const [name, text] of [["docs/catalog.md", catalog], ["README.md", readme]] as const) {
+    // Prose wraps where it will; the words are looked for across line breaks.
+    const prose = text.replace(/\s+/gu, " ");
+    for (const described of [/`rebase`/u, /`reverify`/u, /`rebasedFrom`/u]) assert.match(prose, described, name);
+    assert.match(prose, /never stops with (?:\S+ ){1,4}commit on the ticket branch/iu, `${name} does not state the invariant`);
+    // A base that moved is rebased onto now, so neither file may still say the candidate is delivered on the older commit as it is.
+    assert.doesNotMatch(prose, /without rebasing|nothing is rebased|or rebase a candidate onto a base that moved/iu, name);
+  }
+  // A rewritten or moved-back base ends blocked for delivery by hand, and adopt goes on refusing such a branch.
+  const prose = catalog.replace(/\s+/gu, " ");
+  assert.match(prose, /moved back|rewritten/iu); assert.match(prose, /by hand/iu);
 });

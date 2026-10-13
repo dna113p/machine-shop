@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Event, MachinePrimitives } from "@dna113p/machines";
 import { taskRun, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
@@ -27,6 +27,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let branch = named;
   let baseCommit = "";
   let commitHash = "";
+  let firstApproved: { baseCommit: string; commit: string } | undefined;
+  let rebasedFrom: { baseCommit: string; commit: string } | undefined;
+  let rebaseSteps = 0;
   let created = false;
   let adopted = false;
   let removed = false;
@@ -205,7 +208,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (whose !== ticket.slug) return work.block(`Cannot resume: HEAD in ${worktree} is on ${current}, which belongs to ticket ${whose}; nothing was changed.`);
     branch = current;
     const tip = run("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`], repository.path).stdout;
-    // The base may have gone on while the ticket was stuck. The candidate stays on the commit it was made from, which this run takes as its base; nothing is rebased.
+    // Adopt the candidate on its own base; after approval, rebase compares it with the source checkout's current tip.
     if (!tip || !run("git", ["merge-base", "--is-ancestor", tip, baseCommit], repository.path).ok) {
       if (!tip || !run("git", ["merge-base", tip, baseCommit], repository.path).ok) {
         return work.block(`Cannot resume: ${branch} shares no history with the base commit ${baseCommit}; nothing was changed.`);
@@ -240,7 +243,133 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       return work.block(`A commit hook or Git configuration moved HEAD or ${branch} away from the approved commit; nothing was delivered.`);
     }
     commitHash = head;
+    firstApproved ??= { baseCommit, commit: head };
     return { type: "committed" };
+  }
+
+  /** Every new stop or return to an Agent leaves an uncommitted candidate on the ticket's own branch. */
+  function undo(onto: string): void {
+    if (run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${branch}`) {
+      git(worktree, "symbolic-ref", "HEAD", `refs/heads/${branch}`);
+    }
+    git(worktree, "reset", "--quiet", "--mixed", onto);
+    commitHash = "";
+    baseCommit = onto;
+    work.reopen();
+  }
+
+  function rebase(): Event {
+    const resolved = run("git", ["rev-parse", "--verify", "--quiet", `${repository.base ?? "HEAD"}^{commit}`], repository.path);
+    if (!resolved.ok || resolved.stdout === baseCommit) return { type: "current" };
+    const tip = resolved.stdout;
+    const original = baseCommit;
+    const approved = commitHash;
+    const stop = (reason: string): Event => { work.block(reason); return { type: "stuck" }; };
+    // Unlike attempt's one-off delivery logs, these steps may recur after repair or a Human grants more rounds.
+    const step = (args: string[], cwd = worktree, timeout?: number) => {
+      const done = run("git", args, cwd, timeout);
+      if (!done.ok) {
+        const log = join(work.open(), `rebase-${++rebaseSteps}-${args[0]}.log`);
+        writeFileSync(log, `git ${args.join(" ")}\n${done.stdout}\n${done.detail}\n`, { flag: "wx", mode: 0o600 });
+      }
+      return done;
+    };
+    const restore = () => {
+      if (["rebase-merge", "rebase-apply"].some(state => existsSync(git(worktree, "rev-parse", "--git-path", state)))) {
+        git(worktree, "rebase", "--abort");
+      }
+      // A hook may have detached HEAD or switched branches. Reattach only this ticket's branch before resetting it.
+      if (run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${branch}`) {
+        git(worktree, "symbolic-ref", "HEAD", `refs/heads/${branch}`);
+      }
+      if (git(worktree, "rev-parse", "HEAD") !== approved || pending() !== "") git(worktree, "reset", "--hard", approved);
+      undo(original);
+    };
+    if (!run("git", ["merge-base", "--is-ancestor", original, tip], repository.path).ok) {
+      undo(original);
+      return work.block(`Base ${original} was rewritten or moved back to ${tip}; the ticket must be delivered by hand.`);
+    }
+    if (repository.output === "pr") {
+      const ref = `refs/heads/${checkedBase}`;
+      const listed = step(["ls-remote", checked, ref], repository.path, publishTimeoutMs);
+      const remoteTip = listed.stdout.split("\n").map(line => line.split("\t"))
+        .find(([id, at]) => at === ref && /^[0-9a-f]{40,64}$/u.test(id ?? ""))?.[0];
+      const available = listed.ok && remoteTip && (run("git", ["cat-file", "-e", `${remoteTip}^{commit}`], repository.path).ok
+        || step(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", checked, remoteTip], repository.path, publishTimeoutMs).ok);
+      if (!available || !run("git", ["merge-base", "--is-ancestor", tip, remoteTip!], repository.path).ok) {
+        undo(original);
+        return stop(`Base ${tip} cannot be shown to be published on ${checkedBase} at ${checked}; the base must be pushed first. Inspect any rebase logs in ${work.open()}.`);
+      }
+    }
+    const patchId = (commit: string) => {
+      const diff = step(["diff-tree", "-p", "--no-ext-diff", "--no-textconv", `${commit}^`, commit]);
+      if (!diff.ok) return "";
+      // Retain both patches as evidence and feed Git a file descriptor, without a shell pipeline.
+      const patch = join(work.open(), `rebase-${++rebaseSteps}.patch`);
+      writeFileSync(patch, diff.stdout + "\n", { flag: "wx", mode: 0o600 });
+      const fd = openSync(patch, "r");
+      try {
+        const id = spawnSync("git", ["patch-id", "--stable"], {
+          cwd: worktree, stdio: [fd, "pipe", "pipe"], encoding: "utf8", timeout: 30_000, killSignal: "SIGKILL", maxBuffer: 8 * 1024 * 1024,
+        });
+        const value = !id.error && id.status === 0 ? /^[0-9a-f]{40,64}(?=\s)/u.exec(id.stdout)?.[0] ?? "" : "";
+        if (!value) writeFileSync(`${patch}.log`, `${id.stdout ?? ""}\n${id.error?.message ?? id.stderr ?? ""}\n`, { flag: "wx", mode: 0o600 });
+        return value;
+      } finally { closeSync(fd); }
+    };
+    const before = patchId(approved);
+    if (!before) {
+      undo(original);
+      return stop(`Cannot identify the approved patch for replay onto ${tip}; inspect the rebase logs in ${work.open()}.`);
+    }
+    const replay = step(["rebase", "--no-autostash", "--no-update-refs", "--onto", tip, original]);
+    if (!replay.ok) {
+      const conflicts = git(worktree, "diff", "--name-only", "--diff-filter=U");
+      restore();
+      return stop(`Replay onto ${tip} failed${conflicts ? ` with conflicts in ${conflicts.split("\n").join(", ")}` : " (Git or a hook refused it)"}. `
+        + `The approved candidate is uncommitted on ${original}; resume alone will stop again until a person ports the candidate onto the new base. Inspect rebase logs in ${work.open()}.`);
+    }
+    const count = git(worktree, "rev-list", "--count", `${tip}..HEAD`);
+    if (count === "0") {
+      restore();
+      return stop(`Base ${tip} already holds this change; the approved candidate is uncommitted on ${original}.`);
+    }
+    const head = git(worktree, "rev-parse", "HEAD");
+    const [parents, subject, ...body] = git(worktree, "log", "-1", "--no-show-signature", "--format=%P%n%s%n%b").split("\n");
+    const after = patchId(head);
+    if (count !== "1" || parents !== tip || subject !== ticket.title || !body.some(line => flat(line) === flat(`Ticket: ${ticket.id}`))
+      || pending() !== "" || !after || run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${branch}`) {
+      restore();
+      return stop(`Replay onto ${tip} did not leave exactly one clean ticket commit on ${branch} with the expected parent, subject, Ticket line, and patch id; the approved candidate was restored uncommitted on ${original}.`);
+    }
+    rebasedFrom ??= firstApproved;
+    // Setup sees a committed, clean tree as it does in prepare, so unignored outputs cannot hide among candidate changes.
+    for (const command of repository.setup) {
+      const passed = work.check(command, "setup");
+      if (git(worktree, "rev-parse", "HEAD") !== head || run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${branch}`) {
+        restore();
+        work.reopen(true);
+        return stop(`setup: ${command.name} moved HEAD or the ticket branch on base ${tip}; the approved candidate was restored uncommitted on ${original}.`);
+      }
+      if (!passed || pending() !== "") {
+        undo(tip);
+        work.reopen(true);
+        return stop(`setup: ${command.name} ${passed ? "changed tracked or unignored files" : "failed"} on base ${tip}; inspect its setup log in ${work.open()}.`);
+      }
+    }
+    if (before !== after) {
+      undo(tip);
+      work.block(`Base moved from ${original} to ${tip} and the replayed patch differs from the approved patch; verify and review this candidate again.`);
+      return { type: "review" };
+    }
+    if (work.checks("reverify").type !== "passed") {
+      undo(tip);
+      work.reopen(true);
+      return { type: "failed" };
+    }
+    commitHash = head;
+    baseCommit = tip;
+    return { type: "rebased" };
   }
 
   /** gh needs a branch name; a commit, tag, or the remote-tracking prefix is not one. */
@@ -401,6 +530,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ...(outcome === "parked" ? { park: parkDetails() } : {}),
       ticket: ticket.id, repository: { name: repository.name, path: repository.path }, branch,
       baseCommit: baseCommit || null, commit: commitHash || null, output: repository.output,
+      ...(rebasedFrom ? { rebasedFrom } : {}),
       ...(prUrl ? { prUrl } : {}), ...(patches.length ? { patches } : {}), ...(archived ? { archive: archived } : {}),
       worktree, ...(adopted ? { resumed: true } : {}), worktreeCreated: created, worktreeRemoved: removed, reviewNotes,
     }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
@@ -616,7 +746,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }, { choices: confirmations }),
       archive: operation(archive, { archived: "remove", blocked: "failure" }),
       remove: operation(remove, { removed: "abandon", blocked: "failure" }),
-      commit: operation(commit, { committed: "deliver", blocked: "failure" }),
+      commit: operation(commit, { committed: "rebase", blocked: "failure" }),
+      rebase: operation(stopped("rebase", rebase), { current: "deliver", rebased: "deliver", review: "verify", failed: "repairBudget", stuck: "stuck", blocked: "failure" }),
       deliver: operation(deliver, { delivered: "success", blocked: "failure" }),
       success: operation(() => conclude("completed"), { delivered: "delivered", blocked: "blocked" }),
       failure: operation(() => conclude("blocked"), { delivered: "delivered", blocked: "blocked" }),
