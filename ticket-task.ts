@@ -6,9 +6,9 @@ import { taskRun, parseCheck, object, text, jsonObject } from "./defaults/_machi
 import { brief, firstLine } from "./defaults/_machine-shop/brief.ts";
 import { outsideScope } from "./defaults/_machine-shop/scope.ts";
 
-export const description = "Carry one local ticket for one Git repository from an isolated worktree through triage, implementation, checks, and review to a delivered branch, patch, or draft pull request; a stuck run parks by default or asks for a Human decision.";
+export const description = "Carry one local ticket for one Git repository from an isolated worktree through falsification, planning, plan review, implementation, checks, and review to a delivered branch, patch, or draft pull request; a stuck run parks by default or asks for a Human decision.";
 export const agentRoles = {
-  investigator: "Decides whether the ticket is actionable as written, without editing",
+  investigator: "Tries to falsify the ticket, then plans its implementation without editing",
   tester: "Writes failing tests for the ticket's acceptance criteria before implementation",
   implementer: "Implements the ticket and its tests in the worktree",
   reviewer: "Reviews evidence and the resulting change without editing",
@@ -48,6 +48,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let repairing: "test" | "change" = "change";
   let scopeChecks = 0;
   let provedRed = false;
+  let planningReport: Event = { type: "sound" };
+  let plan = "";
+  let planRevisions = 0;
+  let planningNeeds: string | undefined;
 
   function scope(stage: "test" | "change"): Event {
     repairing = stage;
@@ -322,7 +326,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       : why.startsWith("Ticket owner must settle repeated discussion: ")
         ? `Answer the open question: ${why.slice("Ticket owner must settle repeated discussion: ".length)}`
         : `Clarify how to resolve this blocker: ${why}`;
-    return { needs: needs.replace(/^(.{600}).+$/u, "$1…"), next: parkNext,
+    return { needs: planningNeeds ?? needs.replace(/^(.{600}).+$/u, "$1…"), next: parkNext,
       budgets: { repairs: { used: repairs, max: maxRepairs }, reviewRounds: { used: reviewRounds, max: maxReviewRounds } } };
   }
   const parkNote = () => brief({
@@ -402,7 +406,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     const reasonBrief = flat(reason).replace(/^(.{600}).+$/u, "$1…").replace(/[^.!?…]$/u, "$&.");
     held = { action: "hold", summary: [
-      { delivered: `Delivered ${result}.`, blocked: `Blocked: ${reasonBrief}`, "handed-off": `Handed off on ${branch}: ${reasonBrief}`, abandoned: `Abandoned: ${reasonBrief}`, parked: `Parked on ${branch}: ${firstLine(parkNote())} Needs: ${parkDetails().needs}` }[outcome],
+      { delivered: `Delivered ${result}.`, blocked: `Blocked: ${reasonBrief}`, "handed-off": `Handed off on ${branch}: ${reasonBrief}`, abandoned: `Abandoned: ${reasonBrief}`, parked: `Parked on ${branch}: ${firstLine(parkNote())} Needs: ${flat(parkDetails().needs)}` }[outcome],
       ...(decision ? [`Decision: ${decision}.`] : []),
       ...(archived ? [`Candidate archived on ${archived.branch} at ${archived.commit}.`] : []),
       ...(outcome === "abandoned" ? [`Worktree and ${branch} removed${archived ? "" : " without saving the candidate"}.`] : []),
@@ -413,6 +417,43 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   }
 
   const record = (stage: string) => ({ event }: { event: Event }) => { stoppedIn = stage; work.capture(stage, event); };
+  const rememberPlanning = ({ event }: { event: Event }) => { planningReport = event; };
+  function falsifyResult(): Event {
+    if (work.unchanged().type === "changed") return { type: "blocked" };
+    const event = planningReport;
+    if (event.type === "sound") {
+      work.capture("falsify", event);
+      return { type: "sound" };
+    }
+    const questions = event.questions;
+    if (!Array.isArray(questions) || questions.length < 1 || questions.length > 10
+      || questions.some(question => typeof question !== "string" || !question.trim())) {
+      return work.block("Malformed falsify report: questions must be an array of 1–10 non-empty strings.");
+    }
+    planningNeeds = questions.join("\n");
+    work.capture("falsify", { ...event, summary: typeof event.summary === "string" && event.summary.trim() ? event.summary : planningNeeds });
+    return work.block(planningNeeds);
+  }
+  function planResult(): Event {
+    if (work.unchanged().type === "changed") return { type: "blocked" };
+    if (typeof planningReport.summary !== "string" || !planningReport.summary.trim() || planningReport.summary.length > 4000) {
+      return work.block("Malformed plan report: summary must be a non-empty plan of at most 4000 characters.");
+    }
+    plan = planningReport.summary;
+    work.capture("plan", planningReport);
+    return { type: "planned" };
+  }
+  function planReviewResult(): Event {
+    if (work.unchanged().type === "changed") return { type: "blocked" };
+    const summary = work.capture("planReview", planningReport);
+    if (planningReport.type === "approved") {
+      work.block("");
+      return { type: "approved" };
+    }
+    if (planRevisions++ === 0) return { type: "revise" };
+    planningNeeds = summary;
+    return work.block(summary);
+  }
   const recordReview = ({ event }: { event: Event }) => {
     reviewSummary = work.capture("review", event);
     reviews.push(event);
@@ -478,14 +519,27 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       shape: operation(shape, { prepared: "prepare", blocked: "failure" }),
       // A resumed candidate is held to the Scope as a fresh one is; red cannot be proved again once it is implemented.
       prepare: operation(prepare, { prepared: "start", resumed: "scopeAfterChange", blocked: "failure" }),
-      start: operation(work.start, { started: "triage" }),
-      triage: agent(() => work.prompt("Decide whether this ticket is actionable as written. Do not edit any file. Read the relevant code and judge whether the request, scope, and acceptance criteria are specific enough to implement and test in this repository. Return ready with a short implementation plan as the summary, or blocked with exactly what is missing."), {
-        ready: { target: "triageResult", actions: record("triage") },
-        blocked: { target: "stuck", actions: record("triage") },
+      start: operation(work.start, { started: "falsify" }),
+      falsify: agent(() => work.prompt("Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 non-empty strings giving the exact questions a person must answer."), {
+        sound: { target: "falsifyResult", actions: rememberPlanning },
+        questions: { target: "falsifyResult", actions: rememberPlanning },
       }, { using: "investigator", cwd: worktree }),
-      triageResult: operation(stopped("triageResult", work.unchanged), { unchanged: redGreen ? "test" : "change", changed: "stuck" }),
+      falsifyResult: operation(stopped("falsifyResult", falsifyResult), { sound: "plan", blocked: "stuck" }),
+      plan: agent(() => work.prompt("Plan the implementation of this sound ticket. Do not edit any file. Cover the acceptance criteria, tests, permitted paths, and required checks. Address any plan review feedback in the stage reports. Return planned with the complete plan as the summary, at most 4000 characters."), {
+        planned: { target: "planResult", actions: rememberPlanning },
+      }, { using: "investigator", cwd: worktree }),
+      planResult: operation(stopped("planResult", planResult), { planned: "planReview", blocked: "stuck" }),
+      planReview: agent(() => work.prompt([
+        "Review the plan against the ticket, relevant code, scope, acceptance criteria, and tests. Do not edit any file. Return approved with a summary if it is ready to implement, or revise with a summary of what must change. Only one revision of the plan is allowed.",
+        "Plan:", plan,
+      ].join("\n")), {
+        approved: { target: "planReviewResult", actions: rememberPlanning },
+        revise: { target: "planReviewResult", actions: rememberPlanning },
+      }, { using: "reviewer", cwd: worktree }),
+      planReviewResult: operation(stopped("planReviewResult", planReviewResult), { approved: redGreen ? "test" : "change", revise: "plan", blocked: "stuck" }),
       test: agent(() => work.prompt([
         "Write only tests that encode the acceptance criteria below, one or more per criterion, inside the Scope paths below. Do not implement anything and do not change non-test files. The tests must fail now and pass once the ticket is implemented. Leave changes uncommitted.",
+        ...(plan ? ["Plan:", plan] : []),
         "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
         "Scope:", ...ticket.sections.scope.map(text => `- ${text}`),
         cannotRun,
@@ -501,7 +555,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         return result;
       }, { passed: "change", failed: "repairBudget" }),
       change: agent(() => work.prompt([
-        "Implement the ticket and its tests, following the triage plan in the stage reports. Keep the change focused. Do not weaken checks or expand scope. Leave your changes uncommitted; the workflow commits and delivers them.",
+        "Implement the ticket and its tests. Keep the change focused. Do not weaken checks or expand scope. Leave your changes uncommitted; the workflow commits and delivers them.",
+        ...(plan ? ["Plan:", plan] : []),
         ...(redGreen ? ["The tester's tests in the stage reports are the contract; make them pass without weakening or deleting them. If a test is wrong, say so in the summary rather than changing its intent."] : []),
         "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
         "Scope (the only paths you may change; the workflow checks them):", ...ticket.sections.scope.map(text => `- ${text}`),
@@ -544,6 +599,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           // Back to whichever stage was being repaired: the tester after a failed red, else the implementer.
           { guard: chose("more rounds"), target: "repairTarget", actions: (args: { event: Event }) => {
             decide(args); work.renew();
+            planningNeeds = undefined;
             if (standingReview !== undefined) work.block(standingReview);
             standingReview = undefined;
           } },

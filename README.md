@@ -170,7 +170,18 @@ Indented continuations and nested bullets join their parent item with single
 spaces. Thematic breaks and subheadings do not count as bullets; subheadings
 stay within the current section.
 
-By default (`redGreen: true`), a `tester` writes acceptance tests first. The
+Before editing, `falsify` asks the investigator to show that the ticket is wrong,
+already done, impossible here, or underspecified. It returns `sound` with a
+one-paragraph summary or `questions` with 1–10 non-empty questions a person must
+answer. Questions go through the stuck policy and become the park note's exact
+`needs`, one per line. A sound ticket proceeds to `plan`: the investigator returns
+`planned` with a plan of at most 4000 characters, recorded as stage `plan`.
+In `planReview`, the reviewer approves it or requests one revision; a second
+`revise` goes through the stuck policy with the reviewer's summary as `needs`.
+An unchanged-worktree guard follows each of these read-only stages.
+The tester and implementer receive the approved plan verbatim under `Plan:`.
+
+By default (`redGreen: true`), a `tester` then writes acceptance tests first. The
 Machine checks their paths against Scope and proves they fail using the named
 `repository.redCheck` gate (default `"tests"`, which must exist in `checks`).
 The implementer then makes them pass without weakening or deleting them, and
@@ -197,8 +208,8 @@ It writes `park.txt` and `delivery.json` with what needs an answer and how to
 resume. Failed red, scope, and green gates use `maxRepairs` (0–3, default 3);
 review revisions use `maxReviewRounds` (0–5, default 2). The budgets are independent.
 
-When either budget is exhausted, or triage, testing, implementation, or review
-blocks, the `stuck` Operation chooses parking or, with `stuck: "ask"`, the Human state
+When either budget is exhausted, or falsification, planning, testing, implementation,
+or review blocks, the `stuck` Operation chooses parking or, with `stuck: "ask"`, the Human state
 `decide`. Read-only stage edits also go through this policy. Every Human prompt
 and park note uses one brief helper: decision first (at most ten words), then
 the ticket's standing, stopped state, reason, both budgets, evidence locations,
@@ -223,7 +234,7 @@ choices remain:
 
 Failures while preparing the worktree, committing, or delivering still end
 `blocked` without asking. `"resume": true` starts a new run in the uncommitted
-worktree a park or `hand off` left behind: it skips triage and setup, and goes straight
+worktree a park or `hand off` left behind: it skips `falsify`, `plan`, `planReview`, and setup, and goes straight
 to the checks, review, commit, and delivery with fresh budgets. The
 base branch may have moved forward in the meantime: the ticket branch must point
 at the base commit or an ancestor of it, with no commit of its own, and the run

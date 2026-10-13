@@ -81,6 +81,21 @@ const tester = (request: { cwd: string }) => {
 };
 const implement = (request: { cwd: string }) => { writeFileSync(join(request.cwd, "greeting.txt"), "hello\n"); return ok(); };
 type Ask = { prompt: string; choices?: readonly string[] };
+type Request = { prompt: string; cwd: string; outcomes: readonly string[] };
+type Runner = (request: Request) => unknown;
+// Quotes, a backslash, and line breaks show whether a prompt carries the plan as it was written or as JSON.
+const plan = 'Write "hello" to greeting.txt:\n1. Cover it in greeting.test.txt with a path\\name check.\n2. Add greeting.txt.';
+/** The read-only states ahead of the work, the role each uses, and what its Agent answers unless a test replaces it by the state's name. */
+const planning: Record<string, { role: string; answer: Runner }> = {
+  falsify: { role: "investigator", answer: () => ok("sound", "The ticket names its file and what the file must contain") },
+  plan: { role: "investigator", answer: () => ok("planned", plan) },
+  planReview: { role: "reviewer", answer: () => ok("approved", "The plan covers the criterion") },
+};
+const isPlanning = (state: string) => Object.hasOwn(planning, state);
+/** The read-only states a run has gone through once it reaches this one. */
+const upTo = (state: string) => Object.keys(planning).slice(0, Object.keys(planning).indexOf(state) + 1);
+/** The plan a prompt carries: what follows its own `Plan:` heading line. */
+const planIn = (prompt: string) => prompt.split(/^Plan:\n+/mu)[1] ?? "";
 /** Answers Human requests in order and keeps what each one showed; one more request than answers fails the run. */
 function person(...answers: (string | (() => string))[]) {
   const requests: Ask[] = [];
@@ -91,10 +106,27 @@ function person(...answers: (string | (() => string))[]) {
     return typeof next === "string" ? next : next();
   }, { requests });
 }
-async function execute(assignment: unknown, agents = {}, human: (request: Ask) => string = person()) {
+/**
+ * Agents are given by role, where `reviewer` is the review of the implementation, or by state name for falsify, plan, and planReview;
+ * `investigator` stands for both of that role's states, which is how a test says that neither may run.
+ */
+async function execute(assignment: unknown, agents: Record<string, Runner> = {}, human: (request: Ask) => string = person()) {
   const states: string[] = [];
+  const working: Record<string, Runner> = {
+    tester, implementer: implement, reviewer: () => review("approved", "Greeting matches the ticket"),
+    investigator: () => assert.fail(`the investigator has no work in ${states.at(-1)}`), ...agents,
+  };
+  // The runtime starts a runner before it reports the state that asked, so each waits a turn to learn which one it serves.
+  const staged = (role: string) => async (request: Request) => {
+    await Promise.resolve();
+    const state = states.at(-1)!;
+    if (!isPlanning(state)) return working[role]!(request);
+    const stage = planning[state]!;
+    assert.equal(role, stage.role, `${state} uses the ${stage.role} role`);
+    return (agents[state] ?? (role === "investigator" ? agents.investigator : undefined) ?? stage.answer)(request);
+  };
   const result = await runtime.run(mod.default(runtime, assignment), {
-    agents: { tester, investigator: () => ok("ready", "Plan: add greeting.txt"), implementer: implement, reviewer: () => review("approved", "Greeting matches the ticket"), ...agents },
+    agents: Object.fromEntries(["tester", "investigator", "implementer", "reviewer"].map(role => [role, staged(role)])),
     human, onState: state => states.push(String(state)),
   });
   return { state: result.value, output: result.output as any, states };
@@ -160,7 +192,10 @@ function parked(f: Fixture, result: { state: unknown; output: any; states: strin
   assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
   assert.ok(result.output.summary.includes(`Worktree kept at ${f.worktree}. Evidence: `));
   const note = readFileSync(join(run.directory, "park.txt"), "utf8");
-  assert.ok(result.output.summary.startsWith(`Parked on ${branch}: ${note.split("\n")[0]} Needs: ${run.delivery.park.needs}`));
+  // What is needed can be several lines, as a falsified ticket's questions are; the hold stays one line and still carries each of them.
+  const needs: string[] = run.delivery.park.needs.split("\n");
+  assert.ok(result.output.summary.startsWith(`Parked on ${branch}: ${note.split("\n")[0]} Needs: ${needs[0]}`));
+  for (const need of needs) assert.ok(result.output.summary.includes(need), need);
   assert.ok(note.includes(`Needs: ${run.delivery.park.needs}\n`)); assert.ok(note.includes(run.delivery.park.next));
   assert.ok(note.includes(`Worktree: ${f.worktree}\nBranch: ${branch}\nEvidence: ${run.directory}`));
   assert.ok(note.includes(`Stopped in ${result.states.at(-4)}.`));
@@ -186,6 +221,9 @@ test("construction has no effects and declares exactly the four roles", context 
     assert.deepEqual(runtime.requiredAgentNames(mod.default(runtime, data)), ["implementer", "investigator", "reviewer", "tester"]);
   }
   assert.deepEqual(Object.keys(mod.agentRoles).sort(), ["implementer", "investigator", "reviewer", "tester"]);
+  const states = Object.keys(mod.default(runtime, input(f)).states);
+  for (const state of ["falsify", "plan", "planReview"]) assert.ok(states.includes(state), state);
+  for (const state of ["triage", "triageResult"]) assert.equal(states.includes(state), false, state);
   assert.deepEqual(readdirSync(f.root), ["widgets"]);
   assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), "main"); untouched(f);
 });
@@ -510,14 +548,18 @@ for (const output of ["branch", "patch", "pr"]) {
         assert.match(request.prompt, /Do not implement anything and do not change non-test files/u);
         assert.match(request.prompt, /one or more per criterion/u);
         assert.match(request.prompt, /Leave changes uncommitted/u);
+        assert.ok(planIn(request.prompt).startsWith(`${plan}\n`));
         return tester(request);
       },
-      investigator: request => { assert.equal(request.cwd, f.worktree); assert.match(request.prompt, /Ticket PROJ-12: Add a greeting\n\n## Goal\nWrite hello/u); return ok("ready", "Plan: add greeting.txt"); },
-      implementer: request => { assert.equal(request.cwd, f.worktree); assert.match(request.prompt, /Plan: add greeting\.txt/u); assert.match(request.prompt, /without weakening or deleting them/u); assert.match(request.prompt, /If a test is wrong, say so in the summary/u); assert.match(request.prompt, /uncommitted/u); return implement(request); },
+      falsify: request => { assert.equal(request.cwd, f.worktree); assert.match(request.prompt, /Ticket PROJ-12: Add a greeting\n\n## Goal\nWrite hello/u); return planning.falsify!.answer(request); },
+      implementer: request => { assert.equal(request.cwd, f.worktree); assert.ok(planIn(request.prompt).startsWith(`${plan}\n`)); assert.match(request.prompt, /without weakening or deleting them/u); assert.match(request.prompt, /If a test is wrong, say so in the summary/u); assert.match(request.prompt, /uncommitted/u); return implement(request); },
       reviewer: request => { assert.equal(request.cwd, f.worktree); assert.match(request.prompt, /Do not edit/u); assert.match(request.prompt, /Machine saw them fail/u); return review("approved", "Greeting matches the ticket"); },
     });
     assert.equal(result.state, "delivered");
-    assert.deepEqual(result.states, ["shape", "prepare", "start", "triage", "triageResult", "test", "scopeAfterTest", "red", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
+    assert.deepEqual(result.states.slice(0, 4), ["shape", "prepare", "start", "falsify"]);
+    // The Operations that follow the three read-only states are the Machine's own; the ticket names only the Agent states and their order.
+    assert.deepEqual(result.states.slice(0, result.states.indexOf("test")).filter(isPlanning), ["falsify", "plan", "planReview"]);
+    assert.deepEqual(result.states.slice(result.states.indexOf("test")), ["test", "scopeAfterTest", "red", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
     const commit = git(f.repo, "rev-parse", branch);
     const run = held(f, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
     assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", branch), "Add a greeting\nTicket: PROJ-12");
@@ -533,9 +575,10 @@ for (const output of ["branch", "patch", "pr"]) {
       ...(output === "pr" ? { prUrl: url } : {}), ...(output === "patch" ? { patches: [join(run.directory, "0001-Add-a-greeting.patch")] } : {}),
       worktree: f.worktree, worktreeCreated: true, worktreeRemoved: true, reviewNotes: [],
     });
-    assert.deepEqual([run.result.workflow, run.result.outcome, run.result.checksPassed, run.result.agentInvocations], ["ticket-task", "completed", true, 4]);
+    assert.deepEqual([run.result.workflow, run.result.outcome, run.result.checksPassed, run.result.agentInvocations], ["ticket-task", "completed", true, 6]);
     assert.deepEqual(run.result.checks.map(check => [check.phase, check.expected, check.passed]), [["red", "nonzero exit", true], ["verify", "exit 0", true]]);
-    assert.equal(run.result.agents[1].stage, "test");
+    assert.deepEqual(run.result.agents.map((agent: any) => agent.outcome), ["sound", "planned", "approved", "completed", "completed", "approved"]);
+    assert.deepEqual(run.result.agents[1], { stage: "plan", outcome: "planned", summary: plan }); assert.equal(run.result.agents[3].stage, "test");
     assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-1.json"), "utf8")), { stage: "test", changed: ["greeting.test.txt"], outside: [] });
     assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-2.json"), "utf8")), { stage: "change", changed: ["greeting.test.txt", "greeting.txt"], outside: [] });
     assert.ok(run.result.checks.every(c => c.passed && c.log.startsWith(run.directory) && existsSync(c.log)));
@@ -603,7 +646,7 @@ test("setup commands run in the worktree before any Agent and are kept as eviden
   writeFileSync(join(f.repo, ".gitignore"), "deps/\n"); git(f.repo, "add", "."); git(f.repo, "commit", "-qm", "ignore deps"); f.head = git(f.repo, "rev-parse", "HEAD");
   const install = 'require("fs").mkdirSync("deps");require("fs").writeFileSync("deps/installed","x");console.log(process.cwd())';
   const result = await execute(input(f, { setup: [command(install, { name: "install" })] }), {
-    investigator: request => { assert.ok(existsSync(join(request.cwd, "deps/installed"))); return ok("ready"); },
+    falsify: request => { assert.ok(existsSync(join(request.cwd, "deps/installed"))); return planning.falsify!.answer(request); },
   });
   assert.equal(result.state, "delivered"); untouched(f);
   const run = evidence(f); const [setup, red, verify] = run.result.checks;
@@ -654,17 +697,150 @@ for (const [label, occupy, found] of [
   });
 }
 
-test("a ticket that triage finds unactionable waits for a decision with what is missing", async context => {
-  const f = fixture(context); const human = person("hand off");
-  const result = await execute(input(f), { investigator: () => ok("blocked", "Acceptance criteria\nare missing"), implementer: () => assert.fail(), reviewer: () => assert.fail() }, human);
-  handedOff(f, result, /Acceptance criteria\s+are missing/u, human);
-  assert.ok(result.output.summary.startsWith(`Handed off on ${branch}: Acceptance criteria are missing. Decision: hand off. Worktree kept at ${f.worktree}. Evidence: `));
+test("a sound ticket is planned, reviewed, and delivered with the approved plan in the tester's and the implementer's prompts", async context => {
+  const f = fixture(context); const calls: string[] = []; const prompts: Record<string, string> = {};
+  const result = await execute(input(f, {}, { stuck: "park" }), {
+    falsify: request => {
+      calls.push("falsify"); assert.equal(request.cwd, f.worktree); assert.deepEqual([...request.outcomes].sort(), ["questions", "sound"]);
+      assert.match(request.prompt, /Ticket PROJ-12: Add a greeting\n\n## Goal\nWrite hello/u);
+      for (const asked of [/\bsound\b/u, /one[- ]paragraph summary/iu, /\bquestions\b/u, /\barray\b/iu, /\bperson\b/iu]) assert.match(request.prompt, asked);
+      return ok("sound", "The ticket names its file and what the file must contain");
+    },
+    plan: request => { calls.push("plan"); assert.equal(request.cwd, f.worktree); assert.deepEqual(request.outcomes, ["planned"]); return ok("planned", plan); },
+    planReview: request => {
+      calls.push("planReview"); assert.equal(request.cwd, f.worktree); assert.deepEqual([...request.outcomes].sort(), ["approved", "revise"]);
+      assert.ok(request.prompt.includes("Cover it in greeting.test.txt"));
+      return ok("approved", "The plan covers the criterion");
+    },
+    tester: request => { calls.push("tester"); prompts.tester = request.prompt; return tester(request); },
+    implementer: request => { calls.push("implementer"); prompts.implementer = request.prompt; return implement(request); },
+    reviewer: () => { calls.push("reviewer"); return review(); },
+  });
+  assert.equal(result.state, "delivered"); assert.deepEqual(calls, ["falsify", "plan", "planReview", "tester", "implementer", "reviewer"]);
+  for (const role of ["tester", "implementer"]) assert.ok(planIn(prompts[role]!).startsWith(`${plan}\n`), role);
+  const run = held(f, result, /^Delivered/u);
+  assert.deepEqual(run.result.agents[1], { stage: "plan", outcome: "planned", summary: plan });
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "agent-2.json"), "utf8")), { stage: "plan", outcome: "planned", summary: plan });
+  assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
 });
 
-test("triage that edits the worktree waits for a decision before implementation", async context => {
+for (const policy of ["park", undefined]) {
+  test(`${policy ?? "default"} stuck policy parks a ticket falsified with two questions on those questions, with the worktree unedited`, async context => {
+    const f = fixture(context); const human = person();
+    const questions = ["Which language is the greeting in?", "Does greeting.txt replace code.txt or stand beside it?"];
+    const data = input(f);
+    if (policy === undefined) Reflect.deleteProperty(data, "stuck"); else data.stuck = policy;
+    const result = await execute(data, {
+      falsify: () => ({ type: "questions", summary: "The ticket leaves two things open", questions }),
+      plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+    }, human);
+    const run = parked(f, result, /\S/u, human);
+    assert.deepEqual(run.delivery.park.needs.split("\n"), questions);
+    assert.ok(readFileSync(join(run.directory, "park.txt"), "utf8").includes(`Needs: ${questions[0]}\n${questions[1]}\n`));
+    for (const question of questions) assert.ok(result.output.summary.includes(question), question);
+    assert.equal(result.states[3], "falsify"); assert.equal(result.states.some(state => state === "plan" || state === "planReview" || state === "test" || state === "change"), false);
+    assert.deepEqual(candidate(f.worktree), { status: "", files: [["code.txt", 0, Buffer.from("old").toString("base64")]] });
+    assert.deepEqual(run.result.checks, []);
+  });
+}
+
+test("ten questions are the most a falsified ticket parks with, and all ten are kept", async context => {
+  const f = fixture(context); const human = person();
+  const questions = Array.from({ length: 10 }, (_, index) => `What does part ${index + 1} of the greeting say?`);
+  const result = await execute(input(f, {}, { stuck: "park" }), { falsify: () => ({ type: "questions", summary: "The ticket leaves ten things open", questions }), plan: () => assert.fail() }, human);
+  const run = parked(f, result, /\S/u, human);
+  assert.deepEqual(run.delivery.park.needs.split("\n"), questions);
+});
+
+for (const [label, questions] of [
+  ["left out", undefined], ["a string rather than an array", "Which language is the greeting in?"], ["an empty array", []],
+  ["an array holding a blank string", ["Which language is the greeting in?", " \n"]], ["an array holding a value that is not a string", ["Which language is the greeting in?", 7]],
+  ["an array of eleven", Array.from({ length: 11 }, (_, index) => `What does part ${index + 1} of the greeting say?`)],
+] as const) {
+  test(`a falsify report whose questions field is ${label} parks with the field named`, async context => {
+    const f = fixture(context); const human = person();
+    const result = await execute(input(f, {}, { stuck: "park" }), {
+      falsify: () => ({ type: "questions", summary: "The ticket leaves the language open", ...(questions === undefined ? {} : { questions }) }),
+      plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+    }, human);
+    // Nothing the Agent wrote says "questions", so the word can only be the Machine naming the field.
+    const run = parked(f, result, /\bquestions\b/u, human);
+    assert.doesNotMatch(run.delivery.park.needs, /What does part 11/u);
+    assert.equal(candidate(f.worktree).status, ""); assert.deepEqual(run.result.checks, []);
+  });
+}
+
+test("a plan the reviewer sends back once is planned again with that review, whatever the budgets, and the approved plan is the one worked from", async context => {
+  const f = fixture(context); const plans: string[] = []; const planReviews: string[] = []; const prompts: string[] = [];
+  const first = "Add greeting.txt and nothing else.";
+  const result = await execute(input(f, {}, { stuck: "park", maxRepairs: 0, maxReviewRounds: 0 }), {
+    plan: request => { plans.push(request.prompt); return ok("planned", plans.length === 1 ? first : plan); },
+    planReview: request => { planReviews.push(request.prompt); return planReviews.length === 1 ? ok("revise", "Name the test that proves the greeting") : ok("approved", "The plan now names its test"); },
+    tester: request => { prompts.push(request.prompt); return tester(request); },
+    implementer: request => { prompts.push(request.prompt); return implement(request); },
+  });
+  assert.equal(result.state, "delivered"); assert.deepEqual([plans.length, planReviews.length, prompts.length], [2, 2, 2]);
+  assert.deepEqual(result.states.slice(0, result.states.indexOf("test")).filter(isPlanning), ["falsify", "plan", "planReview", "plan", "planReview"]);
+  assert.equal(plans[0]!.includes("Name the test that proves the greeting"), false); assert.ok(plans[1]!.includes("Name the test that proves the greeting"));
+  assert.ok(planReviews[0]!.includes(first)); assert.ok(planReviews[1]!.includes("Cover it in greeting.test.txt"));
+  for (const prompt of prompts) { assert.ok(planIn(prompt).startsWith(`${plan}\n`)); assert.equal(planIn(prompt).startsWith(first), false); }
+  const run = held(f, result, /^Delivered/u);
+  // Sending a plan back is not a review round of the implementation: neither budget is spent on it.
+  assert.deepEqual([run.result.repairs, run.result.reviewRounds], [0, 0]);
+  assert.deepEqual(run.result.agents.filter((agent: any) => agent.stage === "plan").map((agent: any) => agent.summary), [first, plan]);
+});
+
+test("a plan the reviewer sends back twice parks with the reviewer's summary as what is needed, before anything is edited", async context => {
+  const f = fixture(context); const human = person(); let plans = 0; let planReviews = 0;
+  const result = await execute(input(f, {}, { stuck: "park" }), {
+    plan: () => ok("planned", `Attempt ${++plans}: add greeting.txt.`),
+    planReview: () => ok("revise", ++planReviews === 1 ? "Name the test that proves the greeting" : "The plan still names no test"),
+    tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+  }, human);
+  const run = parked(f, result, /\S/u, human);
+  assert.deepEqual([plans, planReviews], [2, 2]);
+  assert.ok(run.delivery.park.needs.includes("The plan still names no test")); assert.ok(result.output.summary.includes("The plan still names no test"));
+  assert.doesNotMatch(run.delivery.park.needs, /Name the test that proves the greeting/u);
+  assert.deepEqual(result.states.filter(isPlanning), ["falsify", "plan", "planReview", "plan", "planReview"]);
+  assert.equal(candidate(f.worktree).status, ""); assert.deepEqual(run.result.checks, []);
+});
+
+test("a plan of 4000 characters is carried whole, and one of 4001 never reaches the tester or the implementer", async context => {
+  for (const length of [4000, 4001]) {
+    const f = fixture(context); const long = "p".repeat(length); let edits = 0;
+    const counted = (work: Runner): Runner => request => { edits++; assert.ok(planIn(request.prompt).startsWith(`${long}\n`)); return work(request); };
+    // Whether the run fails outright or the stuck policy takes it is the Machine's choice; either way it says the limit and edits nothing.
+    const [state, said] = await execute(input(f, {}, { stuck: "park" }), { plan: () => ok("planned", long), tester: counted(tester), implementer: counted(implement) })
+      .then(done => [done.state, evidence(f).delivery.reason ?? ""], error => ["failed", String(error.message)]);
+    if (length === 4000) { assert.deepEqual([state, edits], ["delivered", 2]); continue; }
+    assert.notEqual(state, "delivered"); assert.equal(edits, 0); assert.match(said, /4000/u);
+    assert.equal(candidate(f.worktree).status, ""); assert.equal(git(f.repo, "rev-parse", branch), f.head);
+  }
+});
+
+for (const state of ["falsify", "plan", "planReview"]) {
+  test(`${state} editing the worktree waits for a decision before any later Agent`, async context => {
+    const f = fixture(context); const human = person("hand off"); const calls: string[] = [];
+    const reading = (name: string): Runner => request => {
+      calls.push(name);
+      if (name === state) writeFileSync(join(request.cwd, "code.txt"), "edited");
+      return planning[name]!.answer(request);
+    };
+    const result = await execute(input(f), {
+      falsify: reading("falsify"), plan: reading("plan"), planReview: reading("planReview"),
+      tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+    }, human);
+    handedOff(f, result, /read-only stage/u, human);
+    assert.deepEqual(calls, upTo(state));
+    assert.equal(readFileSync(join(f.worktree, "code.txt"), "utf8"), "edited");
+  });
+}
+
+test("a tester blocker waits for a decision with what is missing, before any implementation", async context => {
   const f = fixture(context); const human = person("hand off");
-  const result = await execute(input(f), { investigator: request => { writeFileSync(join(request.cwd, "code.txt"), "edited"); return ok("ready"); }, implementer: () => assert.fail(), reviewer: () => assert.fail() }, human);
-  handedOff(f, result, /read-only stage/u, human);
+  const result = await execute(input(f), { tester: () => ok("blocked", "Acceptance criteria\nare missing"), implementer: () => assert.fail(), reviewer: () => assert.fail() }, human);
+  handedOff(f, result, /Acceptance criteria\s+are missing/u, human);
+  assert.ok(result.output.summary.startsWith(`Handed off on ${branch}: Acceptance criteria are missing. Decision: hand off. Worktree kept at ${f.worktree}. Evidence: `));
 });
 
 test("an implementer blocker waits for a decision without green checks, review, or a commit", async context => {
@@ -758,7 +934,7 @@ test("more rounds restarts the budget with the standing findings, and an approva
   const commit = git(f.repo, "rev-parse", branch);
   const run = held(f, result, new RegExp(`^Delivered ${branch} at ${commit}\\. Decision: more rounds\\. Evidence: `, "u")); untouched(f);
   assert.deepEqual([run.delivery.outcome, run.delivery.decision, run.delivery.commit, run.delivery.worktreeRemoved], ["delivered", "more rounds", commit, true]);
-  assert.deepEqual([run.result.outcome, run.result.repairs, run.result.reviewRounds, run.result.agentInvocations], ["completed", 0, 1, 8]);
+  assert.deepEqual([run.result.outcome, run.result.repairs, run.result.reviewRounds, run.result.agentInvocations], ["completed", 0, 1, 10]);
   assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }]);
   assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello 3"); assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head);
   assert.equal(existsSync(f.worktree), false);
@@ -845,8 +1021,8 @@ test("a candidate that does not differ from its base is not archived, and nothin
   const f = fixture(context);
   writeFileSync(join(f.repo, ".gitignore"), "*.log\n"); git(f.repo, "add", "."); git(f.repo, "commit", "-qm", "ignore"); f.head = git(f.repo, "rev-parse", "HEAD");
   // An ignored file is no difference: delivery would not have committed it either.
-  const human = person(() => { writeFileSync(join(f.worktree, "debug.log"), "what the investigator learned\n"); return "archive"; });
-  const result = await execute(input(f), { investigator: () => ok("blocked", "The ticket names no file"), implementer: () => assert.fail(), reviewer: () => assert.fail() }, human);
+  const human = person(() => { writeFileSync(join(f.worktree, "debug.log"), "what the tester learned\n"); return "archive"; });
+  const result = await execute(input(f), { tester: () => ok("blocked", "The ticket names no file"), implementer: () => assert.fail(), reviewer: () => assert.fail() }, human);
   const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: the candidate does not differ from its base commit ${f.head}, so there is nothing to archive; discard removes it`, "u"));
   assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
   assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.doesNotMatch(result.output.summary, /archived on/u);
@@ -1034,10 +1210,10 @@ async function handOff(f: Fixture) {
   return { ...f, evidence: join(f.root, "evidence-resumed") };
 }
 
-test("a resumed run verifies, reviews, and delivers the candidate a handed-off run left, without triage or setup", async context => {
+test("a resumed run verifies, reviews, and delivers the candidate a handed-off run left, without falsify, plan, plan review, or setup", async context => {
   const f = fixture(context); const again = await handOff(f);
   const result = await execute(input(again, { setup: [command("process.exit(1)", { name: "install" })] }, { resume: true }), {
-    investigator: () => assert.fail(), implementer: () => assert.fail(),
+    investigator: () => assert.fail(), planReview: () => assert.fail(), implementer: () => assert.fail(),
     reviewer: request => { assert.equal(request.cwd, f.worktree); assert.equal(readFileSync(join(request.cwd, "greeting.txt"), "utf8"), "hello\n"); return review("approved", "Greeting matches the ticket"); },
   });
   assert.equal(result.state, "delivered");
@@ -1049,6 +1225,17 @@ test("a resumed run verifies, reviews, and delivers the candidate a handed-off r
   assert.equal(existsSync(f.worktree), false); assert.equal(git(f.repo, "worktree", "list").split("\n").length, 1);
   assert.deepEqual([run.delivery.outcome, run.delivery.resumed, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.decision], ["delivered", true, false, true, undefined]);
   assert.deepEqual([run.result.checks.map((check: any) => check.phase), run.result.repairs, run.result.agentInvocations], [["verify"], 0, 1]);
+});
+
+test("a resumed run reaches scopeAfterChange without falsify, plan, or planReview", async context => {
+  const f = fixture(context); const again = await handOff(f);
+  const result = await execute(input(again, {}, { resume: true }), {
+    falsify: () => assert.fail(), plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(),
+  });
+  assert.equal(result.state, "delivered");
+  assert.deepEqual(result.states.slice(0, 3), ["shape", "prepare", "scopeAfterChange"]);
+  assert.deepEqual(result.states.filter(isPlanning), []);
+  assert.deepEqual(evidence(again).result.agents.map((agent: any) => agent.stage), ["review"]);
 });
 
 test("a resumed run whose review asks for changes repairs within a fresh budget", async context => {
@@ -1565,7 +1752,8 @@ test("a review returned as a JSON object is written as prose in the pull request
   assert.equal(readFileSync(join(run.directory, "pull-request.md"), "utf8"),
     "Add a greeting\n\n## Summary\n\nWrite hello to greeting.txt.\n\n## Checks\n\n- tests: passed\n\n## Review\n\nGreeting matches the ticket.\n\nNo findings.\n\nTicket: PROJ-12\n");
   const stage = { stage: "review", outcome: "approved", summary: "Greeting matches the ticket.\n\nNo findings." };
-  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "agent-4.json"), "utf8")), stage); assert.deepEqual(run.result.agents[3], stage);
+  // The review is the last report, whatever the states before it reported.
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, `agent-${run.result.agents.length}.json`), "utf8")), stage); assert.deepEqual(run.result.agents.at(-1), stage);
 });
 
 test("a review that is a JSON object without a summary never reaches the pull request body", async context => {
@@ -1575,7 +1763,7 @@ test("a review that is a JSON object without a summary never reaches the pull re
   const body = readFileSync(join(evidence(f).directory, "pull-request.md"), "utf8");
   assert.match(body, /## Review\n\nThe reviewer approved this change without a written summary; its report is kept with the run evidence\.\n\nTicket: PROJ-12\n$/u);
   assert.doesNotMatch(body, /[{}]|findings/u);
-  assert.equal(evidence(f).result.agents[3].summary, '{"outcome":"approved","findings":[]}');
+  assert.equal(evidence(f).result.agents.at(-1).summary, '{"outcome":"approved","findings":[]}');
 });
 
 test("review findings returned as a JSON object reach the implementer and the Human as prose", async context => {
@@ -1682,7 +1870,7 @@ test("ticketSections counts a list that starts at a different indent after a sub
 
 
 for (const policy of ["park", undefined]) {
-  for (const cause of ["triage", "implementer", "gates", "review budget", "reviewer", "discussion", "criterion", "triage drift", "review drift"]) {
+  for (const cause of ["implementer", "gates", "review budget", "reviewer", "discussion", "criterion", "falsify drift", "plan drift", "planReview drift", "review drift"]) {
     test(`${policy ?? "default"} stuck policy parks on ${cause} without a Human and preserves the candidate`, async context => {
       const f = fixture(context); const human = person(); let before: unknown; let reviews = 0;
       const reason = cause === "gates" ? /Repair budget exhausted \(0\)/u : cause === "review budget" ? /Review budget exhausted \(0\)/u
@@ -1692,14 +1880,17 @@ for (const policy of ["park", undefined]) {
         maxRepairs: 0, maxReviewRounds: cause === "review budget" ? 0 : 2,
       });
       if (policy === undefined) Reflect.deleteProperty(data, "stuck"); else data.stuck = policy;
+      // A read-only state that edits is stopped by the guard behind it, so nothing later runs and no candidate is written.
+      const early = isPlanning(cause.split(" ")[0]!);
+      const reading = (state: string): Runner => request => {
+        if (cause === `${state} drift`) { writeFileSync(join(request.cwd, "code.txt"), `${state} edit`); before = candidate(request.cwd); }
+        return planning[state]!.answer(request);
+      };
       const result = await execute(data, {
-        investigator: request => {
-          if (cause === "triage drift") writeFileSync(join(request.cwd, "code.txt"), "triage edit");
-          before = candidate(request.cwd);
-          return ok(cause === "triage" ? "blocked" : "ready", "Specify the greeting language");
-        },
+        falsify: reading("falsify"), plan: reading("plan"), planReview: reading("planReview"),
+        tester: request => { assert.equal(early, false); return tester(request); },
         implementer: request => {
-          implement(request); before = candidate(request.cwd);
+          assert.equal(early, false); implement(request); before = candidate(request.cwd);
           return ok(cause === "implementer" ? "blocked" : "completed", "Specify the greeting language");
         },
         reviewer: request => {
@@ -1711,7 +1902,8 @@ for (const policy of ["park", undefined]) {
         },
       }, human);
       const run = parked(f, result, reason, human); assert.deepEqual(candidate(f.worktree), before);
-      if (cause !== "triage" && cause !== "triage drift") assert.ok(candidate(f.worktree).status.includes("greeting.txt"));
+      assert.equal(candidate(f.worktree).status.includes("greeting.txt"), !early);
+      if (early) assert.deepEqual(result.states.filter(isPlanning), upTo(cause.split(" ")[0]!));
       if (cause === "discussion" || cause === "criterion") assert.equal(reviews, 2);
       assert.deepEqual(run.delivery.park.budgets, {
         repairs: { used: 0, max: 0 }, reviewRounds: { used: cause === "discussion" || cause === "criterion" ? 1 : 0, max: cause === "review budget" ? 0 : 2 },
@@ -1789,11 +1981,14 @@ for (const extra of [{ stuck: "wait" }, { stuck: null }, ...[null, -1, 6, 1.5, "
   });
 }
 
-test("redGreen false skips the tester and red but still checks implementation scope", async context => {
-  const f = fixture(context);
-  const result = await execute(input(f, {}, { redGreen: false }), { tester: () => assert.fail() });
+test("redGreen false skips the tester and red, hands the approved plan to the implementer, and still checks implementation scope", async context => {
+  const f = fixture(context); let prompt = "";
+  const result = await execute(input(f, {}, { redGreen: false }), { tester: () => assert.fail(), implementer: request => { prompt = request.prompt; return implement(request); } });
   assert.equal(result.state, "delivered");
   assert.equal(result.states.includes("test"), false); assert.equal(result.states.includes("red"), false);
+  // The approved plan goes straight to the implementer.
+  assert.deepEqual(result.states.slice(0, result.states.indexOf("change")).filter(isPlanning), ["falsify", "plan", "planReview"]);
+  assert.ok(planIn(prompt).startsWith(`${plan}\n`));
   assert.ok(result.states.includes("scopeAfterChange"));
   const run = evidence(f);
   assert.deepEqual(run.result.checks.map(check => check.phase), ["verify"]);
@@ -1812,7 +2007,7 @@ for (const fixes of [false, true]) {
       implementer: request => { edits++; assert.equal(tests, 2); return implement(request); },
     });
     assert.deepEqual([tests, edits], [2, fixes ? 1 : 0]);
-    assert.deepEqual(result.states.slice(4, 13), ["triageResult", "test", "scopeAfterTest", "red", "repairBudget", "repairTarget", "test", "scopeAfterTest", "red"]);
+    assert.deepEqual(result.states.slice(result.states.indexOf("test")).slice(0, 8), ["test", "scopeAfterTest", "red", "repairBudget", "repairTarget", "test", "scopeAfterTest", "red"]);
     const run = fixes ? held(f, result, /^Delivered/u) : parked(f, result, /Repair budget exhausted \(1\).*tests passed/u, { requests: [] });
     assert.equal(result.state, fixes ? "delivered" : "parked");
     assert.deepEqual(run.result.checks.filter(check => check.phase === "red").map(check => [check.expected, check.passed]), [["nonzero exit", false], ["nonzero exit", fixes]]);
@@ -1845,7 +2040,7 @@ test("tester scope violations return to the tester before red or implementation"
     implementer: request => { edits++; assert.equal(tests, 2); return implement(request); },
   });
   assert.equal(result.state, "delivered"); assert.equal(edits, 1);
-  assert.deepEqual(result.states.slice(5, 12), ["test", "scopeAfterTest", "repairBudget", "repairTarget", "test", "scopeAfterTest", "red"]);
+  assert.deepEqual(result.states.slice(result.states.indexOf("test")).slice(0, 7), ["test", "scopeAfterTest", "repairBudget", "repairTarget", "test", "scopeAfterTest", "red"]);
   const run = evidence(f);
   assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-1.json"), "utf8")), { stage: "test", changed: ["greeting.test.txt", "outside.test.txt"], outside: ["outside.test.txt"] });
   assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-2.json"), "utf8")), { stage: "test", changed: ["greeting.test.txt"], outside: [] });
@@ -1949,8 +2144,7 @@ test("more rounds after a failed red returns to the tester, not the implementer"
   }, human);
   assert.equal(result.state, "delivered");
   assert.deepEqual([tests, edits, human.requests.length], [2, 1, 1]);
-  assert.deepEqual(result.states.slice(7, 12), ["red", "repairBudget", "stuck", "decide", "repairTarget"]);
-  assert.equal(result.states[12], "test");
+  assert.deepEqual(result.states.slice(result.states.indexOf("red")).slice(0, 6), ["red", "repairBudget", "stuck", "decide", "repairTarget", "test"]);
 });
 
 test("the tester and the implementer are told that checks they cannot run are the workflow's, and the implementer is given the Scope", async context => {
@@ -1962,4 +2156,16 @@ test("the tester and the implementer are told that checks they cannot run are th
   assert.equal(result.state, "delivered");
   for (const role of ["tester", "implementer"]) assert.match(prompts[role]!, /cannot run them.*still return completed: the workflow runs every required check itself/u, role);
   assert.match(prompts.implementer!, /Scope \(the only paths you may change; the workflow checks them\):\n- greeting\.txt/u);
+});
+
+test("the catalog and the README describe falsify, plan, and planReview where they described triage", () => {
+  const catalog = readFileSync(resolve("docs/catalog.md"), "utf8"); const readme = readFileSync(resolve("README.md"), "utf8");
+  // A state table row names its states in backticks in the first column, several of them separated by commas.
+  const named = catalog.split("\n").filter(line => line.startsWith("| `")).flatMap(line => line.split("|")[1]!.split(",").map(name => name.trim()));
+  for (const state of ["falsify", "plan", "planReview"]) assert.ok(named.includes(`\`${state}\``), `${state} has no row in the state table`);
+  for (const state of ["triage", "triageResult"]) assert.equal(named.includes(`\`${state}\``), false, `${state} still has a row in the state table`);
+  for (const [name, text] of [["docs/catalog.md", catalog], ["README.md", readme]] as const) {
+    assert.doesNotMatch(text, /\btriage/iu, `${name} still describes triage`);
+    for (const described of [/\bfalsif/iu, /\bplan\b/iu, /\bplan ?review/iu]) assert.match(text, described, name);
+  }
 });

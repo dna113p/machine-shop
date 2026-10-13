@@ -152,10 +152,11 @@ budgets. Required Agent roles are `investigator`, `tester`, `implementer`, and
 `reviewer`. Failed red, scope, and green gates use `maxRepairs` (0–3, default 3
 here); review revisions use
 `maxReviewRounds` (0–5, default 2). Neither consumes the other's budget. This
-allows at most 11 Agent calls before the stuck policy applies (one triage,
-one initial tester pass, up to six implementation passes, and three reviews;
+allows at most 15 Agent calls before the stuck policy applies (one falsify,
+up to two plans and two plan reviews, one initial tester pass, up to six implementation passes, and three implementation reviews;
 tester retries share the repair budget with implementation retries). Setting
-both budgets to zero allows at most four calls, or three with `redGreen: false`.
+both budgets to zero allows at most eight calls, or seven with `redGreen: false`.
+The single permitted plan revision consumes neither budget.
 With `stuck: "ask"`, each `more rounds` decision
 renews both budgets and grants another implementation pass. The default
 `stuck: "park"` ends unattended runs immediately with their candidate kept.
@@ -300,7 +301,12 @@ is.
 | `shape` | Validate the checkout and root paths; open evidence and block missing ticket sections or empty required lists before any Agent or worktree |
 | `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch instead and go to `scopeAfterChange`, then `verify` |
 | `start` | Open the helper's run on the worktree, which must be clean |
-| `triage` | The investigator returns `ready` with a short plan or `blocked` with what is missing; an unchanged-worktree guard follows |
+| `falsify` | Read-only investigator tries to show the ticket is wrong, already done, impossible here, or underspecified; returns `sound` with a one-paragraph summary or `questions` with 1–10 non-empty strings a person must answer |
+| `falsifyResult` | Guard the unchanged worktree and validate `questions`; a sound ticket goes to `plan`, questions go through the stuck policy with those exact questions as `needs`, one per line |
+| `plan` | Read-only investigator returns `planned` with the complete plan as a summary of at most 4000 characters, recorded as stage `plan` |
+| `planResult` | Guard the unchanged worktree and validate the plan length before `planReview` |
+| `planReview` | Read-only reviewer returns `approved` or `revise` with a summary; the prompt includes the plan verbatim |
+| `planReviewResult` | Guard the unchanged worktree; first `revise` returns to `plan`, second `revise` goes through the stuck policy with the reviewer's summary as `needs`; `approved` continues to `test` or, with `redGreen: false`, `change` |
 | `test` | With `redGreen: true`, the tester writes only tests for every acceptance criterion inside Scope, leaving them uncommitted; its summary is recorded as stage `test` |
 | `scopeAfterTest`, `red` | Check changed paths against Scope, then run the named red check; failures consume the repair budget and return to `test` |
 | `change` | The implementer edits the worktree and leaves the changes uncommitted, making the tester's tests pass without weakening or deleting them |
@@ -315,10 +321,15 @@ is.
 | `confirmDiscard` | Human: `confirm discard` or `go back`, asked before a discard removes anything |
 | `archive`, `remove` | Commit the candidate and keep that commit as the branch `archive/<slug>`; `git worktree remove --force` and `git branch -D` for this run's own worktree and ticket branch |
 
-After `triageResult`, new runs go through `test` → `scopeAfterTest` → `red` →
+New runs begin with `falsify` → `plan` → `planReview`, with an unchanged-worktree
+guard after each read-only Agent. A plan sent back once is re-planned with the
+reviewer's feedback and reviewed again; a second revision stops before editing.
+Malformed questions or a plan over 4000 characters go through the stuck policy.
+After plan approval, new runs go through `test` → `scopeAfterTest` → `red` →
 `change` → `scopeAfterChange` → `verify`. With `redGreen: false`, they skip
 `test`, `scopeAfterTest`, and `red`. Resumed runs skip them too, since red cannot be proved again once the change exists, but are held to the Scope at `scopeAfterChange` before `verify`.
-The tester receives the acceptance and Scope lists and must write one or more
+Both the tester and implementer receive the approved plan verbatim under a `Plan:`
+heading. The tester receives the acceptance and Scope lists and must write one or more
 tests per criterion without implementing behavior or editing non-test files.
 Red requires a non-empty Git status excluding `.machine-runs` and a nonzero
 exit from the named check, without a signal, timeout, or spawn error. A passing
@@ -446,8 +457,9 @@ reached or its tip fetched (the Git output is saved as a log). The check, like t
 has a two-minute timeout and also runs for a resumed `pr` run. `branch` and
 `patch` runs make no network call.
 
-Stuck work goes to the `stuck` Operation. This covers triage returning
-`blocked`, triage having edited files, the tester or implementer returning `blocked`,
+Stuck work goes to the `stuck` Operation. This covers falsify returning
+`questions`, malformed planning reports, a second plan review revision, any read-only
+planning stage having edited files, the tester or implementer returning `blocked`,
 the reviewer returning `blocked` or having edited files, review non-convergence,
 repeated owner questions, malformed review reports, and either budget exhausting.
 With the default `stuck: "park"`, `park` writes `park.txt` and a delivery receipt
@@ -534,8 +546,8 @@ A worktree on a branch whose ownership is unresolved, or that belongs to another
 ticket, is not adopted; for the first the message gives the `git config` command
 that records it. If any of these fails
 the run ends `blocked` with a message naming the condition, changing nothing.
-Setup commands are not run again and triage is skipped: a resumed run goes
-straight to `verify`, then review, commit, and deliver as usual, with fresh
+Setup commands are not run again and `falsify`, `plan`, and `planReview` are skipped:
+a resumed run goes straight to `scopeAfterChange`, then `verify`, review, commit, and deliver as usual, with fresh
 budgets and the normal repair loop if review asks for changes. The base
 must resolve to the commit the first run started from or to a descendant of it,
 so name `repository.base` explicitly, or leave the source checkout on the branch
@@ -592,8 +604,11 @@ For parking, `delivery.json` also records the `reason` and
 `park: { needs, next, budgets: { repairs: { used, max }, reviewRounds: { used, max } } }`.
 The one-line hold starts `Parked on <branch>: ` followed by the first line of
 `park.txt`, then `Needs: ...`, `Worktree kept at ...`, and ends `Evidence: <directory>`.
-The receipt, note, and summary use the same needs text, capped at 600 characters
-plus an ellipsis when truncated. The full reason remains in the receipt and note.
+The receipt, note, and summary use the same needs text, with whitespace flattened
+in the single-line summary. Falsification questions are kept in full, one per line
+in the receipt and note; a second plan review revision uses the reviewer's summary
+in full. Other blockers are capped at 600 characters plus an ellipsis when
+truncated. The full reason remains in the receipt and note.
 `result.json` keeps the helper's vocabulary: its `outcome` is `blocked` for
 `parked`, `handedOff`, and `abandoned`; `repairs` counts red, scope, and green
 gate retries and `reviewRounds` counts review revisions, each cumulative across renewals;
