@@ -202,6 +202,40 @@ const discussions = (questions: { text: string; where: string }[]) => questions.
 const openQuestions = /^Answer the open questions?:$/u;
 /** One numbered line per question with where it was raised, in the reviewer's order. */
 const questionLines = (questions: { text: string; where: string }[]) => questions.map((question, index) => `${index + 1}. ${question.text} (${question.where})`);
+/** A gap as the investigator reports it from falsify: the question, the answers it could take, the one recommended, whether that one is safe to assume, and why. */
+type Gap = { text: string; options: string[]; recommended: string; assumable: boolean; why: string };
+const gap = (text: string, extra: Partial<Gap> = {}): Gap => ({
+  text, options: ["Write it in English", "Leave it out"], recommended: "Leave it out", assumable: false, why: "The ticket does not say.", ...extra,
+});
+// A product decision: only the owner can answer it. The recommended answer is listed last.
+const language = gap("Which language is the greeting in?", {
+  options: ["French", "The reader's locale", "English"], recommended: "English", why: "The product ships in several languages and the ticket names none.",
+});
+// Gaps whose conservative answer keeps more and loses nothing if wrong. Quotes and a line break show whether a prompt carries the file's own text.
+const beside = gap("Does greeting.txt replace code.txt or stand beside it?", {
+  options: ["Replace code.txt", "Stand beside code.txt"], recommended: "Stand beside code.txt", assumable: true,
+  why: 'Keeping "code.txt" loses nothing\nif the owner wanted it gone.',
+});
+const newline = gap("Does the greeting end with a line break?", {
+  options: ["End with a line break", "No line break"], recommended: "End with a line break", assumable: true, why: "A text file that ends with a line break loses nothing.",
+});
+const gaps = (questions: unknown, summary = "The ticket leaves the language open") => ({ type: "questions", summary, questions });
+/** What a run that assumes records for each gap: the question, the recommended answer it took, the options it had, and why. */
+const assumed = (questions: Gap[]) => questions.map(({ text, options, recommended, why }) => ({ question: text, answer: recommended, options, why }));
+/** The assumptions a prompt carries: what follows its own `Assumptions:` heading line. */
+const assumptionsIn = (prompt: string) => prompt.split(/^Assumptions:\n+/mu)[1] ?? "";
+const numberedLines = (lines: string[]) => lines.filter(line => /^\d+\. /u.test(line));
+/** A falsify question's one line of the park note: its number and text, then every option, the recommended one first and marked as such. */
+function optionsFirst(line: string, number: number, asked: Gap, shown = oneLine(asked.text)) {
+  assert.ok(line.startsWith(`${number}. ${shown}`), line);
+  const rest = line.slice(`${number}. ${shown}`.length);
+  const recommended = rest.indexOf(oneLine(asked.recommended));
+  assert.ok(recommended >= 0, `${line} does not give the recommended option`);
+  for (const option of asked.options.filter(option => option !== asked.recommended)) {
+    assert.ok(rest.indexOf(oneLine(option)) > recommended, `${line} does not give ${option} after the recommended option`);
+  }
+  assert.match(rest, /\brecommended\b/iu);
+}
 /** Parking never asks a Human or changes the candidate; its note and hold share the same brief. */
 function parked(f: Fixture, result: { state: unknown; output: any; states: string[] }, reason: RegExp, human: { requests: Ask[] }) {
   assert.equal(result.state, "parked"); assert.deepEqual(result.states.slice(-3), ["stuck", "park", "parked"]);
@@ -221,7 +255,8 @@ function parked(f: Fixture, result: { state: unknown; output: any; states: strin
   const questions: { text: string; where: string }[] = run.delivery.park.questions ?? [];
   if (questions.length) {
     // Open owner questions are the exception: the receipt and the note number every one, and the hold counts them and gives only the first.
-    assert.equal(needs.length, questions.length + 1);
+    // Lines below the numbered ones are not questions for the owner, as with the gaps a run would have assumed.
+    assert.equal(numberedLines(needs).length, questions.length);
     for (const [index, question] of questions.entries()) {
       assert.ok(needs[index + 1]!.startsWith(`${index + 1}. `));
       const where = question.where.replace(/\s+/gu, " ").trim();
@@ -848,58 +883,80 @@ test("a sound ticket is planned, reviewed, and delivered with the approved plan 
   assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
 });
 
-for (const policy of ["park", undefined]) {
-  test(`${policy ?? "default"} stuck policy parks a ticket falsified with two questions on those questions, with the worktree unedited`, async context => {
+for (const [policy, assume] of [["park", undefined], [undefined, undefined], ["park", false], [undefined, false]] as const) {
+  test(`${policy ?? "default"} stuck policy with assume ${assume ?? "left out"} parks a ticket falsified with two questions on both, one of them assumable, each with its options and the recommended one first`, async context => {
     const f = fixture(context); const human = person();
-    const questions = ["Which language is the greeting in?", "Does greeting.txt replace code.txt or stand beside it?"];
-    const data = input(f);
+    const questions = [language, beside];
+    const data = input(f, {}, assume === undefined ? {} : { assume });
     if (policy === undefined) Reflect.deleteProperty(data, "stuck"); else data.stuck = policy;
     const result = await execute(data, {
-      falsify: () => ({ type: "questions", summary: "The ticket leaves two things open", questions }),
+      falsify: () => gaps(questions, "The ticket leaves two things open"),
       plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
     }, human);
     const run = parked(f, result, /\S/u, human);
     // The investigator's questions go to the owner as a review's do: numbered, with no location, and counted in the hold.
-    const lines = questions.map((question, index) => `${index + 1}. ${question}`);
-    assert.deepEqual(run.delivery.park.questions, questions.map(text => ({ text, where: "" })));
+    assert.deepEqual(run.delivery.park.questions, questions.map(({ text }) => ({ text, where: "" })));
     const needs: string[] = run.delivery.park.needs.split("\n");
-    assert.match(needs[0]!, openQuestions); assert.deepEqual(needs.slice(1), lines);
-    assert.ok(readFileSync(join(run.directory, "park.txt"), "utf8").includes(`Needs: ${needs[0]}\n${lines.join("\n")}\nWorktree: ${f.worktree}\n`));
-    assert.ok(result.output.summary.includes(` Needs: ${counted(2)}; the first: ${questions[0]} Worktree kept at ${f.worktree}. `));
-    assert.equal(result.output.summary.includes(questions[1]!), false);
-    for (const question of questions) assert.ok(run.delivery.reason.includes(question), question);
+    // Each keeps one line, which goes on to its options: "English" is recommended, and the investigator listed it last.
+    assert.match(needs[0]!, openQuestions); assert.equal(needs.length, 3);
+    for (const [index, asked] of questions.entries()) optionsFirst(needs[index + 1]!, index + 1, asked);
+    // With assume off the assumable question is the owner's like the other, and nothing is said of what would have been assumed.
+    assert.doesNotMatch(run.delivery.park.needs, /would have assumed/iu);
+    assert.ok(readFileSync(join(run.directory, "park.txt"), "utf8").includes(`Needs: ${run.delivery.park.needs}\nWorktree: ${f.worktree}\n`));
+    // The hold is as it was: the count and the first question's text, without its options.
+    assert.ok(result.output.summary.includes(` Needs: ${counted(2)}; the first: ${language.text} Worktree kept at ${f.worktree}. `));
+    for (const absent of [beside.text, "The reader's locale", language.why]) assert.equal(result.output.summary.includes(absent), false, absent);
+    for (const question of questions) assert.ok(run.delivery.reason.includes(question.text), question.text);
     assert.deepEqual(run.result.agents, [{ stage: "falsify", outcome: "questions", summary: "The ticket leaves two things open" }]);
     assert.equal(result.states[3], "falsify"); assert.equal(result.states.some(state => state === "plan" || state === "planReview" || state === "test" || state === "change"), false);
     assert.deepEqual(candidate(f.worktree), { status: "", files: [["code.txt", 0, Buffer.from("old").toString("base64")]] });
     assert.deepEqual(run.result.checks, []);
+    assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
   });
 }
 
-test("ten questions are the most a falsified ticket parks with, and all ten are kept", async context => {
-  const f = fixture(context); const human = person();
-  const questions = Array.from({ length: 10 }, (_, index) => `What does part ${index + 1} of the greeting say?`);
-  const result = await execute(input(f, {}, { stuck: "park" }), { falsify: () => ({ type: "questions", summary: "The ticket leaves ten things open", questions }), plan: () => assert.fail() }, human);
-  const run = parked(f, result, /\S/u, human);
-  assert.deepEqual(run.delivery.park.questions, questions.map(text => ({ text, where: "" })));
-  assert.deepEqual(run.delivery.park.needs.split("\n").slice(1), questions.map((question, index) => `${index + 1}. ${question}`));
-  assert.ok(result.output.summary.includes(` Needs: ${counted(10)}; the first: ${questions[0]} Worktree kept at `));
+test("with assume left out or false, a report whose every question is assumable still parks with all of them and assumes nothing", async context => {
+  for (const extra of [{}, { assume: false }]) {
+    const f = fixture(context); const human = person();
+    const result = await execute(input(f, {}, { stuck: "park", ...extra }), { falsify: () => gaps([beside, newline], "Two gaps, each with a conservative answer"), plan: () => assert.fail() }, human);
+    const run = parked(f, result, /stand beside it\?/u, human);
+    assert.deepEqual(run.delivery.park.questions, [beside, newline].map(({ text }) => ({ text, where: "" })));
+    const needs: string[] = run.delivery.park.needs.split("\n"); assert.equal(needs.length, 3);
+    optionsFirst(needs[1]!, 1, beside); optionsFirst(needs[2]!, 2, newline);
+    assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
+  }
 });
 
-test("a falsify question that runs over several lines and 600 characters takes one capped line of the park note, and the hold stays one line", async context => {
+test("ten questions are the most a falsified ticket parks with, and all ten are kept", async context => {
   const f = fixture(context); const human = person();
-  const long = `Which language is the greeting in?\n${"The ticket names none,\nand the product ships in several. ".repeat(14)}`.trim();
-  const short = "Does greeting.txt replace code.txt\nor stand beside it?";
+  const questions = Array.from({ length: 10 }, (_, index) => gap(`What does part ${index + 1} of the greeting say?`));
+  const result = await execute(input(f, {}, { stuck: "park" }), { falsify: () => gaps(questions, "The ticket leaves ten things open"), plan: () => assert.fail() }, human);
+  const run = parked(f, result, /\S/u, human);
+  assert.deepEqual(run.delivery.park.questions, questions.map(({ text }) => ({ text, where: "" })));
+  const needs: string[] = run.delivery.park.needs.split("\n"); assert.equal(needs.length, 11);
+  for (const [index, asked] of questions.entries()) optionsFirst(needs[index + 1]!, index + 1, asked);
+  assert.ok(result.output.summary.includes(` Needs: ${counted(10)}; the first: ${questions[0]!.text} Worktree kept at `));
+});
+
+test("a falsify question that runs over several lines and 600 characters takes one line of the park note with its text capped, and the hold stays one line", async context => {
+  const f = fixture(context); const human = person();
+  const long = gap(`Which language is the greeting in?\n${"The ticket names none,\nand the product ships in several. ".repeat(14)}`.trim(),
+    { options: ["English", "The reader's\nlocale"], recommended: "English", why: "The product ships\nin several languages." });
+  const short = gap("Does greeting.txt replace code.txt\nor stand beside it?", { why: "Nothing in the ticket\nsays which." });
   const result = await execute(input(f, {}, { stuck: "park" }), {
-    falsify: () => ({ type: "questions", summary: "The ticket leaves two things open", questions: [long, short] }),
+    falsify: () => gaps([long, short], "The ticket leaves two things open"),
     plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
   }, human);
   const run = parked(f, result, /Which language is the greeting in\?/u, human);
-  const whole = oneLine(long); const cut = `${whole.slice(0, 600)}…`;
-  assert.ok(whole.length > 700); assert.ok(long.includes("\n"));
-  // The receipt keeps each question as it was asked; the note gives each one line of at most 600 characters.
-  assert.deepEqual(run.delivery.park.questions, [{ text: long, where: "" }, { text: short, where: "" }]);
+  const whole = oneLine(long.text); const cut = `${whole.slice(0, 600)}…`;
+  assert.ok(whole.length > 700); assert.ok(long.text.includes("\n"));
+  // The receipt keeps each question as it was asked; the note gives each one line, with the question's text cut at 600 characters.
+  assert.deepEqual(run.delivery.park.questions, [{ text: long.text, where: "" }, { text: short.text, where: "" }]);
   const needs: string[] = run.delivery.park.needs.split("\n");
-  assert.match(needs[0]!, openQuestions); assert.deepEqual(needs.slice(1), [`1. ${cut}`, `2. ${oneLine(short)}`]);
+  // Options and a reason written over several lines stay on their question's line.
+  assert.match(needs[0]!, openQuestions); assert.equal(needs.length, 3);
+  optionsFirst(needs[1]!, 1, long, cut); optionsFirst(needs[2]!, 2, short);
+  assert.equal(needs[1]!.includes(whole), false);
   assert.ok(readFileSync(join(run.directory, "park.txt"), "utf8").includes(`Needs: ${run.delivery.park.needs}\nWorktree: `));
   // The reason is never cut.
   assert.ok(oneLine(run.delivery.reason).includes(whole));
@@ -907,29 +964,248 @@ test("a falsify question that runs over several lines and 600 characters takes o
   assert.ok(result.output.summary.includes(` Needs: ${counted(2)}; the first: ${cut} Worktree kept at ${f.worktree}. `));
 });
 
-for (const [label, questions] of [
-  ["left out", undefined], ["a string rather than an array", "Which language is the greeting in?"], ["an empty array", []],
-  ["an array holding a blank string", ["Which language is the greeting in?", " \n"]], ["an array holding a value that is not a string", ["Which language is the greeting in?", 7]],
-  ["an array of eleven", Array.from({ length: 11 }, (_, index) => `What does part ${index + 1} of the greeting say?`)],
-] as const) {
-  test(`a falsify report whose questions field is ${label} parks with the field named`, async context => {
-    const f = fixture(context); const human = person();
-    const result = await execute(input(f, {}, { stuck: "park" }), {
-      falsify: () => ({ type: "questions", summary: "The ticket leaves the language open", ...(questions === undefined ? {} : { questions }) }),
-      plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
-    }, human);
-    // Nothing the Agent wrote says "questions", so the word can only be the Machine naming the field.
-    const run = parked(f, result, /\bquestions\b/u, human);
-    assert.doesNotMatch(run.delivery.park.needs, /What does part 11/u);
-    // The report is a stage report before it is judged, so a refused one is still what the investigator said.
-    const stage = { stage: "falsify", outcome: "questions", summary: "The ticket leaves the language open" };
-    assert.deepEqual([run.result.agents, run.result.agentInvocations], [[stage], 1]);
-    assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "agent-1.json"), "utf8")), stage);
-    // Too many questions are still the investigator's: all of them are kept with the evidence, none in the note.
-    if (Array.isArray(questions) && questions.length === 11) assert.notDeepEqual(holding(run.directory, questions as string[]), []);
-    assert.equal(candidate(f.worktree).status, ""); assert.deepEqual(run.result.checks, []);
+const without = (asked: Gap, field: keyof Gap) => Object.fromEntries(Object.entries(asked).filter(([key]) => key !== field));
+// Each report has one thing wrong. Where an entry is at fault it is the second, after one that is sound and assumable.
+for (const [label, questions, named] of [
+  ["left out", undefined, /\bquestions\b/u],
+  ["a string rather than an array", "Which language is the greeting in?", /\bquestions\b/u],
+  ["an empty array", [], /\bquestions\b/u],
+  ["an array of eleven", Array.from({ length: 11 }, (_, index) => gap(`What does part ${index + 1} of the greeting say?`)), /\bquestions\b/u],
+  ["an array of plain strings, as it was before a question carried its options", ["Which language is the greeting in?"], /\bquestions\[0\]/u],
+  ["an array holding a value that is not an object", [beside, 7], /\bquestions\[1\]/u],
+  ["an array holding an entry with a blank text", [beside, { ...language, text: " \n" }], /\bquestions\[1\]\.text\b/u],
+  ["an array holding an entry whose text is not a string", [beside, { ...language, text: 7 }], /\bquestions\[1\]\.text\b/u],
+  ["an array holding an entry without options", [beside, without(language, "options")], /\bquestions\[1\]\.options\b/u],
+  ["an array holding an entry whose options are not an array", [beside, { ...language, options: "English" }], /\bquestions\[1\]\.options\b/u],
+  ["an array holding an entry with no options to choose from", [beside, { ...language, options: [] }], /\bquestions\[1\]\.options\b/u],
+  ["an array holding an entry with a blank option", [beside, { ...language, options: ["English", " "] }], /\bquestions\[1\]\.options\b/u],
+  ["an array holding an entry with an option that is not a string", [beside, { ...language, options: ["English", 7] }], /\bquestions\[1\]\.options\b/u],
+  ["an array holding an entry without a recommended answer", [beside, without(language, "recommended")], /\bquestions\[1\]\.recommended\b/u],
+  ["an array holding an entry whose recommended answer is not one of its options", [beside, { ...language, options: ["english", "French"] }], /\bquestions\[1\]\.recommended\b/u],
+  ["an array holding an entry that does not say whether it is assumable", [beside, without(language, "assumable")], /\bquestions\[1\]\.assumable\b/u],
+  ["an array holding an entry whose assumable is not a boolean", [beside, { ...language, assumable: "true" }], /\bquestions\[1\]\.assumable\b/u],
+  ["an array holding an entry without a why", [beside, without(language, "why")], /\bquestions\[1\]\.why\b/u],
+  ["an array holding an entry with a blank why", [beside, { ...language, why: " " }], /\bquestions\[1\]\.why\b/u],
+] as [string, unknown, RegExp][]) {
+  for (const assume of [false, true]) {
+    test(`a falsify report whose questions field is ${label} parks with the field named${assume ? ", with assume on as with it off" : ""}`, async context => {
+      const f = fixture(context); const human = person();
+      const result = await execute(input(f, {}, { stuck: "park", ...(assume ? { assume } : {}) }), {
+        falsify: () => ({ type: "questions", summary: "The ticket leaves the language open", ...(questions === undefined ? {} : { questions }) }),
+        plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+      }, human);
+      // Nothing the Agent wrote says "questions", so the word can only be the Machine naming the field.
+      const run = parked(f, result, named, human);
+      // A report that is not well formed asks the owner nothing and assumes nothing, the sound entry beside the bad one included.
+      assert.equal(run.delivery.park.questions, undefined);
+      assert.doesNotMatch(run.delivery.park.needs, /What does part 11|would have assumed/iu);
+      assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
+      // The report is a stage report before it is judged, so a refused one is still what the investigator said.
+      const stage = { stage: "falsify", outcome: "questions", summary: "The ticket leaves the language open" };
+      assert.deepEqual([run.result.agents, run.result.agentInvocations], [[stage], 1]);
+      assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "agent-1.json"), "utf8")), stage);
+      // Too many questions are still the investigator's: all of them are kept with the evidence, none in the note.
+      if (Array.isArray(questions) && questions.length === 11) assert.notDeepEqual(holding(run.directory, (questions as Gap[]).map(question => question.text)), []);
+      assert.equal(candidate(f.worktree).status, ""); assert.deepEqual(run.result.checks, []);
+    });
+  }
+}
+
+test("the falsify prompt asks for each question's text, options, recommended answer, whether it is assumable, and why, with assume on as with it off", async context => {
+  const asks: string[][] = [];
+  for (const extra of [{}, { assume: true }]) {
+    const f = fixture(context);
+    const result = await execute(input(f, {}, extra), {
+      // The paragraphs that name this run's own directories differ from one run to the next; the rest is what the investigator is asked.
+      falsify: request => { asks.push(request.prompt.split("\n\n").filter(part => !part.includes(f.root))); return planning.falsify!.answer(request); },
+    });
+    assert.equal(result.state, "delivered");
+  }
+  for (const ask of asks) {
+    const prompt = ask.join("\n\n");
+    for (const field of ["text", "options", "recommended", "assumable", "why"]) assert.match(prompt, new RegExp(`\\b${field}\\b`, "u"), field);
+    // Assumable is for a gap whose conservative answer loses nothing if wrong; a product decision, a change of scope, or anything irreversible never is.
+    for (const rule of [/\bconservative\b/iu, /\bloses? nothing\b|\bnothing (?:is )?lost\b/iu, /\bproduct decision\b/iu, /\bchange of scope\b|\bscope change\b|\bchang\w+ (?:the |its )?scope\b/iu, /\birreversibl/iu]) {
+      assert.match(prompt, rule);
+    }
+  }
+  // The investigator is asked the same either way: assume changes what the run does with the answer, not the question.
+  assert.equal(asks.length, 2); assert.deepEqual(asks[1], asks[0]);
+});
+
+test("assume is a boolean that adds no state, and anything else fails before effects", context => {
+  const f = fixture(context);
+  for (const assume of [null, "yes", "true", 1, 0, {}]) assert.throws(() => mod.default(runtime, input(f, {}, { assume })), /assume must be a boolean/u);
+  const states = (extra: object) => Object.keys(mod.default(runtime, input(f, {}, extra)).states);
+  // The switch is carried by the states there are: no Human state and no other is added for it.
+  for (const assume of [false, true]) assert.deepEqual(states({ assume }), states({}));
+  assert.deepEqual(readdirSync(f.root), ["widgets"]);
+});
+
+test("with assume on, a report whose every question is assumable goes on to plan with the recommended answers written down, handed on, listed in the pull request, and kept on the receipt", async context => {
+  const f = fixture(context); remote(f); const gh = fakeGh(context, f); const calls: string[] = []; const prompts: Record<string, string> = {};
+  const keeping = (name: string, work: Runner): Runner => request => { calls.push(name); prompts[name] = request.prompt; return work(request); };
+  const questions = [beside, newline];
+  // Nobody is asked: a Human request would fail the run.
+  const result = await execute(input(f, { output: "pr" }, { assume: true }), {
+    falsify: keeping("falsify", () => gaps(questions, "Two gaps, each with a conservative answer")),
+    plan: keeping("plan", planning.plan!.answer), planReview: keeping("planReview", planning.planReview!.answer),
+    tester: keeping("tester", tester), implementer: keeping("implementer", implement), reviewer: keeping("reviewer", () => review()),
+  });
+  assert.equal(result.state, "delivered", evidence(f).delivery.reason);
+  assert.deepEqual(calls, ["falsify", "plan", "planReview", "tester", "implementer", "reviewer"]);
+  assert.deepEqual(route(result.states), ["falsify", "plan", "planReview", "test", "change", "review"]); assert.equal(result.states.includes("stuck"), false);
+  const run = held(f, result, /^Delivered/u);
+  // The evidence directory holds the answers the run went on with.
+  const file = readFileSync(join(run.directory, "assumptions.json"), "utf8");
+  assert.deepEqual(JSON.parse(file), assumed(questions));
+  // Everyone who works after falsify is given that file's own text under its heading, not a summary of it.
+  assert.doesNotMatch(prompts.falsify!, /^Assumptions:/mu);
+  for (const stage of ["plan", "planReview", "tester", "implementer", "reviewer"]) assert.ok(assumptionsIn(prompts[stage]!).startsWith(`${file.trimEnd()}\n`), stage);
+  for (const role of ["tester", "implementer"]) assert.ok(planIn(prompts[role]!).startsWith(`${plan}\n`), role);
+  // The plan was made without standing feedback: the questions were settled, not left open.
+  assert.doesNotMatch(prompts.plan!, /Current failure\/feedback:/u);
+  assert.ok(prompts.reviewer!.split("\n").some(line => /\bassum/iu.test(line) && /\bdiscussion\b/iu.test(line)), "the reviewer is told that an assumption it disagrees with is a discussion finding");
+  const args = gh()!; const path = args[args.indexOf("--body-file") + 1]!;
+  assert.equal(path, join(run.directory, "pull-request.md"));
+  const section = (readFileSync(path, "utf8").split(/^## Assumptions\n+/mu)[1] ?? "").split(/^## /mu)[0]!;
+  const listed = section.split("\n").filter(line => line.startsWith("- "));
+  assert.equal(listed.length, questions.length, section);
+  for (const [index, asked] of questions.entries()) {
+    // One line each: the question, then the answer the run took.
+    const at = listed[index]!.indexOf(oneLine(asked.text));
+    assert.ok(at >= 0 && listed[index]!.indexOf(oneLine(asked.recommended), at + oneLine(asked.text).length) > at, listed[index]);
+  }
+  assert.deepEqual(run.delivery.assumptions, assumed(questions));
+  assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+});
+
+for (const assume of [undefined, true]) {
+  test(`a sound ticket with assume ${assume ? "on" : "left out"} has no assumptions in any prompt, in the pull request, or on the receipt`, async context => {
+    const f = fixture(context); remote(f); const gh = fakeGh(context, f); const prompts: string[] = [];
+    const keeping = (work: Runner): Runner => request => { prompts.push(request.prompt); return work(request); };
+    const result = await execute(input(f, { output: "pr" }, assume ? { assume } : {}), {
+      falsify: keeping(planning.falsify!.answer), plan: keeping(planning.plan!.answer), planReview: keeping(planning.planReview!.answer),
+      tester: keeping(tester), implementer: keeping(implement), reviewer: keeping(() => review()),
+    });
+    assert.equal(result.state, "delivered", evidence(f).delivery.reason); assert.equal(prompts.length, 6);
+    for (const prompt of prompts) assert.doesNotMatch(prompt, /^Assumptions:/mu);
+    const run = held(f, result, /^Delivered/u);
+    const args = gh()!;
+    assert.doesNotMatch(readFileSync(args[args.indexOf("--body-file") + 1]!, "utf8"), /## Assumptions/u);
+    assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
   });
 }
+
+test("the reviewer of a run that assumed is asked for the same report and the same outcomes as the reviewer of a sound one", async context => {
+  const asked: { outcomes: string[]; report: string | undefined }[] = [];
+  for (const [extra, falsify] of [[{}, planning.falsify!.answer], [{ assume: true }, () => gaps([beside], "One gap with a conservative answer")]] as const) {
+    const f = fixture(context);
+    const result = await execute(input(f, {}, extra), {
+      falsify,
+      reviewer: request => {
+        asked.push({ outcomes: [...request.outcomes].sort(), report: request.prompt.split("\n").find(line => line.includes("MACHINES_EVENT {")) });
+        return review();
+      },
+    });
+    assert.equal(result.state, "delivered");
+  }
+  assert.equal(asked.length, 2); assert.ok(asked[0]!.report); assert.deepEqual(asked[1], asked[0]);
+  assert.deepEqual(asked[0]!.outcomes, ["approved", "blocked", "revise"]);
+});
+
+test("with assume on, a mixed report parks on the one question that is not assumable and says which others it would have assumed", async context => {
+  const f = fixture(context); const human = person();
+  const result = await execute(input(f, {}, { assume: true, stuck: "park" }), {
+    falsify: () => gaps([beside, language, newline], "Three gaps, one of them the owner's"),
+    plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+  }, human);
+  const run = parked(f, result, /Which language is the greeting in\?/u, human);
+  // Only the question that needs the owner is theirs to answer: it is the one numbered, counted, and kept on the receipt.
+  assert.deepEqual(run.delivery.park.questions, [{ text: language.text, where: "" }]);
+  assert.match(run.delivery.reason, /\b1 open question:/u);
+  const needs: string[] = run.delivery.park.needs.split("\n");
+  assert.match(needs[0]!, openQuestions); optionsFirst(needs[1]!, 1, language); assert.deepEqual(numberedLines(needs), [needs[1]]);
+  // The others follow, each with the answer the run would have gone on with had it not stopped.
+  const others = needs.slice(2);
+  assert.match(others.join("\n"), /would have assumed/iu); assert.equal(others.join("\n").includes(language.text), false);
+  for (const other of [beside, newline]) {
+    const line = others.find(one => one.includes(other.text)) ?? "";
+    assert.ok(line.indexOf(other.recommended, line.indexOf(other.text) + other.text.length) > 0, `${other.text} is not listed with the answer ${other.recommended}`);
+  }
+  assert.ok(readFileSync(join(run.directory, "park.txt"), "utf8").includes(`Needs: ${run.delivery.park.needs}\nWorktree: ${f.worktree}\n`));
+  assert.ok(result.output.summary.includes(` Needs: ${counted(1)}; the first: ${language.text} Worktree kept at ${f.worktree}. `));
+  for (const other of [beside, newline]) assert.equal(result.output.summary.includes(other.text), false, other.text);
+  // Nothing was assumed: the run stopped before plan, and a stop records no assumptions.
+  assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
+  assert.equal(result.states.some(state => state === "plan" || state === "planReview" || state === "test" || state === "change"), false);
+  assert.deepEqual(candidate(f.worktree), { status: "", files: [["code.txt", 0, Buffer.from("old").toString("base64")]] });
+});
+
+test("with assume on, a report with no assumable question parks with all of them, as with assume off", async context => {
+  const f = fixture(context); const human = person();
+  const questions = [language, gap("Who is greeted?")];
+  const result = await execute(input(f, {}, { assume: true, stuck: "park" }), { falsify: () => gaps(questions, "The ticket leaves two things open"), plan: () => assert.fail() }, human);
+  const run = parked(f, result, /Which language is the greeting in\?/u, human);
+  assert.deepEqual(run.delivery.park.questions, questions.map(({ text }) => ({ text, where: "" })));
+  const needs: string[] = run.delivery.park.needs.split("\n"); assert.equal(needs.length, 3);
+  for (const [index, asked] of questions.entries()) optionsFirst(needs[index + 1]!, index + 1, asked);
+  assert.doesNotMatch(run.delivery.park.needs, /would have assumed/iu);
+  assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
+});
+
+test("more rounds after a mixed report returns to falsify, and a report then wholly assumable is planned from its own assumptions with no standing feedback", async context => {
+  const f = fixture(context); const human = person("more rounds"); let falsified = 0; let planned = "";
+  const result = await execute(input(f, {}, { assume: true }), {
+    falsify: () => ++falsified === 1 ? gaps([language, beside], "Two gaps, one of them the owner's") : gaps([newline], "One gap with a conservative answer"),
+    plan: request => { planned = request.prompt; return planning.plan!.answer(request); },
+  }, human);
+  assert.equal(result.state, "delivered", evidence(f).delivery.reason);
+  assert.deepEqual(route(result.states), ["falsify", "decide", "falsify", "plan", "planReview", "test", "change", "review"]);
+  // The decision shows the one question that stopped the run, and beside it what the run would have assumed.
+  const shown = human.requests[0]!.prompt; assert.equal(human.requests.length, 1);
+  assert.match(shown, /\b1 open question:/u); assert.ok(shown.includes(`1. ${language.text}`));
+  assert.match(shown, /would have assumed/iu);
+  const others = shown.slice(shown.search(/would have assumed/iu));
+  assert.ok(others.includes(beside.text) && others.includes(beside.recommended)); assert.equal(others.includes(language.text), false);
+  // The second report is the one that stands: its answer is assumed, and nothing of the first is left over.
+  assert.doesNotMatch(planned, /Current failure\/feedback:/u);
+  const run = held(f, result, /^Delivered/u);
+  const file = readFileSync(join(run.directory, "assumptions.json"), "utf8");
+  assert.deepEqual(JSON.parse(file), assumed([newline])); assert.deepEqual(run.delivery.assumptions, assumed([newline]));
+  assert.ok(assumptionsIn(planned).startsWith(`${file.trimEnd()}\n`));
+  assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }]);
+});
+
+test("an assumption the reviewer disagrees with in two successive reviews parks for the owner as any discussion does, with the assumptions still on the receipt", async context => {
+  const f = fixture(context); const human = person(); let edits = 0; let reviews = 0;
+  const [first, second] = [
+    { text: "The run assumed greeting.txt stands beside code.txt, but nothing reads code.txt once it exists", where: "assumptions.json" },
+    { text: "Is greeting.txt meant to replace code.txt after all?", where: "assumptions.json" },
+  ];
+  const result = await execute(input(f, {}, { assume: true, stuck: "park" }), {
+    falsify: () => gaps([beside], "One gap with a conservative answer"),
+    // A first review that questions the assumption still gives the implementer one round with it.
+    implementer: request => {
+      assert.ok(assumptionsIn(request.prompt).includes(JSON.stringify(beside.recommended)));
+      if (++edits === 2) assert.ok(request.prompt.includes(`Discussion: ${first.text} (${first.where})`));
+      return implement(request);
+    },
+    reviewer: request => {
+      assert.ok(assumptionsIn(request.prompt).includes(JSON.stringify(beside.recommended)));
+      return review("approved", "The answer the run took looks wrong", { findings: discussions([++reviews === 1 ? first : second]), newSinceLastRound: "A new question" });
+    },
+  }, human);
+  // The stop is the review's own: assume settles nothing outside falsify, and the question keeps the form of any review question.
+  const run = parked(f, result, /replace code\.txt after all\?/u, human); assert.deepEqual([edits, reviews], [2, 2]);
+  assert.equal(result.states.at(-4), "reviewResult");
+  assert.deepEqual(run.delivery.park.questions, [second]);
+  const [reason, needs]: string[][] = [run.delivery.reason.split("\n"), run.delivery.park.needs.split("\n")];
+  assert.match(reason[0]!, /\b1 open question:$/u); assert.deepEqual(reason.slice(1), questionLines([second]));
+  assert.match(needs[0]!, openQuestions); assert.deepEqual(needs.slice(1), questionLines([second]));
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "assumptions.json"), "utf8")), assumed([beside]));
+  assert.deepEqual(run.delivery.assumptions, assumed([beside]));
+});
 
 test("a plan the reviewer sends back once is planned again with that review, whatever the budgets, and the approved plan is the one worked from", async context => {
   const f = fixture(context); const plans: string[] = []; const planReviews: string[] = []; const prompts: string[] = [];
@@ -1046,7 +1322,7 @@ for (const policy of ["park", "ask"] as const) {
         const reading = (name: string): Runner => request => {
           calls.push(name);
           if (name !== state) return planning[name]!.answer(request);
-          return { type: outcome, ...summary, ...(outcome === "questions" ? { questions: ["Which language is the greeting in?"] } : {}) };
+          return { type: outcome, ...summary, ...(outcome === "questions" ? { questions: [language] } : {}) };
         };
         // A run that fails outright, as with "Operation failed in state", stops for nobody.
         const result = await execute(input(f, {}, { stuck: policy }), {
@@ -1067,7 +1343,7 @@ test("more rounds after falsify questions returns to falsify, and a ticket then 
   const f = fixture(context); const human = person("more rounds"); const prompts: Record<string, string> = {}; let falsified = 0;
   const result = await execute(input(f), {
     falsify: request => ++falsified === 1
-      ? { type: "questions", summary: "The ticket leaves the language open", questions: ["Which language is the greeting in?"] } : planning.falsify!.answer(request),
+      ? { type: "questions", summary: "The ticket leaves the language open", questions: [language] } : planning.falsify!.answer(request),
     plan: request => {
       assert.doesNotMatch(request.prompt, /Current failure\/feedback:/u, "sound clears the settled falsify questions");
       return planning.plan!.answer(request);
@@ -1086,7 +1362,7 @@ test("more rounds after falsify questions returns to falsify, and a ticket then 
     ["falsify: questions", "falsify: sound", "plan: planned", "planReview: approved", "test: completed", "change: completed", "review: approved"]);
   const reports = [1, 2].map(round => JSON.parse(readFileSync(join(run.directory, `falsify-${round}.json`), "utf8")));
   assert.deepEqual(reports.map(report => report.type), ["questions", "sound"]);
-  assert.deepEqual(reports[0].questions, ["Which language is the greeting in?"]);
+  assert.deepEqual(reports[0].questions, [language]);
 });
 
 test("more rounds after a second plan revision returns to plan with the reviewer's feedback, and the plan then approved goes to the tester before the implementer", async context => {
@@ -1119,7 +1395,7 @@ for (const state of ["falsify", "plan"]) {
   test(`more rounds after a stop in ${state} that stops again asks again, and never reaches the tester or the implementer`, async context => {
     const f = fixture(context); const human = person("more rounds", "hand off"); let planReviews = 0;
     const result = await execute(input(f), {
-      ...(state === "falsify" ? { falsify: () => ({ type: "questions", summary: "The ticket leaves the language open", questions: ["Which language is the greeting in?"] }) }
+      ...(state === "falsify" ? { falsify: () => ({ type: "questions", summary: "The ticket leaves the language open", questions: [language] }) }
         : { planReview: () => ok("revise", `The plan names no test, round ${++planReviews}`) }),
       tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
     }, human);
@@ -3062,7 +3338,7 @@ test("a parked candidate resumes with fresh budgets and an approving reviewer de
 });
 
 for (const [label, stop] of [
-  ["falsify questions", { falsify: () => ({ type: "questions", summary: "The ticket leaves the language open", questions: ["Which language is the greeting in?"] }) }],
+  ["falsify questions", { falsify: () => ({ type: "questions", summary: "The ticket leaves the language open", questions: [language] }) }],
   ["a second plan revision", { planReview: () => ok("revise", "The plan names no test") }],
 ] as const) {
   test(`a run parked on ${label} leaves no change, and resume starts again at falsify with the amended ticket instead of going to scopeAfterChange`, async context => {
@@ -3381,6 +3657,19 @@ for (const path of ["docs/catalog.md", "README.md"]) {
       && /\bclean\b|\bno (?:uncommitted )?changes?\b|\bholds? no(?:thing)?\b|\bno candidate\b|\bwithout a candidate\b|\bat its base\b/iu.test(said)),
       `${path} must say in one sentence or table row that resume starts again at falsify when the worktree is clean at its base, with no candidate`);
     assert.doesNotMatch(text.replace(/\s+/gu, " "), /a resumed run goes straight to|it skips `falsify`/iu, `${path} still says every resumed run skips falsify`);
+  });
+  test(`${path} describes what a falsify question carries, the assume input and its default, and where assumptions are recorded`, () => {
+    const text = readFileSync(resolve(path), "utf8"); const prose = text.replace(/\s+/gu, " ");
+    for (const field of ["recommended", "assumable"]) assert.match(prose, new RegExp(`\\b${field}\\b`, "u"), `${path} must name the ${field} field of a falsify question`);
+    assert.match(prose, /`assume`/u, `${path} must name the assume input`);
+    assert.ok(statements(text).some(said => /`assume`/u.test(said) && /\bfalse\b|\boff\b|\bdefault/iu.test(said)),
+      `${path} must say in one sentence or table row that assume is false unless it is given`);
+    assert.ok(statements(text).some(said => /\bassumable\b/iu.test(said) && /\bparks?\b|\bparked\b/iu.test(said)),
+      `${path} must say in one sentence or table row that a report with a question that is not assumable parks`);
+    for (const [place, named] of [["the evidence file", /assumptions\.json/u], ["the prompt heading", /Assumptions:/u], ["the pull request heading", /## Assumptions/u]] as const) {
+      assert.match(prose, named, `${path} must name ${place}`);
+    }
+    assert.ok(statements(text).some(said => /\bassumptions\b/iu.test(said) && /delivery\.json/u.test(said)), `${path} must say in one sentence or table row that delivery.json records the assumptions`);
   });
 }
 

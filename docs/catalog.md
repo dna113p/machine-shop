@@ -233,7 +233,7 @@ matter only for `pr`. `worktreeRoot` and `evidenceRoot` are absolute and must be
 outside `repository.path`, and `evidenceRoot` must also be outside the worktree,
 so run files never appear in the source checkout or the commit. `maxRepairs`
 (0–3, default 3), `maxReviewRounds` (0–5, default 2), `stuck` (`"park"` or
-`"ask"`, default `"park"`), and the booleans `resume` (default `false`) and
+`"ask"`, default `"park"`), and the booleans `assume` (default `false`), `resume` (default `false`), and
 `redGreen` (default `true`) are optional. `repository.redCheck` defaults to
 `"tests"`; with red/green enabled, construction rejects a name absent from
 `repository.checks`.
@@ -307,8 +307,8 @@ is.
 | `shape` | Validate the checkout and root paths; open evidence and block missing ticket sections or empty required lists before any Agent or worktree |
 | `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch instead: no uncommitted change goes through `start` to `falsify`, a candidate to `scopeAfterChange`, then `verify` |
 | `start` | Open the helper's run on the worktree, which must be clean |
-| `falsify` | Read-only investigator tries to show the ticket is wrong, already done, impossible here, or underspecified; returns `sound` with a one-paragraph summary or `questions` with 1–10 non-empty strings a person must answer |
-| `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; a sound ticket goes to `plan`, questions go through the stuck policy with numbered needs, each flattened and capped at 600 characters plus an ellipsis |
+| `falsify` | Read-only investigator tries to show the ticket is wrong, already done, impossible here, or underspecified; returns `sound` with a one-paragraph summary or `questions` with 1–10 entries containing text, options, recommended, assumable, and why |
+| `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; a sound ticket goes to `plan`, as does an entirely assumable report with `assume: true`; remaining questions go through the stuck policy with numbered needs, flattened with only question text capped at 600 characters plus an ellipsis |
 | `plan` | Read-only investigator returns `planned` with the complete plan as a summary of at most 4000 characters, recorded as stage `plan` |
 | `planResult` | Capture the report before guarding the unchanged worktree and validating the captured prose plan's length before `planReview` |
 | `planReview` | Read-only reviewer returns `approved` or `revise` with a summary; the prompt includes the plan verbatim |
@@ -334,6 +334,30 @@ planning state goes through the stuck policy, with the state and missing summary
 named in the reason. A plan sent back once is re-planned with the
 reviewer's feedback and reviewed again; a second revision stops before editing.
 Malformed questions or a plan over 4000 characters go through the stuck policy.
+Each question has the shape
+`{ text, options: string[], recommended: string, assumable: boolean, why }`.
+Text and why must be non-empty strings; options must be a non-empty array of
+non-empty strings, and recommended must copy one of those options exactly.
+A malformed entry stops with its field named, such as `questions[0].options`;
+plain strings are no longer valid entries.
+
+The `assume` switch is off by default and applies only in `falsify`; enabling it
+for a ticket or repository remains the owner's decision. `assumable` means a
+gap whose conservative answer loses nothing if wrong: it stops, refuses, or keeps
+more. A product decision, a change of scope, or anything irreversible is never
+assumable. With `assume: false`, all questions go to the owner. With `assume: true`,
+an entirely assumable report records the recommended answers and continues to
+`plan`; a report with any question that is not assumable parks by default on only
+those questions, listing the others as answers it would have assumed, without
+recording them as assumptions. `stuck: "ask"` still routes these stops to `decide`.
+
+When the run continues, its evidence directory gets `assumptions.json`, an array
+of `{ question, answer, options, why }` copied from the questions and recommended
+answers. The file's exact text is passed under `Assumptions:` to `plan`,
+`planReview`, `test`, `change`, and `review`, before `Plan:` wherever that heading
+exists. A reviewer who disagrees with an assumption reports a `discussion`
+finding; the report shape and existing escalation rule are unchanged.
+
 After plan approval, new runs go through `test` → `scopeAfterTest` → `red` →
 `change` → `scopeAfterChange` → `verify`. With `redGreen: false`, they skip
 `test`, `scopeAfterTest`, and `red`. Resumed runs with a candidate skip them too,
@@ -525,6 +549,8 @@ The Operation writes the pull request body, in this order: the ticket title on
 the first line; `## Summary` with the first paragraph of the ticket body below
 its leading headings, ended by a blank line or the next heading, a section left
 out when the body has no such text;
+`## Assumptions` when the run assumed answers in falsify, with one flattened
+`- <question> Assumed: <answer> (<why>)` line per answer;
 `## Checks` with one `- <name>: passed` line per required check; `## Review`
 with the approving review's summary; `## Review notes` listing accumulated minor
 findings and their locations, omitted when none exist; and `Ticket: <id>` as the last line. The commit
@@ -556,7 +582,7 @@ has a two-minute timeout and also runs for a resumed `pr` run. `branch` and
 `patch` runs make no network call.
 
 Stuck work goes to the `stuck` Operation. This covers falsify returning
-`questions`, malformed planning reports (including missing or empty summaries), a second plan review revision, any read-only
+questions that the run cannot assume, malformed planning reports (including missing or empty summaries), a second plan review revision, any read-only
 planning stage having edited files, the tester or implementer returning `blocked`,
 the reviewer returning `blocked` or having edited files, review non-convergence,
 open owner questions, malformed review reports, either budget exhausting,
@@ -653,7 +679,8 @@ the run ends `blocked` with a message naming the condition, changing nothing.
 Setup commands are not run again. With a candidate, resume skips `falsify`, `plan`,
 and `planReview` and goes to `scopeAfterChange`, then `verify`, review, commit,
 rebase, and deliver as usual, with fresh budgets and the normal repair loop if
-review asks for changes. Without a candidate, resume goes through `start` to
+review asks for changes. A resumed run carries no earlier assumptions into its
+prompts, pull request, or receipt. Without a candidate, resume goes through `start` to
 `falsify` and plans and tests the current ticket afresh. This includes a worktree
 left clean by a failed setup in `prepare`; resolve the setup problem in the kept
 worktree before resuming. The base
@@ -705,7 +732,10 @@ as `human-<n>.json`, and `result.json`,
 plus `delivery.json` with the ticket id, repository name and path, branch, base
 commit, commit hash, output mode, pull request URL or patch paths, worktree
 path, whether the worktree was removed, and `reviewNotes: [{text, where}]` in
-every output mode (an empty list when there are no minors). Its `outcome` is `delivered`,
+every output mode (an empty list when there are no minors). When falsify assumed
+answers, `delivery.json` also records `assumptions`, the array written to
+`assumptions.json`, for every outcome in that run; both are absent when nothing
+was assumed. Its `outcome` is `delivered`,
 `parked`, `handed-off`, `abandoned`, or `blocked`. It records `decision` when one was made
 (the last choice at `decide`, so `discard` for a confirmed discard and
 `more rounds` for a run that went on to deliver), `archive` as
@@ -720,7 +750,7 @@ For parking, `delivery.json` also records the `reason` and
 The one-line hold starts `Parked on <branch>: ` followed by the first line of
 `park.txt`, then `Needs: ...`, `Worktree kept at ...`, and ends `Evidence: <directory>`.
 For open review or falsification questions, `park.questions` is the report's
-ordered array of `{text, where}`; falsification questions use an empty `where`.
+ordered array of open `{text, where}` entries; falsification questions use an empty `where`.
 The reason and needs list every question on its own numbered
 line with its location. Needs cap each question's flattened text separately at
 600 characters plus an ellipsis, keeping its location; the list itself is not
@@ -729,7 +759,11 @@ capped. The one-line hold instead uses `Needs: N open questions; the first:
 the parentheses. Other stops use the same needs text in the receipt, note, and
 summary, with whitespace flattened in the single-line summary and no
 `park.questions` field. Falsification questions follow the same limits as review
-questions; a second plan review revision uses the usual blocker needs, capped at
+questions for question text only: each numbered line then lists the options with
+the recommended answer first and marked, followed by why, all flattened and
+without a cap on those fields. In a mixed report with `assume: true`, reason and
+needs also list the answers the run would have assumed, outside the numbered
+questions. A second plan review revision uses the usual blocker needs, capped at
 600 characters plus an ellipsis when truncated. The full reason remains in the
 receipt and note, and raw planning events preserve even malformed reports.
 `result.json` keeps the helper's vocabulary: its `outcome` is `blocked` for

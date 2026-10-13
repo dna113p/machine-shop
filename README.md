@@ -172,9 +172,34 @@ stay within the current section.
 
 Before editing, `falsify` asks the investigator to show that the ticket is wrong,
 already done, impossible here, or underspecified. It returns `sound` with a
-one-paragraph summary or `questions` with 1–10 non-empty questions a person must
-answer. Falsification questions go through the stuck policy and become numbered
-`needs`, each flattened to one line and capped at 600 characters plus an ellipsis.
+one-paragraph summary or `questions` with 1–10 entries shaped as
+`{ text, options: string[], recommended: string, assumable: boolean, why }`.
+Text and why must be non-empty strings; options must be a non-empty array of
+non-empty strings, with recommended copied exactly from one of them. Malformed
+entries go through the stuck policy with the bad field named. Falsification
+questions become numbered `needs`, each flattened to one line with only its
+question text capped at 600 characters plus an ellipsis, followed by its options
+(recommended first and marked) and why.
+
+The optional boolean `assume` defaults to `false`: every question still stops the
+run. Only a gap whose conservative answer loses nothing if wrong (stops, refuses,
+or keeps more) is `assumable`; product decisions, changes of scope, and anything
+irreversible never are. With `assume: true`, an entirely assumable report records
+the recommended answers and continues to `plan`; any question that is not
+assumable parks by default, listing only those questions for the owner and saying
+which other answers the run would have assumed. The `stuck: "ask"` policy still
+applies. Enabling the switch for a ticket or repository is the owner's decision;
+this library leaves it off, and it applies only in `falsify`.
+
+When the run continues with assumptions, `assumptions.json` in the evidence
+directory records `[{ question, answer, options, why }]`. Its exact text is handed
+to the planner, plan reviewer, tester, implementer, and implementation reviewer
+under `Assumptions:`. The pull request lists them under `## Assumptions` after
+the summary, and `delivery.json` records `assumptions` for every outcome in that
+run. These are omitted when nothing was assumed. An assumption the reviewer
+disagrees with is a `discussion` finding, following the existing owner escalation
+rule.
+
 A sound ticket proceeds to `plan`: the investigator returns
 `planned` with a plan of at most 4000 characters, recorded as stage `plan`.
 In `planReview`, the reviewer approves it or requests one revision; a second
@@ -247,8 +272,9 @@ worktree a park or `hand off` left behind, with fresh budgets and without rerunn
 setup. A resumed worktree with no uncommitted change starts again at `falsify`,
 then plans, reviews the plan, and tests the current ticket before implementation.
 A worktree with a candidate skips planning and the tester and goes straight to
-scope checks, verification, review, commit, rebase, and delivery. The
-base branch may have moved forward in the meantime: the ticket branch must point
+scope checks, verification, review, commit, rebase, and delivery. A resumed run
+does not carry earlier assumptions into its prompts, pull request, or receipt.
+The base branch may have moved forward in the meantime: the ticket branch must point
 at the base commit or an ancestor of it, with no commit of its own.
 
 After `commit`, the `rebase` Operation resolves the current base in the source
@@ -285,10 +311,14 @@ and `Evidence: <directory>`. `delivery.json` records `outcome: "parked"`, the
 reason, and `park: { needs, next, budgets: { repairs: { used, max }, reviewRounds:
 { used, max } } }`. `result.json` records cumulative `repairs` and `reviewRounds`.
 For open review or falsification questions, `park.questions` is the report's
-ordered array of `{text, where}`; falsification questions use an empty `where`.
+ordered array of open `{text, where}` entries; falsification questions use an empty `where`.
 The reason and `park.needs` list every question on its own
 numbered line with its location; needs cap each question's flattened text separately at 600
-characters plus an ellipsis, keeping its location. The reason stays full. The
+characters plus an ellipsis, keeping its location. Falsification lines also list
+the options with the recommended answer first, then why; those fields are not
+capped. In a mixed report with `assume: true`, reason and needs also list the
+answers the run would have assumed, outside the numbered owner questions.
+The reason stays full. The
 one-line hold uses `Needs: N open questions; the first: <text> (<where>)`, with
 the same cap on that first question. Empty locations omit the parentheses.
 

@@ -22,7 +22,7 @@ const confirmations = ["confirm discard", "go back"] as const;
 
 export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const { machine, operation, agent, human, final } = p;
-  const { ticket, repository, prefix, worktree, evidenceRoot, resume, redGreen, stuck, work, branch: named } = parseTicket(input);
+  const { ticket, repository, prefix, worktree, evidenceRoot, resume, redGreen, assume, stuck, work, branch: named } = parseTicket(input);
   // A resumed run continues on the branch its worktree is already on, whatever title named it.
   let branch = named;
   let baseCommit = "";
@@ -59,6 +59,11 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let plan = "";
   let planRevisions = 0;
   let ownerQuestions: { text: string; where: string }[] | undefined;
+  let falsifyQuestions: FalsifyQuestion[] = [];
+  let wouldAssume: FalsifyQuestion[] = [];
+  let assumptions: { question: string; answer: string; options: string[]; why: string }[] = [];
+  let assumptionsJson = "";
+  const assumptionsPrompt = () => assumptionsJson ? ["Assumptions:", assumptionsJson] : [];
 
   function scope(stage: "test" | "change"): Event {
     repairing = stage;
@@ -447,6 +452,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       writeFileSync(body, [
         ticket.title,
         ...(ticket.summary ? ["## Summary", ticket.summary] : []),
+        ...(assumptions.length ? ["## Assumptions", assumptions.map(({ question, answer, why }) => `- ${flat(question)} Assumed: ${flat(answer)} (${flat(why)})`).join("\n")] : []),
         "## Checks", repository.checks.map(name => `- ${name}: passed`).join("\n"),
         // The helper has already taken the summary out of a JSON report; one that is still an object is evidence, not text for a reader.
         "## Review", jsonObject(reviewSummary) ? "The reviewer approved this change without a written summary; its report is kept with the run evidence." : reviewSummary,
@@ -501,7 +507,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const text = flat(question.text); const where = flat(question.where);
     return `${text.length > cap ? `${text.slice(0, cap)}…` : text}${where ? ` (${where})` : ""}`;
   };
-  const questionLines = (cap?: number) => ownerQuestions!.map((question, index) => `${index + 1}. ${questionText(question, cap)}`).join("\n");
+  const questionLines = (cap?: number) => ownerQuestions!.map((question, index) => {
+    const gap = falsifyQuestions[index];
+    const options = gap ? ` Options: ${[`${flat(gap.recommended)} (recommended)`, ...gap.options.filter(option => option !== gap.recommended).map(flat)].join("; ")} Why: ${flat(gap.why)}` : "";
+    return `${index + 1}. ${questionText(question, cap)}${options}`;
+  }).join("\n");
+  const wouldAssumeLines = () => wouldAssume.length
+    ? `\nHad these been the only questions, the run would have assumed:\n${wouldAssume.map(question => `- ${flat(question.text)} → ${flat(question.recommended)}`).join("\n")}` : "";
   function parkDetails() {
     const { reason, repairs, maxRepairs, reviewRounds, maxReviewRounds } = work.status();
     // Ask for one owner response while preserving the actual question or criterion as context.
@@ -510,7 +522,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ? `Explain how to resolve the remaining findings: ${why}`
       : `Clarify how to resolve this blocker: ${why}`;
     return { needs: ownerQuestions
-      ? `Answer the open question${ownerQuestions.length === 1 ? "" : "s"}:\n${questionLines(600)}`
+      ? `Answer the open question${ownerQuestions.length === 1 ? "" : "s"}:\n${questionLines(600)}${wouldAssumeLines()}`
       : needs.replace(/^(.{600}).+$/u, "$1…"),
       ...(ownerQuestions ? { questions: ownerQuestions } : {}), next: parkNext,
       budgets: { repairs: { used: repairs, max: maxRepairs }, reviewRounds: { used: reviewRounds, max: maxReviewRounds } } };
@@ -588,6 +600,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ticket: ticket.id, repository: { name: repository.name, path: repository.path }, branch,
       baseCommit: baseCommit || null, commit: commitHash || null, output: repository.output,
       ...(rebasedFrom ? { rebasedFrom } : {}),
+      ...(assumptions.length ? { assumptions } : {}),
       ...(prUrl ? { prUrl } : {}), ...(patches.length ? { patches } : {}), ...(archived ? { archive: archived } : {}),
       worktree, ...(adopted ? { resumed: true } : {}), worktreeCreated: created, worktreeRemoved: removed, reviewNotes,
     }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
@@ -626,13 +639,20 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       work.block("");
       return { type: "sound" };
     }
-    const questions = event.questions;
-    if (!Array.isArray(questions) || questions.length < 1 || questions.length > 10
-      || questions.some(question => typeof question !== "string" || !question.trim())) {
-      return work.block("Malformed falsify report: questions must be an array of 1–10 non-empty strings.");
+    const malformed = questionField(event.questions);
+    if (malformed) return work.block(`Malformed falsify report: ${malformed}.`);
+    const questions = event.questions as FalsifyQuestion[];
+    falsifyQuestions = assume ? questions.filter(question => !question.assumable) : questions;
+    if (!falsifyQuestions.length) {
+      assumptions = questions.map(({ text, recommended, options, why }) => ({ question: text, answer: recommended, options, why }));
+      assumptionsJson = JSON.stringify(assumptions, null, 2) + "\n";
+      writeFileSync(join(work.open(), "assumptions.json"), assumptionsJson, { flag: "wx", mode: 0o600 });
+      work.block("");
+      return { type: "assumed" };
     }
-    ownerQuestions = questions.map(text => ({ text, where: "" }));
-    return work.block(`Ticket owner must settle ${questionCount()}:\n${questionLines()}`);
+    ownerQuestions = falsifyQuestions.map(({ text }) => ({ text, where: "" }));
+    wouldAssume = assume ? questions.filter(question => question.assumable) : [];
+    return work.block(`Ticket owner must settle ${questionCount()}:\n${questionLines()}${wouldAssumeLines()}`);
   }
   function planResult(): Event {
     const kept = keep("plan");
@@ -725,17 +745,21 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       // A clean resume starts planning afresh. A resumed candidate is held to Scope; red cannot be proved again once implemented.
       prepare: operation(prepare, { prepared: "start", resumed: "scopeAfterChange", blocked: "failure" }),
       start: operation(work.start, { started: "falsify" }),
-      falsify: agent(() => work.prompt("Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 non-empty strings giving the exact questions a person must answer."), {
+      falsify: agent(() => work.prompt("Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 entries shaped as { text, options: string[], recommended: string, assumable: boolean, why }, giving the exact questions a person could answer. text and why must be non-empty strings; options must be a non-empty array of non-empty strings; recommended must copy one of those options exactly. Mark assumable true only for a gap whose conservative answer loses nothing if wrong: it stops, refuses, or keeps more. A product decision, a change of scope, or anything irreversible is never assumable."), {
         sound: { target: "falsifyResult", actions: rememberPlanning },
         questions: { target: "falsifyResult", actions: rememberPlanning },
       }, { using: "investigator", cwd: worktree }),
-      falsifyResult: operation(stopped("falsifyResult", falsifyResult), { sound: "plan", blocked: "stuck" }),
-      plan: agent(() => work.prompt("Plan the implementation of this sound ticket. Do not edit any file. Cover the acceptance criteria, tests, permitted paths, and required checks. Address any plan review feedback in the stage reports. Return planned with the complete plan as the summary, at most 4000 characters."), {
+      falsifyResult: operation(stopped("falsifyResult", falsifyResult), { sound: "plan", assumed: "plan", blocked: "stuck" }),
+      plan: agent(() => work.prompt([
+        "Plan the implementation of this sound ticket. Do not edit any file. Cover the acceptance criteria, tests, permitted paths, and required checks. Address any plan review feedback in the stage reports. Return planned with the complete plan as the summary, at most 4000 characters.",
+        ...assumptionsPrompt(),
+      ].join("\n")), {
         planned: { target: "planResult", actions: rememberPlanning },
       }, { using: "investigator", cwd: worktree }),
       planResult: operation(stopped("planResult", planResult), { planned: "planReview", blocked: "stuck" }),
       planReview: agent(() => work.prompt([
         "Review the plan against the ticket, relevant code, scope, acceptance criteria, and tests. Do not edit any file. Return approved with a summary if it is ready to implement, or revise with a summary of what must change. Only one revision of the plan is allowed.",
+        ...assumptionsPrompt(),
         "Plan:", plan,
       ].join("\n")), {
         approved: { target: "planReviewResult", actions: rememberPlanning },
@@ -746,6 +770,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         repairing = "test";
         return work.prompt([
           "Write only tests that encode the acceptance criteria below, one or more per criterion, inside the Scope paths below. Do not implement anything and do not change non-test files. The tests must fail now and pass once the ticket is implemented. Leave changes uncommitted.",
+          ...assumptionsPrompt(),
           ...(plan ? ["Plan:", plan] : []),
           "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
           "Scope:", ...ticket.sections.scope.map(text => `- ${text}`),
@@ -766,6 +791,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         repairing = "change";
         return work.prompt([
           "Implement the ticket and its tests. Keep the change focused. Do not weaken checks or expand scope. Leave your changes uncommitted; the workflow commits and delivers them.",
+          ...assumptionsPrompt(),
           ...(plan ? ["Plan:", plan] : []),
           ...(redGreen ? ["The tester's tests in the stage reports are the contract; make them pass without weakening or deleting them. If a test is wrong, say so in the summary rather than changing its intent."] : []),
           "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
@@ -783,6 +809,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       sealReview: operation(work.seal, { sealed: "review" }),
       review: agent(() => work.prompt([
         "Review the current diff and verification evidence. Do not edit any file. Check acceptance criteria, regressions, scope, and whether tests actually establish the intended behavior.",
+        ...assumptionsPrompt(),
+        ...(assumptions.length ? ["An assumption you disagree with is a discussion finding for the ticket owner."] : []),
         ...(provedRed ? ["The tests were written before the implementation and the Machine saw them fail; check that the implementation makes them pass for the right reason and that no test was weakened."] : []),
         "Acceptance criteria:", ...ticket.sections.acceptance.map((text, index) => `${index + 1}. ${text}`),
         "Return one criteria entry per acceptance criterion, in order, with its text exactly as given, a boolean met, and evidence as a file:line or command.",
@@ -811,6 +839,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           { guard: chose("more rounds"), target: "repairTarget", actions: (args: { event: Event }) => {
             decide(args); work.renew();
             ownerQuestions = undefined;
+            falsifyQuestions = [];
+            wouldAssume = [];
             if (standingReview !== undefined) work.block(standingReview);
             standingReview = undefined;
           } },
@@ -837,6 +867,22 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       delivered: final(), blocked: final(), handedOff: final(), abandoned: final(), parked: final(),
     },
   });
+}
+
+type FalsifyQuestion = { text: string; options: string[]; recommended: string; assumable: boolean; why: string };
+/** Validate every question before using any recommended answer. */
+function questionField(questions: unknown): string | undefined {
+  if (!Array.isArray(questions) || questions.length < 1 || questions.length > 10) return "questions must be an array of 1–10 entries";
+  for (const [index, question] of questions.entries()) {
+    const field = `questions[${index}]`;
+    if (question === null || typeof question !== "object" || Array.isArray(question)) return `${field} must be an object`;
+    if (typeof question.text !== "string" || !question.text.trim()) return `${field}.text must be a non-empty string`;
+    if (!Array.isArray(question.options) || !question.options.length || question.options.some((option: unknown) => typeof option !== "string" || !option.trim())) return `${field}.options must be a non-empty array of non-empty strings`;
+    if (typeof question.recommended !== "string" || !question.options.includes(question.recommended)) return `${field}.recommended must be one of its options`;
+    if (typeof question.assumable !== "boolean") return `${field}.assumable must be a boolean`;
+    if (typeof question.why !== "string" || !question.why.trim()) return `${field}.why must be a non-empty string`;
+  }
+  return undefined;
 }
 
 type ReviewReport = Event & {
@@ -922,7 +968,7 @@ export function ticketSections(body: string) {
 
 function parseTicket(input: unknown) {
   const value: unknown = typeof input === "string" ? JSON.parse(input) : input;
-  const data = object(value, "input", ["ticket", "repository", "worktreeRoot", "evidenceRoot", "maxRepairs", "maxReviewRounds", "resume", "stuck", "redGreen"]);
+  const data = object(value, "input", ["ticket", "repository", "worktreeRoot", "evidenceRoot", "maxRepairs", "maxReviewRounds", "resume", "stuck", "redGreen", "assume"]);
   // Trackers attach their own fields (source, metadata) to a ticket; only id, title, and body are read.
   const ticket = object(data.ticket, "ticket", Object.keys(data.ticket ?? {}));
   const id = text(ticket.id, "ticket.id");
@@ -934,6 +980,7 @@ function parseTicket(input: unknown) {
   }
   if (data.resume !== undefined && typeof data.resume !== "boolean") throw new Error("resume must be a boolean");
   if (data.redGreen !== undefined && typeof data.redGreen !== "boolean") throw new Error("redGreen must be a boolean");
+  if (data.assume !== undefined && typeof data.assume !== "boolean") throw new Error("assume must be a boolean");
   const redGreen = data.redGreen !== false;
 
   const stuck = data.stuck === undefined ? "park" : data.stuck;
@@ -967,7 +1014,7 @@ function parseTicket(input: unknown) {
   const titled = titleSlug(title);
   return {
     ticket: { id, slug, title, summary: firstParagraph(ticket.body ?? ""), sections: ticketSections(ticket.body ?? "") }, prefix, branch: titled ? `${prefix}-${titled}` : prefix,
-    worktree, evidenceRoot, work, resume: data.resume === true, redGreen, stuck,
+    worktree, evidenceRoot, work, resume: data.resume === true, redGreen, assume: data.assume === true, stuck,
     repository: { name, path, base, setup, output, remote, draft: repo.draft !== false, redCheck, checks },
   };
 }
