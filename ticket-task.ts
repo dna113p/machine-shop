@@ -40,6 +40,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let reviewSummary = "";
   let standingReview: string | undefined;
   const reviews: Event[] = [];
+  // Keep evidence across rebases, but compare reports only within the current patch's reviews.
+  let reviewsFrom = 0;
   const reviewNotes: { text: string; where: string }[] = [];
   let prUrl = "";
   // Where prepare found the base published: the remote's URL and the pull request base branch there, its default branch by name when the base names none.
@@ -345,6 +347,43 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       return stop(`Replay onto ${tip} did not leave exactly one clean ticket commit on ${branch} with the expected parent, subject, Ticket line, and patch id; the approved candidate was restored uncommitted on ${original}.`);
     }
     rebasedFrom ??= firstApproved;
+    const undoOnTip = (why: string): Event | undefined => {
+      // Only added paths become untracked after a mixed reset; modified and deleted paths stay tracked.
+      const restoreAndStop = (reason: string) => {
+        restore();
+        return stop(`${reason} Undo onto ${tip} was needed because ${why}. The approved candidate is uncommitted on its original base ${original}; resume alone will stop again until the candidate or ignore rules are reconciled.`);
+      };
+      const paths = join(work.open(), `rebase-${++rebaseSteps}.paths`);
+      // Keep raw output: run() trims whitespace, which can be part of the first filename.
+      const added = spawnSync("git", ["diff-tree", "-r", "--no-renames", "--diff-filter=A", "--name-only", "-z", tip, head], {
+        cwd: worktree, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", timeout: 30_000, killSignal: "SIGKILL", maxBuffer: 8 * 1024 * 1024,
+      });
+      if (added.error || added.status !== 0) {
+        writeFileSync(`${paths}.log`, `${added.stdout ?? ""}\n${added.error?.message ?? added.stderr ?? ""}\n`, { flag: "wx", mode: 0o600 });
+        return restoreAndStop(`Cannot identify added paths before undo; inspect ${paths}.log.`);
+      }
+      writeFileSync(paths, added.stdout, { flag: "wx", mode: 0o600 });
+      const fd = openSync(paths, "r");
+      try {
+        // --no-index checks paths while the replayed commit still tracks them; -z preserves literal filenames.
+        const ignored = spawnSync("git", ["check-ignore", "--no-index", "-v", "-z", "--stdin"], {
+          cwd: worktree, stdio: [fd, "pipe", "pipe"], encoding: "utf8", timeout: 30_000, killSignal: "SIGKILL", maxBuffer: 8 * 1024 * 1024,
+        });
+        if (ignored.error || (ignored.status !== 0 && ignored.status !== 1)) {
+          writeFileSync(`${paths}.log`, `${ignored.stdout ?? ""}\n${ignored.error?.message ?? ignored.stderr ?? ""}\n`, { flag: "wx", mode: 0o600 });
+          return restoreAndStop(`Cannot check ignore rules before undo; inspect ${paths}.log.`);
+        }
+        const entries = ignored.stdout.split("\0");
+        const dropped: string[] = [];
+        // Verbose NUL records are source, line, pattern, path. A negated pattern re-includes the path.
+        for (let index = 0; index + 3 < entries.length; index += 4) {
+          if (!entries[index + 2]!.startsWith("!")) dropped.push(`${JSON.stringify(entries[index + 3])} (rule in ${JSON.stringify(entries[index])}:${entries[index + 1]})`);
+        }
+        if (dropped.length) return restoreAndStop(`Ignore rules would drop added files from the next commit: ${dropped.slice(0, 10).join(", ")}${dropped.length > 10 ? `; and ${dropped.length - 10} more` : ""}.`);
+      } finally { closeSync(fd); }
+      undo(tip);
+      return undefined;
+    };
     // Setup sees a committed, clean tree as it does in prepare, so unignored outputs cannot hide among candidate changes.
     for (const command of repository.setup) {
       const passed = work.check(command, "setup");
@@ -354,19 +393,23 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         return stop(`setup: ${command.name} moved HEAD or the ticket branch on base ${tip}; the approved candidate was restored uncommitted on ${original}.`);
       }
       if (!passed || pending() !== "") {
-        undo(tip);
+        const stopped = undoOnTip(`setup: ${command.name} ${passed ? "changed tracked or unignored files" : "failed"}`);
         work.reopen(true);
+        if (stopped) return stopped;
         return stop(`setup: ${command.name} ${passed ? "changed tracked or unignored files" : "failed"} on base ${tip}; inspect its setup log in ${work.open()}.`);
       }
     }
     if (before !== after) {
-      undo(tip);
+      const stopped = undoOnTip("the replayed patch differs from the approved patch");
+      if (stopped) return stopped;
+      reviewsFrom = reviews.length;
       work.block(`Base moved from ${original} to ${tip} and the replayed patch differs from the approved patch; verify and review this candidate again.`);
       return { type: "review" };
     }
     if (work.checks("reverify").type !== "passed") {
-      undo(tip);
+      const stopped = undoOnTip("reverify gates failed");
       work.reopen(true);
+      if (stopped) return stopped;
       return { type: "failed" };
     }
     commitHash = head;
@@ -434,7 +477,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     options: [
       { name: "more rounds", does: repairing === "falsify" || repairing === "plan" || repairing === "planReview"
         ? `restart the repair budget and return to ${repairing} with the standing feedback.`
-        : "restart the repair budget and send the standing findings back to the implementer." },
+        : `restart the repair budget and send the standing findings back to the ${repairing === "test" ? "tester" : "implementer"}.` },
       { name: "hand off", does: "stop here and keep the worktree and branch exactly as they are, with nothing committed, for another workflow or a person.", recommended: true },
       { name: "archive", does: `commit the candidate as delivery would have and keep that commit as the branch ${archiveBranch()}, then remove the worktree and delete ${branch}. Ignored files are not kept.` },
       { name: "discard", does: "remove the worktree and delete the branch without saving the candidate; asks for confirmation first." },
@@ -645,7 +688,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const unmet = report.criteria.flatMap((criterion, index) => criterion.met ? [] : [ticket.sections.acceptance[index]!]);
     const blockers = report.findings.filter(finding => finding.severity === "blocker");
     const discussions = report.findings.filter(finding => finding.severity === "discussion");
-    const previous = reviews.at(-2);
+    const previous = reviews.length - 1 > reviewsFrom ? reviews.at(-2) : undefined;
     const prior = previous && previous.type !== "blocked" && !reviewField(previous, ticket.sections.acceptance) ? previous as ReviewReport : undefined;
     // Decide whether repair is needed first, then whether another repair can make progress.
     if (unmet.length || blockers.length) {
@@ -696,13 +739,16 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         revise: { target: "planReviewResult", actions: rememberPlanning },
       }, { using: "reviewer", cwd: worktree }),
       planReviewResult: operation(stopped("planReviewResult", planReviewResult), { approved: redGreen ? "test" : "change", revise: "plan", blocked: "stuck" }),
-      test: agent(() => work.prompt([
-        "Write only tests that encode the acceptance criteria below, one or more per criterion, inside the Scope paths below. Do not implement anything and do not change non-test files. The tests must fail now and pass once the ticket is implemented. Leave changes uncommitted.",
-        ...(plan ? ["Plan:", plan] : []),
-        "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
-        "Scope:", ...ticket.sections.scope.map(text => `- ${text}`),
-        cannotRun,
-      ].join("\n")), {
+      test: agent(() => {
+        repairing = "test";
+        return work.prompt([
+          "Write only tests that encode the acceptance criteria below, one or more per criterion, inside the Scope paths below. Do not implement anything and do not change non-test files. The tests must fail now and pass once the ticket is implemented. Leave changes uncommitted.",
+          ...(plan ? ["Plan:", plan] : []),
+          "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
+          "Scope:", ...ticket.sections.scope.map(text => `- ${text}`),
+          cannotRun,
+        ].join("\n"));
+      }, {
         completed: { target: "scopeAfterTest", actions: record("test") },
         blocked: { target: "stuck", actions: record("test") },
       }, { using: "tester", cwd: worktree }),
@@ -713,16 +759,19 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         provedRed = result.type === "passed";
         return result;
       }, { passed: "change", failed: "repairBudget" }),
-      change: agent(() => work.prompt([
-        "Implement the ticket and its tests. Keep the change focused. Do not weaken checks or expand scope. Leave your changes uncommitted; the workflow commits and delivers them.",
-        ...(plan ? ["Plan:", plan] : []),
-        ...(redGreen ? ["The tester's tests in the stage reports are the contract; make them pass without weakening or deleting them. If a test is wrong, say so in the summary rather than changing its intent."] : []),
-        "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
-        "Scope (the only paths you may change; the workflow checks them):", ...ticket.sections.scope.map(text => `- ${text}`),
-        "Forbidden:", ...ticket.sections.forbidden.map(text => `- ${text}`),
-        "Resolve discussion findings or explain why they need the ticket owner in your summary.",
-        cannotRun,
-      ].join("\n")), {
+      change: agent(() => {
+        repairing = "change";
+        return work.prompt([
+          "Implement the ticket and its tests. Keep the change focused. Do not weaken checks or expand scope. Leave your changes uncommitted; the workflow commits and delivers them.",
+          ...(plan ? ["Plan:", plan] : []),
+          ...(redGreen ? ["The tester's tests in the stage reports are the contract; make them pass without weakening or deleting them. If a test is wrong, say so in the summary rather than changing its intent."] : []),
+          "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
+          "Scope (the only paths you may change; the workflow checks them):", ...ticket.sections.scope.map(text => `- ${text}`),
+          "Forbidden:", ...ticket.sections.forbidden.map(text => `- ${text}`),
+          "Resolve discussion findings or explain why they need the ticket owner in your summary.",
+          cannotRun,
+        ].join("\n"));
+      }, {
         completed: { target: "scopeAfterChange", actions: record("change") },
         blocked: { target: "stuck", actions: record("change") },
       }, { using: "implementer", cwd: worktree }),
@@ -755,7 +804,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }, { parked: "parked" }),
       decide: human(stuckPrompt, {
         submitted: [
-          // Back to planning when it stopped there, the tester after a failed red, else the implementer.
+          // Back to the planning or editing stage that stopped, including the tester after a failed red.
           { guard: chose("more rounds"), target: "repairTarget", actions: (args: { event: Event }) => {
             decide(args); work.renew();
             ownerQuestions = undefined;

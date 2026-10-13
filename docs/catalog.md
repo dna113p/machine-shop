@@ -161,7 +161,8 @@ both budgets to zero allows at most eight calls, or seven with `redGreen: false`
 The single permitted plan revision consumes neither budget. A moved base that
 changes the approved patch adds a fresh review outside these budgets.
 With `stuck: "ask"`, each `more rounds` decision
-renews both budgets and returns to the planning or editing stage that needs work;
+renews both budgets and returns to the planning or editing stage that stopped,
+including the tester or implementer when that Agent returned `blocked`;
 after a second plan revision it grants one more plan and review with the reviewer's
 feedback. The default
 `stuck: "park"` ends unattended runs immediately with their candidate kept.
@@ -319,7 +320,7 @@ is.
 | `verify` | The required checks; a failure goes to the repair budget |
 | `review`, `reviewResult` | Capture the structured report; the Operation preserves the unchanged-checkout guard and judges criteria, finding severity, and progress to approve, revise, or apply the stuck policy |
 | `commit` | One commit of everything except `.machine-runs`, even if an Agent staged it: subject is the ticket title, body is `Ticket: <id>` |
-| `rebase` | Resolve the current base; replay exactly the approved ticket commit onto a forward tip. Rerun setup, then `reverify` for an equal patch or `verify` and fresh review for a changed patch. Undo the commit before any new stop, repair, or re-review |
+| `rebase` | Resolve the current base; replay exactly the approved ticket commit onto a forward tip. Rerun setup, then `reverify` for an equal patch or `verify` and fresh review for a changed patch. Undo the commit before any new stop, repair, or re-review; if ignore rules on the tip would drop added files, restore the candidate on its original base through `stuck` |
 | `deliver` | `branch`: nothing more. `patch`: `git format-patch` for base..HEAD into the evidence directory. `pr`: `git push --no-follow-tags <remote URL>` of the approved commit to the ticket branch alone, then `gh pr create --repo <host/owner/repository>` |
 | `repairBudget`, `repairTarget`, `reviewBudget` | Count gate retries and review revisions separately; gate retries route to the responsible editing stage, review retries to `change`; exhaustion goes to `stuck` |
 | `stuck`, `park` | Select the input policy: `ask` goes to `decide`; `park` writes a note and receipt, keeps the candidate, and ends `parked` |
@@ -392,13 +393,15 @@ evidence directory and describes what is new.
    not converging and goes to `stuck`, naming the unchanged blockers. Empty or
    whitespace-only text also means none, as does `none` after trimming,
    lower-casing, and dropping a trailing period. With no blockers, the reason
-   names the unmet ticket criteria instead.
+   names the unmet ticket criteria instead. The first review of a changed patch
+   after rebase is not compared with reports from before the rebase.
 5. Discussions get one repair round to resolve them or explain why they need
    the owner. If the previous review also had discussions, every discussion in
    the next review goes to the owner together through `stuck`, whatever its
    wording, only when no criteria or blockers need repair. This depends on review
    position, not matching text. Discussions after a review without any get a
-   fresh repair round.
+   fresh repair round, as do discussions in the first review of a changed patch
+   after rebase; only subsequent reviews of that patch are compared.
 6. All criteria met with no blockers or discussions approves, including a
    reviewer `revise` event containing only minors. Minor notes accumulate across
    review rounds, deduplicated by text and location after trimming and
@@ -472,18 +475,32 @@ after replay conservatively restores the approved candidate on the original
 base and stops through `stuck`. No new Human choices or park instructions are
 needed.
 
+Before undoing onto the new tip, the step checks the replayed commit's added
+paths against ignore rules with `git check-ignore --no-index`; if any would
+be dropped by the next `git add --all`, it restores the approved candidate
+uncommitted on its original base and stops through `stuck`.
+The ignore stop names the affected files and each rule's file, the new tip,
+and why the undo was needed; resume alone repeats the stop until the candidate
+or ignore rules are reconciled. Modified and deleted paths stay tracked after
+the undo, and re-included added paths are safe. Failure to inspect added paths
+or ignore rules also restores the candidate and goes through `stuck`, with
+failure logs retained. The added paths are saved as `rebase-<n>.paths`.
+
 After a valid replay, setup runs again as phase `setup` while the rebased tree
 is still committed and clean, so its unignored outputs can be detected as in
 `prepare`. A failed command or tracked/unignored leftovers undoes the commit
 on the new tip, updates `baseCommit`, marks checks failed, and goes through
-`stuck` naming the command; this is not an implementer repair. If patch ids
-differ, the commit is undone on the new tip and the run returns to `verify`
-and a fresh `review`, which can approve, revise, or block normally. This
+`stuck` naming the command, subject to the ignore guard above; this is not an
+implementer repair. If patch ids differ and the ignore guard permits the undo
+on the new tip, the run returns to `verify`
+and a fresh `review`, which is a first review of the new patch for convergence
+and discussion escalation and can approve, revise, or block normally. This
 re-review uses neither budget and repeats only if the base moves again.
 If patch ids match, the gates run as phase `reverify`. Passing delivers the
 rebased commit with the new tip as `baseCommit`. Failing undoes the commit on
-that tip, marks checks failed, and goes to `repairBudget`; the implementer sees
-the failed gates before the normal verify/review/commit/rebase sequence. With
+that tip if the ignore guard permits, marks checks failed, and goes to
+`repairBudget`; the implementer sees the failed gates before the normal
+verify/review/commit/rebase sequence. With
 no further base movement that second `rebase` needs no second `reverify`, since
 `verify` checked the candidate on the new base.
 
@@ -533,6 +550,9 @@ planning stage having edited files, the tester or implementer returning `blocked
 the reviewer returning `blocked` or having edited files, review non-convergence,
 open owner questions, malformed review reports, either budget exhausting,
 and the recoverable rebase stops described above.
+Entering `test` or `change` marks the tester or implementer as the stage to
+repair, so `more rounds` after that Agent returns `blocked` goes back to it;
+the decision prompt names that same Agent.
 With the default `stuck: "park"`, `park` writes `park.txt` and a delivery receipt
 and ends `parked` immediately, without a Human request, commit, archive, or
 removal. The worktree, branch, and uncommitted candidate stay exactly as they are.
@@ -550,7 +570,7 @@ recommended and listed first in the decision prompt. The restricted choices are:
 
 | Choice | Effect | Final state |
 | --- | --- | --- |
-| `more rounds` | Both used budget counts return to zero; return to the planning state that stopped, or to `plan` with the reviewer's feedback after a second revision. Otherwise return to the responsible editing stage with the standing findings. A plan must be approved before testing and implementation. It can be chosen again every time a budget runs out | continues |
+| `more rounds` | Both used budget counts return to zero; return to the planning state that stopped, or to `plan` with the reviewer's feedback after a second revision. Otherwise return to the editing stage that stopped, the tester or implementer, with the standing findings. A plan must be approved before testing and implementation. It can be chosen again every time a budget runs out | continues |
 | `hand off` | Nothing is touched: the worktree and the branch stay, uncommitted, for another workflow or a person to work in | `handedOff` |
 | `archive` | What delivery would have committed, tracked and untracked files without ignored files or `.machine-runs`, is committed and kept as the branch `archive/<slug>`; then the worktree is removed and the ticket branch deleted | `abandoned` |
 | `discard` | After confirmation, the worktree is removed and the branch deleted without saving the candidate | `abandoned` |
