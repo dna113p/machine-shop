@@ -286,9 +286,20 @@ nothing, even on a malformed report. A failed delete or write stops, naming the 
 The base branch may have moved forward in the meantime: the ticket branch must point
 at the base commit or an ancestor of it, with no commit of its own.
 
+With the worktree gone, `resume: true` can instead adopt a delivered commit and
+continue directly at `rebase`, without an Agent before that step. This requires
+exactly one branch of the ticket, holding exactly one commit above an ancestor
+of the current base, with the current ticket title as subject and its `Ticket:`
+line. Every successful delivery records its commit in local Git configuration
+as `branch.<name>.ticketDelivered`; that record must equal the branch tip.
+An absent or mismatched record refuses resume, including deliveries from before
+this record existed. The workflow recreates the worktree on that branch and
+runs setup. This path supports `branch` and `patch`; in `pr` mode it blocks,
+because the pull request is brought up to date at its host.
+
 After `commit`, the `rebase` Operation resolves the current base in the source
-checkout (its HEAD when no base is named). An unchanged or unresolvable base
-continues to delivery. A forward move replays exactly the ticket commit onto
+checkout (its HEAD when no base is named). For a commit approved in this run,
+an unchanged or unresolvable base continues to delivery. A forward move replays exactly the ticket commit onto
 the new tip. The same patch runs setup again, then the gates as `reverify`;
 a changed patch is undone on the new tip and goes through verification and a
 fresh review. Failed `reverify` gates return to the normal repair loop.
@@ -298,6 +309,16 @@ patch for convergence and discussion escalation, without comparisons to reports
 from before the rebase. When the run changes base, `delivery.json` includes a `rebasedFrom` field, `{ baseCommit, commit }`,
 with the starting base and first approved commit. In `pr` mode the new tip must
 already be published on the recorded pull request base before replay.
+
+For a resumed delivered commit, an equal-patch replay runs setup again and the
+gates as `verify`, so this run records its own passing checks. A changed patch
+still needs fresh verification and review. If the base has not moved, the run
+verifies and delivers the same commit without replay, recording
+`redelivered: true` in `delivery.json`; this can be repeated. A failed setup at
+adoption or failed gates on the unchanged base refuses resume and removes the
+recreated worktree. A successful hold adds one sentence saying the delivered
+commit was replayed onto a new base or delivered again unchanged, before
+`Evidence: <directory>`.
 
 For every new stop, the run never stops with the workflow's commit on the ticket
 branch: it undoes that commit and keeps the candidate uncommitted, clearing the

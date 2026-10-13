@@ -4130,3 +4130,424 @@ for (const third of ["approves", "repeats its report"] as const) {
     rebasedFrom(f, run, started);
   });
 }
+
+// A delivered ticket whose base moved under it: its run has ended and its worktree is gone, so `resume: true` takes up the delivered commit itself.
+const deliveredKey = `branch.${branch}.ticketDelivered`;
+/** The commit a run recorded with the branch when it delivered, or "" for a branch that carries no such record. */
+const deliveredAs = (f: Fixture) => git(f.repo, "config", "--local", "--default", "", "--get", deliveredKey);
+/** No Agent has work on a run that only delivers again: any call fails the test. */
+const nobody: Record<string, Runner> = Object.fromEntries(["investigator", "planReview", "tester", "implementer", "reviewer"]
+  .map(name => [name, () => assert.fail(`${name} has no work on a ticket that was already delivered`)]));
+/** What a setup command saw: whether the base's later file and the ticket's own are in the tree it ran in. */
+const sees = 'const fs = require("fs"); console.log(`later.txt ${fs.existsSync("later.txt")}, greeting.txt ${fs.existsSync("greeting.txt")}`)';
+/** A gate that passes as the fixture's own does and says which commit it ran on, so its log shows the tree that was tested. */
+const testedOn = command('if (require("fs").existsSync("greeting.test.txt")) eval(require("fs").readFileSync("greeting.test.txt", "utf8")); '
+  + 'console.log("tested " + require("child_process").execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }))');
+const ran = (run: { result: any }) => run.result.checks.map((check: any) => [check.phase, check.name, check.passed]);
+const oneSentence = /^[^.!?]+\.$/u;
+/** A first run delivers the ticket and ends: its worktree is gone and its branch holds the delivered commit, which waits for whoever merges it. */
+async function deliverFirst(f: Fixture, data: unknown = input(f), agents: Record<string, Runner> = {}) {
+  const first = await execute(data, agents);
+  assert.equal(first.state, "delivered"); assert.equal(existsSync(f.worktree), false);
+  assert.equal(git(f.repo, "rev-list", "--count", `${f.head}..${branch}`), "1");
+  return git(f.repo, "rev-parse", branch);
+}
+/** What a refused resume leaves as it was: every ref, the registered worktrees, the local configuration with its records, and the place worktrees are made in. */
+const everything = (f: Fixture) => [git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"), git(f.repo, "worktree", "list", "--porcelain"),
+  git(f.repo, "config", "--local", "--list"), existsSync(f.worktree), existsSync(join(f.root, "worktrees")) ? readdirSync(join(f.root, "worktrees")) : null];
+/** What a delivery's hold says between its usual first sentence and where the evidence is; "" for a hold that is those two alone. */
+function between(result: { output: any }, run: { directory: string; delivery: any }) {
+  const summary: string = result.output.summary;
+  const first = `Delivered ${branch} at ${run.delivery.commit}${run.delivery.prUrl ? `, pull request ${run.delivery.prUrl}` : ""}${run.delivery.patches ? `, patch ${run.delivery.patches.join(", ")}` : ""}.`;
+  const last = `Evidence: ${run.directory}`;
+  assert.ok(summary.startsWith(first), summary); assert.ok(summary.endsWith(` ${last}`), summary); assert.doesNotMatch(summary, /\n/u);
+  return summary.slice(first.length, -last.length).trim();
+}
+/** The worktree is made again with `git worktree add` on the branch that exists: no new branch, no detached HEAD, and nothing forced. */
+function recreated(calls: string[], f: Fixture, times = 1) {
+  const added = calls.filter(call => /^worktree add(?:\s|$)/u.test(call));
+  assert.equal(added.length, times, `git worktree add: ${added.join("; ")}`);
+  for (const call of added) {
+    assert.ok(call.endsWith(` ${f.worktree} ${branch}`), call); assert.doesNotMatch(call, /(?:^|\s)(?:-b|-B|-f|--force|--detach|--orphan)(?:\s|$)/u);
+  }
+}
+/** A commit a person made on top of `parent`, changing greeting.txt: nobody reviewed it and no run delivered it. */
+function byHand(f: Fixture, parent: string, message: readonly string[] = ["Add a greeting", "Ticket: PROJ-12"]) {
+  const scratch = join(f.root, "scratch");
+  git(f.repo, "worktree", "add", "-q", "--detach", scratch, parent);
+  writeFileSync(join(scratch, "greeting.txt"), "by hand\n"); git(scratch, "add", "."); git(scratch, "commit", "-q", ...message.flatMap(part => ["-m", part]));
+  const commit = git(scratch, "rev-parse", "HEAD");
+  git(f.repo, "worktree", "remove", "--force", scratch);
+  return commit;
+}
+/** Puts a commit at the ticket branch's tip and records it as the delivered one, so that its shape alone is what a resume can refuse. */
+const place = (f: Fixture, commit: string) => { git(f.repo, "update-ref", `refs/heads/${branch}`, commit); git(f.repo, "config", deliveredKey, commit); };
+
+for (const output of ["branch", "patch", "pr"] as const) {
+  test(`${output} delivery records the delivered commit with the branch, beside the ticket's id slug, and its hold gains no sentence`, async context => {
+    const f = fixture(context); remote(f); fakeGh(context, f);
+    const result = await execute(input(f, { output }));
+    assert.equal(result.state, "delivered"); const commit = onTip(f, f.head);
+    const run = held(f, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u"));
+    assert.equal(deliveredAs(f), commit, `git config ${deliveredKey} <commit>`);
+    assert.equal(git(f.repo, "config", "--local", "--get", `branch.${branch}.ticket`), "proj-12");
+    // An ordinary delivery replayed nothing a run had delivered and delivered nothing again: its hold and receipt are as they were.
+    assert.equal(between(result, run), ""); assert.equal(run.delivery.redelivered, undefined);
+  });
+}
+
+test("a delivery after a replay records the commit on the new tip, not the one approved first, and its hold gains no sentence either", async context => {
+  const f = fixture(context); let tip = "";
+  const result = await execute(input(f), { reviewer: () => { tip = advance(f); return review(); } });
+  assert.equal(result.state, "delivered"); const commit = onTip(f, tip);
+  const run = held(f, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u"));
+  assert.equal(deliveredAs(f), commit); assert.notEqual(run.delivery.rebasedFrom.commit, commit);
+  assert.equal(between(result, run), ""); assert.equal(run.delivery.redelivered, undefined);
+});
+
+test("a run that does not deliver records no delivered commit: a failed pull request leaves its committed branch without one", async context => {
+  const f = fixture(context); remote(f); fakeGh(context, f, 1);
+  const run = blocked(f, await execute(input(f, { output: "pr" })), /gh pr failed; inspect .+gh-pr\.log/u, 1);
+  assert.equal(run.delivery.commit, git(f.repo, "rev-parse", branch)); assert.equal(deliveredAs(f), "");
+});
+
+for (const output of ["branch", "patch"] as const) {
+  test(`with resume, a delivered ${output} ticket whose base moved is replayed onto the new tip, set up and verified there, and delivered again without any Agent`, async context => {
+    const f = fixture(context); const started = f.head;
+    const repository = { output, setup: [command(sees, { name: "install" })], checks: [testedOn] };
+    const delivered = await deliverFirst(f, input(f, repository));
+    // Another ticket's delivery is merged first, in two commits: this one no longer fast-forwards.
+    advance(f); const tip = advance(f, "latest.txt"); const refs = others(f);
+    const calls = recordGit(context, f); const again = next(f, 2);
+    const result = await execute(input(again, repository, { resume: true }), nobody);
+    assert.equal(result.state, "delivered"); assert.deepEqual(result.states, ["shape", "prepare", "rebase", "deliver", "success", "delivered"]);
+    // Exactly the ticket commit lies above the new tip, and no other ref moved: nothing was merged into the base.
+    const commit = onTip(f, tip); assert.notEqual(commit, delivered);
+    const run = held(again, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f); assert.equal(others(f), refs);
+    assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+    assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", branch), "code.txt\ngreeting.test.txt\ngreeting.txt\nlater.txt\nlatest.txt");
+    // The worktree was made again on the branch that exists, and the delivered commit replayed from its own parent, never by force.
+    recreated(calls(), f);
+    assert.ok(calls().some(call => /(?:^|\s)rebase\s/u.test(call) && call.includes(`--onto ${tip} ${started}`)), "git rebase --onto <tip> <the delivered commit's parent>");
+    unforced(calls());
+    assert.equal(existsSync(f.worktree), false); assert.equal(git(f.repo, "worktree", "list").split("\n").length, 1);
+    // The receipt: delivered on the tip, from the commit the first run delivered on the base that run started from.
+    assert.deepEqual([run.delivery.outcome, run.delivery.baseCommit, run.delivery.commit, run.delivery.resumed, run.delivery.worktreeCreated, run.delivery.worktreeRemoved],
+      ["delivered", tip, commit, true, true, true]);
+    assert.equal(rebasedFrom(f, run, started), delivered); assert.notEqual(run.delivery.redelivered, true);
+    // Setup ran where the worktree was recreated and again on the replayed tree; then the gates, as `verify`, on the commit that was delivered.
+    assert.deepEqual(ran(run), [["setup", "install", true], ["setup", "install", true], ["verify", "tests", true]]);
+    assert.match(readFileSync(run.result.checks[0].log, "utf8"), /later\.txt false, greeting\.txt true/u);
+    assert.match(readFileSync(run.result.checks[1].log, "utf8"), /later\.txt true, greeting\.txt true/u);
+    assert.ok(readFileSync(run.result.checks[2].log, "utf8").includes(`tested ${commit}`), "the gates ran on the commit that was delivered");
+    assert.deepEqual([run.result.outcome, run.result.checksPassed, run.result.repairs, run.result.reviewRounds, run.result.agentInvocations], ["completed", true, 0, 0, 0]);
+    // The new commit is the delivered one now, so a base that moves again is answered the same way.
+    assert.equal(deliveredAs(f), commit);
+    // One sentence between the usual first one and the evidence says what happened to the delivered commit.
+    const said = between(result, run); assert.match(said, oneSentence); assert.match(said, /\breplayed\b/iu); assert.match(said, /\bbase\b/iu);
+    if (output === "patch") {
+      // One patch: the ticket's, on the new tip, not the base's commits with it.
+      assert.deepEqual(run.delivery.patches, [join(run.directory, "0001-Add-a-greeting.patch")]); assert.match(readFileSync(run.delivery.patches[0], "utf8"), /\+hello/u);
+    }
+  });
+}
+
+for (const output of ["branch", "patch"] as const) {
+  test(`with resume, a delivered ${output} ticket whose base has not moved is set up and verified on the same commit and delivered again unchanged, and a second time changes only the evidence`, async context => {
+    const f = fixture(context); const started = f.head;
+    const repository = { output, setup: [command(sees, { name: "install" })], checks: [testedOn] };
+    const delivered = await deliverFirst(f, input(f, repository));
+    assert.equal(deliveredAs(f), delivered); const before = everything(f); const calls = recordGit(context, f);
+    for (const number of [2, 3]) {
+      const again = next(f, number);
+      const result = await execute(input(again, repository, { resume: true }), nobody);
+      assert.equal(result.state, "delivered"); assert.deepEqual(result.states, ["shape", "prepare", "rebase", "deliver", "success", "delivered"]);
+      const run = held(again, result, new RegExp(`^Delivered ${branch} at ${delivered}`, "u")); untouched(f);
+      // The same commit on the same base: no ref, record, or registered worktree differs from before the run.
+      assert.deepEqual(everything(f), before); assert.equal(git(f.repo, "rev-parse", branch), delivered);
+      assert.deepEqual([run.delivery.outcome, run.delivery.redelivered, run.delivery.baseCommit, run.delivery.commit, run.delivery.rebasedFrom, run.delivery.resumed, run.delivery.worktreeRemoved],
+        ["delivered", true, started, delivered, undefined, true, true]);
+      // Nothing vouches for the commit but this run's own setup and gates on it.
+      assert.deepEqual(ran(run), [["setup", "install", true], ["verify", "tests", true]]);
+      assert.match(readFileSync(run.result.checks[0].log, "utf8"), /later\.txt false, greeting\.txt true/u);
+      assert.ok(readFileSync(run.result.checks[1].log, "utf8").includes(`tested ${delivered}`), "the gates ran on the commit that was delivered");
+      assert.deepEqual([run.result.outcome, run.result.checksPassed, run.result.repairs, run.result.reviewRounds, run.result.agentInvocations], ["completed", true, 0, 0, 0]);
+      const said = between(result, run); assert.match(said, oneSentence); assert.match(said, /\bunchanged\b|\bagain\b/iu); assert.doesNotMatch(said, /\breplayed\b/iu);
+      if (output === "patch") assert.deepEqual(run.delivery.patches, [join(run.directory, "0001-Add-a-greeting.patch")]);
+    }
+    recreated(calls(), f, 2);
+    assert.equal(calls().some(call => /(?:^|\s)rebase\s/u.test(call)), false, "nothing is replayed onto a base that has not moved");
+  });
+}
+
+test("with resume, a delivered ticket whose moved base conflicts parks in rebase with the candidate uncommitted on the base it was delivered on, and the next resume is accepted", async context => {
+  const f = fixture(context); const started = f.head; const human = person();
+  const delivered = await deliverFirst(f);
+  // The base gains a greeting of its own before this one is merged.
+  const tip = advance(f, "greeting.txt", "hi\n"); const refs = others(f);
+  let again = next(f, 2);
+  const result = await execute(input(again, {}, { resume: true, stuck: "park" }), nobody, human);
+  assert.deepEqual(result.states, ["shape", "prepare", "rebase", "stuck", "park", "parked"]);
+  const run = parkedIn("rebase", again, result, /greeting\.txt/u); untouched(f); assert.ok(names(run.delivery.reason, tip), "the reason names the new tip");
+  // No commit stays on the branch: what was delivered is back as an uncommitted candidate on the delivered commit's parent.
+  const now = candidate(f.worktree); assert.equal(now.status, "?? greeting.test.txt\n?? greeting.txt");
+  for (const name of ["greeting.test.txt", "greeting.txt"]) assert.equal(readFileSync(join(f.worktree, name), "utf8").trim(), git(f.repo, "show", `${delivered}:${name}`));
+  uncommitted(f, run, started, now); assert.equal(others(f), refs);
+  assert.deepEqual([run.delivery.resumed, run.result.agentInvocations, phases(run)], [true, 0, []]); assert.notEqual(run.result.checksPassed, true);
+  // The kept worktree holds a candidate like any other: a person ports it onto the tip, and resume takes the usual road to delivery.
+  git(f.worktree, "reset", "-q", tip); assert.equal(candidate(f.worktree).status, "M greeting.txt\n?? greeting.test.txt");
+  again = next(f, 3);
+  const resumed = await execute(input(again, {}, { resume: true, stuck: "park" }), { investigator: () => assert.fail(), implementer: () => assert.fail() }, human);
+  assert.equal(resumed.state, "delivered"); accepted(resumed.states);
+  const commit = onTip(f, tip); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello");
+  assert.deepEqual([phases(evidence(again)), evidence(again).delivery.commit, deliveredAs(f)], [["verify"], commit, commit]);
+  assert.deepEqual(human.requests, []);
+});
+
+test("with resume, a delivered ticket whose replayed patch is not the one that was reviewed is undone on the new tip, verified, and reviewed again before it is delivered there", async context => {
+  const f = fixture(context); const started = advance(f, "lines.txt", numbered()); const human = person(); let reviews = 0;
+  const data = (at: Fixture, extra = {}) => scoped(input(at, {}, { stuck: "park", ...extra }), "lines.txt");
+  const delivered = await deliverFirst(f, data(f), {
+    implementer: request => { writeFileSync(join(request.cwd, "lines.txt"), numbered({ 5: "five" })); return implement(request); },
+  });
+  // The base changes a line two below the ticket's: the replay applies cleanly, but its patch is no longer the one the first run's review read.
+  const tip = advance(f, "lines.txt", numbered({ 7: "seven" })); const refs = others(f); const again = next(f, 2);
+  const result = await execute(data(again, { resume: true }), {
+    ...nobody,
+    reviewer: request => {
+      reviews++;
+      // The candidate is uncommitted on the new tip, with the base's change beside its own.
+      assert.equal(git(request.cwd, "rev-parse", "HEAD"), tip); assert.equal(git(request.cwd, "symbolic-ref", "HEAD"), `refs/heads/${branch}`);
+      assert.equal(candidate(request.cwd).status, "M lines.txt\n?? greeting.test.txt\n?? greeting.txt");
+      assert.equal(readFileSync(join(request.cwd, "lines.txt"), "utf8"), numbered({ 5: "five", 7: "seven" }));
+      return review();
+    },
+  }, human);
+  // The only Agent is the reviewer, and it runs after `rebase`.
+  assert.equal(result.state, "delivered"); untouched(f); assert.deepEqual(human.requests, []); assert.equal(reviews, 1);
+  assert.deepEqual(result.states, ["shape", "prepare", "rebase", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "delivered"]);
+  const commit = onTip(f, tip); assert.notEqual(commit, delivered); assert.equal(others(f), refs);
+  assert.equal(git(f.repo, "show", `${branch}:lines.txt`), numbered({ 5: "five", 7: "seven" }).trim()); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello");
+  const run = held(again, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u"));
+  assert.deepEqual([run.delivery.outcome, run.delivery.baseCommit, run.delivery.commit, run.delivery.resumed], ["delivered", tip, commit, true]);
+  assert.equal(rebasedFrom(f, run, started), delivered);
+  // The gates ran once, in `verify` ahead of the review; nothing is verified as `reverify`.
+  assert.deepEqual([phases(run), run.result.checksPassed, run.result.agents.map((agent: any) => agent.stage)], [["verify"], true, ["review"]]);
+  assert.equal(deliveredAs(f), commit);
+  const said = between(result, run); assert.match(said, oneSentence); assert.match(said, /\breplayed\b/iu);
+});
+
+test("with resume, gates that fail on a delivered ticket's replayed tree are a gate failure on the new base: the commit is undone there, repaired, reviewed, and delivered", async context => {
+  const f = fixture(context); const started = f.head; const checks = [command(), command(greetsLater, { name: "later-gate" })]; let reviews = 0; let edits = 0;
+  const delivered = await deliverFirst(f, input(f, { checks }));
+  const tip = advance(f); const again = next(f, 2);
+  const result = await execute(input(again, { checks }, { resume: true }), {
+    ...nobody,
+    implementer: request => {
+      edits++;
+      // With the implementer: the candidate is uncommitted on the new tip, and the failed gate is named.
+      assert.equal(git(request.cwd, "rev-parse", "HEAD"), tip); assert.equal(candidate(request.cwd).status, "?? greeting.test.txt\n?? greeting.txt");
+      assert.match(request.prompt.split("Current failure/feedback: ")[1] ?? "", /later-gate/u);
+      writeFileSync(join(request.cwd, "greeting.txt"), "hello later\n"); return ok();
+    },
+    reviewer: () => { reviews++; return review(); },
+  });
+  assert.equal(result.state, "delivered"); untouched(f); assert.deepEqual([edits, reviews], [1, 1]);
+  assert.deepEqual(result.states, ["shape", "prepare", "rebase", "repairBudget", "repairTarget", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult",
+    "commit", "rebase", "deliver", "success", "delivered"]);
+  const commit = onTip(f, tip); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello later");
+  const run = held(again, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u"));
+  // On this road the gates are the helper's `verify` from the start, so the receipt never says a tree passed that did not.
+  assert.deepEqual(ran(run), [["verify", "tests", true], ["verify", "later-gate", false], ["verify", "tests", true], ["verify", "later-gate", true]]);
+  assert.deepEqual([run.delivery.baseCommit, run.delivery.commit, run.result.checksPassed, run.result.repairs], [tip, commit, true, 1]);
+  assert.equal(rebasedFrom(f, run, started), delivered); assert.equal(deliveredAs(f), commit);
+});
+
+test("with resume, setup that fails on the new tip parks a delivered ticket there: the replayed commit is undone and the candidate is uncommitted on the tip", async context => {
+  const f = fixture(context); const human = person();
+  const setup = [command('process.exit(require("fs").existsSync("later.txt") ? 3 : 0)', { name: "install" })];
+  const delivered = await deliverFirst(f, input(f, { setup }));
+  const tip = advance(f); const refs = others(f); const again = next(f, 2);
+  const result = await execute(input(again, { setup }, { resume: true, stuck: "park" }), nobody, human);
+  assert.deepEqual(result.states, ["shape", "prepare", "rebase", "stuck", "park", "parked"]);
+  const run = parkedIn("rebase", again, result, /setup: install failed/u); untouched(f); assert.deepEqual(human.requests, []);
+  // As after any failed setup on a new tip: no commit on the branch, and the candidate beside the base's later file.
+  const now = candidate(f.worktree); assert.equal(now.status, "?? greeting.test.txt\n?? greeting.txt"); assert.ok(existsSync(join(f.worktree, "later.txt")));
+  assert.equal(readFileSync(join(f.worktree, "greeting.txt"), "utf8").trim(), git(f.repo, "show", `${delivered}:greeting.txt`));
+  uncommitted(f, run, tip, now); assert.equal(others(f), refs);
+  assert.deepEqual([ran(run), run.result.agentInvocations], [[["setup", "install", true], ["setup", "install", false]], 0]); assert.notEqual(run.result.checksPassed, true);
+});
+
+for (const [label, repository, reason, states, checked] of [
+  ["a setup command that fails where the worktree was recreated", { setup: [command("process.exit(3)", { name: "install" })] }, /\bsetup\b|\binstall\b/iu,
+    ["shape", "prepare", "failure", "blocked"], [["setup", "install", false]]],
+  ["a setup command that leaves an unignored file where the worktree was recreated", { setup: [command('require("fs").writeFileSync("setup-output.txt", "leftover")', { name: "install" })] }, /\bsetup\b|\binstall\b/iu,
+    ["shape", "prepare", "failure", "blocked"], [["setup", "install", true]]],
+  ["gates that fail on the delivered commit when the base has not moved", { checks: [command('console.log("the gate refuses"); process.exit(1)')] }, /\bgates?\b|\bchecks?\b|\bverif|\btests\b/iu,
+    ["shape", "prepare", "rebase", "failure", "blocked"], [["verify", "tests", false]]],
+] as const) {
+  test(`with resume, ${label} refuse${label.startsWith("gates") ? "" : "s"} the delivered ticket: the recreated worktree is removed, and the branch, its record, and every other ref are as they were`, async context => {
+    const f = fixture(context); const delivered = await deliverFirst(f); const before = everything(f); const again = next(f, 2);
+    const result = await execute(input(again, repository, { resume: true }), nobody);
+    // It ends by itself, as other refusals do: nothing to repair in a tree that passed before, and nobody to ask.
+    assert.equal(result.state, "blocked"); assert.deepEqual(result.states, states); untouched(f);
+    const run = held(again, result, /^Blocked: Cannot resume: /u); assert.match(run.delivery.reason, reason);
+    assert.doesNotMatch(result.output.summary, /Worktree kept/u); assert.equal(existsSync(f.worktree), false);
+    assert.deepEqual(everything(f), before); assert.deepEqual([git(f.repo, "rev-parse", branch), deliveredAs(f)], [delivered, delivered]);
+    assert.deepEqual([run.delivery.outcome, run.delivery.commit, run.delivery.worktreeRemoved, run.result.outcome, run.result.agentInvocations], ["blocked", null, true, "blocked", 0]);
+    // The receipt does not say the delivered commit passed: this run's own checks are all it has.
+    assert.notEqual(run.result.checksPassed, true); assert.deepEqual(ran(run), checked);
+  });
+}
+
+test("with resume in pr mode, a delivered ticket is not taken up: the run ends blocked saying the pull request is brought up to date at its host, and nothing is changed or asked of the remote", async context => {
+  const path = process.env.PATH; const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const calls = recordGit(context, f);
+  context.after(() => { process.env.PATH = path; });
+  const delivered = await deliverFirst(f, input(f, { output: "pr" }));
+  // The base moves on and is published, as its owner leaves it: only the output mode stands in the way.
+  advance(f); git(f.repo, "push", "-q", "origin", "main");
+  rmSync(join(f.root, "bin/args")); const before = [everything(f), pushed()]; const since = calls().length; const again = next(f, 2);
+  const result = await execute(input(again, { output: "pr", setup: [command("process.exit(1)", { name: "install" })] }, { resume: true }), nobody);
+  assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
+  const run = held(again, result, /^Blocked: .*\bpull request\b.*\bhost\b/iu); assert.doesNotMatch(result.output.summary, /Worktree kept/u);
+  assert.deepEqual([run.delivery.outcome, run.delivery.commit, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.result.checks.length, run.result.agentInvocations],
+    ["blocked", null, false, false, 0, 0]);
+  assert.deepEqual([everything(f), pushed()], before); assert.equal(git(f.repo, "rev-parse", branch), delivered); assert.equal(gh(), undefined);
+  assert.deepEqual(calls().slice(since).filter(call => /^(?:ls-remote|fetch|push|worktree add)(?:\s|$)/u.test(call)), []);
+});
+
+/** The branch an earlier run of the ticket made and recorded, with no worktree left for it. */
+const branchOnly = (f: Fixture, at = f.head) => { git(f.repo, "branch", branch, at); git(f.repo, "config", `branch.${branch}.ticket`, "proj-12"); };
+const refusals: [label: string, arrange: (f: Fixture) => unknown, reason?: RegExp][] = [
+  // Only a commit that a run delivered is taken up: the record must be there, and must name the branch's tip.
+  ["a delivered commit whose record is gone, as on a branch delivered before commits were recorded", async f => {
+    await deliverFirst(f); if (deliveredAs(f)) git(f.repo, "config", "--local", "--unset", deliveredKey);
+  }, /deliver/iu],
+  ["a commit of the right shape that a person made and no run delivered", f => { branchOnly(f, byHand(f, f.head)); }, /deliver/iu],
+  ["a commit put in place of the delivered one, while the record still names the delivered commit", async f => {
+    git(f.repo, "config", deliveredKey, await deliverFirst(f)); git(f.repo, "update-ref", `refs/heads/${branch}`, byHand(f, f.head));
+  }, /deliver/iu],
+  ["a record that names the commit below the delivered one", async f => { await deliverFirst(f); git(f.repo, "config", deliveredKey, f.head); }, /deliver/iu],
+  // Every other refusal stays. Each commit below is recorded as delivered, so its shape alone is what refuses it.
+  ["a second branch of the ticket beside the delivered one", async f => {
+    await deliverFirst(f); git(f.repo, "branch", "ticket/proj-12-an-earlier-title", f.head); git(f.repo, "config", "branch.ticket/proj-12-an-earlier-title.ticket", "proj-12");
+  }],
+  ["a branch beside the delivered one that may be this ticket's, with no record of whose it is", async f => { await deliverFirst(f); git(f.repo, "branch", "ticket/proj-12-1", f.head); }],
+  ["a branch that holds a second commit above the delivered one", async f => { place(f, byHand(f, await deliverFirst(f))); }],
+  ["a commit under another subject", async f => { await deliverFirst(f); place(f, byHand(f, f.head, ["Add a salutation", "Ticket: PROJ-12"])); }],
+  ["a commit whose Ticket: line names another ticket", async f => { await deliverFirst(f); place(f, byHand(f, f.head, ["Add a greeting", "Ticket: PROJ-13"])); }],
+  ["a commit with no Ticket: line", async f => { await deliverFirst(f); place(f, byHand(f, f.head, ["Add a greeting"])); }],
+  ["a merge commit at the tip, the one commit above the base", async f => {
+    const older = f.head; const tip = advance(f); const delivered = await deliverFirst(f);
+    place(f, git(f.repo, "commit-tree", git(f.repo, "rev-parse", `${delivered}^{tree}`), "-p", tip, "-p", older, "-m", "Add a greeting", "-m", "Ticket: PROJ-12"));
+  }],
+  ["a base moved back behind the commit the delivery stands on", async f => {
+    advance(f); await deliverFirst(f); git(f.repo, "reset", "-q", "--hard", "HEAD^"); f.head = git(f.repo, "rev-parse", "HEAD");
+  }],
+  ["a delivered commit the base already holds", async f => { await deliverFirst(f); git(f.repo, "merge", "-q", "--ff-only", branch); f.head = git(f.repo, "rev-parse", "HEAD"); }],
+  ["a branch still at its base", f => { branchOnly(f); }, /worktree directory .+ does not exist; nothing was changed/u],
+];
+for (const [label, arrange, reason] of refusals) {
+  test(`resume with no worktree and ${label} blocks without changing anything`, async context => {
+    const f = fixture(context); await arrange(f); const before = everything(f); const again = next(f, 2);
+    const result = await execute(input(again, { setup: [command("process.exit(1)", { name: "install" })] }, { resume: true }), nobody);
+    assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
+    const run = held(again, result, /^Blocked: Cannot resume: /u); if (reason) assert.match(run.delivery.reason, reason);
+    assert.doesNotMatch(result.output.summary, /Worktree kept/u);
+    assert.deepEqual([run.delivery.outcome, run.delivery.resumed, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.result.checks.length, run.result.agentInvocations],
+      ["blocked", undefined, false, false, null, 0, 0]);
+    assert.deepEqual(everything(f), before);
+  });
+}
+
+for (const path of ["docs/catalog.md", "README.md"]) {
+  test(`${path} describes, where it describes resume, taking up a delivered ticket whose worktree is gone: the record it needs, the road to rebase, and what the receipt says`, () => {
+    const text = readFileSync(resolve(path), "utf8"); const prose = text.replace(/\s+/gu, " ");
+    assert.ok(statements(text).some(said => /\bresum/iu.test(said) && /\bdelivered\b/iu.test(said) && /`rebase`/u.test(said)),
+      `${path} must say in one sentence or table row that resume takes up a delivered commit and continues at \`rebase\``);
+    assert.match(prose, /ticketDelivered/u, `${path} must name the record a delivery leaves with the branch`);
+    assert.match(prose, /\bredelivered\b/u, `${path} must name what delivery.json records when the same commit is delivered again`);
+  });
+}
+
+test("the catalog says which delivered commits resume refuses, what pr mode does instead, and no longer says what the delivered-candidate resume made untrue", () => {
+  const said = statements(readFileSync(resolve("docs/catalog.md"), "utf8"));
+  assert.ok(said.some(one => /\brecord/iu.test(one) && /\bdeliver/iu.test(one) && /\brefus|\bnot adopted\b|Cannot resume/iu.test(one)),
+    "docs/catalog.md must say in one sentence or table row that a commit with no delivery record, or one whose record names another commit, is refused");
+  assert.ok(said.some(one => /\bpull request\b/iu.test(one) && /\bhost\b/iu.test(one) && /\bresum|\bdelivered\b/iu.test(one)),
+    "docs/catalog.md must say in one sentence or table row that in pr mode the pull request is brought up to date at its host");
+  // Setup does run again on this road, the run does create its worktree, and a branch that holds a delivered commit is continued:
+  // a sentence that still says otherwise must say where the delivered commit is the exception.
+  const excepted = (one: string) => /\bdelivered\b|\brecreat/iu.test(one);
+  assert.equal(said.some(one => one.trim() === "Setup commands are not run again."), false, "docs/catalog.md still says without exception that setup commands are not run again");
+  assert.equal(said.some(one => /a resumed run, whose `worktreeCreated` is false/u.test(one) && !excepted(one)), false, "docs/catalog.md still says every resumed run has worktreeCreated false");
+  assert.equal(said.some(one => /continue a branch that already holds a commit/u.test(one) && !excepted(one)), false, "docs/catalog.md still says resume never continues a branch that holds a commit");
+});
+
+test("a delivered ticket can follow successive base moves, with every run testing and recording its own delivery", async context => {
+  const f = fixture(context);
+  let delivered = await deliverFirst(f);
+  let parent = f.head;
+  for (const number of [2, 3, 4]) {
+    const tip = number === 2 ? parent : advance(f, `base-${number}.txt`);
+    const again = next(f, number);
+    const result = await execute(input(again, {}, { resume: true }), nobody);
+    assert.deepEqual(result.states, ["shape", "prepare", "rebase", "deliver", "success", "delivered"]);
+    const run = held(again, result, /^Delivered /u);
+    const commit = onTip(f, tip);
+    assert.equal(deliveredAs(f), commit);
+    assert.deepEqual([phases(run), run.result.checksPassed, run.result.agentInvocations], [["verify"], true, 0]);
+    if (number === 2) {
+      assert.equal(commit, delivered);
+      assert.equal(run.delivery.redelivered, true);
+    } else {
+      assert.deepEqual(run.delivery.rebasedFrom, { baseCommit: parent, commit: delivered });
+      assert.notEqual(commit, delivered);
+    }
+    delivered = commit;
+    parent = tip;
+  }
+});
+
+for (const stale of [true, false]) {
+  test(`delivered resume refuses ${stale ? "a stale worktree registration" : "a branch checked out elsewhere"} without forcing recreation`, async context => {
+    const f = fixture(context); await deliverFirst(f);
+    const registered = stale ? f.worktree : join(f.root, "elsewhere");
+    git(f.repo, "worktree", "add", registered, branch);
+    if (stale) rmSync(registered, { recursive: true, force: true });
+    const before = everything(f); const again = next(f, 2);
+    const result = await execute(input(again, {}, { resume: true }), nobody);
+    assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]);
+    const run = held(again, result, /^Blocked: Cannot resume: the worktree could not be recreated/u);
+    assert.deepEqual(everything(f), before);
+    assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.result.checks.length], [false, false, 0]);
+  });
+}
+
+test("failed withdrawal reports the recreated worktree as kept and never claims that nothing changed", async context => {
+  const f = fixture(context); const delivered = await deliverFirst(f); const again = next(f, 2);
+  const result = await execute(input(again, {
+    setup: [{ name: "lock", command: ["git", "worktree", "lock", f.worktree] }],
+    checks: [command("process.exit(1)")],
+  }, { resume: true }), nobody);
+  assert.deepEqual(result.states, ["shape", "prepare", "rebase", "failure", "blocked"]);
+  const run = held(again, result, /^Blocked: Cannot resume: .*recreated worktree could not be removed/u);
+  assert.match(result.output.summary, /Worktree kept at /u);
+  assert.doesNotMatch(result.output.summary, /nothing was changed/iu);
+  assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.result.checksPassed], [true, false, null, false]);
+  assert.deepEqual([git(f.repo, "rev-parse", branch), deliveredAs(f)], [delivered, delivered]);
+});
+
+test("resume with a regular file as the worktree root refuses without changing anything and writes its receipts", async context => {
+  const f = fixture(context);
+  const root = join(f.root, "worktrees"); writeFileSync(root, "keep this file\n");
+  const snapshot = () => [git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"), git(f.repo, "worktree", "list", "--porcelain"),
+    git(f.repo, "config", "--local", "--list"), readFileSync(root, "utf8")];
+  const before = snapshot();
+  const result = await execute(input(f, { setup: [command("process.exit(1)")] }, { resume: true }), nobody);
+  assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); assert.equal(result.state, "blocked"); untouched(f);
+  const run = held(f, result, /^Blocked: Cannot resume: worktree directory .+ does not exist; nothing was changed\. Evidence: /u);
+  assert.deepEqual([run.delivery.outcome, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit,
+    run.result.outcome, run.result.checks.length, run.result.agentInvocations], ["blocked", false, false, null, "blocked", 0, 0]);
+  assert.deepEqual(snapshot(), before);
+});

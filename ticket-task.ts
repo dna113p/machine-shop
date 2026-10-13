@@ -27,6 +27,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let branch = named;
   let baseCommit = "";
   let commitHash = "";
+  let taken = "";
+  let untested = false;
+  let redelivered = false;
   let firstApproved: { baseCommit: string; commit: string } | undefined;
   let rebasedFrom: { baseCommit: string; commit: string } | undefined;
   let rebaseSteps = 0;
@@ -114,6 +117,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
    * a title. "" when none of these says: the branch may be this ticket's, so it is neither started beside nor taken over.
    */
   const owner = (name: string) => recorded(name) || committed(name) || (name === prefix ? ticket.slug : "");
+  const branchOwners = () => new Map(git(repository.path, "for-each-ref", "--format=%(refname)", "refs/heads/ticket/").split("\n")
+    .map(ref => ref.slice("refs/heads/".length)).filter(fits).map(name => [name, owner(name)]));
   const unresolved = (name: string) => `no record of its ticket, and its name does not say where the id ends: it may be this ticket's, or that of a ticket whose id goes on after ${ticket.slug}-. `
     + `Nothing was changed. Record whose it is with git config branch.${name}.ticket <id-slug> (${ticket.slug} for this ticket), then run again.`;
 
@@ -133,14 +138,20 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (!base.ok) return work.block(`Base ${repository.base ?? "HEAD"} does not resolve to a commit in ${repository.path}.`);
     baseCommit = base.stdout;
     // A resumed run's base is the commit its branch is on, so the branch is read before the remote is asked about the base.
-    if (resume && adopt().type === "blocked") return { type: "blocked" };
+    if (resume) {
+      const adoption = adopt();
+      if (adoption.type === "blocked") return adoption;
+      if (adoption.type === "redeliver") {
+        adopted = true;
+        return adoption;
+      }
+    }
     if (repository.output === "pr" && !published()) return { type: "blocked" };
     if (resume) {
       adopted = true;
       return { type: pending() === "" ? "prepared" : "resumed" };
     }
-    const owners = new Map(git(repository.path, "for-each-ref", "--format=%(refname)", "refs/heads/ticket/").split("\n")
-      .map(ref => ref.slice("refs/heads/".length)).filter(fits).map(name => [name, owner(name)]));
+    const owners = branchOwners();
     const first = (whose: string) => [...owners].find(([, slug]) => slug === whose)?.[0];
     // Any branch of this ticket blocks, so a retitled ticket cannot start a second one.
     const existing = first(ticket.slug);
@@ -200,6 +211,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
 
   /** A resumed run adopts the worktree an earlier run left behind, with or without a candidate; every condition is read, never repaired. */
   function adopt(): Event {
+    let present: boolean;
+    try {
+      present = Boolean(lstatSync(worktree, { throwIfNoEntry: false }));
+    } catch {
+      return work.block(`Cannot resume: worktree directory ${worktree} does not exist; nothing was changed.`);
+    }
+    if (!present) return takeUp();
     if (!existsSync(worktree) || !statSync(worktree).isDirectory()) return work.block(`Cannot resume: worktree directory ${worktree} does not exist; nothing was changed.`);
     const top = run("git", ["rev-parse", "--show-toplevel"], worktree);
     const common = (cwd: string) => run("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd);
@@ -248,6 +266,54 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: "resumed" };
   }
 
+  /** Only the recorded delivery may bypass review; all eligibility checks precede recreating its worktree. */
+  function takeUp(): Event {
+    const refuse = (why: string) => work.block(`Cannot resume: ${why}; nothing was changed.`);
+    const missing = () => refuse(`worktree directory ${worktree} does not exist`);
+    const owners = branchOwners();
+    const names = [...owners].filter(([, slug]) => slug === ticket.slug).map(([name]) => name);
+    if (!names.length) return missing();
+    if (names.length !== 1 || [...owners.values()].includes("")) {
+      return refuse("there is more than one branch of this ticket, or a sibling branch has unresolved ownership");
+    }
+    const name = names[0]!;
+    const tip = git(repository.path, "rev-parse", `refs/heads/${name}`);
+    if (run("git", ["merge-base", "--is-ancestor", tip, baseCommit], repository.path).ok) return missing();
+    const [parent, subject, ...body] = git(repository.path, "log", "-1", "--no-show-signature", "--format=%P%n%s%n%b", tip).split("\n");
+    if (!parent || parent.includes(" ") || !run("git", ["merge-base", "--is-ancestor", parent, baseCommit], repository.path).ok
+      || git(repository.path, "rev-list", "--count", `${baseCommit}..${tip}`) !== "1"
+      || subject !== ticket.title || !body.some(line => line === `Ticket: ${ticket.id}`)) {
+      return refuse(`${name} does not hold exactly one ticket commit with the expected parent, subject, and Ticket line above an ancestor of the current base`);
+    }
+    const delivered = run("git", ["config", "--local", "--get", `branch.${name}.ticketDelivered`], repository.path);
+    if (!delivered.ok || delivered.stdout !== tip) return refuse(`${name} has no delivery record matching its tip`);
+    if (repository.output === "pr") return refuse("the delivered pull request is brought up to date at its host");
+    if (!attempt("git", ["worktree", "add", worktree, name], repository.path, undefined,
+      "Cannot resume: the worktree could not be recreated; nothing was changed").ok) return { type: "blocked" };
+    created = true;
+    branch = name;
+    if (!repository.setup.every(command => work.check(command, "setup"))) return withdraw("setup failed on the delivered commit");
+    if (pending() !== "" || git(worktree, "rev-parse", "HEAD") !== tip
+      || run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${branch}`) {
+      return withdraw("setup changed tracked or unignored files, HEAD, or the ticket branch");
+    }
+    baseCommit = parent;
+    commitHash = taken = tip;
+    firstApproved = { baseCommit, commit: tip };
+    untested = true;
+    return { type: "redeliver" };
+  }
+
+  /** A refusal after recreation removes only the worktree this run made, retaining the recorded delivery. */
+  function withdraw(why: string): Event {
+    commitHash = "";
+    untested = false;
+    if (!attempt("git", ["worktree", "remove", "--force", worktree], repository.path, undefined,
+      `Cannot resume: ${why}; the recreated worktree could not be removed`).ok) return { type: "blocked" };
+    removed = true;
+    return work.block(`Cannot resume: ${why}; the recreated worktree was removed.`);
+  }
+
   function commit(): Event {
     if (git(worktree, "rev-parse", "HEAD") !== baseCommit || run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${branch}`) {
       return work.block(`An Agent committed or moved HEAD or ${branch} itself; only this workflow commits. Nothing was delivered.`);
@@ -281,13 +347,22 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }
     git(worktree, "reset", "--quiet", "--mixed", onto);
     commitHash = "";
+    untested = false;
     baseCommit = onto;
     work.reopen();
   }
 
   function rebase(): Event {
     const resolved = run("git", ["rev-parse", "--verify", "--quiet", `${repository.base ?? "HEAD"}^{commit}`], repository.path);
-    if (!resolved.ok || resolved.stdout === baseCommit) return { type: "current" };
+    if (!resolved.ok || resolved.stdout === baseCommit) {
+      if (untested) {
+        if (!resolved.ok) return withdraw("the current base no longer resolves");
+        if (work.checks().type !== "passed" || !work.accept()) return withdraw("verification gates failed on the delivered commit");
+        untested = false;
+        redelivered = true;
+      }
+      return { type: "current" };
+    }
     const tip = resolved.stdout;
     const original = baseCommit;
     const approved = commitHash;
@@ -438,7 +513,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       work.block(`Base moved from ${original} to ${tip} and the replayed patch differs from the approved patch; verify and review this candidate again.`);
       return { type: "review" };
     }
-    if (work.checks("reverify").type !== "passed") {
+    if (work.checks(untested ? "verify" : "reverify").type !== "passed" || (untested && !work.accept())) {
       const stopped = undoOnTip("reverify gates failed");
       work.reopen(true);
       if (stopped) return stopped;
@@ -447,6 +522,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }
     commitHash = head;
     baseCommit = tip;
+    untested = false;
     return { type: "rebased" };
   }
 
@@ -491,6 +567,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       prUrl = opened.stdout.split(/\s+/u).findLast(word => /^https?:\/\/\S+$/u.test(word)) ?? "";
       if (!prUrl) return work.block(`gh pr create printed no pull request URL; inspect ${branch} on ${repository.remote}.`);
     }
+    if (!attempt("git", ["config", "--local", `branch.${branch}.ticketDelivered`, commitHash], repository.path).ok) return { type: "blocked" };
     return { type: "delivered" };
   }
 
@@ -624,6 +701,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ticket: ticket.id, repository: { name: repository.name, path: repository.path }, branch,
       baseCommit: baseCommit || null, commit: commitHash || null, output: repository.output,
       ...(rebasedFrom ? { rebasedFrom } : {}),
+      ...(finished && redelivered ? { redelivered: true } : {}),
       ...(assumptions.length ? { assumptions } : {}),
       ...(prUrl ? { prUrl } : {}), ...(patches.length ? { patches } : {}), ...(archived ? { archive: archived } : {}),
       worktree, ...(adopted ? { resumed: true } : {}), worktreeCreated: created, worktreeRemoved: removed, reviewNotes,
@@ -632,6 +710,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const needsBrief = ownerQuestions ? `${questionCount()}; the first: ${questionText(ownerQuestions[0]!, 600)}` : flat(parkDetails().needs);
     held = { action: "hold", summary: [
       { delivered: `Delivered ${result}.`, blocked: `Blocked: ${reasonBrief}`, "handed-off": `Handed off on ${branch}: ${reasonBrief}`, abandoned: `Abandoned: ${reasonBrief}`, parked: `Parked on ${branch}: ${firstLine(parkNote())} Needs: ${needsBrief}` }[outcome],
+      ...(finished && taken ? [redelivered ? "The base has not moved, so the same commit was delivered again unchanged."
+        : `The delivered commit ${taken} was replayed onto the new base ${baseCommit}.`] : []),
       ...(decision ? [`Decision: ${decision}.`] : []),
       ...(archived ? [`Candidate archived on ${archived.branch} at ${archived.commit}.`] : []),
       ...(outcome === "abandoned" ? [`Worktree and ${branch} removed${archived ? "" : " without saving the candidate"}.`] : []),
@@ -777,7 +857,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     states: {
       shape: operation(shape, { prepared: "prepare", blocked: "failure" }),
       // A clean resume starts planning afresh. A resumed candidate is held to Scope; red cannot be proved again once implemented.
-      prepare: operation(prepare, { prepared: "start", resumed: "scopeAfterChange", blocked: "failure" }),
+      prepare: operation(prepare, { prepared: "start", resumed: "scopeAfterChange", redeliver: "rebase", blocked: "failure" }),
       start: operation(work.start, { started: "falsify" }),
       falsify: agent(() => work.prompt("Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 entries shaped as { text, options: string[], recommended: string, assumable: boolean, why }, giving the exact questions a person could answer. text and why must be non-empty strings; options must be a non-empty array of non-empty strings; recommended must copy one of those options exactly. Mark assumable true only for a gap whose conservative answer loses nothing if wrong: it stops, refuses, or keeps more. A product decision, a change of scope, or anything irreversible is never assumable."), {
         sound: { target: "falsifyResult", actions: rememberPlanning },

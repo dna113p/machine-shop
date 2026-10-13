@@ -141,6 +141,9 @@ it. A later source change invalidates it. Never interpret `checksPassed: true`
 as proof that review or Human approval was accepted; also inspect `outcome`.
 For ticket delivery, undoing the workflow's commit reopens that drift check;
 a failed post-rebase setup or `reverify` also makes `checksPassed` false.
+Resuming a delivered commit runs the gates as `verify` on the tree delivered
+in this run, including after an equal-patch replay; it never inherits passing
+checks from the earlier delivery.
 Unexpected failures can leave `started.json`, Agent summaries, and check logs
 without a final receipt. These workflows do not resume, undo, or roll back work.
 
@@ -305,7 +308,7 @@ is.
 | State | Work |
 | --- | --- |
 | `shape` | Validate the checkout and root paths; open evidence and block missing ticket sections or empty required lists before any Agent or worktree |
-| `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch instead: no uncommitted change goes through `start` to `falsify`, a candidate to `scopeAfterChange`, then `verify` |
+| `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch instead: no uncommitted change goes through `start` to `falsify`, a candidate to `scopeAfterChange`, then `verify`; with no worktree, a recorded delivered commit is recreated and set up, then continues at `rebase` |
 | `start` | Open the helper's run on the worktree, which must be clean |
 | `falsify` | Read-only investigator tries to show the ticket is wrong, already done, impossible here, or underspecified; returns `sound` with a one-paragraph summary or `questions` with 1–10 entries containing text, options, recommended, assumable, and why |
 | `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; a sound ticket goes to `plan`, as does an entirely assumable report with `assume: true`; remaining questions go through the stuck policy with numbered needs, flattened with question text, each option, and why capped separately at 600 characters plus an ellipsis |
@@ -320,8 +323,8 @@ is.
 | `verify` | The required checks; a failure goes to the repair budget |
 | `review`, `reviewResult` | Capture the structured report; the Operation preserves the unchanged-checkout guard and judges criteria, finding severity, and progress to approve, revise, or apply the stuck policy |
 | `commit` | One commit of everything except `.machine-runs`, even if an Agent staged it: subject is the ticket title, body is `Ticket: <id>` |
-| `rebase` | Resolve the current base; replay exactly the approved ticket commit onto a forward tip. Rerun setup, then `reverify` for an equal patch or `verify` and fresh review for a changed patch. Undo the commit before any new stop, repair, or re-review; if ignore rules on the tip would drop added files, restore the candidate on its original base through `stuck` |
-| `deliver` | `branch`: nothing more. `patch`: `git format-patch` for base..HEAD into the evidence directory. `pr`: `git push --no-follow-tags <remote URL>` of the approved commit to the ticket branch alone, then `gh pr create --repo <host/owner/repository>` |
+| `rebase` | Resolve the current base; replay exactly the approved ticket commit onto a forward tip. Rerun setup, then `reverify` for an equal patch (`verify` on a resumed delivered commit) or `verify` and fresh review for a changed patch. An unchanged-base delivered resume runs `verify` without replay. Undo the replayed commit before any new stop, repair, or re-review; if ignore rules on the tip would drop added files, restore the candidate on its original base through `stuck` |
+| `deliver` | `branch`: keep the branch. `patch`: `git format-patch` for base..HEAD into the evidence directory. `pr`: `git push --no-follow-tags <remote URL>` of the approved commit to the ticket branch alone, then `gh pr create --repo <host/owner/repository>`. After these succeed, every mode records `branch.<name>.ticketDelivered` in local Git configuration |
 | `repairBudget`, `repairTarget`, `reviewBudget` | Count gate retries and review revisions separately; gate retries route to the responsible editing stage, review retries to `change`; exhaustion goes to `stuck` |
 | `stuck`, `park` | Select the input policy: `ask` goes to `decide`; `park` writes a note and receipt, keeps the candidate, and ends `parked` |
 | `decide` | Human, only with `stuck: "ask"`: stuck work waits for one of `more rounds`, `hand off`, `archive`, or `discard` |
@@ -473,8 +476,10 @@ have a two-minute timeout.
 
 Between `commit` and `deliver`, `rebase` resolves
 `${repository.base ?? "HEAD"}^{commit}` in the source checkout, just as
-`prepare` does. An unchanged tip or a base that no longer resolves continues
-to delivery unchanged, with no `reverify` phase. Otherwise the tip must descend
+`prepare` does. For a commit approved in this run, an unchanged tip or a base
+that no longer resolves continues to delivery unchanged, with no `reverify`
+phase. A resumed delivered commit instead requires its own `verify` gates on
+an unchanged base and refuses if the base no longer resolves. Otherwise the tip must descend
 from the current `baseCommit`. A base that was rewritten or moved back is not
 replayed onto: `git reset --mixed <baseCommit>` undoes the ticket commit, and
 `failure` ends `blocked` with both commits named and instructions to deliver
@@ -539,7 +544,8 @@ above. If patch ids differ and the ignore guard permits the undo on the new tip,
 the run returns to `verify` and a fresh `review` under that same rule, which can
 approve, revise, or block normally. This re-review uses neither budget and
 repeats only if the base moves again.
-If patch ids match, the gates run as phase `reverify`. Passing delivers the
+If patch ids match, the gates run as phase `reverify`, or `verify` when resuming
+a delivered commit so the helper records this run's checks. Passing delivers the
 rebased commit with the new tip as `baseCommit`. Failing undoes the commit on
 that tip if the ignore guard permits, marks checks failed, and goes to
 `repairBudget`; the implementer sees the failed gates before the normal
@@ -664,7 +670,7 @@ on this run's own worktree and ticket branch; if either fails the run ends
 Human primitive with restricted choices. How they are presented, and how long a
 run may wait, belongs to whichever surface runs the Machine.
 
-With `"resume": true`, `prepare` adopts the existing worktree instead of
+With `"resume": true` and an existing worktree, `prepare` adopts it instead of
 creating one, whether or not a park or `hand off` left a candidate. It requires all of: the
 worktree directory exists and is a Git worktree of `repository.path`; its `HEAD`
 is a symbolic ref to a branch that belongs to this ticket by the rule above; and
@@ -684,7 +690,7 @@ A worktree on a branch whose ownership is unresolved, or that belongs to another
 ticket, is not adopted; for the first the message gives the `git config` command
 that records it. If any of these fails
 the run ends `blocked` with a message naming the condition, changing nothing.
-Setup commands are not run again. With a candidate, resume skips `falsify`, `plan`,
+Setup commands are not run again for an existing worktree. With a candidate, resume skips `falsify`, `plan`,
 and `planReview` and goes to `scopeAfterChange`, then `verify`, review, commit,
 rebase, and deliver as usual, with fresh budgets and the normal repair loop if
 review asks for changes. A candidate resume reads `ticket-task-assumptions.json`
@@ -710,11 +716,44 @@ unless the base moves again; resolve the setup problem in the kept worktree
 before resuming. Without `resume`,
 an existing branch or worktree directory still blocks.
 
+When the worktree path is absent, `resume: true` can adopt a delivered commit
+and continue directly at `rebase`, with no Agent before that step. Exactly one
+branch must belong to the ticket, with no sibling of unresolved ownership.
+It must hold exactly one commit outside the current base's history, with one
+parent that is an ancestor of the current base, the current ticket title as
+subject, and an exact `Ticket: <id>` line. Its local
+`branch.<name>.ticketDelivered` record must equal its tip: an absent or
+mismatched delivery record refuses resume with `Cannot resume`, changing
+nothing, including for deliveries made before this record existed.
+Merge commits, already merged tips, branches at their base, multiple commits,
+unrelated or moved-back history, a retitled ticket, and wrong or missing ticket
+lines are refused. No branch, multiple owned branches, or an unresolved sibling
+also refuses without changing anything. In `pr` mode a delivered resume blocks
+because the pull request is brought up to date at its host; it makes no remote
+request and changes nothing.
+
+After those checks, `git worktree add <worktree> <branch>` recreates the worktree
+on the existing branch and runs `repository.setup`. A stale worktree registration
+or a branch checked out elsewhere that prevents recreation is refused, without
+pruning registrations or forcing the add. Failed setup, leftovers, or changed
+HEAD at adoption refuses resume and removes only the recreated worktree; a
+removal failure reports the kept worktree instead. The delivered commit's parent
+becomes `baseCommit`, and the delivered commit becomes the approved commit.
+An unresolved base after recreation also refuses and removes that worktree.
+If the base moved forward, the existing replay, conflict, setup-failure, repair,
+and changed-patch review rules apply, with equal-patch gates run as `verify`.
+If the base has not moved, setup and `verify` test the same commit before it is
+delivered again, without replay or an Agent. Failed unchanged-base gates refuse
+with `Cannot resume` and remove the recreated worktree without entering repair;
+the delivery record and branch remain unchanged unless a command itself moved
+them. No prior run's checks are accepted as evidence for this run.
+
 A run ends `blocked` without asking, changing nothing further, when: required
 ticket sections or list entries are missing; the base
 does not resolve; in `pr` mode the base is not published or the remote cannot be
 asked; a branch of the ticket or the worktree directory already exists; a resume
-precondition fails; a setup command during `prepare` fails or leaves tracked or unignored files
+precondition fails, including the delivered-candidate checks above; unchanged-base
+redelivery gates fail; recording the delivered commit fails; a setup command during `prepare` fails or leaves tracked or unignored files
 behind; there is nothing to commit; an Agent committed or moved HEAD or the
 branch itself; a commit hook rejects the commit or changes its content or
 message; the base was rewritten or moved back before replay; the commit, patch, push, or `gh` step fails; the worktree cannot be
@@ -733,8 +772,10 @@ archive branch and its commit after `archive`, the worktree if it was kept
 (always for `parked` and `handedOff`, and for `blocked` once it exists), and the evidence
 directory. Read
 the final state, not the action, to tell the endings apart. `delivered` means
-the worktree was removed and the branch kept; `parked`, `handedOff`, and `blocked` keep the
-worktree and branch for inspection or further work; `abandoned` means both are
+the worktree was removed and the branch kept; `parked` and `handedOff` keep the
+worktree and branch for inspection or further work. A `blocked` run also keeps
+them unless delivered-candidate adoption was refused before recreation or its
+recreated worktree was withdrawn; `abandoned` means both are
 gone, with the candidate on its archive branch after `archive`. A worktree that
 cannot be removed, for example because it holds unignored nested `.machine-runs`
 evidence, ends `blocked` with a reason naming the branch, commit, and pull
@@ -759,11 +800,18 @@ run; both are absent when no assumptions were made or restored. Its `outcome` is
 (the last choice at `decide`, so `discard` for a confirmed discard and
 `more rounds` for a run that went on to deliver), `archive` as
 `{ "branch", "commit" }` when the archive branch was created, and `resumed` for
-a resumed run, whose `worktreeCreated` is false. Its `baseCommit` is the final
+a resumed run. Its `worktreeCreated` is false for an existing worktree and true
+for a recreated delivered-candidate worktree. A successful unchanged-base
+redelivery also records `redelivered: true`; repeated runs deliver the same
+commit and change only their evidence. Its `baseCommit` is the final
 base used by the run. Once a valid replay changes the base, every receipt includes
 `rebasedFrom`, shaped as `{ baseCommit, commit }`: the base the run started from and its
 first approved ticket commit. This also survives re-review, repaired `reverify`,
 and later stops in that run; it is not carried between separate resumed runs.
+For a delivered-candidate resume, the successful hold retains its usual
+`Delivered <branch> at <commit>` first sentence and adds one sentence saying
+the delivered commit was replayed onto the new base, or delivered again
+unchanged, before the final `Evidence: <directory>`.
 For parking, `delivery.json` also records the `reason` and
 `park: { needs, next, budgets: { repairs: { used, max }, reviewRounds: { used, max } } }`.
 The one-line hold starts `Parked on <branch>: ` followed by the first line of
@@ -794,8 +842,13 @@ gate retries and `reviewRounds` counts review revisions, each cumulative across 
 
 Limits: a run waiting in a Human state keeps its worktree and branch until it is
 answered. `resume` adopts only the ticket's own worktree and branch, either clean
-at its base or holding an uncommitted candidate; it does not restore an archive branch, continue a branch
-that already holds a commit, or accept a base rewritten away from its history.
+at its base or holding an uncommitted candidate, or recreates a missing worktree
+for the recorded delivered commit under the conditions above; it does not
+restore an archive branch, adopt any other committed candidate, or accept a
+base rewritten away from its history. Delivery records are local configuration
+and do not travel with a push or clone; without one, even a correctly shaped
+commit cannot be resumed as delivered. Earlier assumptions and review notes
+are not restored from the removed worktree on this path.
 Without `resume`, a second run of the same ticket is blocked while any branch
 of that ticket exists; resume it, or delete
 the branch and any kept worktree to retry from scratch.
