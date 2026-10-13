@@ -287,6 +287,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         git(worktree, "symbolic-ref", "HEAD", `refs/heads/${branch}`);
       }
       if (git(worktree, "rev-parse", "HEAD") !== approved || pending() !== "") git(worktree, "reset", "--hard", approved);
+      // The approved tree was clean: remove later outputs under its ignore rules before making the candidate untracked.
+      step(["clean", "-f", "-d", "-q", "-e", "/.machine-runs"]);
       undo(original);
     };
     if (!run("git", ["merge-base", "--is-ancestor", original, tip], repository.path).ok) {
@@ -410,6 +412,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       const stopped = undoOnTip("reverify gates failed");
       work.reopen(true);
       if (stopped) return stopped;
+      reviewsFrom = reviews.length;
       return { type: "failed" };
     }
     commitHash = head;

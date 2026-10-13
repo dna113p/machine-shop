@@ -224,7 +224,8 @@ choices remain:
 
 - `more rounds`: restart both budgets and return to the planning state that
   stopped, or to `plan` with the reviewer's feedback after a second revision.
-  Otherwise return to the responsible editing stage with the standing findings.
+  Otherwise return to the editing stage that stopped, the tester or the
+  implementer, with the standing findings.
   It can be chosen every time a budget runs out.
 - `hand off`: end `handedOff` with the worktree and branch kept, uncommitted,
   for another workflow or a person.
@@ -255,7 +256,9 @@ checkout (its HEAD when no base is named). An unchanged or unresolvable base
 continues to delivery. A forward move replays exactly the ticket commit onto
 the new tip. The same patch runs setup again, then the gates as `reverify`;
 a changed patch is undone on the new tip and goes through verification and a
-fresh review. Failed `reverify` gates return to the normal repair loop. When the
+fresh review. Failed `reverify` gates return to the normal repair loop; the
+review after repair is a first review of the new patch for convergence and
+discussion escalation, without comparisons to reports from before the rebase. When the
 run changes base, `delivery.json` includes a `rebasedFrom` field, `{ baseCommit, commit }`,
 with the starting base and first approved commit. In `pr` mode the new tip must
 already be published on the recorded pull request base before replay.
@@ -264,7 +267,12 @@ For every new stop, the run never stops with the workflow's commit on the ticket
 branch: it undoes that commit and keeps the candidate uncommitted, clearing the
 recorded commit. Conflicts, a base already holding the change, and unpublished
 tips restore the original base and go through `stuck`; a failed setup keeps the
-candidate on the new tip and also goes through `stuck`. Resume alone repeats a
+candidate on the new tip and also goes through `stuck`. Restoring the original
+candidate removes later untracked outputs under the approved tree's ignore
+rules, keeping files those rules ignore, `.machine-runs/`, and nested Git
+repositories. This includes setup outputs only the tip ignored, so resuming an
+ignore stop reaches `rebase` again with the same reason until the candidate or
+ignore rules are reconciled. Resume alone repeats a
 conflict until someone ports the candidate in the worktree. A rewritten or
 moved-back base ends `blocked` for delivery by hand; `adopt` still refuses resume
 when the branch's base is not an ancestor of the current tip. See the catalog

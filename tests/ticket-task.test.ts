@@ -2032,6 +2032,69 @@ for (const [label, extra] of [
   });
 }
 
+/** A run whose first review approves while the base gains later.txt: the replayed patch is the approved one, later-gate fails in `reverify`, and the implementer repairs the candidate on the tip. */
+function reverifyRepaired(f: Fixture, later: (reviews: number) => unknown) {
+  const moved = { started: f.head, tip: "", reviews: 0, prompts: [] as string[] };
+  const agents = {
+    implementer: (request: Request) => {
+      if (moved.prompts.push(request.prompt) === 1) return implement(request);
+      // Every later round keeps what the criterion and the gate on the new base each ask of the file.
+      writeFileSync(join(request.cwd, "greeting.txt"), moved.prompts.length === 2 ? "hello later\n" : "hello again later\n"); return ok();
+    },
+    reviewer: () => {
+      if (++moved.reviews === 1) { moved.tip = advance(f); return review(); }
+      return later(moved.reviews);
+    },
+  };
+  return { moved, agents, data: input(f, { checks: [command(), command(greetsLater, { name: "later-gate" })] }, { stuck: "park" }) };
+}
+/** From `rebase` on: the failed gate takes a repair round, and the review of the repaired candidate sends what it found back to the implementer. */
+const repairedThenRevised = ["rebase", "repairBudget", "repairTarget", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "reviewBudget", "change"];
+
+for (const third of ["approves", "repeats its report"] as const) {
+  test(`the review after a repaired reverify failure is a first review of the new patch: an unmet criterion with nothing new gets a repair round, and a next review that ${third} ${third === "approves" ? "delivers on the tip" : "stops as not converging"}`, async context => {
+    const f = fixture(context); const human = person();
+    const { moved, agents, data } = reverifyRepaired(f, reviews => reviews === 2 || third === "repeats its report" ? stillUnmet() : review());
+    const result = await execute(data, agents, human);
+    untouched(f); assert.deepEqual(human.requests, []);
+    // The approval before the rebase read the patch the repair has since changed: beside it, this report would be an unchanged one and stop the run.
+    assert.deepEqual(result.states.slice(result.states.indexOf("rebase")).slice(0, repairedThenRevised.length), repairedThenRevised,
+      "the first review of the repaired patch sends its unmet criterion to the implementer");
+    assert.deepEqual([moved.reviews, moved.prompts.length], [3, 3]);
+    assert.match(moved.prompts[1]!.split("Current failure/feedback: ")[1] ?? "", /later-gate/u);
+    assert.match(moved.prompts[2]!.split("Current failure/feedback: ")[1] ?? "", new RegExp(`Unmet criterion: ${criterion}`, "u"));
+    // The gate failure used the repair budget and the review its own, one round each.
+    const run = evidence(f); assert.deepEqual([run.result.repairs, run.result.reviewRounds], [1, 1]);
+    if (third === "repeats its report") {
+      // The second review of the new patch is compared with the first, as any later review is with the one before it.
+      const stop = parkedIn("reviewResult", f, result, /^Review is not converging: newSinceLastRound is none and criteria remain unmet: /u);
+      assert.equal(stop.delivery.reason, `Review is not converging: newSinceLastRound is none and criteria remain unmet: ${criterion}`);
+      assert.deepEqual([git(f.worktree, "rev-parse", "HEAD"), stop.delivery.baseCommit, stop.delivery.commit], [moved.tip, moved.tip, null]);
+      assert.deepEqual(result.states.filter(state => ["reviewBudget", "repairBudget", "stuck"].includes(state)), ["repairBudget", "reviewBudget", "stuck"]);
+      return;
+    }
+    assert.equal(result.state, "delivered"); assert.equal(result.states.includes("stuck"), false);
+    assert.deepEqual(result.states.filter(state => ["change", "commit", "rebase", "reviewBudget", "repairBudget"].includes(state)),
+      ["change", "commit", "rebase", "repairBudget", "change", "reviewBudget", "change", "commit", "rebase"]);
+    const commit = onTip(f, moved.tip); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello again later");
+    assert.deepEqual([run.delivery.outcome, run.delivery.baseCommit, run.delivery.commit, run.result.checksPassed], ["delivered", moved.tip, commit, true]);
+    assert.equal(git(f.repo, "show", `${rebasedFrom(f, run, moved.started)}:greeting.txt`), "hello");
+  });
+}
+
+test("a question in the review after a repaired reverify failure gets its one repair round, and goes to the owner when the next review of that patch still asks", async context => {
+  const f = fixture(context); const human = person();
+  const { moved, agents, data } = reverifyRepaired(f, reviews => review("approved", "A question for the owner", { findings: discussions([reviews === 2 ? asked[0]! : askedAgain[0]!]) }));
+  const result = await execute(data, agents, human);
+  untouched(f); assert.deepEqual(human.requests, []);
+  // No report from before the rebase can hold a question: only the reviews of the repaired patch count toward asking twice.
+  assert.deepEqual(result.states.slice(result.states.indexOf("rebase")).slice(0, repairedThenRevised.length), repairedThenRevised);
+  const stop = parkedIn("reviewResult", f, result, new RegExp(`${counted(1)}:\\s${literal(questionLines([askedAgain[0]!])[0]!)}`, "u"));
+  assert.deepEqual([moved.reviews, moved.prompts.length, stop.delivery.park.questions], [3, 3, [askedAgain[0]]]);
+  assert.deepEqual([stop.result.repairs, stop.result.reviewRounds], [1, 1]);
+  assert.equal(git(f.worktree, "rev-parse", "HEAD"), moved.tip);
+});
+
 for (const policy of ["park", "ask"] as const) {
   test(`a setup command that fails on the new tip is not the implementer's to repair: the commit is undone there and the run ${policy === "park" ? "parks naming the command, and a resumed run delivers on the tip" : "waits for a decision, where archive keeps the candidate on the tip"}`, async context => {
     const f = fixture(context); const human = person(...(policy === "ask" ? ["archive"] : [])); const calls = recordGit(context, f);
@@ -2111,6 +2174,73 @@ for (const trigger of ["a replayed patch that differs", "a gate that fails in re
     accepted(second.states); stopped(again, second); assert.deepEqual([edits, reviews], [1, 2]); assert.deepEqual(human.requests, []);
   });
 }
+
+/** Setup writes kept/out.txt on every tree and cache/out.txt only where the tip's later.txt is, and says in its log which it did. */
+const writesOutputs = 'const fs = require("fs"); const write = dir => { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(dir + "/out.txt", "built\\n"); }; '
+  + 'write("kept"); const tip = fs.existsSync("later.txt"); if (tip) write("cache"); console.log(tip ? "wrote cache on the tip" : "wrote kept only");';
+/**
+ * A run that meets an ignore stop with setup outputs in the worktree. The base ignores kept/ from the start, so prepare stays clean. Under
+ * review it gains rules for greeting.txt and cache/, then later.txt: setup stays clean on the tip, later-gate fails there in `reverify`,
+ * and the commit cannot be undone onto a tip that would drop greeting.txt.
+ */
+function ignoredOutputs(f: Fixture) {
+  const seen = { started: ignoring(f, "kept/\n"), tip: "", reviews: 0, edits: 0, before: undefined as Candidate | undefined };
+  const repository = { setup: [command(writesOutputs, { name: "install" })], checks: [command(), command(greetsLater, { name: "later-gate" })] };
+  const agents = {
+    implementer: (request: Request) => {
+      if (++seen.edits > 1) return ok();
+      // Run evidence nested in the worktree is no setup output either.
+      mkdirSync(join(request.cwd, ".machine-runs")); writeFileSync(join(request.cwd, ".machine-runs/nested.json"), "{}"); return implement(request);
+    },
+    reviewer: (request: Request) => {
+      // A resumed run does not set up again: what setup wrote under the base's own rules must still be there for it.
+      assert.equal(readFileSync(join(request.cwd, "kept/out.txt"), "utf8"), "built\n");
+      if (++seen.reviews === 1) { seen.before = candidate(request.cwd); ignoring(f, "kept/\ngreeting.txt\ncache/\n"); seen.tip = advance(f); }
+      return review();
+    },
+  };
+  /** The candidate is the approved one and nothing else: of what setup wrote, only the file the original base ignores is left. */
+  const restored = (run: { delivery: any }) => {
+    assert.equal(existsSync(join(f.worktree, "cache/out.txt")), false, "a setup output only the tip's rules ignore was left beside the restored candidate");
+    uncommitted(f, run, seen.started, seen.before!);
+    assert.equal(candidate(f.worktree, true).status, "?? greeting.test.txt\n?? greeting.txt\n!! kept/out.txt");
+    assert.equal(readFileSync(join(f.worktree, "kept/out.txt"), "utf8"), "built\n"); assert.ok(existsSync(join(f.worktree, ".machine-runs/nested.json")));
+    assert.equal(readFileSync(join(f.worktree, ".gitignore"), "utf8"), "kept/\n"); assert.equal(existsSync(join(f.worktree, "later.txt")), false);
+  };
+  return { seen, agents, restored, data: (at: Fixture, extra = {}) => input(at, repository, { stuck: "park", ...extra }) };
+}
+
+test("an ignore stop leaves no setup output that only the tip's rules ignore beside the restored candidate: a directory setup wrote into on the tip is gone, and what the original base ignores stays", async context => {
+  const f = fixture(context); const human = person();
+  const { seen, agents, restored, data } = ignoredOutputs(f);
+  const result = await execute(data(f), agents, human);
+  assert.deepEqual(result.states.slice(result.states.indexOf("rebase")), ["rebase", "stuck", "park", "parked"]);
+  const run = parkedIn("rebase", f, result, /greeting\.txt/u); untouched(f); assert.deepEqual(human.requests, []);
+  assert.match(run.delivery.reason, /\.gitignore/u); assert.ok(names(run.delivery.reason, seen.tip), "the reason names the new tip");
+  // Setup did write into cache/ on the tip, where the rule kept the tree clean; the gate then failed there.
+  assert.deepEqual(run.result.checks.map((check: any) => [check.phase, check.name, check.passed]), [["setup", "install", true], ["red", "tests", true],
+    ["verify", "tests", true], ["verify", "later-gate", true], ["setup", "install", true], ["reverify", "tests", true], ["reverify", "later-gate", false]]);
+  assert.match(readFileSync(run.result.checks[0].log, "utf8"), /wrote kept only/u); assert.match(readFileSync(run.result.checks[4].log, "utf8"), /wrote cache on the tip/u);
+  restored(run); assert.deepEqual([seen.edits, seen.reviews], [1, 1]);
+});
+
+test("a run resumed after an ignore stop finds no setup output outside the ticket Scope: it spends no implementer round, replays, and stops in rebase again with the same reason", async context => {
+  const f = fixture(context); const human = person();
+  const { seen, agents, restored, data } = ignoredOutputs(f);
+  const reason: string = parkedIn("rebase", f, await execute(data(f), agents, human), /greeting\.txt/u).delivery.reason;
+  const again = next(f, 2);
+  const second = await execute(data(again, { resume: true }), { ...agents, investigator: () => assert.fail() }, human);
+  accepted(second.states); const run = evidence(again);
+  // The resumed candidate is held to Scope first: nothing setup wrote on the tip is there to be counted against it.
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-1.json"), "utf8")), { stage: "change", changed: ["greeting.test.txt", "greeting.txt"], outside: [] });
+  assert.deepEqual([seen.edits, seen.reviews, run.result.repairs, run.result.reviewRounds], [1, 2, 0, 0], "the resumed run spent implementer rounds");
+  assert.deepEqual(second.states.slice(2), ["scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "stuck", "park", "parked"]);
+  parkedIn("rebase", again, second, /greeting\.txt/u); untouched(f); assert.deepEqual(human.requests, []);
+  assert.equal(run.delivery.reason, reason); assert.doesNotMatch(run.delivery.reason, /Paths outside the ticket Scope/u);
+  // It set up on the tip again, not on the base it resumed on, and left the same candidate behind.
+  assert.deepEqual(phases(run), ["verify", "verify", "setup", "reverify", "reverify"]);
+  restored(run);
+});
 
 test("an ignore rule on the new tip does not stop a replay that is never undone: an equal patch with passing gates delivers the file the rule matches", async context => {
   const f = fixture(context); const started = f.head; let tip = "";
@@ -3276,4 +3406,11 @@ test("the catalog's more rounds row says the work returns to the editing stage t
   const row = readFileSync(resolve("docs/catalog.md"), "utf8").split("\n").find(line => line.startsWith("| `more rounds` |")) ?? "";
   assert.ok(statements(row).some(one => /\btester\b/u.test(one) && /\bimplementer\b/u.test(one) && /\bstopped\b|\bblocked\b/iu.test(one)),
     "the `more rounds` row must say in one sentence that it returns to the editing stage that stopped, naming the tester and the implementer");
+});
+
+test("the README's more rounds choice says the work returns to the editing stage that stopped, the tester or the implementer, as the catalog's row does", () => {
+  // The choice's own list item, taken a sentence at a time: `the responsible editing stage` does not say which stage that is.
+  const item = /^- `more rounds`:[^]*?(?=\n- `|\n\n)/mu.exec(readFileSync(resolve("README.md"), "utf8"))?.[0] ?? "";
+  assert.ok(statements(item).some(one => /\btester\b/u.test(one) && /\bimplementer\b/u.test(one) && /\bstopped\b|\bblocked\b/iu.test(one)),
+    "the `more rounds` item must say in one sentence that it returns to the editing stage that stopped, naming the tester and the implementer");
 });

@@ -394,14 +394,16 @@ evidence directory and describes what is new.
    whitespace-only text also means none, as does `none` after trimming,
    lower-casing, and dropping a trailing period. With no blockers, the reason
    names the unmet ticket criteria instead. The first review of a changed patch
-   after rebase is not compared with reports from before the rebase.
+   after rebase, including after repairing a `reverify` failure, is not compared
+   with reports from before the rebase.
 5. Discussions get one repair round to resolve them or explain why they need
    the owner. If the previous review also had discussions, every discussion in
    the next review goes to the owner together through `stuck`, whatever its
    wording, only when no criteria or blockers need repair. This depends on review
    position, not matching text. Discussions after a review without any get a
    fresh repair round, as do discussions in the first review of a changed patch
-   after rebase; only subsequent reviews of that patch are compared.
+   after rebase, including after repairing a `reverify` failure; only subsequent
+   reviews of that patch are compared.
 6. All criteria met with no blockers or discussions approves, including a
    reviewer `revise` event containing only minors. Minor notes accumulate across
    review rounds, deduplicated by text and location after trimming and
@@ -486,6 +488,13 @@ the undo, and re-included added paths are safe. Failure to inspect added paths
 or ignore rules also restores the candidate and goes through `stuck`, with
 failure logs retained. The added paths are saved as `rebase-<n>.paths`.
 
+Restoring the original candidate first resets to the approved commit, then
+runs `git clean -f -d -q -e /.machine-runs` before undoing that commit. This
+removes later untracked files and directories under the approved tree's ignore
+rules, including setup outputs only the tip ignored. Files those rules ignore,
+`.machine-runs/`, and nested Git repositories are kept. A clean failure leaves
+a numbered `rebase-<n>-clean.log` and still proceeds to undo the commit.
+
 After a valid replay, setup runs again as phase `setup` while the rebased tree
 is still committed and clean, so its unignored outputs can be detected as in
 `prepare`. A failed command or tracked/unignored leftovers undoes the commit
@@ -500,7 +509,9 @@ If patch ids match, the gates run as phase `reverify`. Passing delivers the
 rebased commit with the new tip as `baseCommit`. Failing undoes the commit on
 that tip if the ignore guard permits, marks checks failed, and goes to
 `repairBudget`; the implementer sees the failed gates before the normal
-verify/review/commit/rebase sequence. With
+verify/review/commit/rebase sequence. The review after repair is a first review
+of the new patch for convergence and discussion escalation, without comparisons
+to reports from before the rebase. With
 no further base movement that second `rebase` needs no second `reverify`, since
 `verify` checked the candidate on the new base.
 
