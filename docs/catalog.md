@@ -195,7 +195,11 @@ Describe the goal.
 
 Goal is free text. Scope lists allowed paths or globs, Acceptance lists testable
 criteria, and Forbidden lists things the change must not do. Each list needs at
-least one non-empty bullet. The optional first `# ` heading is the ticket title
+least one non-empty bullet. Indented continuation lines and nested bullets join
+their parent bullet with single spaces; nested bullets do not add criteria.
+Thematic breaks are not bullets. Subheadings (`###` and deeper) remain text of
+the current section and do not introduce required sections or count as bullets.
+The optional first `# ` heading is the ticket title
 when Dispatch reads a `.tickets/<id>.md` file. The exported pure
 `ticketSections(body)` returns `{ goal, scope, acceptance, forbidden, missing }`;
 `missing` names absent sections and empty required lists. `shape` opens evidence
@@ -307,22 +311,36 @@ evidence directory and describes what is new.
 
 `reviewResult` judges the report, preserving the read-only guard:
 
-1. Missing or wrongly typed fields, invalid entries, or a criteria count that
+1. For `approved` and `revise`, missing or wrongly typed fields, invalid entries, or a criteria count that
    differs from the acceptance list block with the field named and go to
    `decide`. Entries are matched to criteria by position, so a reworded
-   criterion is not malformed.
-2. A valid reviewer `blocked` event goes to `decide` with its summary.
+   criterion is not malformed. Feedback uses the ticket's criterion text at that
+   position, not the reviewer's wording.
+2. A reviewer `blocked` event goes to `decide` with its summary; it does not
+   require `criteria`, `findings`, or `newSinceLastRound`.
 3. Any unmet criterion or blocker requires repair, regardless of the event's
-   type. Feedback lists each unmet criterion and each blocker with its location.
+   approval verdict. Feedback lists each unmet criterion, blocker, and discussion
+   with its evidence or location.
 4. Before retrying an unresolved criterion or blocker on a later review,
    `newSinceLastRound: "none"` with the same set of blocker texts blocks as
-   not converging and goes to `decide`.
+   not converging and goes to `decide`, naming the unchanged blockers. Empty or
+   whitespace-only text also means none, as does `none` after trimming,
+   lower-casing, and dropping a trailing period. With no blockers, the reason
+   names the unmet ticket criteria instead.
 5. A discussion gets one repair round to resolve it or explain why it needs
    the owner. Repeating the question in the next review, compared after trimming
-   and lower-casing, blocks with the question quoted for `decide`.
+   and lower-casing, blocks with the question quoted for `decide` only when
+   no criteria or blockers need repair. A question absent from the immediately
+   preceding review gets a fresh repair round if it returns.
 6. All criteria met with no blockers or discussions approves, including a
    reviewer `revise` event containing only minors. Minor notes accumulate across
-   review rounds.
+   review rounds, deduplicated by text and location after trimming and
+   lower-casing. The pull request renders each note on one line and omits
+   parentheses when its location is empty.
+
+After a Machine block for non-convergence, repeated discussion, or a malformed
+report, `more rounds` restores the latest review's available findings as the
+implementer's feedback, including their locations, rather than the stop reason.
 
 Operations do all Git, command, and publishing work. Machine-judged `revise` and failed checks
 return to `change` within `maxRepairs`, and every retry passes through the real

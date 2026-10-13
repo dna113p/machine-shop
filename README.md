@@ -166,6 +166,9 @@ needs at least one bullet. Scope lists permitted paths or globs, Acceptance
 lists testable criteria, and Forbidden lists prohibited changes (including
 `- nothing beyond the scope above`). A missing section or empty list blocks
 before any Agent runs or worktree is created, including with `resume: true`.
+Indented continuations and nested bullets join their parent item with single
+spaces. Thematic breaks and subheadings do not count as bullets; subheadings
+stay within the current section.
 
 Reviews report a verdict and evidence for each acceptance criterion, tagged
 findings, and what changed since the previous round. The Machine requires
@@ -173,7 +176,10 @@ repairs for unmet criteria or blocker findings, escalates malformed reports,
 non-converging repairs, and repeated owner questions to `decide`, and accepts
 minor findings without another round. Minor findings from every review are
 kept in `delivery.json` as `reviewNotes` and in a pull request's `## Review notes`
-section. Full reports are saved as `review-<n>.json` in the evidence directory.
+section, deduplicated by trimmed, case-insensitive text and location. Pull request
+notes occupy one line each and omit empty locations. A reviewer `blocked` event
+needs only its summary. Repeated questions escalate only when no criteria or
+blockers need repair. Full reports are saved as `review-<n>.json` in the evidence directory.
 
 A ticket run can wait for a person. Failed checks and review findings are
 repaired within `maxRepairs`, which defaults to 3 here (0-3 accepted). When that

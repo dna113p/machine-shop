@@ -170,13 +170,40 @@ test("ticketSections parses headings case-insensitively and in any order", () =>
   assert.deepEqual(mod.ticketSections("```md\n## Goal\n## Scope\n- path\n## Acceptance\n- test\n## Forbidden\n- none\n```\n").missing, ["Goal", "Scope", "Acceptance", "Forbidden"]);
 });
 
+test("ticketSections joins hard-wrapped bullet continuations with single spaces", () => {
+  assert.deepEqual(mod.ticketSections("## Acceptance\n- Handles empty\n  and   missing input\n  without crashing.\n- Preserves output").acceptance,
+    ["Handles empty and missing input without crashing.", "Preserves output"]);
+});
+
+test("ticketSections includes nested bullets in their parent criterion", () => {
+  assert.deepEqual(mod.ticketSections("## Acceptance\n  - Handles input\n    - Empty values\n      + Missing values\n    * Invalid values\n  - Preserves output").acceptance,
+    ["Handles input Empty values Missing values Invalid values", "Preserves output"]);
+});
+
+test("ticketSections does not count thematic breaks as bullets", () => {
+  for (const divider of ["* * *", "---", "- - -", "***", "___"]) {
+    const sections = mod.ticketSections(`## Scope\n${divider}\n## Acceptance\n- First\n  ${divider}\n- Second`);
+    assert.deepEqual(sections.scope, []); assert.ok(sections.missing.includes("Scope"));
+    assert.deepEqual(sections.acceptance, ["First", "Second"]);
+  }
+});
+
+test("ticketSections keeps subheadings as section text without creating sections or bullets", () => {
+  const sections = mod.ticketSections("## Goal\nA goal\n### Scope\nStill the goal\n## Acceptance\n- First\n### Forbidden\n- Second");
+  assert.equal(sections.goal, "A goal\n### Scope\nStill the goal");
+  assert.deepEqual(sections.acceptance, ["First", "Second"]);
+  assert.deepEqual(sections.missing, ["Scope", "Forbidden"]);
+  assert.deepEqual(mod.ticketSections("## Acceptance\n### A subheading").acceptance, []);
+});
+
 for (const [section, remove] of [["Acceptance", /## Acceptance\n- [^\n]+/u], ["Scope", /- greeting\.txt\n/u]] as const) {
   for (const resume of [false, true]) {
     test(`a ${resume ? "resumed" : "new"} ticket with missing or empty ${section} blocks before any Agent or worktree`, async context => {
       const f = fixture(context); const data = input(f, {}, { resume }); data.ticket.body = data.ticket.body.replace(remove, "");
       const result = await execute(data, { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
       assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "failure", "blocked"]);
-      const run = held(f, result, new RegExp(`^Blocked: .*${section}`, "u")); untouched(f);
+      const run = held(f, result, new RegExp(`^Blocked: Ticket body is missing required sections or non-empty lists: ${section}\\. Expected shape:`, "u")); untouched(f);
+      assert.equal(run.delivery.reason.split(" Expected shape:")[0], `Ticket body is missing required sections or non-empty lists: ${section}.`);
       assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.result.agentInvocations], [false, false, 0]);
       assert.equal(existsSync(f.worktree), false); assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), "main");
       for (const heading of ["Goal", "Scope", "Acceptance", "Forbidden"]) assert.ok(run.delivery.reason.includes(`## ${heading}`));
@@ -189,15 +216,14 @@ test("an approved report with unmet criteria repairs and persists the structured
   data.ticket.body = data.ticket.body.replace(`- ${criterion}`, `- ${criterion}\n- greeting ends with a newline`);
   let edits = 0; let reviews = 0;
   const first = review("approved", "Claims approval", {
-    criteria: [{ text: criterion, met: false, evidence: "greeting.txt:1" }, { text: "greeting ends with a newline", met: false, evidence: "greeting.txt:1" }],
+    criteria: [{ text: "Reviewer reworded the first criterion", met: false, evidence: "greeting.txt:1" }, { text: "Reviewer reworded the second criterion", met: false, evidence: "greeting.txt:2" }],
   });
   const result = await execute(data, {
     implementer: request => {
       assert.ok(request.prompt.includes(`Acceptance criteria:\n- ${criterion}\n- greeting ends with a newline`));
       assert.ok(request.prompt.includes("Forbidden:\n- nothing beyond the scope above"));
       if (++edits === 2) {
-        assert.ok(request.prompt.includes(`Unmet criterion: ${criterion}`));
-        assert.match(request.prompt, /Unmet criterion: greeting ends with a newline/u);
+        assert.equal(request.prompt.split("Current failure/feedback: ")[1], `Claims approval\nUnmet criterion: ${criterion} (greeting.txt:1)\nUnmet criterion: greeting ends with a newline (greeting.txt:2)`);
       }
       return implement(request);
     },
@@ -243,7 +269,11 @@ test("unchanged blocker texts with nothing new stop a repair as not converging",
     },
     reviewer: () => review("approved", "Claims approval", { findings: ++reviews === 1 ? findings : [...findings].reverse(), newSinceLastRound: reviews === 1 ? "Initial findings" : "none" }),
   }, human);
-  handedOff(f, result, /not converging/u, human); assert.deepEqual([edits, reviews], [2, 2]);
+  const run = handedOff(f, result, /not converging/u, human); assert.deepEqual([edits, reviews], [2, 2]);
+  for (const finding of findings) {
+    assert.ok(run.delivery.reason.includes(`${finding.text} (${finding.where})`));
+    assert.ok(human.requests[0]!.prompt.includes(`${finding.text} (${finding.where})`));
+  }
 });
 
 test("a discussion repeated in the next review asks the owner to settle the question", async context => {
@@ -256,6 +286,143 @@ test("a discussion repeated in the next review asks the owner to settle the ques
   }, human);
   handedOff(f, result, /must settle repeated discussion: "SHOULD THE GREETING BE LOCALIZED\?"/u, human);
   assert.deepEqual([edits, reviews], [2, 2]);
+});
+
+for (const cause of ["not converging", "repeated discussion", "malformed report"]) {
+  test(`more rounds restores the last review findings after ${cause}`, async context => {
+    const f = fixture(context); const human = person("more rounds"); let edits = 0; let reviews = 0;
+    const rounds = cause === "malformed report" ? 1 : 2;
+    const discussion = { severity: "discussion", text: "Which locale?", where: "greeting.txt:3" };
+    const needsRepair = cause !== "repeated discussion";
+    const findings = needsRepair ? [{ severity: "blocker", text: "Handle empty input", where: "greeting.txt:2" }, discussion] : [discussion];
+    const feedback = [
+      "Latest review",
+      ...(needsRepair ? [`Unmet criterion: ${criterion} (greeting.txt:1)`, "Blocker: Handle empty input (greeting.txt:2)"] : []),
+      "Discussion: Which locale? (greeting.txt:3)",
+    ].join("\n");
+    const result = await execute(input(f), {
+      implementer: request => {
+        if (++edits === rounds + 1) assert.equal(request.prompt.split("Current failure/feedback: ")[1], feedback);
+        return implement(request);
+      },
+      reviewer: () => ++reviews > rounds ? review() : review("approved", "Latest review", {
+        criteria: [{ text: "Reviewer paraphrase", met: !needsRepair, evidence: "greeting.txt:1" }], findings,
+        newSinceLastRound: cause === "malformed report" ? undefined : "none",
+      }),
+    }, human);
+    assert.equal(result.state, "delivered"); assert.deepEqual([edits, reviews, human.requests.length], [rounds + 1, rounds + 1, 1]);
+    assert.match(human.requests[0]!.prompt, /send the standing findings back to the implementer/u);
+    assert.match(human.requests[0]!.prompt, cause === "malformed report" ? /Malformed review report: newSinceLastRound/u : new RegExp(cause, "u"));
+    held(f, result, /^Delivered/u);
+  });
+}
+
+for (const change of ["different blocker", "new findings"]) {
+  test(`rule 4 repairs with ${change} despite another unchanged review field`, async context => {
+    const f = fixture(context); let edits = 0; let reviews = 0;
+    const result = await execute(input(f), {
+      implementer: request => { edits++; return implement(request); },
+      reviewer: () => {
+        if (++reviews === 3) return review();
+        return review("approved", "Needs work", {
+          findings: [{ severity: "blocker", text: reviews === 2 && change === "different blocker" ? "Handle missing input" : "Handle empty input", where: "greeting.txt:1" }],
+          newSinceLastRound: reviews === 2 && change === "new findings" ? "The empty input path now returns a value" : "none",
+        });
+      },
+    });
+    assert.equal(result.state, "delivered"); assert.deepEqual([edits, reviews], [3, 3]);
+    assert.equal(result.states.filter(state => state === "repairBudget").length, 2); assert.equal(result.states.includes("decide"), false);
+  });
+}
+
+for (const newSinceLastRound of ["", "   ", " NoNe ", " NONE. "]) {
+  test(`rule 4 treats ${JSON.stringify(newSinceLastRound)} as nothing new`, async context => {
+    const f = fixture(context); const human = person("hand off"); let reviews = 0;
+    const result = await execute(input(f), {
+      reviewer: () => review("revise", "Handle empty input", { newSinceLastRound: ++reviews === 1 ? "Initial findings" : newSinceLastRound }),
+    }, human);
+    handedOff(f, result, /not converging: .*Handle empty input \(greeting.txt:1\)/u, human); assert.equal(reviews, 2);
+  });
+}
+
+test("unmet criteria alone stop with a reason naming the ticket criteria", async context => {
+  const f = fixture(context); const human = person("hand off"); let reviews = 0;
+  const result = await execute(input(f), {
+    reviewer: () => { reviews++; return review("approved", "Still unmet", {
+      criteria: [{ text: "Reviewer paraphrase", met: false, evidence: "greeting.txt:1" }], newSinceLastRound: "none",
+    }); },
+  }, human);
+  const run = handedOff(f, result, /not converging/u, human);
+  assert.equal(reviews, 2);
+  assert.equal(run.delivery.reason, `Review is not converging: newSinceLastRound is none and criteria remain unmet: ${criterion}`);
+  assert.ok(human.requests[0]!.prompt.includes(run.delivery.reason));
+});
+
+for (const repair of ["blocker", "unmet criterion"]) {
+  test(`a repeated discussion still repairs while a ${repair} is present`, async context => {
+    const f = fixture(context); let edits = 0; let reviews = 0;
+    const result = await execute(input(f), {
+      implementer: request => { edits++; return implement(request); },
+      reviewer: () => {
+        if (++reviews === 3) return review();
+        return review("approved", "Question plus repair", {
+          criteria: [{ text: criterion, met: reviews === 1 || repair === "blocker", evidence: "greeting.txt:1" }],
+          findings: [{ severity: "discussion", text: "Which locale?", where: "greeting.txt:1" },
+            ...(reviews === 2 && repair === "blocker" ? [{ severity: "blocker", text: "Handle empty input", where: "greeting.txt:2" }] : [])],
+        });
+      },
+    });
+    assert.equal(result.state, "delivered"); assert.deepEqual([edits, reviews], [3, 3]);
+    assert.equal(result.states.includes("decide"), false);
+  });
+}
+
+test("a discussion absent from the next review gets a repair when it returns in round three", async context => {
+  const f = fixture(context); let edits = 0; let reviews = 0;
+  const result = await execute(input(f), {
+    implementer: request => { edits++; return implement(request); },
+    reviewer: () => {
+      if (++reviews === 4) return review();
+      return review("approved", "Needs another round", {
+        findings: [reviews === 2 ? { severity: "blocker", text: "Handle empty input", where: "greeting.txt:2" }
+          : { severity: "discussion", text: "Which locale?", where: "greeting.txt:1" }], newSinceLastRound: "none",
+      });
+    },
+  });
+  assert.equal(result.state, "delivered"); assert.deepEqual([edits, reviews], [4, 4]);
+  assert.equal(result.states.filter(state => state === "repairBudget").length, 3); assert.equal(result.states.includes("decide"), false);
+});
+
+test("a reviewer blocked event needs only its summary and does not require a structured report", async context => {
+  const f = fixture(context); const human = person("more rounds", "hand off"); let reviews = 0; let edits = 0;
+  const result = await execute(input(f), {
+    implementer: request => {
+      if (++edits === 2) assert.equal(request.prompt.split("Current failure/feedback: ")[1], "Cannot inspect the generated output");
+      return implement(request);
+    },
+    reviewer: () => ++reviews === 1 ? ok("blocked", "Cannot inspect the generated output") : review("revise", "Handle empty input", { newSinceLastRound: "none" }),
+  }, human);
+  assert.ok(human.requests[0]!.prompt.includes("This run is stuck and needs a decision: Cannot inspect the generated output\n\n"));
+  assert.doesNotMatch(human.requests[0]!.prompt, /Malformed/u);
+  handedOff(f, result, /not converging/u, human); assert.deepEqual([edits, reviews], [3, 3]);
+});
+
+test("minor notes deduplicate by trimmed case-insensitive text and location and render on one line", async context => {
+  const f = fixture(context); remote(f); fakeGh(context, f); let reviews = 0;
+  const note = { text: "  Consider\na clearer name  ", where: " Greeting.txt:1 " };
+  const elsewhere = { text: "Consider\na clearer name", where: "greeting.txt:2" };
+  const noLocation = { text: "Explain\n  the choice", where: "  " };
+  const result = await execute(input(f, { output: "pr" }), {
+    reviewer: () => review("approved", "Review summary", {
+      findings: ++reviews === 1 ? [{ severity: "blocker", text: "Handle empty input", where: "greeting.txt:1" }, { severity: "minor", ...note }]
+        : [{ severity: "minor", text: "CONSIDER\nA CLEARER NAME", where: "greeting.TXT:1" }, { severity: "minor", ...elsewhere }, { severity: "minor", ...noLocation }],
+    }),
+  });
+  assert.equal(result.state, "delivered"); assert.equal(reviews, 2);
+  const run = held(f, result, /^Delivered/u);
+  assert.deepEqual(run.delivery.reviewNotes, [note, elsewhere, noLocation]);
+  const body = readFileSync(join(run.directory, "pull-request.md"), "utf8");
+  assert.equal(body.split("## Review notes\n\n")[1], "- Consider a clearer name (Greeting.txt:1)\n- Consider a clearer name (greeting.txt:2)\n- Explain the choice\n\nTicket: PROJ-12\n");
 });
 
 test("resolved discussions approve and minor notes accumulate across review rounds", async context => {
@@ -285,9 +452,9 @@ for (const [field, extra] of [
   ["findings[0].where", { findings: [{ severity: "minor", text: "Bad" }] }],
   ["newSinceLastRound", { newSinceLastRound: undefined }], ["newSinceLastRound", { newSinceLastRound: false }],
 ] as const) {
-  test(`a malformed review ${field} (${JSON.stringify(extra)}) reaches decide with the field named`, async context => {
+  for (const verdict of ["approved", "revise"]) test(`a malformed ${verdict} review ${field} (${JSON.stringify(extra)}) reaches decide with the field named`, async context => {
     const f = fixture(context); const human = person("hand off");
-    const result = await execute(input(f), { reviewer: () => review("blocked", "Reviewer blocker must not mask malformed fields", extra) }, human);
+    const result = await execute(input(f), { reviewer: () => review(verdict, "Reviewer verdict must not mask malformed fields", extra) }, human);
     const run = handedOff(f, result, /Malformed review report/u, human);
     assert.ok(run.delivery.reason.includes(field)); assert.ok(existsSync(join(run.directory, "review-1.json")));
   });
@@ -1308,7 +1475,10 @@ for (const [label, body, summary] of [
     const f = fixture(context); remote(f); fakeGh(context, f);
     const result = await execute({ ...input(f, { output: "pr" }), ticket: { ...input(f).ticket, id: "PROJ-12", title: "Add a greeting", body: body === undefined || summary === undefined ? body : `${body}\n${input(f).ticket.body}` } });
     if (summary === undefined) {
-      assert.equal(result.state, "blocked"); held(f, result, /^Blocked: .*Scope.*Acceptance.*Forbidden/u);
+      assert.equal(result.state, "blocked");
+      const run = held(f, result, /^Blocked: Ticket body is missing required sections or non-empty lists: Goal, Scope, Acceptance, Forbidden\. Expected shape:/u);
+      assert.equal(run.delivery.reason.split(" Expected shape:")[0], "Ticket body is missing required sections or non-empty lists: Goal, Scope, Acceptance, Forbidden.");
+      for (const heading of ["Goal", "Scope", "Acceptance", "Forbidden"]) assert.ok(run.delivery.reason.includes(`## ${heading}`));
       assert.equal(existsSync(f.worktree), false); assert.equal(evidence(f).result.agentInvocations, 0);
       assert.equal(existsSync(join(evidence(f).directory, "pull-request.md")), false); return;
     }
@@ -1437,3 +1607,8 @@ for (const output of ["branch", "patch", "pr"]) {
     assert.equal(git(f.repo, "rev-list", "--count", `origin/main..${branch}`), "3");
   });
 }
+
+test("ticketSections counts a list that starts at a different indent after a sub-heading or a paragraph", () => {
+  const body = "## Goal\nG\n## Scope\n- s\n## Forbidden\n- f\n## Acceptance\n- one\n\n### Group B\n  - two\n  - three\n\nA paragraph between lists.\n    - four\n";
+  assert.deepEqual(mod.ticketSections(body).acceptance, ["one", "two", "three", "four"]);
+});

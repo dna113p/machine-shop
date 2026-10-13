@@ -29,6 +29,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let discardConfirmed = false;
   let archived: { branch: string; commit: string } | undefined;
   let reviewSummary = "";
+  let standingReview: string | undefined;
   const reviews: Event[] = [];
   const reviewNotes: { text: string; where: string }[] = [];
   let prUrl = "";
@@ -236,7 +237,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         "## Checks", repository.checks.map(name => `- ${name}: passed`).join("\n"),
         // The helper has already taken the summary out of a JSON report; one that is still an object is evidence, not text for a reader.
         "## Review", jsonObject(reviewSummary) ? "The reviewer approved this change without a written summary; its report is kept with the run evidence." : reviewSummary,
-        ...(reviewNotes.length ? ["## Review notes", reviewNotes.map(note => `- ${note.text} (${note.where})`).join("\n")] : []),
+        ...(reviewNotes.length ? ["## Review notes", reviewNotes.map(note => `- ${flat(note.text)}${flat(note.where) ? ` (${flat(note.where)})` : ""}`).join("\n")] : []),
         `Ticket: ${ticket.id}`,
       ].join("\n\n") + "\n", { flag: "wx", mode: 0o600 });
       // The base is always named, and is the one prepare compared with the remote, not one read again from refs or configuration that may have changed since.
@@ -360,7 +361,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     // Keep well-formed minor notes even when another part of this round's report blocks delivery.
     if (Array.isArray(event.findings)) for (const finding of event.findings) {
       if (finding?.severity === "minor" && typeof finding.text === "string" && typeof finding.where === "string") {
-        reviewNotes.push({ text: finding.text, where: finding.where });
+        if (!reviewNotes.some(note => note.text.trim().toLowerCase() === finding.text.trim().toLowerCase()
+          && note.where.trim().toLowerCase() === finding.where.trim().toLowerCase())) {
+          reviewNotes.push({ text: finding.text, where: finding.where });
+        }
       }
     }
   };
@@ -368,32 +372,41 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     // Keep the helper's read-only guard, but judge the report here instead of trusting its event type.
     if (work.unchanged().type === "changed") return { type: "blocked" };
     const event = reviews.at(-1)!;
+    if (event.type === "blocked") return work.block(reviewSummary);
+    // Even a malformed report can contain useful findings. Keep them apart from the Machine's stop reason.
+    const feedback = [
+      reviewSummary,
+      ...(Array.isArray(event.criteria) ? event.criteria.flatMap((criterion, index) => criterion?.met === false && ticket.sections.acceptance[index]
+        ? [`Unmet criterion: ${ticket.sections.acceptance[index]}${typeof criterion.evidence === "string" ? ` (${criterion.evidence})` : ""}`] : []) : []),
+      ...(Array.isArray(event.findings) ? event.findings.flatMap(finding => (finding?.severity === "blocker" || finding?.severity === "discussion") && typeof finding.text === "string"
+        ? [`${finding.severity === "blocker" ? "Blocker" : "Discussion"}: ${finding.text}${typeof finding.where === "string" ? ` (${finding.where})` : ""}`] : []) : []),
+    ].join("\n");
+    const stop = (reason: string) => { standingReview = feedback; return work.block(reason); };
     const malformed = reviewField(event, ticket.sections.acceptance);
-    if (malformed) return work.block(`Malformed review report: ${malformed}.`);
+    if (malformed) return stop(`Malformed review report: ${malformed}.`);
     const report = event as ReviewReport;
-    if (report.type === "blocked") return work.block(reviewSummary);
-    const unmet = report.criteria.filter(criterion => !criterion.met);
+    const unmet = report.criteria.flatMap((criterion, index) => criterion.met ? [] : [ticket.sections.acceptance[index]!]);
     const blockers = report.findings.filter(finding => finding.severity === "blocker");
     const discussions = report.findings.filter(finding => finding.severity === "discussion");
     const previous = reviews.at(-2);
-    const prior = previous && !reviewField(previous, ticket.sections.acceptance) ? previous as ReviewReport : undefined;
+    const prior = previous && previous.type !== "blocked" && !reviewField(previous, ticket.sections.acceptance) ? previous as ReviewReport : undefined;
     // Decide whether repair is needed first, then whether another repair can make progress.
     if (unmet.length || blockers.length) {
       const before = new Set(prior?.findings.filter(finding => finding.severity === "blocker").map(finding => finding.text));
       const now = new Set(blockers.map(finding => finding.text));
-      if (prior && report.newSinceLastRound === "none" && now.size === before.size && [...now].every(text => before.has(text))) {
-        return work.block("Review is not converging: newSinceLastRound is none and the blocker texts are unchanged.");
+      const newFindings = report.newSinceLastRound.trim().toLowerCase();
+      if (prior && (!newFindings || newFindings.replace(/\.$/u, "") === "none") && now.size === before.size && [...now].every(text => before.has(text))) {
+        return stop(blockers.length
+          ? `Review is not converging: newSinceLastRound is none and these blockers are unchanged: ${blockers.map(finding => `${finding.text} (${finding.where})`).join("; ")}`
+          : `Review is not converging: newSinceLastRound is none and criteria remain unmet: ${unmet.join("; ")}`);
       }
+      work.block(feedback);
+      return { type: "revise" };
     }
     const repeated = discussions.filter(finding => prior?.findings.some(old => old.severity === "discussion" && old.text.trim().toLowerCase() === finding.text.trim().toLowerCase()));
-    if (repeated.length) return work.block(`Ticket owner must settle repeated discussion: ${repeated.map(finding => JSON.stringify(finding.text.trim())).join("; ")}`);
-    if (unmet.length || blockers.length || discussions.length) {
-      work.block([
-        reviewSummary,
-        ...unmet.map(criterion => `Unmet criterion: ${criterion.text} (${criterion.evidence})`),
-        ...blockers.map(finding => `Blocker: ${finding.text} (${finding.where})`),
-        ...discussions.map(finding => `Discussion: ${finding.text} (${finding.where})`),
-      ].join("\n"));
+    if (repeated.length) return stop(`Ticket owner must settle repeated discussion: ${repeated.map(finding => JSON.stringify(finding.text.trim())).join("; ")}`);
+    if (discussions.length) {
+      work.block(feedback);
       return { type: "revise" };
     }
     return { type: "approved" };
@@ -428,6 +441,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         "Return one criteria entry per acceptance criterion, in order, with its text exactly as given, a boolean met, and evidence as a file:line or command.",
         "Tag findings: blocker = must change before delivery; discussion = a question only the ticket owner can settle; minor = worth noting, not worth a round.",
         "On a second or later review, say what is new versus the previous report in newSinceLastRound, or none if nothing is new. Read previous review-<n>.json reports alongside the stage reports in the evidence directory.",
+        "For blocked, only the summary is required. For approved or revise, include the full structured report below.",
         'End with one line: MACHINES_EVENT {"type":"approved"|"revise"|"blocked","summary":"<one paragraph>","criteria":[{"text":"<criterion as given>","met":true|false,"evidence":"<file:line or command>"}],"findings":[{"severity":"blocker"|"discussion"|"minor","text":"<finding>","where":"<file:line>"}],"newSinceLastRound":"none"|"<what changed in this round\'s findings>"}',
       ].join("\n")), {
         approved: { target: "reviewResult", actions: recordReview },
@@ -439,7 +453,11 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       // Stuck work waits for a person; preparation, commit, and delivery failures still end blocked by themselves.
       decide: human(stuckPrompt, {
         submitted: [
-          { guard: chose("more rounds"), target: "change", actions: (args: { event: Event }) => { decide(args); work.renew(); } },
+          { guard: chose("more rounds"), target: "change", actions: (args: { event: Event }) => {
+            decide(args); work.renew();
+            if (standingReview !== undefined) work.block(standingReview);
+            standingReview = undefined;
+          } },
           { guard: chose("hand off"), target: "handOff", actions: decide },
           { guard: chose("archive"), target: "archive", actions: decide },
           { target: "confirmDiscard", actions: decide },
@@ -515,10 +533,27 @@ export function ticketSections(body: string) {
       }
     } else current?.push(line);
   }
-  const bullets = (name: string) => (sections.get(name) ?? []).flatMap(line => {
-    const bullet = /^\s*[-*+]\s+(.+)$/u.exec(line)?.[1]?.trim();
-    return bullet ? [bullet] : [];
-  });
+  const bullets = (name: string) => {
+    const result: string[] = [];
+    let indent: number | undefined;
+    let continuing = false;
+    for (const line of sections.get(name) ?? []) {
+      // Thematic breaks and subheadings stay section text, never list entries or continuations.
+      if (/^\s*(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$/u.test(line) || /^\s*#{3,6}(?:\s|$)/u.test(line)) {
+        // The list is over: the next one may be indented differently and still counts.
+        continuing = false; indent = undefined; continue;
+      }
+      const bullet = /^(\s*)[-*+]\s+(\S.*)$/u.exec(line);
+      if (bullet && (indent === undefined || bullet[1]!.length <= indent)) {
+        indent = bullet[1]!.length;
+        result.push(flat(bullet[2]!));
+        continuing = true;
+      } else if (continuing && line.trim() && /^\s*/u.exec(line)![0].length > indent!) {
+        result[result.length - 1] += ` ${flat(bullet ? bullet[2]! : line)}`;
+      } else if (line.trim()) { continuing = false; indent = undefined; }
+    }
+    return result;
+  };
   const scope = bullets("scope"); const acceptance = bullets("acceptance"); const forbidden = bullets("forbidden");
   return {
     goal: (sections.get("goal") ?? []).join("\n").trim(), scope, acceptance, forbidden,
