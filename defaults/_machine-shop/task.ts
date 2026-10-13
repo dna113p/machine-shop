@@ -92,7 +92,7 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     return directory;
   }
 
-  function check(command: Check, phase: string, red = false): boolean {
+  function check(command: Check, phase: string, red: boolean | "nonzero" = false): boolean {
     if (!directory) throw new Error("Evidence must be initialized before checks");
     const executed = spawnSync(command.command[0]!, command.command.slice(1), {
       cwd: workspace, encoding: "utf8", shell: false, timeout: command.timeoutMs,
@@ -100,7 +100,8 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     });
     const text = `${executed.stdout ?? ""}${executed.stderr ?? ""}`;
     const regression = assignment.regression;
-    const passed = !executed.error && executed.signal === null && (red
+    const passed = !executed.error && executed.signal === null && (red === "nonzero"
+      ? executed.status !== null && executed.status !== 0 : red
       ? executed.status === regression!.failureExitCode && text.includes(regression!.failureIncludes)
       : executed.status === 0);
     const log = join(directory, `${evidence.length + 1}.log`);
@@ -108,11 +109,32 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     evidence.push({
       phase, name: command.name, command: command.command, exitCode: executed.status,
       signal: executed.signal, passed, log,
-      expected: red ? `exit ${regression!.failureExitCode} containing ${JSON.stringify(regression!.failureIncludes)}` : "exit 0",
+      expected: red === "nonzero" ? "nonzero exit" : red ? `exit ${regression!.failureExitCode} containing ${JSON.stringify(regression!.failureIncludes)}` : "exit 0",
       ...(executed.error ? { error: executed.error.message } : {}),
     });
     if (!passed) reason = `${phase}: ${command.name} did not meet its expected result; inspect ${log}`;
     return passed;
+  }
+
+  /** Prove a ticket's new tests red using one of its normal gates. */
+  function redCheck(name: string): Event {
+    const command = assignment.checks.find(check => check.name === name);
+    if (!command) throw new Error(`No check named ${name}`);
+    if (!git(workspace, "status", "--porcelain=v1", "--untracked-files=all", "-z", "--", ".", ":(exclude).machine-runs")) {
+      reason = "the tester changed nothing";
+      return { type: "failed" };
+    }
+    const before = fingerprint(workspace);
+    const passed = check(command, "red", "nonzero");
+    if (before !== fingerprint(workspace)) {
+      reason = "The red check changed the checkout; red/green evidence is not valid.";
+      return { type: "failed" };
+    }
+    const entry = evidence.at(-1)!;
+    if (!passed && entry.exitCode === 0 && !entry.signal && !entry.error) {
+      reason = `red: ${name} passed; the tests do not yet test anything new; inspect ${entry.log}`;
+    }
+    return { type: passed ? "passed" : "failed" };
   }
 
   function checks(phase = "verify"): Event {
@@ -268,7 +290,7 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     console.log(`Machine Shop result: ${join(directory, "result.json")}`);
     return { type: outcome };
   }
-  return { start, open, check, checks, regression, capture, decision, choice, prompt, seal, unchanged, review, repair, reviewRound, renew, block, accept, retire, finish,
+  return { start, open, check, checks, redCheck, regression, capture, decision, choice, prompt, seal, unchanged, review, repair, reviewRound, renew, block, accept, retire, finish,
     workspace, output: () => result,
     status: () => ({ reason, repairs, totalRepairs: renewed + repairs, maxRepairs: assignment.maxRepairs,
       reviewRounds, totalReviewRounds: renewedReviews + reviewRounds, maxReviewRounds: assignment.maxReviewRounds }),

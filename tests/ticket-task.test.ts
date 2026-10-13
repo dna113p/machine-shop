@@ -20,7 +20,7 @@ const review = (type = "approved", summary = "Greeting matches the ticket", extr
   findings: type === "revise" ? [{ severity: "blocker", text: summary, where: "greeting.txt:1" }] : [],
   newSinceLastRound: "Updated findings", ...extra,
 });
-const command = (code = 'console.log("check passed")', extra = {}) => ({ name: "tests", command: [process.execPath, "-e", code], ...extra });
+const command = (code = 'if (require("fs").existsSync("greeting.test.txt")) eval(require("fs").readFileSync("greeting.test.txt", "utf8")); console.log("check passed")', extra = {}) => ({ name: "tests", command: [process.execPath, "-e", code], ...extra });
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
 function fixture(context: TestContext) {
@@ -36,10 +36,14 @@ function fixture(context: TestContext) {
 }
 type Fixture = ReturnType<typeof fixture>;
 const input = (f: Fixture, repository = {}, extra = {}) => ({
-  ticket: { id: "PROJ-12", title: "Add a greeting", body: "## Goal\nWrite hello to greeting.txt.\n\n## Scope\n- greeting.txt\n\n## Acceptance\n- greeting.txt contains hello\n\n## Forbidden\n- nothing beyond the scope above", source: "tk", metadata: { priority: 2 } },
+  ticket: { id: "PROJ-12", title: "Add a greeting", body: "## Goal\nWrite hello to greeting.txt.\n\n## Scope\n- greeting.txt\n- greeting.test.txt\n\n## Acceptance\n- greeting.txt contains hello\n\n## Forbidden\n- nothing beyond the scope above", source: "tk", metadata: { priority: 2 } },
   repository: { name: "widgets", path: f.repo, checks: [command()], output: "branch", ...repository },
   worktreeRoot: join(f.root, "worktrees"), evidenceRoot: f.evidence, stuck: "ask", ...extra,
 });
+function scoped(data: ReturnType<typeof input>, ...paths: string[]) {
+  data.ticket.body = data.ticket.body.replace("## Scope\n", `## Scope\n${paths.map(path => `- ${path}\n`).join("")}`);
+  return data;
+}
 /** A local bare repository stands in for the remote; nothing leaves the machine. */
 function remote(f: Fixture) {
   const bare = join(f.root, "remote.git");
@@ -71,6 +75,10 @@ function fakeGh(context: TestContext, f: Fixture, exitCode = 0) {
   context.after(() => { process.env.PATH = path; });
   return () => existsSync(join(bin, "args")) ? readFileSync(join(bin, "args"), "utf8").trimEnd().split("\n") : undefined;
 }
+const tester = (request: { cwd: string }) => {
+  writeFileSync(join(request.cwd, "greeting.test.txt"), 'require("node:assert/strict").ok(require("node:fs").existsSync("greeting.txt"));\n');
+  return ok("completed", "greeting.test.txt requires the implementation file");
+};
 const implement = (request: { cwd: string }) => { writeFileSync(join(request.cwd, "greeting.txt"), "hello\n"); return ok(); };
 type Ask = { prompt: string; choices?: readonly string[] };
 /** Answers Human requests in order and keeps what each one showed; one more request than answers fails the run. */
@@ -86,7 +94,7 @@ function person(...answers: (string | (() => string))[]) {
 async function execute(assignment: unknown, agents = {}, human: (request: Ask) => string = person()) {
   const states: string[] = [];
   const result = await runtime.run(mod.default(runtime, assignment), {
-    agents: { investigator: () => ok("ready", "Plan: add greeting.txt"), implementer: implement, reviewer: () => review("approved", "Greeting matches the ticket"), ...agents },
+    agents: { tester, investigator: () => ok("ready", "Plan: add greeting.txt"), implementer: implement, reviewer: () => review("approved", "Greeting matches the ticket"), ...agents },
     human, onState: state => states.push(String(state)),
   });
   return { state: result.value, output: result.output as any, states };
@@ -171,13 +179,13 @@ function abandoned(f: Fixture, result: { state: unknown; output: any; states: st
   return run;
 }
 
-test("construction has no effects and declares exactly the three roles", context => {
+test("construction has no effects and declares exactly the four roles", context => {
   const f = fixture(context);
   assert.match(mod.description, /\S/u); assert.doesNotMatch(mod.description, /\n/u);
   for (const data of [input(f, { output: "pr", setup: [command()] }), JSON.stringify(input(f))]) {
-    assert.deepEqual(runtime.requiredAgentNames(mod.default(runtime, data)), ["implementer", "investigator", "reviewer"]);
+    assert.deepEqual(runtime.requiredAgentNames(mod.default(runtime, data)), ["implementer", "investigator", "reviewer", "tester"]);
   }
-  assert.deepEqual(Object.keys(mod.agentRoles).sort(), ["implementer", "investigator", "reviewer"]);
+  assert.deepEqual(Object.keys(mod.agentRoles).sort(), ["implementer", "investigator", "reviewer", "tester"]);
   assert.deepEqual(readdirSync(f.root), ["widgets"]);
   assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), "main"); untouched(f);
 });
@@ -217,7 +225,7 @@ test("ticketSections keeps subheadings as section text without creating sections
   assert.deepEqual(mod.ticketSections("## Acceptance\n### A subheading").acceptance, []);
 });
 
-for (const [section, remove] of [["Acceptance", /## Acceptance\n- [^\n]+/u], ["Scope", /- greeting\.txt\n/u]] as const) {
+for (const [section, remove] of [["Acceptance", /## Acceptance\n- [^\n]+/u], ["Scope", /- greeting\.txt\n- greeting\.test\.txt\n/u]] as const) {
   for (const resume of [false, true]) {
     test(`a ${resume ? "resumed" : "new"} ticket with missing or empty ${section} blocks before any Agent or worktree`, async context => {
       const f = fixture(context); const data = input(f, {}, { resume }); data.ticket.body = data.ticket.body.replace(remove, "");
@@ -259,7 +267,7 @@ test("an approved report with unmet criteria repairs and persists the structured
   assert.equal(result.state, "delivered"); assert.deepEqual([edits, reviews], [2, 2]);
   const run = held(f, result, /^Delivered/u);
   assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "review-1.json"), "utf8")), first);
-  assert.equal(run.result.checks.length, 2);
+  assert.equal(run.result.checks.length, 3);
 });
 
 for (const output of ["branch", "patch", "pr"]) {
@@ -495,17 +503,26 @@ for (const output of ["branch", "patch", "pr"]) {
   test(`${output} delivery commits the reviewed candidate without touching the source checkout`, async context => {
     const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
     const result = await execute(input(f, { output }), {
+      tester: request => {
+        assert.equal(request.cwd, f.worktree);
+        assert.ok(request.prompt.includes(`Acceptance criteria:\n- ${criterion}`));
+        assert.ok(request.prompt.includes("Scope:\n- greeting.txt\n- greeting.test.txt"));
+        assert.match(request.prompt, /Do not implement anything and do not change non-test files/u);
+        assert.match(request.prompt, /one or more per criterion/u);
+        assert.match(request.prompt, /Leave changes uncommitted/u);
+        return tester(request);
+      },
       investigator: request => { assert.equal(request.cwd, f.worktree); assert.match(request.prompt, /Ticket PROJ-12: Add a greeting\n\n## Goal\nWrite hello/u); return ok("ready", "Plan: add greeting.txt"); },
-      implementer: request => { assert.equal(request.cwd, f.worktree); assert.match(request.prompt, /Plan: add greeting\.txt/u); assert.match(request.prompt, /uncommitted/u); return implement(request); },
-      reviewer: request => { assert.equal(request.cwd, f.worktree); assert.match(request.prompt, /Do not edit/u); return review("approved", "Greeting matches the ticket"); },
+      implementer: request => { assert.equal(request.cwd, f.worktree); assert.match(request.prompt, /Plan: add greeting\.txt/u); assert.match(request.prompt, /without weakening or deleting them/u); assert.match(request.prompt, /If a test is wrong, say so in the summary/u); assert.match(request.prompt, /uncommitted/u); return implement(request); },
+      reviewer: request => { assert.equal(request.cwd, f.worktree); assert.match(request.prompt, /Do not edit/u); assert.match(request.prompt, /Machine saw them fail/u); return review("approved", "Greeting matches the ticket"); },
     });
     assert.equal(result.state, "delivered");
-    assert.deepEqual(result.states, ["shape", "prepare", "start", "triage", "triageResult", "change", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
+    assert.deepEqual(result.states, ["shape", "prepare", "start", "triage", "triageResult", "test", "scopeAfterTest", "red", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
     const commit = git(f.repo, "rev-parse", branch);
     const run = held(f, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
     assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", branch), "Add a greeting\nTicket: PROJ-12");
     assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head);
-    assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.txt");
+    assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
     assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello");
     assert.ok(run.directory.startsWith(join(f.evidence, ".machine-runs")));
     assert.equal(existsSync(join(f.repo, ".machine-runs")), false);
@@ -516,7 +533,11 @@ for (const output of ["branch", "patch", "pr"]) {
       ...(output === "pr" ? { prUrl: url } : {}), ...(output === "patch" ? { patches: [join(run.directory, "0001-Add-a-greeting.patch")] } : {}),
       worktree: f.worktree, worktreeCreated: true, worktreeRemoved: true, reviewNotes: [],
     });
-    assert.deepEqual([run.result.workflow, run.result.outcome, run.result.checksPassed, run.result.agentInvocations], ["ticket-task", "completed", true, 3]);
+    assert.deepEqual([run.result.workflow, run.result.outcome, run.result.checksPassed, run.result.agentInvocations], ["ticket-task", "completed", true, 4]);
+    assert.deepEqual(run.result.checks.map(check => [check.phase, check.expected, check.passed]), [["red", "nonzero exit", true], ["verify", "exit 0", true]]);
+    assert.equal(run.result.agents[1].stage, "test");
+    assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-1.json"), "utf8")), { stage: "test", changed: ["greeting.test.txt"], outside: [] });
+    assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-2.json"), "utf8")), { stage: "change", changed: ["greeting.test.txt", "greeting.txt"], outside: [] });
     assert.ok(run.result.checks.every(c => c.passed && c.log.startsWith(run.directory) && existsSync(c.log)));
     if (output === "patch") {
       const patch = readFileSync(run.delivery.patches[0], "utf8");
@@ -585,10 +606,10 @@ test("setup commands run in the worktree before any Agent and are kept as eviden
     investigator: request => { assert.ok(existsSync(join(request.cwd, "deps/installed"))); return ok("ready"); },
   });
   assert.equal(result.state, "delivered"); untouched(f);
-  const run = evidence(f); const [setup, verify] = run.result.checks;
-  assert.deepEqual([setup.phase, setup.name, setup.passed, verify.phase], ["setup", "install", true, "verify"]);
+  const run = evidence(f); const [setup, red, verify] = run.result.checks;
+  assert.deepEqual([setup.phase, setup.name, setup.passed, red.phase, verify.phase], ["setup", "install", true, "red", "verify"]);
   assert.match(readFileSync(setup.log, "utf8"), /widgets--proj-12/u);
-  assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.txt"); assert.equal(run.delivery.worktreeRemoved, true);
+  assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt"); assert.equal(run.delivery.worktreeRemoved, true);
 });
 
 for (const [label, code, reason] of [
@@ -646,11 +667,11 @@ test("triage that edits the worktree waits for a decision before implementation"
   handedOff(f, result, /read-only stage/u, human);
 });
 
-test("an implementer blocker waits for a decision without checks, review, or a commit", async context => {
+test("an implementer blocker waits for a decision without green checks, review, or a commit", async context => {
   const f = fixture(context); const human = person("hand off");
   const result = await execute(input(f), { implementer: () => ok("blocked", "Required API specification unavailable"), reviewer: () => assert.fail() }, human);
   const run = handedOff(f, result, /specification unavailable/u, human);
-  assert.equal(run.result.checks.length, 0);
+  assert.deepEqual(run.result.checks.map(check => check.phase), ["red"]);
 });
 
 test("checks failing until the repair budget is exhausted wait for a decision, and commit and push nothing", async context => {
@@ -659,12 +680,12 @@ test("checks failing until the repair budget is exhausted wait for a decision, a
     implementer: request => { edits++; return implement(request); }, reviewer: () => assert.fail(),
   }, human);
   const run = handedOff(f, result, /budget exhausted \(2\)/u, human);
-  assert.equal(edits, 3); assert.deepEqual(run.result.checks.map(c => c.passed), [false, false, false]);
+  assert.equal(edits, 3); assert.deepEqual(run.result.checks.map(c => c.passed), [true, false, false, false]);
   assert.equal(pushed(), ""); assert.equal(gh(), undefined);
   assert.equal(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), "hello\n");
   const [request, ...others] = human.requests; assert.deepEqual(others, []);
   assert.deepEqual(request!.choices, ["more rounds", "hand off", "archive", "discard"]);
-  for (const part of ["Ticket PROJ-12: Add a greeting", `Repair budget exhausted (2). verify: tests did not meet its expected result; inspect ${run.result.checks[2].log}`,
+  for (const part of ["Ticket PROJ-12: Add a greeting", `Repair budget exhausted (2). verify: tests did not meet its expected result; inspect ${run.result.checks[3].log}`,
     "Repair rounds used: 2 of 2.", `Worktree: ${f.worktree}`, `Branch: ${branch}`]) assert.ok(request!.prompt.includes(part), part);
 });
 
@@ -675,7 +696,7 @@ test("review feedback is repaired once through fresh checks and another review",
     reviewer: () => ++reviews === 1 ? review("revise", "Handle the empty case") : review("approved"),
   });
   assert.equal(result.state, "delivered"); assert.deepEqual([edits, reviews], [2, 2]);
-  const run = evidence(f); assert.equal(run.result.repairs, 0); assert.equal(run.result.reviewRounds, 1); assert.equal(run.result.checks.length, 2);
+  const run = evidence(f); assert.equal(run.result.repairs, 0); assert.equal(run.result.reviewRounds, 1); assert.equal(run.result.checks.length, 3);
   assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello 2"); assert.equal(git(f.repo, "rev-list", "--count", `main..${branch}`), "1");
 });
 
@@ -698,7 +719,7 @@ test("the default gate budget allows three repairs before failing checks wait fo
   }, human);
   const run = handedOff(f, result, /Repair budget exhausted \(3\)/u, human);
   assert.deepEqual([edits, run.result.repairs, run.result.reviewRounds, run.result.checksPassed], [4, 3, 0, false]);
-  assert.deepEqual(run.result.checks.map(check => check.passed), [false, false, false, false]);
+  assert.deepEqual(run.result.checks.map(check => check.passed), [true, false, false, false, false]);
   assert.equal(human.requests.length, 1);
   assert.ok(human.requests[0]!.prompt.includes("Repair rounds used: 3 of 3."));
 });
@@ -729,7 +750,7 @@ test("more rounds restarts the budget with the standing findings, and an approva
     reviewer: () => ++reviews < 3 ? review("revise", `Finding ${reviews}`) : review("approved", "Greeting matches the ticket"),
   }, human);
   assert.equal(result.state, "delivered"); assert.deepEqual([prompts.length, reviews, human.requests.length], [3, 3, 1]);
-  assert.deepEqual(result.states.slice(-12), ["reviewBudget", "stuck", "decide", "change", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
+  assert.deepEqual(result.states.slice(-14), ["reviewBudget", "stuck", "decide", "repairTarget", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
   assert.ok(human.requests[0]!.prompt.includes("Review budget exhausted (1). Finding 2"));
   // The pass a person granted is briefed exactly as the ordinary repair before it was.
   assert.ok(prompts[1]!.includes("Current failure/feedback: Finding 1")); assert.ok(prompts[2]!.includes("Current failure/feedback: Finding 2"));
@@ -737,7 +758,7 @@ test("more rounds restarts the budget with the standing findings, and an approva
   const commit = git(f.repo, "rev-parse", branch);
   const run = held(f, result, new RegExp(`^Delivered ${branch} at ${commit}\\. Decision: more rounds\\. Evidence: `, "u")); untouched(f);
   assert.deepEqual([run.delivery.outcome, run.delivery.decision, run.delivery.commit, run.delivery.worktreeRemoved], ["delivered", "more rounds", commit, true]);
-  assert.deepEqual([run.result.outcome, run.result.repairs, run.result.reviewRounds, run.result.agentInvocations], ["completed", 0, 1, 7]);
+  assert.deepEqual([run.result.outcome, run.result.repairs, run.result.reviewRounds, run.result.agentInvocations], ["completed", 0, 1, 8]);
   assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }]);
   assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello 3"); assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head);
   assert.equal(existsSync(f.worktree), false);
@@ -752,7 +773,7 @@ test("more rounds can be chosen again each time the budget runs out", async cont
   assert.equal(edits, 6); assert.equal(result.states.filter(state => state === "decide").length, 3);
   assert.deepEqual(human.requests.map(request => /Repair rounds used: .+/u.exec(request.prompt)![0]),
     ["Repair rounds used: 1 of 1.", "Repair rounds used: 1 of 1 in this budget, 2 in all.", "Repair rounds used: 1 of 1 in this budget, 3 in all."]);
-  assert.deepEqual([run.result.repairs, run.result.checks.length], [3, 6]);
+  assert.deepEqual([run.result.repairs, run.result.checks.length], [3, 7]);
   assert.deepEqual(run.result.decisions.map((made: any) => made.response), ["more rounds", "more rounds", "hand off"]);
 });
 
@@ -765,11 +786,11 @@ test("more rounds after a budget of zero still gives the implementer one pass", 
 test("hand off leaves the worktree, the branch, and the uncommitted candidate as they were", async context => {
   const f = fixture(context); let before: unknown;
   const human = person(() => { before = candidate(f.worktree); return "hand off"; });
-  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), {
+  const result = await execute(scoped(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), "code.txt"), {
     implementer: request => { writeFileSync(join(request.cwd, "code.txt"), "new"); return implement(request); }, reviewer: () => review("revise", "Handle the empty case"),
   }, human);
   const run = handedOff(f, result, /budget exhausted \(0\)\. Handle the empty case/u, human);
-  assert.deepEqual(candidate(f.worktree), before); assert.equal(candidate(f.worktree).status, "M code.txt\n?? greeting.txt");
+  assert.deepEqual(candidate(f.worktree), before); assert.equal(candidate(f.worktree).status, "M code.txt\n?? greeting.test.txt\n?? greeting.txt");
   assert.equal(git(f.repo, "rev-list", "--count", `main..${branch}`), "0"); assert.equal(git(f.repo, "worktree", "list").split("\n").length, 2);
   assert.equal(run.delivery.archive, undefined); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
 });
@@ -779,7 +800,7 @@ test("archive leaves the tracked and untracked candidate on archive/<slug>, with
   writeFileSync(join(f.repo, "obsolete.txt"), "remove me\n"); git(f.repo, "add", "."); git(f.repo, "commit", "-qm", "obsolete"); f.head = git(f.repo, "rev-parse", "HEAD");
   let before: ReturnType<typeof candidate> | undefined;
   const human = person(() => { before = candidate(f.worktree); return "archive"; });
-  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), {
+  const result = await execute(scoped(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), "code.txt", "obsolete.txt", "bin", "logo.bin"), {
     implementer: request => {
       writeFileSync(join(request.cwd, "code.txt"), "new without a final newline "); rmSync(join(request.cwd, "obsolete.txt"));
       mkdirSync(join(request.cwd, "bin")); writeFileSync(join(request.cwd, "bin/tool.sh"), "#!/bin/sh\necho hi\n", { mode: 0o755 });
@@ -791,11 +812,11 @@ test("archive leaves the tracked and untracked candidate on archive/<slug>, with
   }, human);
   abandoned(f, result, "archive");
   assert.deepEqual(result.states.slice(-5), ["decide", "archive", "remove", "abandon", "abandoned"]);
-  assert.equal(before!.status, "M code.txt\n D obsolete.txt\n?? bin/tool.sh\n?? greeting.txt\n?? logo.bin");
+  assert.equal(before!.status, "M code.txt\n D obsolete.txt\n?? bin/tool.sh\n?? greeting.test.txt\n?? greeting.txt\n?? logo.bin");
   // The archive is one commit on the base, holding what the ticket commit would have.
   assert.equal(git(f.repo, "rev-parse", `${archiveBranch}^`), f.head);
   assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", archiveBranch), "Archive: Add a greeting\nTicket: PROJ-12");
-  assert.equal(git(f.repo, "diff", "--name-status", "--no-renames", f.head, archiveBranch), "A\tbin/tool.sh\nM\tcode.txt\nA\tgreeting.txt\nA\tlogo.bin\nD\tobsolete.txt");
+  assert.equal(git(f.repo, "diff", "--name-status", "--no-renames", f.head, archiveBranch), "A\tbin/tool.sh\nM\tcode.txt\nA\tgreeting.test.txt\nA\tgreeting.txt\nA\tlogo.bin\nD\tobsolete.txt");
   // A fresh clone on the archive branch stands in for whoever picks the candidate up later.
   const restored = join(f.root, "restored"); git(f.root, "clone", "-q", "--branch", archiveBranch, f.repo, restored);
   assert.deepEqual(candidate(restored), { status: "", files: before!.files });
@@ -815,8 +836,8 @@ test("archive leaves ignored files out of the archive commit, as delivery leaves
     reviewer: () => review("revise", "Handle the empty case"),
   }, human);
   abandoned(f, result, "archive");
-  assert.equal(before, "?? greeting.txt\n!! build/out.bin\n!! debug.log");
-  assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", archiveBranch), ".gitignore\ncode.txt\ngreeting.txt");
+  assert.equal(before, "?? greeting.test.txt\n?? greeting.txt\n!! build/out.bin\n!! debug.log");
+  assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", archiveBranch), ".gitignore\ncode.txt\ngreeting.test.txt\ngreeting.txt");
   assert.ok(human.requests[0]!.prompt.includes(`archive: commit the candidate as delivery would have and keep that commit as the branch ${archiveBranch}, then remove the worktree and delete ${branch}. Ignored files are not kept.`));
 });
 
@@ -841,7 +862,7 @@ test("an existing archive branch blocks the archive before anything is staged, a
   const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: branch ${archiveBranch} already exists in .+, and nothing was staged`, "u"));
   assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
   assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]);
-  assert.deepEqual(candidate(f.worktree), before); assert.equal(before!.status, "?? greeting.txt"); assert.equal(git(f.worktree, "ls-files", "--stage"), index);
+  assert.deepEqual(candidate(f.worktree), before); assert.equal(before!.status, "?? greeting.test.txt\n?? greeting.txt"); assert.equal(git(f.worktree, "ls-files", "--stage"), index);
   assert.equal(git(f.repo, "rev-parse", archiveBranch), f.head); assert.equal(git(f.repo, "rev-parse", branch), f.head);
 });
 
@@ -853,7 +874,7 @@ test("a failing commit hook does not prevent the archive", async context => {
   const result = await execute(input(f, { checks: [command("process.exit(1)")] }, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => assert.fail() }, person("archive"));
   abandoned(f, result, "archive");
   assert.equal(git(f.repo, "rev-parse", `${archiveBranch}^`), f.head);
-  assert.equal(git(f.repo, "show", "--name-only", "--format=%s", archiveBranch), "Archive: Add a greeting\n\ngreeting.txt");
+  assert.equal(git(f.repo, "show", "--name-only", "--format=%s", archiveBranch), "Archive: Add a greeting\n\ngreeting.test.txt\ngreeting.txt");
 });
 
 test("delivery.json and the summary name the archive branch and its commit", async context => {
@@ -874,7 +895,7 @@ test("delivery.json and the summary name the archive branch and its commit", asy
 for (const further of [false, true]) {
   test(`archive keeps a commit an Agent made on the ticket branch, ${further ? "below the archive commit of what is still uncommitted" : "as it is when nothing else is uncommitted"}`, async context => {
     const f = fixture(context);
-    const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), {
+    const result = await execute(scoped(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), "code.txt"), {
       implementer: request => {
         implement(request); git(request.cwd, "add", "."); git(request.cwd, "commit", "-qm", "agent commit");
         if (further) writeFileSync(join(request.cwd, "code.txt"), "new");
@@ -1020,10 +1041,10 @@ test("a resumed run verifies, reviews, and delivers the candidate a handed-off r
     reviewer: request => { assert.equal(request.cwd, f.worktree); assert.equal(readFileSync(join(request.cwd, "greeting.txt"), "utf8"), "hello\n"); return review("approved", "Greeting matches the ticket"); },
   });
   assert.equal(result.state, "delivered");
-  assert.deepEqual(result.states, ["shape", "prepare", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
+  assert.deepEqual(result.states, ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
   const commit = git(f.repo, "rev-parse", branch);
   const run = held(again, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
-  assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head); assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.txt");
+  assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head); assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
   assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello"); assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", branch), "Add a greeting\nTicket: PROJ-12");
   assert.equal(existsSync(f.worktree), false); assert.equal(git(f.repo, "worktree", "list").split("\n").length, 1);
   assert.deepEqual([run.delivery.outcome, run.delivery.resumed, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.decision], ["delivered", true, false, true, undefined]);
@@ -1038,7 +1059,7 @@ test("a resumed run whose review asks for changes repairs within a fresh budget"
     reviewer: () => ++reviews === 1 ? review("revise", "Explain the greeting") : review("approved"),
   });
   assert.equal(result.state, "delivered"); assert.deepEqual([edits, reviews], [1, 2]); untouched(f);
-  assert.deepEqual(result.states.slice(0, 9), ["shape", "prepare", "verify", "sealReview", "review", "reviewResult", "reviewBudget", "change", "verify"]);
+  assert.deepEqual(result.states.slice(0, 11), ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "reviewBudget", "change", "scopeAfterChange", "verify"]);
   assert.equal(evidence(again).result.repairs, 0); assert.equal(evidence(again).result.reviewRounds, 1); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello again");
 });
 
@@ -1049,14 +1070,14 @@ for (const output of ["branch", "pr"] as const) {
     const older = f.head; writeFileSync(join(f.repo, "later.txt"), "later\n"); git(f.repo, "add", "."); git(f.repo, "commit", "-qm", "later"); f.head = git(f.repo, "rev-parse", "HEAD");
     const result = await execute(input(again, { output }, { resume: true }), {
       investigator: () => assert.fail(), implementer: () => assert.fail(),
-      reviewer: request => { assert.deepEqual(readdirSync(request.cwd).sort(), [".git", "code.txt", "greeting.txt"]); return review("approved", "Greeting matches the ticket"); },
+      reviewer: request => { assert.deepEqual(readdirSync(request.cwd).sort(), [".git", "code.txt", "greeting.test.txt", "greeting.txt"]); return review("approved", "Greeting matches the ticket"); },
     });
     assert.equal(result.state, "delivered");
-    assert.deepEqual(result.states, ["shape", "prepare", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
+    assert.deepEqual(result.states, ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
     const commit = git(f.repo, "rev-parse", branch);
     const run = held(again, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
-    assert.equal(git(f.repo, "rev-parse", `${branch}^`), older); assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.txt");
-    assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", branch), "code.txt\ngreeting.txt");
+    assert.equal(git(f.repo, "rev-parse", `${branch}^`), older); assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+    assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", branch), "code.txt\ngreeting.test.txt\ngreeting.txt");
     assert.deepEqual([run.delivery.baseCommit, run.delivery.commit, run.delivery.resumed, run.delivery.worktreeRemoved], [older, commit, true, true]);
     assert.deepEqual([run.result.outcome, run.result.checksPassed, run.result.checks.map((check: any) => check.phase)], ["completed", true, ["verify"]]);
     if (output !== "pr") { assert.equal(pushed(), ""); assert.equal(gh(), undefined); return; }
@@ -1115,7 +1136,7 @@ test("an Agent that commits by itself is not delivered", async context => {
 
 test("an approved candidate with no change is not committed", async context => {
   const f = fixture(context);
-  blocked(f, await execute(input(f), { implementer: () => ok() }), /Nothing to commit/u);
+  blocked(f, await execute(input(f, {}, { redGreen: false }), { implementer: () => ok() }), /Nothing to commit/u);
 });
 
 test("nested run evidence is never committed, and a worktree that cannot be removed is not reported as delivered", async context => {
@@ -1124,7 +1145,7 @@ test("nested run evidence is never committed, and a worktree that cannot be remo
     implementer: request => { mkdirSync(join(request.cwd, ".machine-runs")); writeFileSync(join(request.cwd, ".machine-runs/nested.json"), "{}"); return implement(request); },
   });
   const run = blocked(f, result, /worktree could not be removed after delivering .+; inspect .+git-worktree\.log/u, 1);
-  assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.txt");
+  assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
   assert.equal(run.delivery.commit, git(f.repo, "rev-parse", branch)); assert.ok(result.output.summary.includes(run.delivery.patches[0]));
   assert.ok(existsSync(join(f.worktree, ".machine-runs/nested.json"))); assert.ok(existsSync(join(run.directory, "git-worktree.log")));
 });
@@ -1139,7 +1160,7 @@ test("run evidence an Agent staged by force is left out of the commit", async co
     },
   });
   assert.equal(result.state, "delivered"); untouched(f);
-  assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.txt"); assert.equal(evidence(f).delivery.worktreeRemoved, true);
+  assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt"); assert.equal(evidence(f).delivery.worktreeRemoved, true);
 });
 
 for (const [hook, script] of [
@@ -1362,7 +1383,7 @@ test("a ticket is not blocked by the branches of a ticket whose id only starts w
   const result = await execute({ ...input(f), ticket: { ...input(f).ticket, id: "PROJ-1", title: "Add a greeting" } });
   assert.equal(result.state, "delivered"); untouched(f);
   assert.equal(evidence(f).delivery.branch, "ticket/proj-1-add-a-greeting");
-  assert.equal(git(f.repo, "show", "--name-only", "--format=", "ticket/proj-1-add-a-greeting"), "greeting.txt");
+  assert.equal(git(f.repo, "show", "--name-only", "--format=", "ticket/proj-1-add-a-greeting"), "greeting.test.txt\ngreeting.txt");
   for (const name of others) assert.equal(git(f.repo, "rev-parse", name), f.head);
 });
 
@@ -1544,7 +1565,7 @@ test("a review returned as a JSON object is written as prose in the pull request
   assert.equal(readFileSync(join(run.directory, "pull-request.md"), "utf8"),
     "Add a greeting\n\n## Summary\n\nWrite hello to greeting.txt.\n\n## Checks\n\n- tests: passed\n\n## Review\n\nGreeting matches the ticket.\n\nNo findings.\n\nTicket: PROJ-12\n");
   const stage = { stage: "review", outcome: "approved", summary: "Greeting matches the ticket.\n\nNo findings." };
-  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "agent-3.json"), "utf8")), stage); assert.deepEqual(run.result.agents[2], stage);
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "agent-4.json"), "utf8")), stage); assert.deepEqual(run.result.agents[3], stage);
 });
 
 test("a review that is a JSON object without a summary never reaches the pull request body", async context => {
@@ -1554,7 +1575,7 @@ test("a review that is a JSON object without a summary never reaches the pull re
   const body = readFileSync(join(evidence(f).directory, "pull-request.md"), "utf8");
   assert.match(body, /## Review\n\nThe reviewer approved this change without a written summary; its report is kept with the run evidence\.\n\nTicket: PROJ-12\n$/u);
   assert.doesNotMatch(body, /[{}]|findings/u);
-  assert.equal(evidence(f).result.agents[2].summary, '{"outcome":"approved","findings":[]}');
+  assert.equal(evidence(f).result.agents[3].summary, '{"outcome":"approved","findings":[]}');
 });
 
 test("review findings returned as a JSON object reach the implementer and the Human as prose", async context => {
@@ -1736,7 +1757,7 @@ for (const exhausted of ["review", "gates"]) {
     assert.deepEqual(run.delivery.park.budgets, {
       repairs: { used: 2, max: exhausted === "gates" ? 2 : 3 }, reviewRounds: { used: 2, max: exhausted === "review" ? 2 : 3 },
     });
-    assert.deepEqual(run.result.checks.map(check => check.passed), exhausted === "review" ? [false, false, true, true, true] : [true, true, false, false, false]);
+    assert.deepEqual(run.result.checks.map(check => check.passed), exhausted === "review" ? [true, false, false, true, true, true] : [true, true, true, false, false, false]);
     assert.deepEqual(candidate(f.worktree), before);
   });
 }
@@ -1753,7 +1774,7 @@ test("a parked candidate resumes with fresh budgets and an approving reviewer de
     reviewer: request => { assert.match(request.prompt, /The greeting language is English/u); assert.equal(readFileSync(join(request.cwd, "greeting.txt"), "utf8"), "hello\n"); return review(); },
   }, human);
   assert.equal(result.state, "delivered");
-  assert.deepEqual(result.states, ["shape", "prepare", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
+  assert.deepEqual(result.states, ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
   const run = held(again, result, /^Delivered/u); untouched(f);
   assert.deepEqual([run.result.repairs, run.result.reviewRounds, run.delivery.resumed, run.delivery.worktreeRemoved], [0, 0, true, true]);
   assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello");
@@ -1767,3 +1788,167 @@ for (const extra of [{ stuck: "wait" }, { stuck: null }, ...[null, -1, 6, 1.5, "
     assert.deepEqual(readdirSync(f.root), ["widgets"]);
   });
 }
+
+test("redGreen false skips the tester and red but still checks implementation scope", async context => {
+  const f = fixture(context);
+  const result = await execute(input(f, {}, { redGreen: false }), { tester: () => assert.fail() });
+  assert.equal(result.state, "delivered");
+  assert.equal(result.states.includes("test"), false); assert.equal(result.states.includes("red"), false);
+  assert.ok(result.states.includes("scopeAfterChange"));
+  const run = evidence(f);
+  assert.deepEqual(run.result.checks.map(check => check.phase), ["verify"]);
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-1.json"), "utf8")), { stage: "change", changed: ["greeting.txt"], outside: [] });
+});
+
+for (const fixes of [false, true]) {
+  test(`already passing tests return to the tester and ${fixes ? "deliver after repair" : "park when repairs exhaust"}`, async context => {
+    const f = fixture(context); let tests = 0; let edits = 0;
+    const result = await execute(input(f, {}, { maxRepairs: 1, stuck: "park" }), {
+      tester: request => {
+        if (++tests > 1) assert.match(request.prompt, /red: tests passed; the tests do not yet test anything new/u);
+        if (fixes && tests > 1) return tester(request);
+        writeFileSync(join(request.cwd, "greeting.test.txt"), "// no assertion yet\n"); return ok();
+      },
+      implementer: request => { edits++; assert.equal(tests, 2); return implement(request); },
+    });
+    assert.deepEqual([tests, edits], [2, fixes ? 1 : 0]);
+    assert.deepEqual(result.states.slice(4, 13), ["triageResult", "test", "scopeAfterTest", "red", "repairBudget", "repairTarget", "test", "scopeAfterTest", "red"]);
+    const run = fixes ? held(f, result, /^Delivered/u) : parked(f, result, /Repair budget exhausted \(1\).*tests passed/u, { requests: [] });
+    assert.equal(result.state, fixes ? "delivered" : "parked");
+    assert.deepEqual(run.result.checks.filter(check => check.phase === "red").map(check => [check.expected, check.passed]), [["nonzero exit", false], ["nonzero exit", fixes]]);
+    assert.equal(run.result.repairs, 1);
+  });
+}
+
+for (const evidenceOnly of [false, true]) {
+  test(`a tester changing ${evidenceOnly ? "only .machine-runs" : "nothing"} cannot prove red`, async context => {
+    const f = fixture(context);
+    const result = await execute(input(f, { checks: [command("process.exit(1)")] }, { maxRepairs: 0, stuck: "park" }), {
+      tester: request => {
+        if (evidenceOnly) { mkdirSync(join(request.cwd, ".machine-runs")); writeFileSync(join(request.cwd, ".machine-runs/test.json"), "{}"); }
+        return ok();
+      }, implementer: () => assert.fail(),
+    });
+    parked(f, result, /the tester changed nothing/u, { requests: [] });
+    assert.ok(result.states.includes("red"));
+  });
+}
+
+test("tester scope violations return to the tester before red or implementation", async context => {
+  const f = fixture(context); let tests = 0; let edits = 0;
+  const result = await execute(input(f, {}, { maxRepairs: 1 }), {
+    tester: request => {
+      if (++tests === 1) writeFileSync(join(request.cwd, "outside.test.txt"), "outside");
+      else { assert.match(request.prompt, /Paths outside the ticket Scope after test: "outside.test.txt"\. Scope: greeting.txt, greeting.test.txt/u); rmSync(join(request.cwd, "outside.test.txt")); }
+      assert.equal(edits, 0); return tester(request);
+    },
+    implementer: request => { edits++; assert.equal(tests, 2); return implement(request); },
+  });
+  assert.equal(result.state, "delivered"); assert.equal(edits, 1);
+  assert.deepEqual(result.states.slice(5, 12), ["test", "scopeAfterTest", "repairBudget", "repairTarget", "test", "scopeAfterTest", "red"]);
+  const run = evidence(f);
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-1.json"), "utf8")), { stage: "test", changed: ["greeting.test.txt", "outside.test.txt"], outside: ["outside.test.txt"] });
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-2.json"), "utf8")), { stage: "test", changed: ["greeting.test.txt"], outside: [] });
+});
+
+test("implementation scope violations return to the implementer and record both rounds", async context => {
+  const f = fixture(context); let edits = 0; let tests = 0;
+  const result = await execute(input(f, {}, { maxRepairs: 1 }), {
+    tester: request => { tests++; return tester(request); },
+    implementer: request => {
+      if (++edits === 1) writeFileSync(join(request.cwd, "other.txt"), "outside");
+      else { assert.match(request.prompt, /Paths outside the ticket Scope after change: "other.txt"/u); rmSync(join(request.cwd, "other.txt")); }
+      return implement(request);
+    },
+  });
+  assert.equal(result.state, "delivered"); assert.deepEqual([tests, edits], [1, 2]);
+  const run = evidence(f);
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-2.json"), "utf8")), { stage: "change", changed: ["greeting.test.txt", "greeting.txt", "other.txt"], outside: ["other.txt"] });
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-3.json"), "utf8")), { stage: "change", changed: ["greeting.test.txt", "greeting.txt"], outside: [] });
+  assert.equal(result.states.filter(state => state === "verify").length, 1);
+});
+
+for (const allowed of ["code.txt", "renamed file.txt"]) {
+  test(`scope checks both rename names when ${allowed} is allowed`, async context => {
+    const f = fixture(context); const data = input(f, {}, { redGreen: false, maxRepairs: 0, stuck: "park" });
+    data.ticket.body = data.ticket.body.replace("## Scope\n", `## Scope\n- ${allowed}\n`);
+    const result = await execute(data, { implementer: request => { git(request.cwd, "mv", "code.txt", "renamed file.txt"); return implement(request); } });
+    const outside = allowed === "code.txt" ? "renamed file.txt" : "code.txt";
+    const run = parked(f, result, /Paths outside the ticket Scope/u, { requests: [] });
+    assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-1.json"), "utf8")), { stage: "change", changed: ["code.txt", "greeting.txt", "renamed file.txt"], outside: [outside] });
+  });
+}
+
+test("scope status preserves spaces, newlines, and literal quotes in paths", async context => {
+  const f = fixture(context); const name = ' a\n"b".txt ';
+  const result = await execute(input(f, {}, { redGreen: false, maxRepairs: 0, stuck: "park" }), {
+    implementer: request => { writeFileSync(join(request.cwd, name), "outside"); return implement(request); },
+  });
+  const run = parked(f, result, /Paths outside the ticket Scope/u, { requests: [] });
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-1.json"), "utf8")).outside, [name]);
+});
+
+test("missing named red checks fail construction while redGreen false needs no named check", context => {
+  const f = fixture(context);
+  assert.throws(() => mod.default(runtime, input(f, { redCheck: "acceptance" })), /missing check: acceptance/u);
+  assert.throws(() => mod.default(runtime, input(f, { checks: [command(undefined, { name: "types" })] })), /missing check: tests/u);
+  assert.doesNotThrow(() => mod.default(runtime, input(f, { redCheck: "absent" }, { redGreen: false })));
+  for (const redGreen of [null, "true", 0]) assert.throws(() => mod.default(runtime, input(f, {}, { redGreen })), /redGreen must be a boolean/u);
+  for (const redCheck of [null, "", false]) assert.throws(() => mod.default(runtime, input(f, { redCheck })), /repository.redCheck must be a non-empty string/u);
+  assert.deepEqual(readdirSync(f.root), ["widgets"]);
+});
+
+test("repository.redCheck selects the named check for red and all gates still prove green", async context => {
+  const f = fixture(context);
+  const checks = [command("process.exit(0)"), { ...input(f).repository.checks[0], name: "acceptance" }];
+  const result = await execute(input(f, { checks, redCheck: "acceptance" }));
+  assert.equal(result.state, "delivered");
+  assert.deepEqual(evidence(f).result.checks.map(check => [check.phase, check.name, check.passed]), [["red", "acceptance", true], ["verify", "tests", true], ["verify", "acceptance", true]]);
+});
+
+for (const [label, check] of [
+  ["signal", command('process.kill(process.pid, "SIGTERM")')],
+  ["timeout", command("setInterval(() => {}, 1000)", { timeoutMs: 50 })],
+  ["spawn error", { name: "tests", command: ["/no-such-ticket-check"] }],
+] as const) {
+  test(`red rejects a ${label} instead of treating it as failing tests`, async context => {
+    const f = fixture(context);
+    const result = await execute(input(f, { checks: [check] }, { maxRepairs: 0, stuck: "park" }), { implementer: () => assert.fail() });
+    const run = parked(f, result, /red: tests did not meet its expected result/u, { requests: [] });
+    assert.deepEqual(run.result.checks.map(check => [check.phase, check.expected, check.passed]), [["red", "nonzero exit", false]]);
+  });
+}
+
+test("red rejects a check that changes the candidate", async context => {
+  const f = fixture(context);
+  const result = await execute(input(f, { checks: [command('require("fs").writeFileSync("greeting.test.txt", "weakened"); process.exit(1)')] }, { maxRepairs: 0, stuck: "park" }), { implementer: () => assert.fail() });
+  parked(f, result, /red check changed the checkout/u, { requests: [] });
+});
+
+test("ticketSections takes a backticked span as the Scope pattern, so an annotated bullet still matches", () => {
+  const body = "## Goal\nG\n## Scope\n- `src/**` (the runtime)\n- tests/\n## Acceptance\n- a\n## Forbidden\n- f\n";
+  assert.deepEqual(mod.ticketSections(body).scope, ["src/**", "tests/"]);
+});
+
+test("a resumed candidate is held to the Scope before it is verified", async context => {
+  const f = fixture(context); const again = await handOff(f);
+  writeFileSync(join(f.worktree, "other.txt"), "outside\n");
+  const result = await execute(input(again, {}, { resume: true, maxRepairs: 0, stuck: "park" }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
+  assert.equal(result.state, "parked");
+  assert.deepEqual(result.states.slice(0, 4), ["shape", "prepare", "scopeAfterChange", "repairBudget"]);
+  assert.match(result.output.summary, /outside the ticket Scope after change: "other\.txt"/u);
+  assert.ok(existsSync(join(f.worktree, "other.txt")));
+});
+
+test("more rounds after a failed red returns to the tester, not the implementer", async context => {
+  const f = fixture(context); let tests = 0; let edits = 0;
+  const human = person("more rounds");
+  const result = await execute(input(f, {}, { maxRepairs: 0, stuck: "ask" }), {
+    tester: request => { if (++tests > 1) return tester(request); writeFileSync(join(request.cwd, "greeting.test.txt"), "// no assertion yet\n"); return ok(); },
+    implementer: request => { edits++; assert.equal(tests, 2); return implement(request); },
+  }, human);
+  assert.equal(result.state, "delivered");
+  assert.deepEqual([tests, edits, human.requests.length], [2, 1, 1]);
+  assert.deepEqual(result.states.slice(7, 12), ["red", "repairBudget", "stuck", "decide", "repairTarget"]);
+  assert.equal(result.states[12], "test");
+});

@@ -148,12 +148,15 @@ without a final receipt. These workflows do not resume, undo, or roll back work.
 defaults: it is not in `defaults/`, the installer does not copy it, and it is the
 only workflow here built on the shared helper that commits or publishes. It
 reuses the helper for evidence, checks, fingerprints, review, and separate
-budgets. Required Agent roles are `investigator`, `implementer`, and `reviewer`.
-Failed gates use `maxRepairs` (0–3, default 3 here); review revisions use
+budgets. Required Agent roles are `investigator`, `tester`, `implementer`, and
+`reviewer`. Failed red, scope, and green gates use `maxRepairs` (0–3, default 3
+here); review revisions use
 `maxReviewRounds` (0–5, default 2). Neither consumes the other's budget. This
-allows at most 10 Agent calls before the stuck policy applies (one triage,
-six implementation passes, and three reviews). Setting both budgets to zero
-allows at most three calls. With `stuck: "ask"`, each `more rounds` decision
+allows at most 11 Agent calls before the stuck policy applies (one triage,
+one initial tester pass, up to six implementation passes, and three reviews;
+tester retries share the repair budget with implementation retries). Setting
+both budgets to zero allows at most four calls, or three with `redGreen: false`.
+With `stuck: "ask"`, each `more rounds` decision
 renews both budgets and grants another implementation pass. The default
 `stuck: "park"` ends unattended runs immediately with their candidate kept.
 
@@ -166,6 +169,7 @@ renews both budgets and grants another implementation pass. The default
     "base": "main",
     "setup": [{ "name": "install", "command": ["npm", "ci"], "timeoutMs": 300000 }],
     "checks": [{ "name": "tests", "command": ["npm", "test"], "timeoutMs": 120000 }],
+    "redCheck": "tests",
     "output": "pr",
     "remote": "origin",
     "draft": true
@@ -175,7 +179,8 @@ renews both budgets and grants another implementation pass. The default
   "maxRepairs": 3,
   "maxReviewRounds": 2,
   "stuck": "park",
-  "resume": false
+  "resume": false,
+  "redGreen": true
 }
 ```
 
@@ -199,7 +204,8 @@ Describe the goal.
 
 Goal is free text. Scope lists allowed paths or globs, Acceptance lists testable
 criteria, and Forbidden lists things the change must not do. Each list needs at
-least one non-empty bullet. Indented continuation lines and nested bullets join
+least one non-empty bullet. A Scope bullet is the pattern itself, or its first
+backticked span when the bullet annotates one, as in `` - `src/**` (the runtime) ``. Indented continuation lines and nested bullets join
 their parent bullet with single spaces; nested bullets do not add criteria.
 Thematic breaks are not bullets. Subheadings (`###` and deeper) remain text of
 the current section and do not introduce required sections or count as bullets.
@@ -220,7 +226,10 @@ matter only for `pr`. `worktreeRoot` and `evidenceRoot` are absolute and must be
 outside `repository.path`, and `evidenceRoot` must also be outside the worktree,
 so run files never appear in the source checkout or the commit. `maxRepairs`
 (0–3, default 3), `maxReviewRounds` (0–5, default 2), `stuck` (`"park"` or
-`"ask"`, default `"park"`), and the boolean `resume` (default `false`) are optional.
+`"ask"`, default `"park"`), and the booleans `resume` (default `false`) and
+`redGreen` (default `true`) are optional. `repository.redCheck` defaults to
+`"tests"`; with red/green enabled, construction rejects a name absent from
+`repository.checks`.
 
 The id slug is the lowercased ticket id with every character outside
 `[a-z0-9._-]` replaced by `-`; an id that leaves no letter or digit, or a name
@@ -289,21 +298,49 @@ is.
 | State | Work |
 | --- | --- |
 | `shape` | Validate the checkout and root paths; open evidence and block missing ticket sections or empty required lists before any Agent or worktree |
-| `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch instead and go straight to `verify` |
+| `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch instead and go to `scopeAfterChange`, then `verify` |
 | `start` | Open the helper's run on the worktree, which must be clean |
 | `triage` | The investigator returns `ready` with a short plan or `blocked` with what is missing; an unchanged-worktree guard follows |
-| `change` | The implementer edits the worktree and leaves the changes uncommitted |
+| `test` | With `redGreen: true`, the tester writes only tests for every acceptance criterion inside Scope, leaving them uncommitted; its summary is recorded as stage `test` |
+| `scopeAfterTest`, `red` | Check changed paths against Scope, then run the named red check; failures consume the repair budget and return to `test` |
+| `change` | The implementer edits the worktree and leaves the changes uncommitted, making the tester's tests pass without weakening or deleting them |
+| `scopeAfterChange` | Check changed paths against Scope; violations consume the repair budget and return to `change`, otherwise continue to `verify` |
 | `verify` | The required checks; a failure goes to the repair budget |
 | `review`, `reviewResult` | Capture the structured report; the Operation preserves the unchanged-checkout guard and judges criteria, finding severity, and progress to approve, revise, or apply the stuck policy |
 | `commit` | One commit of everything except `.machine-runs`, even if an Agent staged it: subject is the ticket title, body is `Ticket: <id>` |
 | `deliver` | `branch`: nothing more. `patch`: `git format-patch` for base..HEAD into the evidence directory. `pr`: `git push --no-follow-tags <remote URL>` of the approved commit to the ticket branch alone, then `gh pr create --repo <host/owner/repository>` |
-| `repairBudget`, `reviewBudget` | Count gate retries and review revisions separately; exhaustion goes to `stuck` |
+| `repairBudget`, `repairTarget`, `reviewBudget` | Count gate retries and review revisions separately; gate retries route to the responsible editing stage, review retries to `change`; exhaustion goes to `stuck` |
 | `stuck`, `park` | Select the input policy: `ask` goes to `decide`; `park` writes a note and receipt, keeps the candidate, and ends `parked` |
 | `decide` | Human, only with `stuck: "ask"`: stuck work waits for one of `more rounds`, `hand off`, `archive`, or `discard` |
 | `confirmDiscard` | Human: `confirm discard` or `go back`, asked before a discard removes anything |
 | `archive`, `remove` | Commit the candidate and keep that commit as the branch `archive/<slug>`; `git worktree remove --force` and `git branch -D` for this run's own worktree and ticket branch |
 
-The implementer receives the parsed acceptance and forbidden lists. The reviewer
+After `triageResult`, new runs go through `test` → `scopeAfterTest` → `red` →
+`change` → `scopeAfterChange` → `verify`. With `redGreen: false`, they skip
+`test`, `scopeAfterTest`, and `red`. Resumed runs skip them too, since red cannot be proved again once the change exists, but are held to the Scope at `scopeAfterChange` before `verify`.
+The tester receives the acceptance and Scope lists and must write one or more
+tests per criterion without implementing behavior or editing non-test files.
+Red requires a non-empty Git status excluding `.machine-runs` and a nonzero
+exit from the named check, without a signal, timeout, or spawn error. A passing
+check or a tester that changed nothing returns to the tester with that reason.
+The check also must not change the candidate. Red evidence records phase `red`
+and `expected: "nonzero exit"`; normal gates prove green.
+
+Both scope Operations read NUL-delimited Git status with all untracked files,
+count both names of a rename, and exclude `.machine-runs`. They write
+`scope-<n>.json` containing `{ stage, changed, outside }`. Violations name the
+paths and allowed Scope list in the next Agent prompt. An empty implementation
+change passes scope; the existing verification and commit guards still apply.
+Patterns use `/` separators: `**` matches zero or more segments, `*` matches
+within a segment, and `?` matches one character. Other characters are literal.
+A literal path matches exactly or as a directory prefix (`src` and `src/` both
+allow `src/a.ts`); a leading `./` is ignored.
+
+The implementer receives the parsed acceptance and forbidden lists. With
+red/green enabled, the tester's tests are the contract: incorrect tests must be
+explained in the summary rather than weakened or deleted. On a new red/green
+run the reviewer is told the Machine saw the tests fail and must check that they
+pass for the right reason without weakening. The reviewer
 receives numbered acceptance criteria and must end with this structured event:
 
 ```text
@@ -410,7 +447,7 @@ has a two-minute timeout and also runs for a resumed `pr` run. `branch` and
 `patch` runs make no network call.
 
 Stuck work goes to the `stuck` Operation. This covers triage returning
-`blocked`, triage having edited files, the implementer returning `blocked`,
+`blocked`, triage having edited files, the tester or implementer returning `blocked`,
 the reviewer returning `blocked` or having edited files, review non-convergence,
 repeated owner questions, malformed review reports, and either budget exhausting.
 With the default `stuck: "park"`, `park` writes `park.txt` and a delivery receipt
@@ -539,8 +576,8 @@ repository through a symlink, and unexpected exceptions are runtime failures.
 
 Evidence is written to `<evidenceRoot>/.machine-runs/machine-shop/<id>/`, outside
 the repository and the commit: the helper's `started.json`, check and setup
-logs, Agent summaries, full structured reviews as `review-<n>.json`, each Human
-answer as `human-<n>.json`, and `result.json`,
+logs (including red), `scope-<n>.json` path checks, Agent summaries, full
+structured reviews as `review-<n>.json`, each Human answer as `human-<n>.json`, and `result.json`,
 plus `delivery.json` with the ticket id, repository name and path, branch, base
 commit, commit hash, output mode, pull request URL or patch paths, worktree
 path, whether the worktree was removed, and `reviewNotes: [{text, where}]` in
@@ -558,8 +595,8 @@ The one-line hold starts `Parked on <branch>: ` followed by the first line of
 The receipt, note, and summary use the same needs text, capped at 600 characters
 plus an ellipsis when truncated. The full reason remains in the receipt and note.
 `result.json` keeps the helper's vocabulary: its `outcome` is `blocked` for
-`parked`, `handedOff`, and `abandoned`; `repairs` counts gate retries and
-`reviewRounds` counts review revisions, each cumulative across renewals;
+`parked`, `handedOff`, and `abandoned`; `repairs` counts red, scope, and green
+gate retries and `reviewRounds` counts review revisions, each cumulative across renewals;
 `decisions` lists every Human answer.
 
 Limits: a run waiting in a Human state keeps its worktree and branch until it is

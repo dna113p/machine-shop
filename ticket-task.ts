@@ -1,13 +1,15 @@
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Event, MachinePrimitives } from "@dna113p/machines";
 import { taskRun, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
 import { brief, firstLine } from "./defaults/_machine-shop/brief.ts";
+import { outsideScope } from "./defaults/_machine-shop/scope.ts";
 
 export const description = "Carry one local ticket for one Git repository from an isolated worktree through triage, implementation, checks, and review to a delivered branch, patch, or draft pull request; a stuck run parks by default or asks for a Human decision.";
 export const agentRoles = {
   investigator: "Decides whether the ticket is actionable as written, without editing",
+  tester: "Writes failing tests for the ticket's acceptance criteria before implementation",
   implementer: "Implements the ticket and its tests in the worktree",
   reviewer: "Reviews evidence and the resulting change without editing",
 };
@@ -18,7 +20,7 @@ const confirmations = ["confirm discard", "go back"] as const;
 
 export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const { machine, operation, agent, human, final } = p;
-  const { ticket, repository, prefix, worktree, evidenceRoot, resume, stuck, work, branch: named } = parseTicket(input);
+  const { ticket, repository, prefix, worktree, evidenceRoot, resume, redGreen, stuck, work, branch: named } = parseTicket(input);
   // A resumed run continues on the branch its worktree is already on, whatever title named it.
   let branch = named;
   let baseCommit = "";
@@ -41,6 +43,32 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let checkedBase = "";
   let patches: string[] = [];
   let held: { action: "hold"; summary: string } | undefined;
+  let repairing: "test" | "change" = "change";
+  let scopeChecks = 0;
+  let provedRed = false;
+
+  function scope(stage: "test" | "change"): Event {
+    repairing = stage;
+    // -z keeps spaces, newlines, and quoted characters literal. Rename records put the new name first, then the old name.
+    const entries = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all", "-z"], {
+      cwd: worktree, encoding: "utf8", timeout: 30_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
+    }).split("\0");
+    const paths: string[] = [];
+    for (let index = 0; index < entries.length; index++) {
+      const entry = entries[index]!;
+      if (!entry) continue;
+      paths.push(entry.slice(3));
+      if (/[RC]/u.test(entry.slice(0, 2))) paths.push(entries[++index]!);
+    }
+    const changed = [...new Set(paths)].filter(path => path !== ".machine-runs" && !path.startsWith(".machine-runs/")).sort();
+    const outside = outsideScope(changed, ticket.sections.scope);
+    writeFileSync(join(work.open(), `scope-${++scopeChecks}.json`), JSON.stringify({ stage, changed, outside }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    if (outside.length) {
+      work.block(`Paths outside the ticket Scope after ${stage}: ${outside.map(path => JSON.stringify(path)).join(", ")}. Scope: ${ticket.sections.scope.join(", ")}.`);
+      return { type: "failed" };
+    }
+    return { type: "passed" };
+  }
 
   /** A failed Git or gh step blocks with its output saved as evidence rather than copied into the ticket summary. */
   function attempt(file: string, args: string[], cwd: string, timeout?: number, failure = `${file} ${args[0]} failed`) {
@@ -446,26 +474,45 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     initial: "shape", output: () => held,
     states: {
       shape: operation(shape, { prepared: "prepare", blocked: "failure" }),
-      prepare: operation(prepare, { prepared: "start", resumed: "verify", blocked: "failure" }),
+      // A resumed candidate is held to the Scope as a fresh one is; red cannot be proved again once it is implemented.
+      prepare: operation(prepare, { prepared: "start", resumed: "scopeAfterChange", blocked: "failure" }),
       start: operation(work.start, { started: "triage" }),
       triage: agent(() => work.prompt("Decide whether this ticket is actionable as written. Do not edit any file. Read the relevant code and judge whether the request, scope, and acceptance criteria are specific enough to implement and test in this repository. Return ready with a short implementation plan as the summary, or blocked with exactly what is missing."), {
         ready: { target: "triageResult", actions: record("triage") },
         blocked: { target: "stuck", actions: record("triage") },
       }, { using: "investigator", cwd: worktree }),
-      triageResult: operation(stopped("triageResult", work.unchanged), { unchanged: "change", changed: "stuck" }),
+      triageResult: operation(stopped("triageResult", work.unchanged), { unchanged: redGreen ? "test" : "change", changed: "stuck" }),
+      test: agent(() => work.prompt([
+        "Write only tests that encode the acceptance criteria below, one or more per criterion, inside the Scope paths below. Do not implement anything and do not change non-test files. The tests must fail now and pass once the ticket is implemented. Leave changes uncommitted.",
+        "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
+        "Scope:", ...ticket.sections.scope.map(text => `- ${text}`),
+      ].join("\n")), {
+        completed: { target: "scopeAfterTest", actions: record("test") },
+        blocked: { target: "stuck", actions: record("test") },
+      }, { using: "tester", cwd: worktree }),
+      scopeAfterTest: operation(() => scope("test"), { passed: "red", failed: "repairBudget" }),
+      red: operation(() => {
+        repairing = "test";
+        const result = work.redCheck(repository.redCheck);
+        provedRed = result.type === "passed";
+        return result;
+      }, { passed: "change", failed: "repairBudget" }),
       change: agent(() => work.prompt([
         "Implement the ticket and its tests, following the triage plan in the stage reports. Keep the change focused. Do not weaken checks or expand scope. Leave your changes uncommitted; the workflow commits and delivers them.",
+        ...(redGreen ? ["The tester's tests in the stage reports are the contract; make them pass without weakening or deleting them. If a test is wrong, say so in the summary rather than changing its intent."] : []),
         "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
         "Forbidden:", ...ticket.sections.forbidden.map(text => `- ${text}`),
         "Resolve discussion findings or explain why they need the ticket owner in your summary.",
       ].join("\n")), {
-        completed: { target: "verify", actions: record("change") },
+        completed: { target: "scopeAfterChange", actions: record("change") },
         blocked: { target: "stuck", actions: record("change") },
       }, { using: "implementer", cwd: worktree }),
-      verify: operation(() => work.checks(), { passed: "sealReview", failed: "repairBudget" }),
+      scopeAfterChange: operation(() => scope("change"), { passed: "verify", failed: "repairBudget" }),
+      verify: operation(() => { repairing = "change"; return work.checks(); }, { passed: "sealReview", failed: "repairBudget" }),
       sealReview: operation(work.seal, { sealed: "review" }),
       review: agent(() => work.prompt([
         "Review the current diff and verification evidence. Do not edit any file. Check acceptance criteria, regressions, scope, and whether tests actually establish the intended behavior.",
+        ...(provedRed ? ["The tests were written before the implementation and the Machine saw them fail; check that the implementation makes them pass for the right reason and that no test was weakened."] : []),
         "Acceptance criteria:", ...ticket.sections.acceptance.map((text, index) => `${index + 1}. ${text}`),
         "Return one criteria entry per acceptance criterion, in order, with its text exactly as given, a boolean met, and evidence as a file:line or command.",
         "Tag findings: blocker = must change before delivery; discussion = a question only the ticket owner can settle; minor = worth noting, not worth a round.",
@@ -478,7 +525,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         blocked: { target: "reviewResult", actions: recordReview },
       }, { using: "reviewer", cwd: worktree }),
       reviewResult: operation(stopped("reviewResult", reviewResult), { approved: "commit", revise: "reviewBudget", blocked: "stuck" }),
-      repairBudget: operation(stopped("repairBudget", work.repair), { retry: "change", exhausted: "stuck" }),
+      repairBudget: operation(stopped("repairBudget", work.repair), { retry: "repairTarget", exhausted: "stuck" }),
+      repairTarget: operation(() => ({ type: repairing }), { test: "test", change: "change" }),
       reviewBudget: operation(stopped("reviewBudget", work.reviewRound), { retry: "change", exhausted: "stuck" }),
       // Preparation, commit, and delivery failures still end blocked by themselves.
       stuck: operation(() => ({ type: stuck }), { ask: "decide", park: "park" }),
@@ -488,7 +536,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }, { parked: "parked" }),
       decide: human(stuckPrompt, {
         submitted: [
-          { guard: chose("more rounds"), target: "change", actions: (args: { event: Event }) => {
+          // Back to whichever stage was being repaired: the tester after a failed red, else the implementer.
+          { guard: chose("more rounds"), target: "repairTarget", actions: (args: { event: Event }) => {
             decide(args); work.renew();
             if (standingReview !== undefined) work.block(standingReview);
             standingReview = undefined;
@@ -589,7 +638,9 @@ export function ticketSections(body: string) {
     }
     return result;
   };
-  const scope = bullets("scope"); const acceptance = bullets("acceptance"); const forbidden = bullets("forbidden");
+  // A Scope bullet is the pattern itself, or the first backticked span when the bullet annotates one: "- `src/**` (the runtime)".
+  const scope = bullets("scope").map(text => /`([^`]+)`/u.exec(text)?.[1]?.trim() || text);
+  const acceptance = bullets("acceptance"); const forbidden = bullets("forbidden");
   return {
     goal: (sections.get("goal") ?? []).join("\n").trim(), scope, acceptance, forbidden,
     missing: names.filter(name => !sections.has(name.toLowerCase()) || (name !== "Goal" && !bullets(name.toLowerCase()).length)),
@@ -598,7 +649,7 @@ export function ticketSections(body: string) {
 
 function parseTicket(input: unknown) {
   const value: unknown = typeof input === "string" ? JSON.parse(input) : input;
-  const data = object(value, "input", ["ticket", "repository", "worktreeRoot", "evidenceRoot", "maxRepairs", "maxReviewRounds", "resume", "stuck"]);
+  const data = object(value, "input", ["ticket", "repository", "worktreeRoot", "evidenceRoot", "maxRepairs", "maxReviewRounds", "resume", "stuck", "redGreen"]);
   // Trackers attach their own fields (source, metadata) to a ticket; only id, title, and body are read.
   const ticket = object(data.ticket, "ticket", Object.keys(data.ticket ?? {}));
   const id = text(ticket.id, "ticket.id");
@@ -609,11 +660,14 @@ function parseTicket(input: unknown) {
     throw new Error("ticket.id must yield a non-empty slug that is usable as a branch and directory name");
   }
   if (data.resume !== undefined && typeof data.resume !== "boolean") throw new Error("resume must be a boolean");
+  if (data.redGreen !== undefined && typeof data.redGreen !== "boolean") throw new Error("redGreen must be a boolean");
+  const redGreen = data.redGreen !== false;
 
   const stuck = data.stuck === undefined ? "park" : data.stuck;
   if (stuck !== "ask" && stuck !== "park") throw new Error('stuck must be "ask" or "park"');
 
-  const repo = object(data.repository, "repository", ["name", "path", "base", "setup", "checks", "output", "remote", "draft"]);
+  const repo = object(data.repository, "repository", ["name", "path", "base", "setup", "checks", "output", "remote", "draft", "redCheck"]);
+  const redCheck = repo.redCheck === undefined ? "tests" : text(repo.redCheck, "repository.redCheck");
   const name = text(repo.name, "repository.name");
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(name)) throw new Error("repository.name must be one path segment of letters, digits, '.', '_', or '-'");
   const output = repo.output;
@@ -634,13 +688,14 @@ function parseTicket(input: unknown) {
     task: [`Ticket ${id}: ${title}`, ...(ticket.body?.trim() ? [ticket.body] : [])].join("\n\n"),
     workspace: worktree, checks: repo.checks, maxRepairs: data.maxRepairs ?? 3, maxReviewRounds: data.maxReviewRounds,
   }, { checks: true, git: "clean", evidenceRoot });
+  const checks = (repo.checks as { name: string }[]).map(c => c.name);
+  if (redGreen && !checks.includes(redCheck)) throw new Error(`repository.redCheck names missing check: ${redCheck}`);
   const prefix = `ticket/${slug}`;
   const titled = titleSlug(title);
   return {
     ticket: { id, slug, title, summary: firstParagraph(ticket.body ?? ""), sections: ticketSections(ticket.body ?? "") }, prefix, branch: titled ? `${prefix}-${titled}` : prefix,
-    worktree, evidenceRoot, work, resume: data.resume === true, stuck,
-    repository: { name, path, base, setup, output, remote, draft: repo.draft !== false,
-      checks: (repo.checks as { name: string }[]).map(c => c.name) },
+    worktree, evidenceRoot, work, resume: data.resume === true, redGreen, stuck,
+    repository: { name, path, base, setup, output, remote, draft: repo.draft !== false, redCheck, checks },
   };
 }
 /** A ticket id as branch and worktree names carry it. */

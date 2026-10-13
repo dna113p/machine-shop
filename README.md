@@ -147,7 +147,7 @@ parking stuck work immediately by default, with an optional Human decision:
 
 ```sh
 machine run /absolute/machine-shop/ticket-task.ts \
-  --agent investigator=codex --agent implementer=default --agent reviewer=codex \
+  --agent investigator=codex --agent tester=default --agent implementer=default --agent reviewer=codex \
   --input-file /absolute/ticket.json
 ```
 
@@ -170,6 +170,16 @@ Indented continuations and nested bullets join their parent item with single
 spaces. Thematic breaks and subheadings do not count as bullets; subheadings
 stay within the current section.
 
+By default (`redGreen: true`), a `tester` writes acceptance tests first. The
+Machine checks their paths against Scope and proves they fail using the named
+`repository.redCheck` gate (default `"tests"`, which must exist in `checks`).
+The implementer then makes them pass without weakening or deleting them, and
+all normal gates prove green. `redGreen: false` skips the tester and red check.
+After both editing stages, Scope checks record changed paths and send violations
+back to the responsible Agent within `maxRepairs`. Scope supports `**` across
+path segments, `*` and `?` within a segment, literal directory prefixes, and
+an optional leading `./`. Evidence includes red check logs and `scope-<n>.json`.
+
 Reviews report a verdict and evidence for each acceptance criterion, tagged
 findings, and what changed since the previous round. The Machine requires
 repairs for unmet criteria or blocker findings, escalates malformed reports,
@@ -184,11 +194,11 @@ blockers need repair. Full reports are saved as `review-<n>.json` in the evidenc
 A stuck ticket parks by default (`stuck: "park"`): the run ends `parked`
 immediately, keeping the worktree, branch, and uncommitted candidate unchanged.
 It writes `park.txt` and `delivery.json` with what needs an answer and how to
-resume. Failed gates use `maxRepairs` (0–3, default 3); review revisions use
-`maxReviewRounds` (0–5, default 2). The budgets are independent.
+resume. Failed red, scope, and green gates use `maxRepairs` (0–3, default 3);
+review revisions use `maxReviewRounds` (0–5, default 2). The budgets are independent.
 
-When either budget is exhausted, or triage, implementation, or review blocks,
-the `stuck` Operation chooses parking or, with `stuck: "ask"`, the Human state
+When either budget is exhausted, or triage, testing, implementation, or review
+blocks, the `stuck` Operation chooses parking or, with `stuck: "ask"`, the Human state
 `decide`. Read-only stage edits also go through this policy. Every Human prompt
 and park note uses one brief helper: decision first (at most ten words), then
 the ticket's standing, stopped state, reason, both budgets, evidence locations,
