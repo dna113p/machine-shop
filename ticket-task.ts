@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { closeSync, existsSync, openSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Event, MachinePrimitives } from "@dna113p/machines";
 import { taskRun, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
@@ -58,10 +58,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const planningReports: Record<PlanningStage, number> = { falsify: 0, plan: 0, planReview: 0 };
   let plan = "";
   let planRevisions = 0;
-  let ownerQuestions: { text: string; where: string }[] | undefined;
-  let falsifyQuestions: FalsifyQuestion[] = [];
+  let ownerQuestions: { text: string; where: string; options?: string[]; recommended?: string; why?: string }[] | undefined;
   let wouldAssume: FalsifyQuestion[] = [];
-  let assumptions: { question: string; answer: string; options: string[]; why: string }[] = [];
+  let assumptions: Assumption[] = [];
   let assumptionsJson = "";
   const assumptionsPrompt = () => assumptionsJson ? ["Assumptions:", assumptionsJson] : [];
 
@@ -227,6 +226,25 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         + "so something was committed on it or the base moved back; only an uncommitted candidate is resumed, and nothing was changed.");
     }
     baseCommit = tip;
+    // A clean resume plans afresh; only a candidate carries the answers its plan used.
+    if (pending() !== "") {
+      const directory = run("git", ["rev-parse", "--path-format=absolute", "--git-dir"], worktree);
+      if (!directory.ok) return work.block(`Cannot resume: cannot locate ticket-task-assumptions.json in the worktree's Git directory: ${directory.detail}; nothing was changed.`);
+      const file = join(directory.stdout, "ticket-task-assumptions.json");
+      try {
+        // lstat distinguishes an absent file from an unreadable or dangling saved link.
+        if (lstatSync(file, { throwIfNoEntry: false })) {
+          const saved: unknown = JSON.parse(readFileSync(file, "utf8"));
+          const malformed = assumptionField(saved);
+          if (malformed) return work.block(`Cannot resume: ${file}: ${malformed}; nothing was changed.`);
+          assumptions = (saved as Assumption[]).map(({ question, answer, options, why }) => ({ question, answer, options, why }));
+          assumptionsJson = JSON.stringify(assumptions, null, 2) + "\n";
+        }
+      } catch (error) {
+        return work.block(`Cannot resume: ${file}: ${String(error)}; nothing was changed.`);
+      }
+      if (assumptionsJson) writeFileSync(join(work.open(), "assumptions.json"), assumptionsJson, { flag: "wx", mode: 0o600 });
+    }
     return { type: "resumed" };
   }
 
@@ -273,15 +291,20 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const tip = resolved.stdout;
     const original = baseCommit;
     const approved = commitHash;
-    const stop = (reason: string): Event => { work.block(reason); return { type: "stuck" }; };
+    let cleanupFailure = "";
+    const stop = (reason: string): Event => {
+      work.block(reason + (cleanupFailure ? ` Cleaning leftovers failed, so some may reappear on resume; inspect ${cleanupFailure}.` : ""));
+      return { type: "stuck" };
+    };
     // Unlike attempt's one-off delivery logs, these steps may recur after repair or a Human grants more rounds.
     const step = (args: string[], cwd = worktree, timeout?: number) => {
       const done = run("git", args, cwd, timeout);
+      let log = "";
       if (!done.ok) {
-        const log = join(work.open(), `rebase-${++rebaseSteps}-${args[0]}.log`);
+        log = join(work.open(), `rebase-${++rebaseSteps}-${args[0]}.log`);
         writeFileSync(log, `git ${args.join(" ")}\n${done.stdout}\n${done.detail}\n`, { flag: "wx", mode: 0o600 });
       }
-      return done;
+      return { ...done, log };
     };
     const restore = () => {
       if (["rebase-merge", "rebase-apply"].some(state => existsSync(git(worktree, "rev-parse", "--git-path", state)))) {
@@ -293,7 +316,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }
       if (git(worktree, "rev-parse", "HEAD") !== approved || pending() !== "") git(worktree, "reset", "--hard", approved);
       // The approved tree was clean: remove later outputs under its ignore rules before making the candidate untracked.
-      step(["clean", "-f", "-d", "-q", "-e", "/.machine-runs"]);
+      const cleaned = step(["clean", "-f", "-d", "-q", "-e", "/.machine-runs"]);
+      if (!cleaned.ok) cleanupFailure = cleaned.log;
       undo(original);
     };
     if (!run("git", ["merge-base", "--is-ancestor", original, tip], repository.path).ok) {
@@ -403,6 +427,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         const stopped = undoOnTip(`setup: ${command.name} ${passed ? "changed tracked or unignored files" : "failed"}`);
         work.reopen(true);
         if (stopped) return stopped;
+        reviewsFrom = reviews.length;
         return stop(`setup: ${command.name} ${passed ? "changed tracked or unignored files" : "failed"} on base ${tip}; inspect its setup log in ${work.open()}.`);
       }
     }
@@ -504,16 +529,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const parkNext = "Add the answer to the ticket body, then run the ticket again with resume: true; the run continues from the kept worktree with fresh budgets.";
   const questionCount = () => `${ownerQuestions!.length} open question${ownerQuestions!.length === 1 ? "" : "s"}`;
   const questionText = (question: { text: string; where: string }, cap = Infinity) => {
-    const text = flat(question.text); const where = flat(question.where);
-    return `${text.length > cap ? `${text.slice(0, cap)}…` : text}${where ? ` (${where})` : ""}`;
+    const where = flat(question.where);
+    return `${capped(question.text, cap)}${where ? ` (${where})` : ""}`;
   };
   const questionLines = (cap?: number) => ownerQuestions!.map((question, index) => {
-    const gap = falsifyQuestions[index];
-    const options = gap ? ` Options: ${[`${flat(gap.recommended)} (recommended)`, ...gap.options.filter(option => option !== gap.recommended).map(flat)].join("; ")} Why: ${flat(gap.why)}` : "";
+    const options = question.options ? ` Options: ${[`${capped(question.recommended!, cap)} (recommended)`, ...question.options.filter(option => option !== question.recommended).map(option => capped(option, cap))].join("; ")} Why: ${capped(question.why!, cap)}` : "";
     return `${index + 1}. ${questionText(question, cap)}${options}`;
   }).join("\n");
-  const wouldAssumeLines = () => wouldAssume.length
-    ? `\nHad these been the only questions, the run would have assumed:\n${wouldAssume.map(question => `- ${flat(question.text)} → ${flat(question.recommended)}`).join("\n")}` : "";
+  const wouldAssumeLines = (cap?: number) => wouldAssume.length
+    ? `\nHad these been the only questions, the run would have assumed:\n${wouldAssume.map(question => `- ${capped(question.text, cap)} → ${capped(question.recommended, cap)}`).join("\n")}` : "";
   function parkDetails() {
     const { reason, repairs, maxRepairs, reviewRounds, maxReviewRounds } = work.status();
     // Ask for one owner response while preserving the actual question or criterion as context.
@@ -522,9 +546,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ? `Explain how to resolve the remaining findings: ${why}`
       : `Clarify how to resolve this blocker: ${why}`;
     return { needs: ownerQuestions
-      ? `Answer the open question${ownerQuestions.length === 1 ? "" : "s"}:\n${questionLines(600)}${wouldAssumeLines()}`
+      ? `Answer the open question${ownerQuestions.length === 1 ? "" : "s"}:\n${questionLines(600)}${wouldAssumeLines(600)}`
       : needs.replace(/^(.{600}).+$/u, "$1…"),
-      ...(ownerQuestions ? { questions: ownerQuestions } : {}), next: parkNext,
+      ...(ownerQuestions ? { questions: ownerQuestions.map(({ text, where }) => ({ text, where })) } : {}), next: parkNext,
       budgets: { repairs: { used: repairs, max: maxRepairs }, reviewRounds: { used: reviewRounds, max: maxReviewRounds } } };
   }
   const parkNote = () => brief({
@@ -632,6 +656,14 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   }
   function falsifyResult(): Event {
     const kept = keep("falsify");
+    const directory = run("git", ["rev-parse", "--path-format=absolute", "--git-dir"], worktree);
+    if (!directory.ok) return work.block(`Cannot locate ticket-task-assumptions.json in the worktree's Git directory: ${directory.detail}`);
+    const file = join(directory.stdout, "ticket-task-assumptions.json");
+    // Even a malformed report replaces the earlier plan's assumptions with none.
+    try { rmSync(file, { force: true }); }
+    catch (error) { return work.block(`Cannot delete saved assumptions ${file}: ${String(error)}`); }
+    assumptions = [];
+    assumptionsJson = "";
     if (work.unchanged().type === "changed") return { type: "blocked" };
     if ("refusal" in kept) return work.block(kept.refusal);
     const event = planningReport;
@@ -642,15 +674,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const malformed = questionField(event.questions);
     if (malformed) return work.block(`Malformed falsify report: ${malformed}.`);
     const questions = event.questions as FalsifyQuestion[];
-    falsifyQuestions = assume ? questions.filter(question => !question.assumable) : questions;
-    if (!falsifyQuestions.length) {
+    const open = assume ? questions.filter(question => !question.assumable) : questions;
+    if (!open.length) {
       assumptions = questions.map(({ text, recommended, options, why }) => ({ question: text, answer: recommended, options, why }));
       assumptionsJson = JSON.stringify(assumptions, null, 2) + "\n";
+      try { writeFileSync(file, assumptionsJson, { flag: "wx", mode: 0o600 }); }
+      catch (error) { return work.block(`Cannot write saved assumptions ${file}: ${String(error)}`); }
       writeFileSync(join(work.open(), "assumptions.json"), assumptionsJson, { flag: "wx", mode: 0o600 });
       work.block("");
       return { type: "assumed" };
     }
-    ownerQuestions = falsifyQuestions.map(({ text }) => ({ text, where: "" }));
+    ownerQuestions = open.map(({ text, options, recommended, why }) => ({ text, where: "", options, recommended, why }));
     wouldAssume = assume ? questions.filter(question => question.assumable) : [];
     return work.block(`Ticket owner must settle ${questionCount()}:\n${questionLines()}${wouldAssumeLines()}`);
   }
@@ -728,6 +762,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }
     if (discussions.length && prior?.findings.some(finding => finding.severity === "discussion")) {
       ownerQuestions = discussions.map(({ text, where }) => ({ text, where }));
+      wouldAssume = [];
       return stop(`Ticket owner must settle ${questionCount()}:\n${questionLines()}`);
     }
     if (discussions.length) {
@@ -839,7 +874,6 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           { guard: chose("more rounds"), target: "repairTarget", actions: (args: { event: Event }) => {
             decide(args); work.renew();
             ownerQuestions = undefined;
-            falsifyQuestions = [];
             wouldAssume = [];
             if (standingReview !== undefined) work.block(standingReview);
             standingReview = undefined;
@@ -867,6 +901,21 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       delivered: final(), blocked: final(), handedOff: final(), abandoned: final(), parked: final(),
     },
   });
+}
+
+type Assumption = { question: string; answer: string; options: string[]; why: string };
+/** Refuse damaged saved answers before adopting or changing the candidate. */
+function assumptionField(assumptions: unknown): string | undefined {
+  if (!Array.isArray(assumptions) || assumptions.length < 1 || assumptions.length > 10) return "assumptions must be an array of 1–10 entries";
+  for (const [index, assumption] of assumptions.entries()) {
+    const field = `assumptions[${index}]`;
+    if (assumption === null || typeof assumption !== "object" || Array.isArray(assumption)) return `${field} must be an object`;
+    for (const key of ["question", "answer", "why"] as const) {
+      if (typeof assumption[key] !== "string" || !assumption[key].trim()) return `${field}.${key} must be a non-empty string`;
+    }
+    if (!Array.isArray(assumption.options) || !assumption.options.length || assumption.options.some((option: unknown) => typeof option !== "string" || !option.trim())) return `${field}.options must be a non-empty array of non-empty strings`;
+  }
+  return undefined;
 }
 
 type FalsifyQuestion = { text: string; options: string[]; recommended: string; assumable: boolean; why: string };
@@ -1070,6 +1119,10 @@ function real(path: string): string {
   return parent === path ? path : join(real(parent), basename(path));
 }
 const flat = (value: string) => value.replace(/\s+/gu, " ").trim();
+const capped = (value: string, cap = Infinity) => {
+  const text = flat(value);
+  return text.length > cap ? `${text.slice(0, cap)}…` : text;
+};
 function run(file: string, args: string[], cwd: string, timeout = 30_000) {
   const done = spawnSync(file, args, {
     cwd, encoding: "utf8", shell: false, timeout, killSignal: "SIGKILL", maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],

@@ -308,7 +308,7 @@ is.
 | `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch instead: no uncommitted change goes through `start` to `falsify`, a candidate to `scopeAfterChange`, then `verify` |
 | `start` | Open the helper's run on the worktree, which must be clean |
 | `falsify` | Read-only investigator tries to show the ticket is wrong, already done, impossible here, or underspecified; returns `sound` with a one-paragraph summary or `questions` with 1–10 entries containing text, options, recommended, assumable, and why |
-| `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; a sound ticket goes to `plan`, as does an entirely assumable report with `assume: true`; remaining questions go through the stuck policy with numbered needs, flattened with only question text capped at 600 characters plus an ellipsis |
+| `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; a sound ticket goes to `plan`, as does an entirely assumable report with `assume: true`; remaining questions go through the stuck policy with numbered needs, flattened with question text, each option, and why capped separately at 600 characters plus an ellipsis |
 | `plan` | Read-only investigator returns `planned` with the complete plan as a summary of at most 4000 characters, recorded as stage `plan` |
 | `planResult` | Capture the report before guarding the unchanged worktree and validating the captured prose plan's length before `planReview` |
 | `planReview` | Read-only reviewer returns `approved` or `revise` with a summary; the prompt includes the plan verbatim |
@@ -357,6 +357,10 @@ answers. The file's exact text is passed under `Assumptions:` to `plan`,
 `planReview`, `test`, `change`, and `review`, before `Plan:` wherever that heading
 exists. A reviewer who disagrees with an assumption reports a `discussion`
 finding; the report shape and existing escalation rule are unchanged.
+At the same time, `falsify` writes `ticket-task-assumptions.json` inside the
+worktree's own Git directory, resolved by
+`git rev-parse --path-format=absolute --git-dir`. This saved copy survives a
+park or hand off, outside the working tree and never staged or committed.
 
 After plan approval, new runs go through `test` → `scopeAfterTest` → `red` →
 `change` → `scopeAfterChange` → `verify`. With `redGreen: false`, they skip
@@ -417,22 +421,25 @@ evidence directory and describes what is new.
    not converging and goes to `stuck`, naming the unchanged blockers. Empty or
    whitespace-only text also means none, as does `none` after trimming,
    lower-casing, and dropping a trailing period. With no blockers, the reason
-   names the unmet ticket criteria instead. The first review of a changed patch
-   after rebase, including after repairing a `reverify` failure, is not compared
-   with reports from before the rebase.
+   names the unmet ticket criteria instead. The first-review rule below defines
+   when comparisons restart after rebase.
 5. Discussions get one repair round to resolve them or explain why they need
    the owner. If the previous review also had discussions, every discussion in
    the next review goes to the owner together through `stuck`, whatever its
    wording, only when no criteria or blockers need repair. This depends on review
    position, not matching text. Discussions after a review without any get a
-   fresh repair round, as do discussions in the first review of a changed patch
-   after rebase, including after repairing a `reverify` failure; only subsequent
-   reviews of that patch are compared.
+   fresh repair round; the first-review rule below also applies after rebase.
 6. All criteria met with no blockers or discussions approves, including a
    reviewer `revise` event containing only minors. Minor notes accumulate across
    review rounds, deduplicated by text and location after trimming and
    lower-casing. The pull request renders each note on one line and omits
    parentheses when its location is empty.
+
+The first review of a new patch is the review after a differing patch id on
+rebase, after repairing a failed `reverify`, or after `more rounds` following a
+setup failure or tracked/unignored leftovers on the new tip. For convergence
+and discussion escalation, these reviews are not compared with reports from
+before the rebase; only subsequent reviews of that patch are compared.
 
 After a Machine block for non-convergence, open owner questions, or a malformed
 report, `more rounds` restores the latest review's available findings as the
@@ -516,27 +523,28 @@ Restoring the original candidate first resets to the approved commit, then
 runs `git clean -f -d -q -e /.machine-runs` before undoing that commit. This
 removes later untracked files and directories under the approved tree's ignore
 rules, including setup outputs only the tip ignored. Files those rules ignore,
-`.machine-runs/`, and nested Git repositories are kept. A clean failure leaves
-a numbered `rebase-<n>-clean.log` and still proceeds to undo the commit.
+`.machine-runs/`, and untracked nested Git repositories are kept. Git requires
+a second `-f` to remove nested repositories; they may hold commits found nowhere
+else, so cleanup keeps them. A clean failure still proceeds to undo the commit;
+the stop reason names the failure and its numbered `rebase-<n>-clean.log`,
+explaining why leftovers may reappear on resume.
 
 After a valid replay, setup runs again as phase `setup` while the rebased tree
 is still committed and clean, so its unignored outputs can be detected as in
 `prepare`. A failed command or tracked/unignored leftovers undoes the commit
 on the new tip, updates `baseCommit`, marks checks failed, and goes through
 `stuck` naming the command, subject to the ignore guard above; this is not an
-implementer repair. If patch ids differ and the ignore guard permits the undo
-on the new tip, the run returns to `verify`
-and a fresh `review`, which is a first review of the new patch for convergence
-and discussion escalation and can approve, revise, or block normally. This
-re-review uses neither budget and repeats only if the base moves again.
+implementer repair. Choosing `more rounds` then follows the first-review rule
+above. If patch ids differ and the ignore guard permits the undo on the new tip,
+the run returns to `verify` and a fresh `review` under that same rule, which can
+approve, revise, or block normally. This re-review uses neither budget and
+repeats only if the base moves again.
 If patch ids match, the gates run as phase `reverify`. Passing delivers the
 rebased commit with the new tip as `baseCommit`. Failing undoes the commit on
 that tip if the ignore guard permits, marks checks failed, and goes to
 `repairBudget`; the implementer sees the failed gates before the normal
-verify/review/commit/rebase sequence. The review after repair is a first review
-of the new patch for convergence and discussion escalation, without comparisons
-to reports from before the rebase. With
-no further base movement that second `rebase` needs no second `reverify`, since
+verify/review/commit/rebase sequence, following the first-review rule above.
+With no further base movement that second `rebase` needs no second `reverify`, since
 `verify` checked the candidate on the new base.
 
 A setup command that moves HEAD or switches branches also counts as failed
@@ -679,11 +687,22 @@ the run ends `blocked` with a message naming the condition, changing nothing.
 Setup commands are not run again. With a candidate, resume skips `falsify`, `plan`,
 and `planReview` and goes to `scopeAfterChange`, then `verify`, review, commit,
 rebase, and deliver as usual, with fresh budgets and the normal repair loop if
-review asks for changes. A resumed run carries no earlier assumptions into its
-prompts, pull request, or receipt. Without a candidate, resume goes through `start` to
-`falsify` and plans and tests the current ticket afresh. This includes a worktree
-left clean by a failed setup in `prepare`; resolve the setup problem in the kept
-worktree before resuming. The base
+review asks for changes. A candidate resume reads `ticket-task-assumptions.json`
+from its worktree's Git directory, if present, validates it, and writes this run's
+evidence `assumptions.json`. It passes those answers under `Assumptions:` to its
+reviewer, lists them under `## Assumptions` in the pull request, and records them
+in `delivery.json`. Without a saved file it behaves as before, with no assumptions.
+An unreadable file, invalid JSON, or anything other than an array of 1–10 objects
+with non-empty `question`, `answer`, and `why` strings and a non-empty array of
+non-empty `options` strings refuses resume with `Cannot resume` naming the file,
+before adopting or asking the remote, changing nothing. Extra fields are omitted
+from the validated answers.
+Without a candidate, resume goes through `start` to `falsify` and plans and tests
+the current ticket afresh. It never reads the saved file; when its own `falsify`
+returns, even with a malformed report, it deletes the file or replaces it with
+what that falsify assumed. A failed delete or write stops naming the file.
+A clean resume also includes a worktree left clean by a failed setup in `prepare`;
+resolve the setup problem in the kept worktree before resuming. The base
 must resolve to the commit the first run started from or to a descendant of it,
 so name `repository.base` explicitly, or leave the source checkout on the branch
 it was on. Even after a post-rebase setup failure, resume does not rerun setup
@@ -733,9 +752,9 @@ plus `delivery.json` with the ticket id, repository name and path, branch, base
 commit, commit hash, output mode, pull request URL or patch paths, worktree
 path, whether the worktree was removed, and `reviewNotes: [{text, where}]` in
 every output mode (an empty list when there are no minors). When falsify assumed
-answers, `delivery.json` also records `assumptions`, the array written to
-`assumptions.json`, for every outcome in that run; both are absent when nothing
-was assumed. Its `outcome` is `delivered`,
+answers or a candidate resume read them back, `delivery.json` also records
+`assumptions`, the array written to `assumptions.json`, for every outcome in that
+run; both are absent when no assumptions were made or restored. Its `outcome` is `delivered`,
 `parked`, `handed-off`, `abandoned`, or `blocked`. It records `decision` when one was made
 (the last choice at `decide`, so `discard` for a confirmed discard and
 `more rounds` for a run that went on to deliver), `archive` as
@@ -759,13 +778,15 @@ capped. The one-line hold instead uses `Needs: N open questions; the first:
 the parentheses. Other stops use the same needs text in the receipt, note, and
 summary, with whitespace flattened in the single-line summary and no
 `park.questions` field. Falsification questions follow the same limits as review
-questions for question text only: each numbered line then lists the options with
-the recommended answer first and marked, followed by why, all flattened and
-without a cap on those fields. In a mixed report with `assume: true`, reason and
-needs also list the answers the run would have assumed, outside the numbered
-questions. A second plan review revision uses the usual blocker needs, capped at
-600 characters plus an ellipsis when truncated. The full reason remains in the
-receipt and note, and raw planning events preserve even malformed reports.
+questions: each numbered line then lists the options with the recommended
+answer first and marked, followed by why. Under Needs, each option and why is
+flattened and capped separately at 600 characters plus an ellipsis. In a mixed
+report with `assume: true`, reason and needs also list the answers the run would
+have assumed, outside the numbered questions; Needs flatten and cap each such
+question and answer separately at 600 characters plus an ellipsis. A second plan
+review revision uses the usual blocker needs, capped at 600 characters plus an
+ellipsis when truncated. The full stop reason remains in the receipt and the
+note's standing section, and raw planning events preserve even malformed reports.
 `result.json` keeps the helper's vocabulary: its `outcome` is `blocked` for
 `parked`, `handedOff`, and `abandoned`; `repairs` counts red, scope, and green
 gate retries and `reviewRounds` counts review revisions, each cumulative across renewals;

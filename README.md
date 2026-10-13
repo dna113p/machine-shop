@@ -177,9 +177,9 @@ one-paragraph summary or `questions` with 1–10 entries shaped as
 Text and why must be non-empty strings; options must be a non-empty array of
 non-empty strings, with recommended copied exactly from one of them. Malformed
 entries go through the stuck policy with the bad field named. Falsification
-questions become numbered `needs`, each flattened to one line with only its
-question text capped at 600 characters plus an ellipsis, followed by its options
-(recommended first and marked) and why.
+questions become numbered `needs`, each flattened to one line with its question
+text, each option (recommended first and marked), and why capped separately at
+600 characters plus an ellipsis.
 
 The optional boolean `assume` defaults to `false`: every question still stops the
 run. Only a gap whose conservative answer loses nothing if wrong (stops, refuses,
@@ -198,7 +198,10 @@ under `Assumptions:`. The pull request lists them under `## Assumptions` after
 the summary, and `delivery.json` records `assumptions` for every outcome in that
 run. These are omitted when nothing was assumed. An assumption the reviewer
 disagrees with is a `discussion` finding, following the existing owner escalation
-rule.
+rule. When `falsify` assumes, it also writes `ticket-task-assumptions.json`
+inside the worktree's own Git directory, resolved by
+`git rev-parse --path-format=absolute --git-dir`. This file survives a park or
+hand off, stays outside the working tree, and is never committed.
 
 A sound ticket proceeds to `plan`: the investigator returns
 `planned` with a plan of at most 4000 characters, recorded as stage `plan`.
@@ -272,8 +275,14 @@ worktree a park or `hand off` left behind, with fresh budgets and without rerunn
 setup. A resumed worktree with no uncommitted change starts again at `falsify`,
 then plans, reviews the plan, and tests the current ticket before implementation.
 A worktree with a candidate skips planning and the tester and goes straight to
-scope checks, verification, review, commit, rebase, and delivery. A resumed run
-does not carry earlier assumptions into its prompts, pull request, or receipt.
+scope checks, verification, review, commit, rebase, and delivery. That candidate
+resume reads the saved assumptions into `Assumptions:` in its reviewer prompt,
+`## Assumptions` in its pull request, and `delivery.json`; without a saved file
+it carries no assumptions. An unreadable file, invalid JSON, or an invalid
+assumption array refuses resume with `Cannot resume` naming the file, changing
+nothing. A clean resume never reads the file: when its own `falsify` returns,
+it replaces the file with its new assumptions or deletes it when it assumed
+nothing, even on a malformed report. A failed delete or write stops naming the file.
 The base branch may have moved forward in the meantime: the ticket branch must point
 at the base commit or an ancestor of it, with no commit of its own.
 
@@ -282,10 +291,11 @@ checkout (its HEAD when no base is named). An unchanged or unresolvable base
 continues to delivery. A forward move replays exactly the ticket commit onto
 the new tip. The same patch runs setup again, then the gates as `reverify`;
 a changed patch is undone on the new tip and goes through verification and a
-fresh review. Failed `reverify` gates return to the normal repair loop; the
-review after repair is a first review of the new patch for convergence and
-discussion escalation, without comparisons to reports from before the rebase. When the
-run changes base, `delivery.json` includes a `rebasedFrom` field, `{ baseCommit, commit }`,
+fresh review. Failed `reverify` gates return to the normal repair loop.
+The review after a differing patch id, repaired `reverify`, or `more rounds`
+after a setup failure or leftovers on the new tip is a first review of the new
+patch for convergence and discussion escalation, without comparisons to reports
+from before the rebase. When the run changes base, `delivery.json` includes a `rebasedFrom` field, `{ baseCommit, commit }`,
 with the starting base and first approved commit. In `pr` mode the new tip must
 already be published on the recorded pull request base before replay.
 
@@ -296,9 +306,10 @@ tips restore the original base and go through `stuck`; a failed setup keeps the
 candidate on the new tip and also goes through `stuck`. Restoring the original
 candidate removes later untracked outputs under the approved tree's ignore
 rules, keeping files those rules ignore, `.machine-runs/`, and nested Git
-repositories. This includes setup outputs only the tip ignored, so resuming an
-ignore stop reaches `rebase` again with the same reason until the candidate or
-ignore rules are reconciled. Resume alone repeats a
+repositories, which may hold commits found nowhere else. Cleanup removes setup
+outputs only the tip ignored, so resuming an ignore stop reaches `rebase` again
+with the same reason until the candidate or ignore rules are reconciled. A cleanup
+failure is named in the stop reason with its `rebase-<n>-clean.log`. Resume alone repeats a
 conflict until someone ports the candidate in the worktree. A rewritten or
 moved-back base ends `blocked` for delivery by hand; `adopt` still refuses resume
 when the branch's base is not an ancestor of the current tip. See the catalog
@@ -315,11 +326,13 @@ ordered array of open `{text, where}` entries; falsification questions use an em
 The reason and `park.needs` list every question on its own
 numbered line with its location; needs cap each question's flattened text separately at 600
 characters plus an ellipsis, keeping its location. Falsification lines also list
-the options with the recommended answer first, then why; those fields are not
-capped. In a mixed report with `assume: true`, reason and needs also list the
-answers the run would have assumed, outside the numbered owner questions.
-The reason stays full. The
-one-line hold uses `Needs: N open questions; the first: <text> (<where>)`, with
+the options with the recommended answer first, then why. Under Needs, each
+option and why is flattened and capped separately at 600 characters plus an
+ellipsis. In a mixed report with `assume: true`, reason and needs also list the
+answers the run would have assumed, outside the numbered owner questions;
+Needs flatten and cap each such question and answer separately at 600 characters
+plus an ellipsis. The stop reason stays full in the note's standing section and
+the receipt. The one-line hold uses `Needs: N open questions; the first: <text> (<where>)`, with
 the same cap on that first question. Empty locations omit the parentheses.
 
 The run ends `delivered`, `parked`, `handedOff`, `abandoned`, or `blocked`, and its output

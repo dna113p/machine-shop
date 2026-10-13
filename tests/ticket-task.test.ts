@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join, resolve } from "node:path";
+import { delimiter, join, relative, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { pathToFileURL } from "node:url";
 import { runtime } from "./runtime.ts";
@@ -225,7 +225,7 @@ const assumed = (questions: Gap[]) => questions.map(({ text, options, recommende
 /** The assumptions a prompt carries: what follows its own `Assumptions:` heading line. */
 const assumptionsIn = (prompt: string) => prompt.split(/^Assumptions:\n+/mu)[1] ?? "";
 const numberedLines = (lines: string[]) => lines.filter(line => /^\d+\. /u.test(line));
-/** A falsify question's one line of the park note: its number and text, then every option, the recommended one first and marked as such. */
+/** A falsify question's one line of the park note: its number and text, then every option, the recommended one first and marked as such, and why it is asked. */
 function optionsFirst(line: string, number: number, asked: Gap, shown = oneLine(asked.text)) {
   assert.ok(line.startsWith(`${number}. ${shown}`), line);
   const rest = line.slice(`${number}. ${shown}`.length);
@@ -235,6 +235,8 @@ function optionsFirst(line: string, number: number, asked: Gap, shown = oneLine(
     assert.ok(rest.indexOf(oneLine(option)) > recommended, `${line} does not give ${option} after the recommended option`);
   }
   assert.match(rest, /\brecommended\b/iu);
+  // The reason comes with the options: a question that has one is never listed without it.
+  assert.ok(rest.indexOf(oneLine(asked.why)) > recommended, `${line} does not say why: ${oneLine(asked.why)}`);
 }
 /** Parking never asks a Human or changes the candidate; its note and hold share the same brief. */
 function parked(f: Fixture, result: { state: unknown; output: any; states: string[] }, reason: RegExp, human: { requests: Ask[] }) {
@@ -2459,9 +2461,9 @@ const writesOutputs = 'const fs = require("fs"); const write = dir => { fs.mkdir
  * review it gains rules for greeting.txt and cache/, then later.txt: setup stays clean on the tip, later-gate fails there in `reverify`,
  * and the commit cannot be undone onto a tip that would drop greeting.txt.
  */
-function ignoredOutputs(f: Fixture) {
+function ignoredOutputs(f: Fixture, outputs = writesOutputs) {
   const seen = { started: ignoring(f, "kept/\n"), tip: "", reviews: 0, edits: 0, before: undefined as Candidate | undefined };
-  const repository = { setup: [command(writesOutputs, { name: "install" })], checks: [command(), command(greetsLater, { name: "later-gate" })] };
+  const repository = { setup: [command(outputs, { name: "install" })], checks: [command(), command(greetsLater, { name: "later-gate" })] };
   const agents = {
     implementer: (request: Request) => {
       if (++seen.edits > 1) return ok();
@@ -3703,3 +3705,385 @@ test("the README's more rounds choice says the work returns to the editing stage
   assert.ok(statements(item).some(one => /\btester\b/u.test(one) && /\bimplementer\b/u.test(one) && /\bstopped\b|\bblocked\b/iu.test(one)),
     "the `more rounds` item must say in one sentence that it returns to the editing stage that stopped, naming the tester and the implementer");
 });
+
+/** The Git directory of the ticket worktree itself: outside the working tree, never staged or committed, and gone with the worktree. */
+const gitDirectory = (f: Fixture) => git(f.worktree, "rev-parse", "--path-format=absolute", "--git-dir");
+/** The JSON files a run left there. Git keeps none of its own in that directory, so any is the run's saved assumptions. */
+const savedIn = (f: Fixture) => (readdirSync(gitDirectory(f), { recursive: true }) as string[]).filter(name => name.endsWith(".json")).map(name => join(gitDirectory(f), name));
+/** The one file that holds what a run assumed for these gaps, kept where no status, commit, or cleanup of the working tree reaches it. */
+function saved(f: Fixture, questions: Gap[]) {
+  const files = savedIn(f);
+  assert.equal(files.length, 1, `the worktree's Git directory ${gitDirectory(f)} holds ${files.length} saved-assumptions files`);
+  const file = files[0]!;
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), assumed(questions));
+  assert.ok(relative(f.worktree, file).startsWith(".."), `${file} is inside the working tree`);
+  return file;
+}
+/** The lines a pull request body lists under `## Assumptions`; none when it has no such section. */
+const assumptionsListed = (body: string) => (body.split(/^## Assumptions\n+/mu)[1] ?? "").split(/^## /mu)[0]!.split("\n").filter(line => line.startsWith("- "));
+/** One line for each gap, in order: the question, then the answer the run took. */
+function listsAnswers(body: string, questions: Gap[]) {
+  const listed = assumptionsListed(body); assert.equal(listed.length, questions.length, body);
+  for (const [index, question] of questions.entries()) {
+    const at = listed[index]!.indexOf(oneLine(question.text));
+    assert.ok(at >= 0 && listed[index]!.indexOf(oneLine(question.recommended), at + oneLine(question.text).length) > at, listed[index]);
+  }
+}
+const bodyOf = (gh: () => string[] | undefined) => { const args = gh()!; return readFileSync(args[args.indexOf("--body-file") + 1]!, "utf8"); };
+const delivers = ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "delivered"];
+
+/** A first run with assume on takes the recommended answer to every gap, and then stops with its candidate uncommitted: parked, or handed off by a person. */
+async function assumedThenStopped(f: Fixture, stop: "parked" | "handed off", questions: Gap[], repository = {}) {
+  const human = stop === "parked" ? person() : person("hand off");
+  const first = await execute(input(f, repository, { assume: true, maxReviewRounds: 0, stuck: stop === "parked" ? "park" : "ask" }), {
+    falsify: () => gaps(questions, "Gaps with a conservative answer each"), reviewer: () => review("revise", "Handle the empty case"),
+  }, human);
+  const run = stop === "parked" ? parked(f, first, /Review budget exhausted \(0\)/u, human) : handedOff(f, first, /Review budget exhausted \(0\)/u, human);
+  assert.deepEqual(run.delivery.assumptions, assumed(questions));
+  return run;
+}
+
+for (const [stop, extra] of [["parked", { assume: true }], ["handed off", {}]] as const) {
+  test(`the answers a run assumed are saved in its worktree's Git directory when it is ${stop} with a candidate, out of the working tree and of every commit, and a resumed run with assume ${"assume" in extra ? "on" : "left out"} gives them to its reviewer, lists them in the pull request, and records them`, async context => {
+    const f = fixture(context); remote(f); const gh = fakeGh(context, f); const questions = [beside, newline];
+    const first = await assumedThenStopped(f, stop, questions, { output: "pr" });
+    const file = saved(f, questions);
+    // Neither tracked, untracked, nor ignored: the candidate is all the working tree holds beyond its base.
+    assert.equal(candidate(f.worktree, true).status, "?? greeting.test.txt\n?? greeting.txt");
+    assert.equal(git(f.repo, "rev-parse", branch), f.head); untouched(f);
+    const written = readFileSync(join(first.directory, "assumptions.json"), "utf8");
+    const again = next(f, 2); let prompt = "";
+    const result = await execute(input(again, { output: "pr" }, { resume: true, ...extra }), {
+      investigator: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(),
+      reviewer: request => { prompt = request.prompt; return review(); },
+    });
+    assert.equal(result.state, "delivered", evidence(again).delivery.reason); assert.deepEqual(result.states, delivers);
+    const run = held(again, result, /^Delivered/u); untouched(f);
+    // The reviewer is given the answers under their heading as the run that assumed handed them on, and is told what a disagreement is.
+    assert.ok(assumptionsIn(prompt).startsWith(`${written.trimEnd()}\n`), prompt);
+    assert.ok(prompt.split("\n").some(line => /\bassum/iu.test(line) && /\bdiscussion\b/iu.test(line)), "the reviewer is told that an assumption it disagrees with is a discussion finding");
+    listsAnswers(bodyOf(gh), questions);
+    assert.deepEqual([run.delivery.assumptions, run.delivery.resumed], [assumed(questions), true]);
+    // The file was never part of the candidate: the ticket commit holds the two greeting files and nothing else.
+    assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+    assert.equal(existsSync(f.worktree), false); assert.equal(existsSync(file), false, "the saved assumptions outlived the worktree they belonged to");
+  });
+}
+
+for (const assuming of [false, true]) {
+  test(`a resumed run with a candidate and no saved assumptions, ${assuming ? "after a person removed the file of a run that assumed" : "after a run that assumed nothing"}, gives its reviewer none, lists none in the pull request, and records none`, async context => {
+    const f = fixture(context); remote(f); const gh = fakeGh(context, f);
+    if (assuming) { await assumedThenStopped(f, "handed off", [beside], { output: "pr" }); rmSync(saved(f, [beside])); }
+    else assert.equal((await execute(input(f, { output: "pr" }, { assume: true, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("hand off"))).state, "handedOff");
+    assert.deepEqual(savedIn(f), []);
+    const again = next(f, 2); let prompt = "";
+    const result = await execute(input(again, { output: "pr" }, { resume: true, assume: true }), {
+      investigator: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(),
+      reviewer: request => { prompt = request.prompt; return review(); },
+    });
+    assert.equal(result.state, "delivered", evidence(again).delivery.reason); assert.deepEqual(result.states, delivers);
+    const run = held(again, result, /^Delivered/u);
+    assert.ok(prompt); assert.doesNotMatch(prompt, /^Assumptions:/mu); assert.doesNotMatch(bodyOf(gh), /## Assumptions/u);
+    assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
+    assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+  });
+}
+
+/** A first run with assume on that parks before anything is edited, its plan sent back twice: the worktree is clean, so a resumed run falsifies again. */
+async function assumedThenParkedClean(f: Fixture, repository = {}) {
+  const human = person();
+  const first = await execute(input(f, repository, { assume: true, stuck: "park" }), {
+    falsify: () => gaps([beside], "One gap with a conservative answer"), planReview: () => ok("revise", "The plan names no test"),
+    tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+  }, human);
+  const run = parked(f, first, /The plan names no test/u, human);
+  assert.deepEqual(run.delivery.assumptions, assumed([beside])); assert.equal(candidate(f.worktree, true).status, "");
+  // The file is written when falsify assumes, not when a candidate is left behind.
+  return saved(f, [beside]);
+}
+/** What the answer an earlier run took to `beside` would show as, in prose or inside JSON. */
+const besideAnswered = [beside.text, beside.recommended, beside.why, oneLine(beside.why)].flatMap(text => [text, JSON.stringify(text).slice(1, -1)]);
+
+for (const damaged of [false, true]) {
+  test(`a resumed run with a clean worktree does not read the saved assumptions${damaged ? ", even a file that is not JSON" : ""}: once its own falsify finds the ticket sound the file is gone, and no prompt, pull request, or receipt carries the earlier answers`, async context => {
+    const f = fixture(context); remote(f); const gh = fakeGh(context, f);
+    const file = await assumedThenParkedClean(f, { output: "pr" });
+    if (damaged) writeFileSync(file, '[{ "question": ');
+    const again = next(f, 2); const prompts: string[] = []; let left: string[] | undefined;
+    const keeping = (work: Runner): Runner => request => { prompts.push(request.prompt); return work(request); };
+    const result = await execute(input(again, { output: "pr" }, { resume: true, assume: true }), {
+      falsify: keeping(planning.falsify!.answer),
+      // The worktree goes with the delivery, so what falsify left in its Git directory is read by the next Agent to run.
+      plan: keeping(request => { left = savedIn(f); return planning.plan!.answer(request); }),
+      planReview: keeping(planning.planReview!.answer), tester: keeping(tester), implementer: keeping(implement), reviewer: keeping(() => review()),
+    });
+    assert.equal(result.state, "delivered", evidence(again).delivery.reason);
+    assert.deepEqual(route(result.states), ["falsify", "plan", "planReview", "test", "change", "review"]);
+    assert.deepEqual(left, [], "a falsify that assumed nothing left the earlier run's answers in the worktree's Git directory");
+    assert.equal(prompts.length, 6);
+    for (const prompt of prompts) { assert.doesNotMatch(prompt, /^Assumptions:/mu); for (const stale of besideAnswered) assert.equal(prompt.includes(stale), false, stale); }
+    const run = held(again, result, /^Delivered/u);
+    assert.doesNotMatch(bodyOf(gh), /## Assumptions/u);
+    assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
+  });
+}
+
+for (const [label, extra, report] of [
+  ["asks its question with assume left out", {}, gaps([newline], "One thing is open")],
+  ["parks on a question that is not assumable beside one that is", { assume: true }, gaps([language, newline], "Two gaps, one of them the owner's")],
+  ["returns a report that is not well formed", { assume: true }, gaps("Does the greeting end with a line break?", "One thing is open")],
+] as const) {
+  test(`a resumed run with a clean worktree whose own falsify ${label} assumed nothing: the saved assumptions are deleted, and its park carries none of the earlier answers`, async context => {
+    const f = fixture(context); const file = await assumedThenParkedClean(f);
+    const again = next(f, 2); const human = person();
+    const result = await execute(input(again, {}, { resume: true, stuck: "park", ...extra }), {
+      falsify: () => report, plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+    }, human);
+    assert.equal(result.state, "parked"); assert.deepEqual(route(result.states), ["falsify"]); assert.deepEqual(human.requests, []);
+    assert.equal(existsSync(file), false, "the earlier run's answers are still saved though this run's falsify assumed nothing"); assert.deepEqual(savedIn(f), []);
+    const run = held(again, result, new RegExp(`^Parked on ${branch}: `, "u"));
+    assert.deepEqual([run.delivery.outcome, run.delivery.resumed], ["parked", true]);
+    assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
+    const receipt = readFileSync(join(run.directory, "delivery.json"), "utf8"); const note = readFileSync(join(run.directory, "park.txt"), "utf8");
+    for (const stale of besideAnswered) for (const text of [receipt, note, result.output.summary]) assert.equal(text.includes(stale), false, stale);
+    assert.equal(candidate(f.worktree, true).status, "");
+  });
+}
+
+test("a resumed run with a clean worktree whose own falsify assumes another gap replaces the saved assumptions: the file, every prompt, the pull request, and the receipt hold the new answer alone", async context => {
+  const f = fixture(context); remote(f); const gh = fakeGh(context, f);
+  const file = await assumedThenParkedClean(f, { output: "pr" });
+  const again = next(f, 2); const prompts: Record<string, string> = {}; let left: [string, unknown][] | undefined;
+  const keeping = (name: string, work: Runner): Runner => request => { prompts[name] = request.prompt; return work(request); };
+  const result = await execute(input(again, { output: "pr" }, { resume: true, assume: true }), {
+    falsify: keeping("falsify", () => gaps([newline], "Another gap with a conservative answer")),
+    plan: keeping("plan", request => { left = savedIn(f).map(path => [path, JSON.parse(readFileSync(path, "utf8"))]); return planning.plan!.answer(request); }),
+    planReview: keeping("planReview", planning.planReview!.answer), tester: keeping("tester", tester), implementer: keeping("implementer", implement), reviewer: keeping("reviewer", () => review()),
+  });
+  assert.equal(result.state, "delivered", evidence(again).delivery.reason);
+  assert.deepEqual(route(result.states), ["falsify", "plan", "planReview", "test", "change", "review"]);
+  // One file still, in the same place, now holding what this run's falsify assumed.
+  assert.deepEqual(left, [[file, assumed([newline])]]);
+  const run = held(again, result, /^Delivered/u);
+  const written = readFileSync(join(run.directory, "assumptions.json"), "utf8"); assert.deepEqual(JSON.parse(written), assumed([newline]));
+  assert.doesNotMatch(prompts.falsify!, /^Assumptions:/mu);
+  for (const stage of ["plan", "planReview", "tester", "implementer", "reviewer"]) assert.ok(assumptionsIn(prompts[stage]!).startsWith(`${written.trimEnd()}\n`), stage);
+  for (const [stage, prompt] of Object.entries(prompts)) for (const stale of besideAnswered) assert.equal(prompt.includes(stale), false, `${stage}: ${stale}`);
+  // A pull request never lists an answer its plan did not use.
+  const body = bodyOf(gh); listsAnswers(body, [newline]); for (const stale of besideAnswered) assert.equal(body.includes(stale), false, stale);
+  assert.deepEqual(run.delivery.assumptions, assumed([newline]));
+  assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+});
+
+/** What stands where the saved assumptions are kept: a link's target, a directory, or a file's bytes. */
+function kept(file: string) {
+  const stat = lstatSync(file);
+  return stat.isSymbolicLink() ? `link to ${readlinkSync(file)}` : stat.isDirectory() ? `directory of ${readdirSync(file).length}` : readFileSync(file, "base64");
+}
+const entry = assumed([beside])[0]!;
+for (const [label, damage] of [
+  ["a directory, which cannot be read", (file: string) => { rmSync(file); mkdirSync(file); }],
+  ["a link to a file that is gone, which cannot be read", (file: string, f: Fixture) => { rmSync(file); symlinkSync(join(f.root, "gone.json"), file); }],
+  ["not JSON", (file: string) => writeFileSync(file, '[{ "question": ')],
+  ["an object rather than an array", (file: string) => writeFileSync(file, JSON.stringify({ assumptions: [entry] }))],
+  ["an empty array, which no run that assumed writes", (file: string) => writeFileSync(file, "[]\n")],
+  ["an array of answers alone", (file: string) => writeFileSync(file, JSON.stringify([entry.answer]))],
+  ["an array holding an entry without why, after one that is whole", (file: string) => writeFileSync(file, JSON.stringify([entry, { question: newline.text, answer: newline.recommended, options: newline.options }]))],
+  ["an array holding an entry whose options are one string", (file: string) => writeFileSync(file, JSON.stringify([{ ...entry, options: entry.options.join(", ") }]))],
+  ["an array holding an entry whose answer is not a string", (file: string) => writeFileSync(file, JSON.stringify([{ ...entry, answer: 7 }]))],
+  ["an array holding an entry without a question", (file: string) => writeFileSync(file, JSON.stringify([{ answer: entry.answer, options: entry.options, why: entry.why }]))],
+] as const) {
+  test(`saved assumptions that are ${label} refuse the resume of a candidate with the file named, and change nothing`, async context => {
+    const f = fixture(context); await assumedThenStopped(f, "parked", [beside]);
+    const file = saved(f, [beside]); damage(file, f);
+    const snapshot = () => [git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"), git(f.repo, "worktree", "list", "--porcelain"), candidate(f.worktree, true), kept(file)];
+    const before = snapshot();
+    const again = next(f, 2);
+    const result = await execute(input(again, { setup: [command("process.exit(1)")] }, { resume: true, assume: true }), {
+      investigator: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+    });
+    // The answers the plan was made from cannot be read back, so the candidate is not reviewed or delivered without them.
+    assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
+    const run = held(again, result, /^Blocked: Cannot resume: /u);
+    assert.match(run.delivery.reason, /^Cannot resume: /u); assert.ok(run.delivery.reason.includes(file), `${run.delivery.reason} does not name ${file}`);
+    assert.deepEqual([run.delivery.outcome, run.delivery.resumed, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.result.checks.length], ["blocked", undefined, false, false, null, 0]);
+    assert.equal(Object.hasOwn(run.delivery, "assumptions"), false); assert.equal(run.result.agentInvocations, 0);
+    assert.deepEqual(snapshot(), before);
+  });
+}
+
+test("under stuck ask, a stop for review questions that follows more rounds after falsify questions shows the reviewer's questions alone, in the second decision and on the receipt after hand off", async context => {
+  const f = fixture(context); const human = person("more rounds", "hand off"); let falsified = 0; let reviews = 0;
+  // Two planning questions, then two review questions: paired by position, each review question would be shown a planning question's options.
+  const planned = [language, beside];
+  const result = await execute(input(f), {
+    falsify: request => ++falsified === 1 ? gaps(planned, "The ticket leaves two things open") : planning.falsify!.answer(request),
+    reviewer: () => review("approved", "Owner questions", { findings: discussions(++reviews === 1 ? asked : askedAgain), newSinceLastRound: "none" }),
+  }, human);
+  assert.deepEqual(route(result.states), ["falsify", "decide", "falsify", "plan", "planReview", "test", "change", "review", "change", "review", "decide"]);
+  const lines = questionLines(askedAgain);
+  const run = handedOff(f, result, new RegExp(`${counted(2)}:\\s${lines.map(literal).join("\\s")}`, "u"), human);
+  assert.deepEqual([falsified, reviews, human.requests.length], [2, 2, 2]);
+  const [first, second] = human.requests.map(request => request.prompt) as [string, string];
+  // The first decision did show each planning question with its own options and reason.
+  for (const [index, question] of planned.entries()) optionsFirst(numberedLines(first.split("\n"))[index]!, index + 1, question);
+  // The second shows what the reviewer asked, each on its numbered line with where it was raised and nothing after it.
+  assert.ok(second.includes(`${counted(2)}:\n${lines.join("\n")}\n`), second); assert.deepEqual(numberedLines(second.split("\n")), lines);
+  assert.deepEqual(run.delivery.reason.split("\n").slice(1), lines);
+  for (const text of [second, run.delivery.reason, result.output.summary]) {
+    for (const stale of planned.flatMap(question => [question.text, ...question.options, oneLine(question.why)])) assert.equal(oneLine(text).includes(stale), false, stale);
+    assert.doesNotMatch(text, /Options:|Why:|would have assumed/iu);
+  }
+  assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }, { stage: "decide", response: "hand off" }]);
+});
+
+test("a park for review questions without more rounds, in a run whose two falsify gaps were assumed, lists the reviewer's questions alone: no options, no reason, and nothing it would have assumed", async context => {
+  const f = fixture(context); const human = person(); let reviews = 0; const taken = [beside, newline];
+  const result = await execute(input(f, {}, { assume: true, stuck: "park" }), {
+    falsify: () => gaps(taken, "Two gaps, each with a conservative answer"),
+    reviewer: () => review("approved", "Owner questions", { findings: discussions(++reviews === 1 ? asked : askedAgain), newSinceLastRound: "none" }),
+  }, human);
+  const run = parked(f, result, /confirmed again through a live engine/u, human); assert.equal(reviews, 2); assert.equal(result.states.at(-4), "reviewResult");
+  const lines = questionLines(askedAgain);
+  assert.deepEqual(run.delivery.park.questions, askedAgain);
+  const [reason, needs]: string[][] = [run.delivery.reason.split("\n"), run.delivery.park.needs.split("\n")];
+  assert.match(reason[0]!, /\b2 open questions:$/u); assert.deepEqual(reason.slice(1), lines);
+  assert.match(needs[0]!, openQuestions); assert.deepEqual(needs.slice(1), lines);
+  const note = readFileSync(join(run.directory, "park.txt"), "utf8");
+  assert.ok(note.includes(`Needs: ${needs[0]}\n${lines.join("\n")}\nWorktree: ${f.worktree}\n`));
+  for (const text of [run.delivery.reason, run.delivery.park.needs, note, result.output.summary]) {
+    for (const stale of taken.flatMap(question => [question.text, ...question.options, oneLine(question.why)])) assert.equal(oneLine(text).includes(stale), false, stale);
+    assert.doesNotMatch(text, /Options:|Why:|would have assumed/iu);
+  }
+  // What the run did assume stays on the receipt, apart from what it asks.
+  assert.deepEqual(run.delivery.assumptions, assumed(taken));
+});
+
+/** A field as a park's needs give it: on one line, and cut at 600 characters with an ellipsis when it runs longer. */
+const capped = (value: string) => { const whole = oneLine(value); return whole.length > 600 ? `${whole.slice(0, 600)}…` : whole; };
+/** Where a field ends in a line of needs, looked for from a position on. A field that is cut is cut by itself: its 601st character is nowhere in the line. */
+function shownAt(line: string, value: string, from = 0) {
+  const shown = capped(value); const at = line.indexOf(shown, from);
+  assert.ok(at >= 0, `${JSON.stringify(shown)} is not in ${JSON.stringify(line.slice(from))}`);
+  if (shown !== oneLine(value)) assert.equal(line.includes(oneLine(value).slice(0, 601)), false, `${JSON.stringify(shown.slice(0, 40))} runs on past 600 characters`);
+  return at + shown.length;
+}
+
+test("under Needs, each option, the reason, and each question and answer the run would have assumed takes one line cut at 600 characters by itself, while short ones stay whole and the reason for the stop stays whole in the note and the receipt", async context => {
+  const f = fixture(context); const human = person();
+  // Each long field runs over several lines and well past the cap, in words of its own.
+  const english = `Write it in English only,\n${"since every other file here is in English. ".repeat(18)}`.trim();
+  const locale = `Follow the reader's locale,\n${"falling back where no translation exists. ".repeat(18)}`.trim();
+  const reason = `The product ships in several languages,\n${"and the ticket names none of them. ".repeat(22)}`.trim();
+  const first = gap("Which language is the greeting in?", { options: [locale, "Leave it out", english], recommended: english, why: reason });
+  const second = gap("Who is greeted?");
+  const replaced = gap(`Does greeting.txt replace code.txt\nor stand beside it? ${"Other files may still read code.txt. ".repeat(20)}`.trim(), {
+    options: ["Replace code.txt", `Stand beside code.txt,\n${"keeping every byte of it as it is. ".repeat(22)}`.trim()], assumable: true,
+    why: "Keeping code.txt loses nothing.",
+  });
+  replaced.recommended = replaced.options[1]!;
+  const long = [english, locale, reason, replaced.text, replaced.recommended];
+  for (const field of long) { assert.ok(oneLine(field).length > 700); assert.ok(field.includes("\n")); }
+  const result = await execute(input(f, {}, { assume: true, stuck: "park" }), {
+    falsify: () => gaps([first, replaced, second, newline], "Four gaps, two of them the owner's"),
+    plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+  }, human);
+  const run = parked(f, result, /Which language is the greeting in\?/u, human);
+  assert.deepEqual(run.delivery.park.questions, [first, second].map(({ text }) => ({ text, where: "" })));
+  // A heading, the two questions for the owner, then a heading and the two gaps the run would have assumed: six lines, whatever the fields held.
+  const needs: string[] = run.delivery.park.needs.split("\n"); assert.equal(needs.length, 6, run.delivery.park.needs);
+  assert.match(needs[0]!, openQuestions); assert.deepEqual(numberedLines(needs), needs.slice(1, 3));
+  // The first question's line: its text, the recommended option cut, the other options after it, the long one cut and the short one whole, and the reason cut.
+  assert.ok(needs[1]!.startsWith(`1. ${first.text}`), needs[1]);
+  const recommended = shownAt(needs[1]!, english, `1. ${first.text}`.length);
+  shownAt(needs[1]!, locale, recommended); shownAt(needs[1]!, "Leave it out", recommended); shownAt(needs[1]!, reason, recommended);
+  assert.match(needs[1]!.slice(0, recommended + 40), /\brecommended\b/iu);
+  // A question whose fields are short keeps every one whole, its reason included.
+  optionsFirst(needs[2]!, 2, second);
+  assert.match(needs[3]!, /would have assumed/iu);
+  // Each gap it would have assumed: the question, then the answer, each cut by itself.
+  shownAt(needs[4]!, replaced.recommended, shownAt(needs[4]!, replaced.text));
+  shownAt(needs[5]!, newline.recommended, shownAt(needs[5]!, newline.text));
+  for (const line of needs) for (const field of long) assert.equal(line.includes(oneLine(field)), false, `${oneLine(field).slice(0, 40)}… is whole under Needs`);
+  // park.txt gives the same needs.
+  const note = readFileSync(join(run.directory, "park.txt"), "utf8");
+  assert.ok(note.includes(`Needs: ${run.delivery.park.needs}\nWorktree: ${f.worktree}\n`));
+  // The reason for the stop is never cut: the receipt holds it whole, and so does the note above its needs.
+  const standing = note.slice(0, note.indexOf("\nNeeds: "));
+  for (const field of long) for (const [where, text] of [["delivery.json", run.delivery.reason], ["park.txt", standing]] as const) {
+    assert.ok(text.includes(oneLine(field)), `the reason in ${where} does not hold ${oneLine(field).slice(0, 40)}… whole`);
+  }
+  assert.doesNotMatch(result.output.summary, /\n/u);
+  assert.ok(result.output.summary.includes(` Needs: ${counted(2)}; the first: ${first.text} Worktree kept at ${f.worktree}. `));
+});
+
+test("a rebase stop whose cleanup cannot remove a setup output says that cleaning failed and names the log that holds Git's refusal, in the receipt and the note, with the candidate uncommitted on its original base", {
+  // Root removes a file from a directory it may not write to, so there the cleanup does not fail.
+  skip: process.getuid?.() === 0 && "runs as root, which a read-only directory does not refuse",
+}, async context => {
+  const f = fixture(context); const human = person();
+  // On the tip, setup leaves cache/ read-only: git clean cannot remove what it holds once the candidate is back on its original base.
+  const { seen, agents, data } = ignoredOutputs(f, `${writesOutputs} if (tip) fs.chmodSync("cache", 0o555);`);
+  const cache = join(f.worktree, "cache");
+  // The fixture's own removal needs the directory writable again.
+  const result = await execute(data(f), agents, human).finally(() => { if (existsSync(cache)) chmodSync(cache, 0o755); });
+  assert.deepEqual(result.states.slice(result.states.indexOf("rebase")), ["rebase", "stuck", "park", "parked"]);
+  const run = parkedIn("rebase", f, result, /greeting\.txt/u); untouched(f); assert.deepEqual(human.requests, []);
+  assert.match(run.delivery.reason, /\.gitignore/u); assert.ok(names(run.delivery.reason, seen.tip), "the reason names the new tip");
+  // Git said which path it could not remove; that output is kept in one log of this rebase.
+  const logs = holding(run.directory, ["cache/out.txt"]).filter(name => /^rebase-\d+-clean\.log$/u.test(name));
+  assert.equal(logs.length, 1, `logs of a failed git clean: ${logs.join(", ")}`);
+  const log = join(run.directory, logs[0]!);
+  // The leftover is still there, and a resumed run will meet it: the reason says why and where to look. Needs are cut at 600 characters, the reason is not.
+  assert.match(run.delivery.reason, /\bclean/iu, "the reason does not say that cleaning failed");
+  assert.ok(run.delivery.reason.includes(log), `${run.delivery.reason} does not name ${log}`);
+  const note = readFileSync(join(run.directory, "park.txt"), "utf8");
+  assert.ok(note.slice(0, note.indexOf("\nNeeds: ")).includes(log), "the note's standing section does not name the log");
+  // The candidate is the approved one, uncommitted on the base it was approved on, beside the one output that could not be removed.
+  assert.equal(candidate(f.worktree, true).status, "?? cache/out.txt\n?? greeting.test.txt\n?? greeting.txt\n!! kept/out.txt");
+  assert.deepEqual(candidate(f.worktree).files.filter(([name]) => name !== "cache/out.txt"), seen.before!.files);
+  assert.equal(git(f.worktree, "diff", "--cached", "--name-only"), ""); assert.equal(git(f.worktree, "symbolic-ref", "HEAD"), `refs/heads/${branch}`);
+  assert.deepEqual([git(f.worktree, "rev-parse", "HEAD"), git(f.repo, "rev-parse", branch)], [seen.started, seen.started]);
+  for (const state of ["rebase-merge", "rebase-apply"]) assert.equal(existsSync(git(f.worktree, "rev-parse", "--path-format=absolute", "--git-path", state)), false, state);
+  assert.deepEqual([run.delivery.commit, run.delivery.baseCommit, run.delivery.worktreeRemoved], [null, seen.started, false]);
+  assert.equal(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), "hello\n"); assert.equal(existsSync(join(f.worktree, "later.txt")), false);
+  assert.deepEqual([seen.edits, seen.reviews], [1, 1]);
+});
+
+for (const third of ["approves", "repeats its report"] as const) {
+  test(`under stuck ask, the review after more rounds that follow a setup failure on the new tip is a first review of a new patch: an unmet criterion with nothing new gets a repair round, and a next review that ${third} ${third === "approves" ? "delivers on the tip" : "stops as not converging"}`, async context => {
+    const f = fixture(context); const started = f.head; const human = person("more rounds", ...(third === "approves" ? [] : ["hand off"]));
+    let tip = ""; let reviews = 0; const prompts: string[] = [];
+    const setup = [command('process.exit(require("fs").existsSync("later.txt") ? 3 : 0)', { name: "install" })];
+    const result = await execute(input(f, { setup }), {
+      implementer: request => { writeFileSync(join(request.cwd, "greeting.txt"), prompts.push(request.prompt) < 3 ? "hello\n" : "hello again\n"); return ok(); },
+      reviewer: () => {
+        if (++reviews === 1) { tip = advance(f); return review(); }
+        return reviews === 2 || third === "repeats its report" ? stillUnmet() : review();
+      },
+    }, human);
+    untouched(f);
+    // The approval before the rebase read the candidate on another base: beside it, the next report would be an unchanged one and stop the run.
+    assert.deepEqual(result.states.slice(result.states.indexOf("rebase")).slice(0, 13),
+      ["rebase", "stuck", "decide", "repairTarget", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "reviewBudget", "change", "scopeAfterChange"],
+      "the first review after more rounds sends its unmet criterion to the implementer");
+    assert.deepEqual([reviews, prompts.length], [3, 3]);
+    assert.match(human.requests[0]!.prompt, /Stopped in rebase\./u); assert.match(human.requests[0]!.prompt, /\binstall\b/u);
+    assert.match(prompts[1]!.split("Current failure/feedback: ")[1] ?? "", /\binstall\b/u);
+    assert.match(prompts[2]!.split("Current failure/feedback: ")[1] ?? "", new RegExp(`Unmet criterion: ${criterion}`, "u"));
+    if (third === "repeats its report") {
+      // The second review of the candidate on the tip is compared with the first, as any later review is with the one before it.
+      const stop = handedOff(f, result, /Review is not converging: newSinceLastRound is none and criteria remain unmet: /u, human);
+      assert.equal(stop.delivery.reason, `Review is not converging: newSinceLastRound is none and criteria remain unmet: ${criterion}`);
+      assert.deepEqual([git(f.worktree, "rev-parse", "HEAD"), stop.delivery.baseCommit, human.requests.length], [tip, tip, 2]);
+      assert.deepEqual(stop.result.decisions, [{ stage: "decide", response: "more rounds" }, { stage: "decide", response: "hand off" }]);
+      return;
+    }
+    assert.equal(result.state, "delivered"); assert.equal(human.requests.length, 1);
+    assert.deepEqual(result.states.filter(state => ["stuck", "decide"].includes(state)), ["stuck", "decide"]);
+    const run = evidence(f); const commit = onTip(f, tip); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello again");
+    assert.deepEqual([run.delivery.outcome, run.delivery.baseCommit, run.delivery.commit, run.result.checksPassed], ["delivered", tip, commit, true]);
+    assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }]);
+    rebasedFrom(f, run, started);
+  });
+}
