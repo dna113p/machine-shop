@@ -3673,6 +3673,13 @@ for (const path of ["docs/catalog.md", "README.md"]) {
     }
     assert.ok(statements(text).some(said => /\bassumptions\b/iu.test(said) && /delivery\.json/u.test(said)), `${path} must say in one sentence or table row that delivery.json records the assumptions`);
   });
+  test(`${path} says a failed delete or write of the saved assumptions stops, naming the file, and not that it stops naming it`, () => {
+    const text = readFileSync(resolve(path), "utf8");
+    assert.ok(statements(text).some(said => /\bfailed delete or write\b.*\bstops, naming the file\b/iu.test(said)),
+      `${path} must say in one sentence that a failed delete or write of the saved assumptions "stops, naming the file"`);
+    // Without the comma the sentence reads as the run ceasing to name the file.
+    assert.doesNotMatch(text.replace(/\s+/gu, " "), /\bstops naming the file\b/iu, `${path} still says a failed delete or write stops naming the file`);
+  });
 }
 
 /** A rule file, or what it does to a file; `unignored` outputs of a setup command are another matter. */
@@ -3881,7 +3888,8 @@ function kept(file: string) {
   return stat.isSymbolicLink() ? `link to ${readlinkSync(file)}` : stat.isDirectory() ? `directory of ${readdirSync(file).length}` : readFileSync(file, "base64");
 }
 const entry = assumed([beside])[0]!;
-for (const [label, damage] of [
+/** A way a saved-assumptions file can be damaged, and for one that damages a single field, what the refusal names it as. */
+const damages: [label: string, damage: (file: string, f: Fixture) => void, names?: RegExp][] = [
   ["a directory, which cannot be read", (file: string) => { rmSync(file); mkdirSync(file); }],
   ["a link to a file that is gone, which cannot be read", (file: string, f: Fixture) => { rmSync(file); symlinkSync(join(f.root, "gone.json"), file); }],
   ["not JSON", (file: string) => writeFileSync(file, '[{ "question": ')],
@@ -3892,7 +3900,11 @@ for (const [label, damage] of [
   ["an array holding an entry whose options are one string", (file: string) => writeFileSync(file, JSON.stringify([{ ...entry, options: entry.options.join(", ") }]))],
   ["an array holding an entry whose answer is not a string", (file: string) => writeFileSync(file, JSON.stringify([{ ...entry, answer: 7 }]))],
   ["an array holding an entry without a question", (file: string) => writeFileSync(file, JSON.stringify([{ answer: entry.answer, options: entry.options, why: entry.why }]))],
-] as const) {
+  // Only a file edited by hand holds one: falsify saves the recommended answer, which is always one of the options.
+  ["an array holding an entry whose answer is not one of its options, after one that is whole",
+    (file: string) => writeFileSync(file, JSON.stringify([entry, { ...assumed([newline])[0]!, answer: "An answer outside its options" }])), /\bassumptions\[1\]\.answer\b/u],
+];
+for (const [label, damage, names] of damages) {
   test(`saved assumptions that are ${label} refuse the resume of a candidate with the file named, and change nothing`, async context => {
     const f = fixture(context); await assumedThenStopped(f, "parked", [beside]);
     const file = saved(f, [beside]); damage(file, f);
@@ -3906,6 +3918,7 @@ for (const [label, damage] of [
     assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
     const run = held(again, result, /^Blocked: Cannot resume: /u);
     assert.match(run.delivery.reason, /^Cannot resume: /u); assert.ok(run.delivery.reason.includes(file), `${run.delivery.reason} does not name ${file}`);
+    if (names) assert.match(run.delivery.reason, names, "the refusal does not name the entry and its field");
     assert.deepEqual([run.delivery.outcome, run.delivery.resumed, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.result.checks.length], ["blocked", undefined, false, false, null, 0]);
     assert.equal(Object.hasOwn(run.delivery, "assumptions"), false); assert.equal(run.result.agentInvocations, 0);
     assert.deepEqual(snapshot(), before);
@@ -3934,6 +3947,36 @@ test("under stuck ask, a stop for review questions that follows more rounds afte
     for (const stale of planned.flatMap(question => [question.text, ...question.options, oneLine(question.why)])) assert.equal(oneLine(text).includes(stale), false, stale);
     assert.doesNotMatch(text, /Options:|Why:|would have assumed/iu);
   }
+  assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }, { stage: "decide", response: "hand off" }]);
+});
+
+test("under stuck ask with assume on, a stop for review questions that follows more rounds after a mixed falsify report shows the reviewer's questions alone: what the first report would have assumed is in neither the second decision nor the receipt after hand off", async context => {
+  const f = fixture(context); const human = person("more rounds", "hand off"); let falsified = 0; let reviews = 0;
+  // One question for the owner beside one gap the run would have assumed, then two review questions.
+  const planned = [language, beside];
+  const result = await execute(input(f, {}, { assume: true }), {
+    falsify: request => ++falsified === 1 ? gaps(planned, "Two gaps, one of them the owner's") : planning.falsify!.answer(request),
+    reviewer: () => review("approved", "Owner questions", { findings: discussions(++reviews === 1 ? asked : askedAgain), newSinceLastRound: "none" }),
+  }, human);
+  assert.deepEqual(route(result.states), ["falsify", "decide", "falsify", "plan", "planReview", "test", "change", "review", "change", "review", "decide"]);
+  const lines = questionLines(askedAgain);
+  const run = handedOff(f, result, new RegExp(`${counted(2)}:\\s${lines.map(literal).join("\\s")}`, "u"), human);
+  assert.deepEqual([falsified, reviews, human.requests.length], [2, 2, 2]);
+  const [first, second] = human.requests.map(request => request.prompt) as [string, string];
+  // The first decision did show the owner's question with its options, and after it the gap the run would have assumed with its answer.
+  assert.match(first, /\b1 open question:/u); assert.equal(numberedLines(first.split("\n")).length, 1); optionsFirst(numberedLines(first.split("\n"))[0]!, 1, language);
+  assert.match(first, /would have assumed/iu);
+  const others = first.slice(first.search(/would have assumed/iu));
+  assert.ok(others.indexOf(beside.recommended, others.indexOf(beside.text) + beside.text.length) > 0, `${beside.text} is not listed with the answer ${beside.recommended}`);
+  // The second shows what the reviewer asked, each on its numbered line with where it was raised and nothing after it.
+  assert.ok(second.includes(`${counted(2)}:\n${lines.join("\n")}\n`), second); assert.deepEqual(numberedLines(second.split("\n")), lines);
+  assert.deepEqual(run.delivery.reason.split("\n").slice(1), lines);
+  for (const text of [second, run.delivery.reason, result.output.summary]) {
+    for (const stale of planned.flatMap(question => [question.text, ...question.options, oneLine(question.why)])) assert.equal(oneLine(text).includes(stale), false, stale);
+    assert.doesNotMatch(text, /Options:|Why:|would have assumed/iu);
+  }
+  // The second falsify found the ticket sound, so the run assumed nothing.
+  assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
   assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }, { stage: "decide", response: "hand off" }]);
 });
 

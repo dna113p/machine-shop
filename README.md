@@ -282,7 +282,7 @@ it carries no assumptions. An unreadable file, invalid JSON, or an invalid
 assumption array refuses resume with `Cannot resume` naming the file, changing
 nothing. A clean resume never reads the file: when its own `falsify` returns,
 it replaces the file with its new assumptions or deletes it when it assumed
-nothing, even on a malformed report. A failed delete or write stops naming the file.
+nothing, even on a malformed report. A failed delete or write stops, naming the file.
 The base branch may have moved forward in the meantime: the ticket branch must point
 at the base commit or an ancestor of it, with no commit of its own.
 

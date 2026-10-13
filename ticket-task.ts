@@ -762,7 +762,6 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }
     if (discussions.length && prior?.findings.some(finding => finding.severity === "discussion")) {
       ownerQuestions = discussions.map(({ text, where }) => ({ text, where }));
-      wouldAssume = [];
       return stop(`Ticket owner must settle ${questionCount()}:\n${questionLines()}`);
     }
     if (discussions.length) {
@@ -874,7 +873,6 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           { guard: chose("more rounds"), target: "repairTarget", actions: (args: { event: Event }) => {
             decide(args); work.renew();
             ownerQuestions = undefined;
-            wouldAssume = [];
             if (standingReview !== undefined) work.block(standingReview);
             standingReview = undefined;
           } },
@@ -914,6 +912,7 @@ function assumptionField(assumptions: unknown): string | undefined {
       if (typeof assumption[key] !== "string" || !assumption[key].trim()) return `${field}.${key} must be a non-empty string`;
     }
     if (!Array.isArray(assumption.options) || !assumption.options.length || assumption.options.some((option: unknown) => typeof option !== "string" || !option.trim())) return `${field}.options must be a non-empty array of non-empty strings`;
+    if (!assumption.options.includes(assumption.answer)) return `${field}.answer must be one of its options`;
   }
   return undefined;
 }

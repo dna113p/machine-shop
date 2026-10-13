@@ -695,12 +695,12 @@ in `delivery.json`. Without a saved file it behaves as before, with no assumptio
 An unreadable file, invalid JSON, or anything other than an array of 1–10 objects
 with non-empty `question`, `answer`, and `why` strings and a non-empty array of
 non-empty `options` strings refuses resume with `Cannot resume` naming the file,
-before adopting or asking the remote, changing nothing. Extra fields are omitted
-from the validated answers.
+before adopting or asking the remote, changing nothing. Each `answer` must be one
+of its entry's `options`. Extra fields are omitted from the validated answers.
 Without a candidate, resume goes through `start` to `falsify` and plans and tests
 the current ticket afresh. It never reads the saved file; when its own `falsify`
 returns, even with a malformed report, it deletes the file or replaces it with
-what that falsify assumed. A failed delete or write stops naming the file.
+what that falsify assumed. A failed delete or write stops, naming the file.
 A clean resume also includes a worktree left clean by a failed setup in `prepare`;
 resolve the setup problem in the kept worktree before resuming. The base
 must resolve to the commit the first run started from or to a descendant of it,
