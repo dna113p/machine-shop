@@ -29,6 +29,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let discardConfirmed = false;
   let archived: { branch: string; commit: string } | undefined;
   let reviewSummary = "";
+  const reviews: Event[] = [];
+  const reviewNotes: { text: string; where: string }[] = [];
   let prUrl = "";
   // Where prepare found the base published: the remote's URL and the pull request base branch there, its default branch by name when the base names none.
   // The push and the pull request go there, whatever the remote, the local refs, and gh's own configuration are by then.
@@ -67,13 +69,18 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const unresolved = (name: string) => `no record of its ticket, and its name does not say where the id ends: it may be this ticket's, or that of a ticket whose id goes on after ${ticket.slug}-. `
     + `Nothing was changed. Record whose it is with git config branch.${name}.ticket <id-slug> (${ticket.slug} for this ticket), then run again.`;
 
-  function prepare(): Event {
+  function shape(): Event {
     const top = run("git", ["rev-parse", "--show-toplevel"], repository.path);
     if (!top.ok || realpathSync(top.stdout) !== realpathSync(repository.path)) throw new Error("repository.path must be a Git checkout root, not a subdirectory or a bare repository");
     // The lexical check at construction cannot see symlinks; nothing has been written yet.
     separate(real(repository.path), real(worktree), real(evidenceRoot));
     // Evidence lives under evidenceRoot, so a blocked preparation is recorded without touching the repository.
     work.open();
+    if (ticket.sections.missing.length) return work.block(`Ticket body is missing required sections or non-empty lists: ${ticket.sections.missing.join(", ")}. Expected shape:\n## Goal\nDescribe the goal.\n## Scope\n- path/or/glob\n## Acceptance\n- Testable criterion\n## Forbidden\n- nothing beyond the scope above`);
+    return { type: "prepared" };
+  }
+
+  function prepare(): Event {
     const base = run("git", ["rev-parse", "--verify", "--quiet", `${repository.base ?? "HEAD"}^{commit}`], repository.path);
     if (!base.ok) return work.block(`Base ${repository.base ?? "HEAD"} does not resolve to a commit in ${repository.path}.`);
     baseCommit = base.stdout;
@@ -229,6 +236,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         "## Checks", repository.checks.map(name => `- ${name}: passed`).join("\n"),
         // The helper has already taken the summary out of a JSON report; one that is still an object is evidence, not text for a reader.
         "## Review", jsonObject(reviewSummary) ? "The reviewer approved this change without a written summary; its report is kept with the run evidence." : reviewSummary,
+        ...(reviewNotes.length ? ["## Review notes", reviewNotes.map(note => `- ${note.text} (${note.where})`).join("\n")] : []),
         `Ticket: ${ticket.id}`,
       ].join("\n\n") + "\n", { flag: "wx", mode: 0o600 });
       // The base is always named, and is the one prepare compared with the remote, not one read again from refs or configuration that may have changed since.
@@ -330,7 +338,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ticket: ticket.id, repository: { name: repository.name, path: repository.path }, branch,
       baseCommit: baseCommit || null, commit: commitHash || null, output: repository.output,
       ...(prUrl ? { prUrl } : {}), ...(patches.length ? { patches } : {}), ...(archived ? { archive: archived } : {}),
-      worktree, ...(adopted ? { resumed: true } : {}), worktreeCreated: created, worktreeRemoved: removed,
+      worktree, ...(adopted ? { resumed: true } : {}), worktreeCreated: created, worktreeRemoved: removed, reviewNotes,
     }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     const brief = flat(reason).replace(/^(.{600}).+$/u, "$1…").replace(/[^.!?…]$/u, "$&.");
     held = { action: "hold", summary: [
@@ -345,11 +353,57 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   }
 
   const record = (stage: string) => ({ event }: { event: Event }) => work.capture(stage, event);
+  const recordReview = ({ event }: { event: Event }) => {
+    reviewSummary = work.capture("review", event);
+    reviews.push(event);
+    writeFileSync(join(work.open(), `review-${reviews.length}.json`), JSON.stringify(event, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    // Keep well-formed minor notes even when another part of this round's report blocks delivery.
+    if (Array.isArray(event.findings)) for (const finding of event.findings) {
+      if (finding?.severity === "minor" && typeof finding.text === "string" && typeof finding.where === "string") {
+        reviewNotes.push({ text: finding.text, where: finding.where });
+      }
+    }
+  };
+  function reviewResult(): Event {
+    // Keep the helper's read-only guard, but judge the report here instead of trusting its event type.
+    if (work.unchanged().type === "changed") return { type: "blocked" };
+    const event = reviews.at(-1)!;
+    const malformed = reviewField(event, ticket.sections.acceptance);
+    if (malformed) return work.block(`Malformed review report: ${malformed}.`);
+    const report = event as ReviewReport;
+    if (report.type === "blocked") return work.block(reviewSummary);
+    const unmet = report.criteria.filter(criterion => !criterion.met);
+    const blockers = report.findings.filter(finding => finding.severity === "blocker");
+    const discussions = report.findings.filter(finding => finding.severity === "discussion");
+    const previous = reviews.at(-2);
+    const prior = previous && !reviewField(previous, ticket.sections.acceptance) ? previous as ReviewReport : undefined;
+    // Decide whether repair is needed first, then whether another repair can make progress.
+    if (unmet.length || blockers.length) {
+      const before = new Set(prior?.findings.filter(finding => finding.severity === "blocker").map(finding => finding.text));
+      const now = new Set(blockers.map(finding => finding.text));
+      if (prior && report.newSinceLastRound === "none" && now.size === before.size && [...now].every(text => before.has(text))) {
+        return work.block("Review is not converging: newSinceLastRound is none and the blocker texts are unchanged.");
+      }
+    }
+    const repeated = discussions.filter(finding => prior?.findings.some(old => old.severity === "discussion" && old.text.trim().toLowerCase() === finding.text.trim().toLowerCase()));
+    if (repeated.length) return work.block(`Ticket owner must settle repeated discussion: ${repeated.map(finding => JSON.stringify(finding.text.trim())).join("; ")}`);
+    if (unmet.length || blockers.length || discussions.length) {
+      work.block([
+        reviewSummary,
+        ...unmet.map(criterion => `Unmet criterion: ${criterion.text} (${criterion.evidence})`),
+        ...blockers.map(finding => `Blocker: ${finding.text} (${finding.where})`),
+        ...discussions.map(finding => `Discussion: ${finding.text} (${finding.where})`),
+      ].join("\n"));
+      return { type: "revise" };
+    }
+    return { type: "approved" };
+  }
   const chose = (value: string) => ({ event }: { event: Event }) => event.value === value;
   const decide = ({ event }: { event: Event }) => { decision = work.choice("decide", event, decisions); };
   return machine({
-    initial: "prepare", output: () => held,
+    initial: "shape", output: () => held,
     states: {
+      shape: operation(shape, { prepared: "prepare", blocked: "failure" }),
       prepare: operation(prepare, { prepared: "start", resumed: "verify", blocked: "failure" }),
       start: operation(work.start, { started: "triage" }),
       triage: agent(() => work.prompt("Decide whether this ticket is actionable as written. Do not edit any file. Read the relevant code and judge whether the request, scope, and acceptance criteria are specific enough to implement and test in this repository. Return ready with a short implementation plan as the summary, or blocked with exactly what is missing."), {
@@ -357,18 +411,30 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         blocked: { target: "decide", actions: record("triage") },
       }, { using: "investigator", cwd: worktree }),
       triageResult: operation(work.unchanged, { unchanged: "change", changed: "decide" }),
-      change: agent(() => work.prompt("Implement the ticket and its tests, following the triage plan in the stage reports. Keep the change focused. Do not weaken checks or expand scope. Leave your changes uncommitted; the workflow commits and delivers them."), {
+      change: agent(() => work.prompt([
+        "Implement the ticket and its tests, following the triage plan in the stage reports. Keep the change focused. Do not weaken checks or expand scope. Leave your changes uncommitted; the workflow commits and delivers them.",
+        "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
+        "Forbidden:", ...ticket.sections.forbidden.map(text => `- ${text}`),
+        "Resolve discussion findings or explain why they need the ticket owner in your summary.",
+      ].join("\n")), {
         completed: { target: "verify", actions: record("change") },
         blocked: { target: "decide", actions: record("change") },
       }, { using: "implementer", cwd: worktree }),
       verify: operation(() => work.checks(), { passed: "sealReview", failed: "repairBudget" }),
       sealReview: operation(work.seal, { sealed: "review" }),
-      review: agent(() => work.prompt("Review the current diff and verification evidence. Do not edit any file. Check acceptance criteria, regressions, scope, and whether tests actually establish the intended behavior. Return approved, revise with actionable findings, or blocked."), {
-        approved: { target: "reviewResult", actions: ({ event }: { event: Event }) => { reviewSummary = work.capture("review", event); } },
-        revise: { target: "reviewResult", actions: record("review") },
-        blocked: { target: "reviewResult", actions: record("review") },
+      review: agent(() => work.prompt([
+        "Review the current diff and verification evidence. Do not edit any file. Check acceptance criteria, regressions, scope, and whether tests actually establish the intended behavior.",
+        "Acceptance criteria:", ...ticket.sections.acceptance.map((text, index) => `${index + 1}. ${text}`),
+        "Return one criteria entry per acceptance criterion, in order, with its text exactly as given, a boolean met, and evidence as a file:line or command.",
+        "Tag findings: blocker = must change before delivery; discussion = a question only the ticket owner can settle; minor = worth noting, not worth a round.",
+        "On a second or later review, say what is new versus the previous report in newSinceLastRound, or none if nothing is new. Read previous review-<n>.json reports alongside the stage reports in the evidence directory.",
+        'End with one line: MACHINES_EVENT {"type":"approved"|"revise"|"blocked","summary":"<one paragraph>","criteria":[{"text":"<criterion as given>","met":true|false,"evidence":"<file:line or command>"}],"findings":[{"severity":"blocker"|"discussion"|"minor","text":"<finding>","where":"<file:line>"}],"newSinceLastRound":"none"|"<what changed in this round\'s findings>"}',
+      ].join("\n")), {
+        approved: { target: "reviewResult", actions: recordReview },
+        revise: { target: "reviewResult", actions: recordReview },
+        blocked: { target: "reviewResult", actions: recordReview },
       }, { using: "reviewer", cwd: worktree }),
-      reviewResult: operation(work.review, { approved: "commit", revise: "repairBudget", blocked: "decide" }),
+      reviewResult: operation(reviewResult, { approved: "commit", revise: "repairBudget", blocked: "decide" }),
       repairBudget: operation(work.repair, { retry: "change", exhausted: "decide" }),
       // Stuck work waits for a person; preparation, commit, and delivery failures still end blocked by themselves.
       decide: human(stuckPrompt, {
@@ -396,6 +462,68 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       delivered: final(), blocked: final(), handedOff: final(), abandoned: final(),
     },
   });
+}
+
+type ReviewReport = Event & {
+  criteria: { text: string; met: boolean; evidence: string }[];
+  findings: { severity: "blocker" | "discussion" | "minor"; text: string; where: string }[];
+  newSinceLastRound: string;
+};
+/** Return the first malformed field, before any verdict is used. */
+function reviewField(report: Event, acceptance: string[]): string | undefined {
+  const entry = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
+  if (!Array.isArray(report.criteria)) return "criteria must be an array";
+  if (report.criteria.length !== acceptance.length) return "criteria count must match the acceptance list";
+  for (const [index, criterion] of report.criteria.entries()) {
+    if (!entry(criterion)) return `criteria[${index}] must be an object`;
+    // Order and count are the contract; a reviewer that rewords a criterion is not malformed.
+    if (typeof criterion.text !== "string" || !criterion.text.trim()) return `criteria[${index}].text must be a non-empty string`;
+    if (typeof criterion.met !== "boolean") return `criteria[${index}].met must be a boolean`;
+    if (typeof criterion.evidence !== "string") return `criteria[${index}].evidence must be a string`;
+  }
+  if (!Array.isArray(report.findings)) return "findings must be an array";
+  for (const [index, finding] of report.findings.entries()) {
+    if (!entry(finding)) return `findings[${index}] must be an object`;
+    if (typeof finding.severity !== "string" || !["blocker", "discussion", "minor"].includes(finding.severity)) return `findings[${index}].severity must be blocker, discussion, or minor`;
+    if (typeof finding.text !== "string") return `findings[${index}].text must be a string`;
+    if (typeof finding.where !== "string") return `findings[${index}].where must be a string`;
+  }
+  if (typeof report.newSinceLastRound !== "string") return "newSinceLastRound must be a string";
+  return undefined;
+}
+
+/** Extract the required level-two sections from a Markdown ticket, independently of their order or case. */
+export function ticketSections(body: string) {
+  const names = ["Goal", "Scope", "Acceptance", "Forbidden"] as const;
+  const sections = new Map<string, string[]>();
+  let current: string[] | undefined;
+  let fence = "";
+  for (const line of body.split(/\r?\n/u)) {
+    const delimiter = /^\s{0,3}(`{3,}|~{3,})/u.exec(line)?.[1];
+    if (fence) {
+      if (delimiter && delimiter[0] === fence[0] && delimiter.length >= fence.length && line.trim() === delimiter) fence = "";
+      continue;
+    }
+    if (delimiter) { fence = delimiter; continue; }
+    const heading = /^\s{0,3}(#{1,2})\s+(.+?)\s*$/u.exec(line);
+    if (heading) {
+      const name = heading[2]!.replace(/\s+#+$/u, "").toLowerCase();
+      current = undefined;
+      if (heading[1] === "##" && names.some(expected => expected.toLowerCase() === name)) {
+        current = sections.get(name) ?? [];
+        sections.set(name, current);
+      }
+    } else current?.push(line);
+  }
+  const bullets = (name: string) => (sections.get(name) ?? []).flatMap(line => {
+    const bullet = /^\s*[-*+]\s+(.+)$/u.exec(line)?.[1]?.trim();
+    return bullet ? [bullet] : [];
+  });
+  const scope = bullets("scope"); const acceptance = bullets("acceptance"); const forbidden = bullets("forbidden");
+  return {
+    goal: (sections.get("goal") ?? []).join("\n").trim(), scope, acceptance, forbidden,
+    missing: names.filter(name => !sections.has(name.toLowerCase()) || (name !== "Goal" && !bullets(name.toLowerCase()).length)),
+  };
 }
 
 function parseTicket(input: unknown) {
@@ -436,7 +564,7 @@ function parseTicket(input: unknown) {
   const prefix = `ticket/${slug}`;
   const titled = titleSlug(title);
   return {
-    ticket: { id, slug, title, summary: firstParagraph(ticket.body ?? "") }, prefix, branch: titled ? `${prefix}-${titled}` : prefix,
+    ticket: { id, slug, title, summary: firstParagraph(ticket.body ?? ""), sections: ticketSections(ticket.body ?? "") }, prefix, branch: titled ? `${prefix}-${titled}` : prefix,
     worktree, evidenceRoot, work, resume: data.resume === true,
     repository: { name, path, base, setup, output, remote, draft: repo.draft !== false,
       checks: (repo.checks as { name: string }[]).map(c => c.name) },

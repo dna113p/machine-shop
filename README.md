@@ -153,12 +153,27 @@ machine run /absolute/machine-shop/ticket-task.ts \
 
 Unlike the ten defaults, **it commits**: one commit on a new
 `ticket/<id-slug>-<title-slug>` branch after the required checks pass and the
-reviewer approves. With `"output": "pr"` it also pushes that branch and opens a
+Machine approves the structured review. With `"output": "pr"` it also pushes that branch and opens a
 pull request with `gh`, after checking with the remote that the base is already
 published there.
 Use it only where the assignment authorizes those effects. It never merges,
 tags, force-pushes, or pushes any other ref, and never modifies the source
 checkout's working tree, index, or current branch.
+
+The ticket body must contain `## Goal`, `## Scope`, `## Acceptance`, and
+`## Forbidden`, in any order and case. Goal is free text; each other section
+needs at least one bullet. Scope lists permitted paths or globs, Acceptance
+lists testable criteria, and Forbidden lists prohibited changes (including
+`- nothing beyond the scope above`). A missing section or empty list blocks
+before any Agent runs or worktree is created, including with `resume: true`.
+
+Reviews report a verdict and evidence for each acceptance criterion, tagged
+findings, and what changed since the previous round. The Machine requires
+repairs for unmet criteria or blocker findings, escalates malformed reports,
+non-converging repairs, and repeated owner questions to `decide`, and accepts
+minor findings without another round. Minor findings from every review are
+kept in `delivery.json` as `reviewNotes` and in a pull request's `## Review notes`
+section. Full reports are saved as `review-<n>.json` in the evidence directory.
 
 A ticket run can wait for a person. Failed checks and review findings are
 repaired within `maxRepairs`, which defaults to 3 here (0-3 accepted). When that

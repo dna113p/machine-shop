@@ -157,7 +157,7 @@ wait for a person: stuck work stops in a Human state rather than ending.
 
 ```json
 {
-  "ticket": { "id": "PROJ-12", "title": "Add the empty state", "body": "Scope and acceptance criteria." },
+  "ticket": { "id": "PROJ-12", "title": "Add the empty state", "body": "## Goal\nShow an empty state.\n## Scope\n- src/widgets/**\n## Acceptance\n- An empty list shows No widgets.\n## Forbidden\n- nothing beyond the scope above" },
   "repository": {
     "name": "widgets",
     "path": "/absolute/widgets",
@@ -175,10 +175,34 @@ wait for a person: stuck work stops in a Human state rather than ending.
 }
 ```
 
-The input is an object or JSON string, fully validated at construction with no
-filesystem or subprocess effects. Unknown fields are rejected at every level
+The input is an object or JSON string, validated at construction with no
+filesystem or subprocess effects; ticket body sections are checked by the first
+Operation, `shape`. Unknown fields are rejected at every level
 except inside `ticket`, where tracker fields such as `source` or `metadata` are
-ignored. `ticket.id` and `ticket.title` are required; `body` is optional.
+ignored. `ticket.id` and `ticket.title` are required. `ticket.body` must contain
+four level-two Markdown headings, case-insensitively and in any order:
+
+```markdown
+## Goal
+Describe the goal.
+## Scope
+- path/or/glob
+## Acceptance
+- Testable criterion
+## Forbidden
+- nothing beyond the scope above
+```
+
+Goal is free text. Scope lists allowed paths or globs, Acceptance lists testable
+criteria, and Forbidden lists things the change must not do. Each list needs at
+least one non-empty bullet. The optional first `# ` heading is the ticket title
+when Dispatch reads a `.tickets/<id>.md` file. The exported pure
+`ticketSections(body)` returns `{ goal, scope, acceptance, forbidden, missing }`;
+`missing` names absent sections and empty required lists. `shape` opens evidence
+and blocks an invalid body before any Agent or worktree, naming the missing
+sections and showing the template. It applies to resumed runs too; the result
+has `worktreeCreated: false` and a hold summary starting `Blocked: `.
+
 `repository.name` is one path segment and `repository.path` is the absolute
 checkout root. `base` is a branch or ref and defaults to the checkout's current
 HEAD commit. `setup` is optional and `checks` needs 1–20 entries; both use the
@@ -255,19 +279,52 @@ is.
 
 | State | Work |
 | --- | --- |
+| `shape` | Validate the checkout and root paths; open evidence and block missing ticket sections or empty required lists before any Agent or worktree |
 | `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch instead and go straight to `verify` |
 | `start` | Open the helper's run on the worktree, which must be clean |
 | `triage` | The investigator returns `ready` with a short plan or `blocked` with what is missing; an unchanged-worktree guard follows |
 | `change` | The implementer edits the worktree and leaves the changes uncommitted |
 | `verify` | The required checks; a failure goes to the repair budget |
-| `review` | The reviewer returns `approved`, `revise`, or `blocked`, sealed by the unchanged-checkout guard |
+| `review`, `reviewResult` | Capture the structured report; the Operation preserves the unchanged-checkout guard and judges criteria, finding severity, and progress to approve, revise, or ask for a decision |
 | `commit` | One commit of everything except `.machine-runs`, even if an Agent staged it: subject is the ticket title, body is `Ticket: <id>` |
 | `deliver` | `branch`: nothing more. `patch`: `git format-patch` for base..HEAD into the evidence directory. `pr`: `git push --no-follow-tags <remote URL>` of the approved commit to the ticket branch alone, then `gh pr create --repo <host/owner/repository>` |
 | `decide` | Human: stuck work waits for one of `more rounds`, `hand off`, `archive`, or `discard` |
 | `confirmDiscard` | Human: `confirm discard` or `go back`, asked before a discard removes anything |
 | `archive`, `remove` | Commit the candidate and keep that commit as the branch `archive/<slug>`; `git worktree remove --force` and `git branch -D` for this run's own worktree and ticket branch |
 
-Operations do all Git, command, and publishing work. `revise` and failed checks
+The implementer receives the parsed acceptance and forbidden lists. The reviewer
+receives numbered acceptance criteria and must end with this structured event:
+
+```text
+MACHINES_EVENT {"type":"approved"|"revise"|"blocked","summary":"<one paragraph>","criteria":[{"text":"<criterion as given>","met":true|false,"evidence":"<file:line or command>"}],"findings":[{"severity":"blocker"|"discussion"|"minor","text":"<finding>","where":"<file:line>"}],"newSinceLastRound":"none"|"<what changed in this round's findings>"}
+```
+
+There must be one criterion entry per acceptance bullet, in order. `blocker`
+means a change required before delivery; `discussion` is a question only the
+ticket owner can settle; `minor` is worth noting but not worth another round.
+On later reviews the reviewer reads previous `review-<n>.json` reports in the
+evidence directory and describes what is new.
+
+`reviewResult` judges the report, preserving the read-only guard:
+
+1. Missing or wrongly typed fields, invalid entries, or a criteria count that
+   differs from the acceptance list block with the field named and go to
+   `decide`. Entries are matched to criteria by position, so a reworded
+   criterion is not malformed.
+2. A valid reviewer `blocked` event goes to `decide` with its summary.
+3. Any unmet criterion or blocker requires repair, regardless of the event's
+   type. Feedback lists each unmet criterion and each blocker with its location.
+4. Before retrying an unresolved criterion or blocker on a later review,
+   `newSinceLastRound: "none"` with the same set of blocker texts blocks as
+   not converging and goes to `decide`.
+5. A discussion gets one repair round to resolve it or explain why it needs
+   the owner. Repeating the question in the next review, compared after trimming
+   and lower-casing, blocks with the question quoted for `decide`.
+6. All criteria met with no blockers or discussions approves, including a
+   reviewer `revise` event containing only minors. Minor notes accumulate across
+   review rounds.
+
+Operations do all Git, command, and publishing work. Machine-judged `revise` and failed checks
 return to `change` within `maxRepairs`, and every retry passes through the real
 checks and the review again. The commit happens only for an approved candidate
 that still matches its passing checks. Commit hooks run, and the result is then
@@ -297,7 +354,8 @@ the first line; `## Summary` with the first paragraph of the ticket body below
 its leading headings, ended by a blank line or the next heading, a section left
 out when the body has no such text;
 `## Checks` with one `- <name>: passed` line per required check; `## Review`
-with the reviewer's summary; and `Ticket: <id>` as the last line. The commit
+with the approving review's summary; `## Review notes` listing accumulated minor
+findings and their locations, omitted when none exist; and `Ticket: <id>` as the last line. The commit
 message is separate and unchanged. A reviewer whose report arrives as a JSON
 object, as a capturing runner can return it, contributes that object's
 non-empty string `summary`: the shared helper unwraps it for every workflow, so
@@ -411,7 +469,8 @@ so name `repository.base` explicitly, or leave the source checkout on the branch
 it was on. Without `resume`,
 an existing branch or worktree directory still blocks.
 
-A run ends `blocked` without asking, changing nothing further, when: the base
+A run ends `blocked` without asking, changing nothing further, when: required
+ticket sections or list entries are missing; the base
 does not resolve; in `pr` mode the base is not published or the remote cannot be
 asked; a branch of the ticket or the worktree directory already exists; a resume
 precondition fails; a setup command fails or leaves tracked or unignored files
@@ -444,10 +503,12 @@ repository through a symlink, and unexpected exceptions are runtime failures.
 
 Evidence is written to `<evidenceRoot>/.machine-runs/machine-shop/<id>/`, outside
 the repository and the commit: the helper's `started.json`, check and setup
-logs, Agent reports, each Human answer as `human-<n>.json`, and `result.json`,
+logs, Agent summaries, full structured reviews as `review-<n>.json`, each Human
+answer as `human-<n>.json`, and `result.json`,
 plus `delivery.json` with the ticket id, repository name and path, branch, base
 commit, commit hash, output mode, pull request URL or patch paths, worktree
-path, and whether the worktree was removed. Its `outcome` is `delivered`,
+path, whether the worktree was removed, and `reviewNotes: [{text, where}]` in
+every output mode (an empty list when there are no minors). Its `outcome` is `delivered`,
 `handed-off`, `abandoned`, or `blocked`. It records `decision` when one was made
 (the last choice at `decide`, so `discard` for a confirmed discard and
 `more rounds` for a run that went on to deliver), `archive` as
