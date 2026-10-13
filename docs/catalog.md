@@ -157,17 +157,19 @@ budgets. Required Agent roles are `investigator`, `tester`, `implementer`, and
 `reviewer`. Failed red, scope, and green gates use `maxRepairs` (0–3, default 3
 here); review revisions use
 `maxReviewRounds` (0–5, default 2). Neither consumes the other's budget. With a
-stable base this allows at most 15 Agent calls before the stuck policy applies (one falsify,
-up to two plans and two plan reviews, one initial tester pass, up to six implementation passes, and three implementation reviews;
+stable base this allows at most 16 Agent calls before the stuck policy applies (one falsify,
+up to three plans and two plan reviews, one initial tester pass, up to six implementation passes, and three implementation reviews;
 tester retries share the repair budget with implementation retries). Setting
-both budgets to zero allows at most eight calls, or seven with `redGreen: false`.
-The single permitted plan revision consumes neither budget. A moved base that
+both budgets to zero allows at most nine calls, or eight with `redGreen: false`.
+The single permitted plan revision and the separate one-time return for length
+consume neither budget. A moved base that
 changes the approved patch adds a fresh review outside these budgets.
 With `stuck: "ask"`, each `more rounds` decision
 renews both budgets and returns to the planning or editing stage that stopped,
 including the tester or implementer when that Agent returned `blocked`;
 after a second plan revision it grants one more plan and review with the reviewer's
-feedback. The default
+feedback. After a second over-long plan it returns to `plan` with the length reason,
+without renewing the automatic return for length. The default
 `stuck: "park"` ends unattended runs immediately with their candidate kept.
 
 ```json
@@ -312,8 +314,8 @@ is.
 | `start` | Open the helper's run on the worktree, which must be clean |
 | `falsify` | Read-only investigator tries to show the ticket is wrong, already done, impossible here, or underspecified; returns `sound` with a one-paragraph summary or `questions` with 1–10 entries containing text, options, recommended, assumable, and why |
 | `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; a sound ticket goes to `plan`, as does an entirely assumable report with `assume: true`; remaining questions go through the stuck policy with numbered needs, flattened with question text, each option, and why capped separately at 600 characters plus an ellipsis |
-| `plan` | Read-only investigator returns `planned` with the complete plan as a summary of at most 4000 characters, recorded as stage `plan` |
-| `planResult` | Capture the report before guarding the unchanged worktree and validating the captured prose plan's length before `planReview` |
+| `plan` | Read-only investigator returns `planned` with the complete plan as a summary of at most 4000 characters, recorded as stage `plan`; a return for length names the previous length and limit and asks for the same plan in fewer words, naming files and tests without restating the ticket |
+| `planResult` | Capture the report before guarding the unchanged worktree and validating the captured prose plan's length before `planReview`; a captured plan over 4000 characters returns to `plan` once per run, separately from the reviewer's revision; a second goes through the stuck policy with its length, the limit, and a plain explanation |
 | `planReview` | Read-only reviewer returns `approved` or `revise` with a summary; the prompt includes the plan verbatim |
 | `planReviewResult` | Capture the report before guarding the unchanged worktree; first `revise` returns to `plan`, second `revise` goes through the stuck policy with the reviewer's summary as the reason and the usual capped blocker needs; `approved` continues to `test` or, with `redGreen: false`, `change` |
 | `test` | With `redGreen: true`, the tester writes only tests for every acceptance criterion inside Scope, leaving them uncommitted; its summary is recorded as stage `test` |
@@ -334,9 +336,17 @@ is.
 New runs begin with `falsify` → `plan` → `planReview`, capturing each report before
 its unchanged-worktree guard or validation. A missing or empty summary in any
 planning state goes through the stuck policy, with the state and missing summary
-named in the reason. A plan sent back once is re-planned with the
+named in the reason. A plan sent back once by the reviewer is re-planned with the
 reviewer's feedback and reviewed again; a second revision stops before editing.
-Malformed questions or a plan over 4000 characters go through the stuck policy.
+Separately, a captured prose plan over 4000 characters returns to `plan` once per
+run with its length and the limit. The planner must say the same plan in fewer
+words, naming files and tests without restating the ticket. This return is also
+available after a reviewer revision if not already used. A second over-long plan
+goes through the stuck policy with its length against 4000, saying it was sent
+back once and that the ticket may be too broad for one run. Neither over-long
+plan is truncated or passed onward under `Plan:`; both remain captured evidence.
+An empty plan or one over the capture limit of 16000 characters is refused without
+a return for length. Malformed questions go through the stuck policy.
 Each question has the shape
 `{ text, options: string[], recommended: string, assumable: boolean, why }`.
 Text and why must be non-empty strings; options must be a non-empty array of
@@ -596,7 +606,7 @@ has a two-minute timeout and also runs for a resumed `pr` run. `branch` and
 `patch` runs make no network call.
 
 Stuck work goes to the `stuck` Operation. This covers falsify returning
-questions that the run cannot assume, malformed planning reports (including missing or empty summaries), a second plan review revision, any read-only
+questions that the run cannot assume, malformed planning reports (including missing or empty summaries), a second over-long plan, a second plan review revision, any read-only
 planning stage having edited files, the tester or implementer returning `blocked`,
 the reviewer returning `blocked` or having edited files, review non-convergence,
 open owner questions, malformed review reports, either budget exhausting,

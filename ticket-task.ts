@@ -61,6 +61,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const planningReports: Record<PlanningStage, number> = { falsify: 0, plan: 0, planReview: 0 };
   let plan = "";
   let planRevisions = 0;
+  let lengthReturned = false;
+  let overLimit = 0;
   let ownerQuestions: { text: string; where: string; options?: string[]; recommended?: string; why?: string }[] | undefined;
   let wouldAssume: FalsifyQuestion[] = [];
   let assumptions: Assumption[] = [];
@@ -770,10 +772,16 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   }
   function planResult(): Event {
     const kept = keep("plan");
+    overLimit = 0;
     if (work.unchanged().type === "changed") return { type: "blocked" };
     if ("refusal" in kept) return work.block(kept.refusal);
     if (kept.summary.length > 4000) {
-      return work.block("Malformed plan report: summary must be a non-empty plan of at most 4000 characters.");
+      if (!lengthReturned) {
+        lengthReturned = true;
+        overLimit = kept.summary.length;
+        return { type: "shorten" };
+      }
+      return work.block(`The plan was ${kept.summary.length} characters against a limit of 4000 after being sent back once to be shortened. A ticket whose plan does not fit may be too broad for one run.`);
     }
     plan = kept.summary;
     return { type: "planned" };
@@ -866,11 +874,12 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       falsifyResult: operation(stopped("falsifyResult", falsifyResult), { sound: "plan", assumed: "plan", blocked: "stuck" }),
       plan: agent(() => work.prompt([
         "Plan the implementation of this sound ticket. Do not edit any file. Cover the acceptance criteria, tests, permitted paths, and required checks. Address any plan review feedback in the stage reports. Return planned with the complete plan as the summary, at most 4000 characters.",
+        ...(overLimit ? [`Your last plan was ${overLimit} characters; the limit is 4000. Say the same plan in fewer words: name the files and the tests, and do not restate the ticket.`] : []),
         ...assumptionsPrompt(),
       ].join("\n")), {
         planned: { target: "planResult", actions: rememberPlanning },
       }, { using: "investigator", cwd: worktree }),
-      planResult: operation(stopped("planResult", planResult), { planned: "planReview", blocked: "stuck" }),
+      planResult: operation(stopped("planResult", planResult), { planned: "planReview", shorten: "plan", blocked: "stuck" }),
       planReview: agent(() => work.prompt([
         "Review the plan against the ticket, relevant code, scope, acceptance criteria, and tests. Do not edit any file. Return approved with a summary if it is ready to implement, or revise with a summary of what must change. Only one revision of the plan is allowed.",
         ...assumptionsPrompt(),

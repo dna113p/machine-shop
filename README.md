@@ -205,6 +205,15 @@ hand off, stays outside the working tree, and is never committed.
 
 A sound ticket proceeds to `plan`: the investigator returns
 `planned` with a plan of at most 4000 characters, recorded as stage `plan`.
+A captured prose plan over 4000 characters returns to `plan`
+once, with its length and the limit and instructions to shorten it, name the files
+and tests, and avoid restating the ticket. This allowance is separate from the
+reviewer's revision and consumes neither repair nor review budget. A second
+over-long plan goes through the stuck policy: the reason gives its length against
+4000 after one return and says the ticket may be too broad for one run.
+Over-long plans remain evidence and are never passed onward under `Plan:` or truncated.
+Empty plans and plans over the capture limit of 16000 characters are refused
+without a return for length.
 In `planReview`, the reviewer approves it or requests one revision; a second
 `revise` goes through the stuck policy with the reviewer's summary as the reason
 and the usual capped blocker needs. Each planning report is captured before its
