@@ -147,13 +147,15 @@ without a final receipt. These workflows do not resume, undo, or roll back work.
 [ticket-task](../ticket-task.ts) is a separate root workflow, not one of the ten
 defaults: it is not in `defaults/`, the installer does not copy it, and it is the
 only workflow here built on the shared helper that commits or publishes. It
-reuses the helper for evidence, checks, fingerprints, review, and the repair
-budget. Required Agent roles are `investigator`, `implementer`, and `reviewer`;
-`maxRepairs` defaults to 3 here, not the helper's 1, and still accepts 0-3. The
-default allows at most 9 Agent calls before a person is asked, and
-`maxRepairs: 0` at most 3; each `more rounds` decision allows one more
-implementer pass and review plus `maxRepairs` further repairs. A ticket run can
-wait for a person: stuck work stops in a Human state rather than ending.
+reuses the helper for evidence, checks, fingerprints, review, and separate
+budgets. Required Agent roles are `investigator`, `implementer`, and `reviewer`.
+Failed gates use `maxRepairs` (0–3, default 3 here); review revisions use
+`maxReviewRounds` (0–5, default 2). Neither consumes the other's budget. This
+allows at most 10 Agent calls before the stuck policy applies (one triage,
+six implementation passes, and three reviews). Setting both budgets to zero
+allows at most three calls. With `stuck: "ask"`, each `more rounds` decision
+renews both budgets and grants another implementation pass. The default
+`stuck: "park"` ends unattended runs immediately with their candidate kept.
 
 ```json
 {
@@ -171,6 +173,8 @@ wait for a person: stuck work stops in a Human state rather than ending.
   "worktreeRoot": "/absolute/worktrees",
   "evidenceRoot": "/absolute/project",
   "maxRepairs": 3,
+  "maxReviewRounds": 2,
+  "stuck": "park",
   "resume": false
 }
 ```
@@ -215,7 +219,8 @@ check shape and limits under [Common input](#common-input). `output` is `pr`,
 matter only for `pr`. `worktreeRoot` and `evidenceRoot` are absolute and must be
 outside `repository.path`, and `evidenceRoot` must also be outside the worktree,
 so run files never appear in the source checkout or the commit. `maxRepairs`
-(0-3, default 3) and the boolean `resume` (default `false`) are optional.
+(0–3, default 3), `maxReviewRounds` (0–5, default 2), `stuck` (`"park"` or
+`"ask"`, default `"park"`), and the boolean `resume` (default `false`) are optional.
 
 The id slug is the lowercased ticket id with every character outside
 `[a-z0-9._-]` replaced by `-`; an id that leaves no letter or digit, or a name
@@ -289,10 +294,12 @@ is.
 | `triage` | The investigator returns `ready` with a short plan or `blocked` with what is missing; an unchanged-worktree guard follows |
 | `change` | The implementer edits the worktree and leaves the changes uncommitted |
 | `verify` | The required checks; a failure goes to the repair budget |
-| `review`, `reviewResult` | Capture the structured report; the Operation preserves the unchanged-checkout guard and judges criteria, finding severity, and progress to approve, revise, or ask for a decision |
+| `review`, `reviewResult` | Capture the structured report; the Operation preserves the unchanged-checkout guard and judges criteria, finding severity, and progress to approve, revise, or apply the stuck policy |
 | `commit` | One commit of everything except `.machine-runs`, even if an Agent staged it: subject is the ticket title, body is `Ticket: <id>` |
 | `deliver` | `branch`: nothing more. `patch`: `git format-patch` for base..HEAD into the evidence directory. `pr`: `git push --no-follow-tags <remote URL>` of the approved commit to the ticket branch alone, then `gh pr create --repo <host/owner/repository>` |
-| `decide` | Human: stuck work waits for one of `more rounds`, `hand off`, `archive`, or `discard` |
+| `repairBudget`, `reviewBudget` | Count gate retries and review revisions separately; exhaustion goes to `stuck` |
+| `stuck`, `park` | Select the input policy: `ask` goes to `decide`; `park` writes a note and receipt, keeps the candidate, and ends `parked` |
+| `decide` | Human, only with `stuck: "ask"`: stuck work waits for one of `more rounds`, `hand off`, `archive`, or `discard` |
 | `confirmDiscard` | Human: `confirm discard` or `go back`, asked before a discard removes anything |
 | `archive`, `remove` | Commit the candidate and keep that commit as the branch `archive/<slug>`; `git worktree remove --force` and `git branch -D` for this run's own worktree and ticket branch |
 
@@ -313,23 +320,23 @@ evidence directory and describes what is new.
 
 1. For `approved` and `revise`, missing or wrongly typed fields, invalid entries, or a criteria count that
    differs from the acceptance list block with the field named and go to
-   `decide`. Entries are matched to criteria by position, so a reworded
+   `stuck`. Entries are matched to criteria by position, so a reworded
    criterion is not malformed. Feedback uses the ticket's criterion text at that
    position, not the reviewer's wording.
-2. A reviewer `blocked` event goes to `decide` with its summary; it does not
+2. A reviewer `blocked` event goes to `stuck` with its summary; it does not
    require `criteria`, `findings`, or `newSinceLastRound`.
 3. Any unmet criterion or blocker requires repair, regardless of the event's
    approval verdict. Feedback lists each unmet criterion, blocker, and discussion
    with its evidence or location.
 4. Before retrying an unresolved criterion or blocker on a later review,
    `newSinceLastRound: "none"` with the same set of blocker texts blocks as
-   not converging and goes to `decide`, naming the unchanged blockers. Empty or
+   not converging and goes to `stuck`, naming the unchanged blockers. Empty or
    whitespace-only text also means none, as does `none` after trimming,
    lower-casing, and dropping a trailing period. With no blockers, the reason
    names the unmet ticket criteria instead.
 5. A discussion gets one repair round to resolve it or explain why it needs
    the owner. Repeating the question in the next review, compared after trimming
-   and lower-casing, blocks with the question quoted for `decide` only when
+   and lower-casing, blocks with the question quoted for `stuck` only when
    no criteria or blockers need repair. A question absent from the immediately
    preceding review gets a fresh repair round if it returns.
 6. All criteria met with no blockers or discussions approves, including a
@@ -342,8 +349,9 @@ After a Machine block for non-convergence, repeated discussion, or a malformed
 report, `more rounds` restores the latest review's available findings as the
 implementer's feedback, including their locations, rather than the stop reason.
 
-Operations do all Git, command, and publishing work. Machine-judged `revise` and failed checks
-return to `change` within `maxRepairs`, and every retry passes through the real
+Operations do all Git, command, and publishing work. Machine-judged `revise`
+returns to `change` within `maxReviewRounds`; failed checks use `maxRepairs`.
+Every retry passes through the real
 checks and the review again. The commit happens only for an approved candidate
 that still matches its passing checks. Commit hooks run, and the result is then
 compared with that candidate: the commit must have the approved tree, the base
@@ -401,17 +409,27 @@ reached or its tip fetched (the Git output is saved as a log). The check, like t
 has a two-minute timeout and also runs for a resumed `pr` run. `branch` and
 `patch` runs make no network call.
 
-Stuck work goes to the Human state `decide` instead of ending. That covers
-triage returning `blocked`, triage having edited files, the implementer returning
-`blocked`, the reviewer returning `blocked` or having edited files, and the
-repair budget being exhausted after failed checks or after `revise`. The prompt
-states the ticket id and title, the reason a blocked run would report, the
-repair rounds used, the worktree path, the branch, and the evidence directory.
-It offers exactly these restricted choices:
+Stuck work goes to the `stuck` Operation. This covers triage returning
+`blocked`, triage having edited files, the implementer returning `blocked`,
+the reviewer returning `blocked` or having edited files, review non-convergence,
+repeated owner questions, malformed review reports, and either budget exhausting.
+With the default `stuck: "park"`, `park` writes `park.txt` and a delivery receipt
+and ends `parked` immediately, without a Human request, commit, archive, or
+removal. The worktree, branch, and uncommitted candidate stay exactly as they are.
+The note names the answer needed from the reason and gives this next step:
+"Add the answer to the ticket body, then run the ticket again with resume: true;
+the run continues from the kept worktree with fresh budgets."
+
+With `stuck: "ask"`, the run enters the Human state `decide`. All Human prompts
+and park notes use the same brief helper: decision first (at most ten words,
+truncated at a word boundary with `…`), a blank line, standing against the ticket,
+optional changes and needs, evidence locations, then options. Standing includes
+the ticket id and title, stopped state, reason, and both budgets. `hand off` is
+recommended and listed first in the decision prompt. The restricted choices are:
 
 | Choice | Effect | Final state |
 | --- | --- | --- |
-| `more rounds` | The used repair count returns to zero and the run goes back to `change`; the implementer is briefed with the standing findings as in any repair. It can be chosen again every time the budget runs out | continues |
+| `more rounds` | Both used budget counts return to zero and the run goes back to `change`; the implementer is briefed with the standing findings as in any repair. It can be chosen again every time a budget runs out | continues |
 | `hand off` | Nothing is touched: the worktree and the branch stay, uncommitted, for another workflow or a person to work in | `handedOff` |
 | `archive` | What delivery would have committed, tracked and untracked files without ignored files or `.machine-runs`, is committed and kept as the branch `archive/<slug>`; then the worktree is removed and the ticket branch deleted | `abandoned` |
 | `discard` | After confirmation, the worktree is removed and the branch deleted without saving the candidate | `abandoned` |
@@ -461,7 +479,7 @@ Human primitive with restricted choices. How they are presented, and how long a
 run may wait, belongs to whichever surface runs the Machine.
 
 With `"resume": true`, `prepare` adopts the existing worktree instead of
-creating one, for the candidate a `hand off` left. It requires all of: the
+creating one, for the candidate a park or `hand off` left. It requires all of: the
 worktree directory exists and is a Git worktree of `repository.path`; its `HEAD`
 is a symbolic ref to a branch that belongs to this ticket by the rule above; and
 that branch points at the resolved base commit or at an ancestor of it, so
@@ -480,8 +498,8 @@ ticket, is not adopted; for the first the message gives the `git config` command
 that records it. If any of these fails
 the run ends `blocked` with a message naming the condition, changing nothing.
 Setup commands are not run again and triage is skipped: a resumed run goes
-straight to `verify`, then review, commit, and deliver as usual, with a fresh
-repair budget and the normal repair loop if review asks for changes. The base
+straight to `verify`, then review, commit, and deliver as usual, with fresh
+budgets and the normal repair loop if review asks for changes. The base
 must resolve to the commit the first run started from or to a descendant of it,
 so name `repository.base` explicitly, or leave the source checkout on the branch
 it was on. Without `resume`,
@@ -499,7 +517,7 @@ removed after delivery; or, after a decision, the candidate cannot be archived
 or the worktree or branch cannot be removed. A failed Git or `gh` step
 saves its output as a log in the evidence directory.
 
-Final states are `delivered`, `handedOff`, `abandoned`, and `blocked`. In every
+Final states are `delivered`, `parked`, `handedOff`, `abandoned`, and `blocked`. In every
 case the Machine output is exactly `{ "action": "hold", "summary": "<text>" }`
 with no other field, the strict shape Machines Dispatch accepts for a ticket
 that must stay open until a person merges or closes it. The workflow never
@@ -507,10 +525,10 @@ relaunches itself, launches another Machine, or edits or closes a ticket file.
 The one-line summary names the branch, commit, and pull request URL or patch
 path on success, or the reason otherwise; then the decision if one was made, the
 archive branch and its commit after `archive`, the worktree if it was kept
-(always for `handedOff`, and for `blocked` once it exists), and the evidence
+(always for `parked` and `handedOff`, and for `blocked` once it exists), and the evidence
 directory. Read
 the final state, not the action, to tell the endings apart. `delivered` means
-the worktree was removed and the branch kept; `handedOff` and `blocked` keep the
+the worktree was removed and the branch kept; `parked`, `handedOff`, and `blocked` keep the
 worktree and branch for inspection or further work; `abandoned` means both are
 gone, with the candidate on its archive branch after `archive`. A worktree that
 cannot be removed, for example because it holds unignored nested `.machine-runs`
@@ -527,15 +545,22 @@ plus `delivery.json` with the ticket id, repository name and path, branch, base
 commit, commit hash, output mode, pull request URL or patch paths, worktree
 path, whether the worktree was removed, and `reviewNotes: [{text, where}]` in
 every output mode (an empty list when there are no minors). Its `outcome` is `delivered`,
-`handed-off`, `abandoned`, or `blocked`. It records `decision` when one was made
+`parked`, `handed-off`, `abandoned`, or `blocked`. It records `decision` when one was made
 (the last choice at `decide`, so `discard` for a confirmed discard and
 `more rounds` for a run that went on to deliver), `archive` as
 `{ "branch", "commit" }` when the archive branch was created, and `resumed` for
 a resumed run, whose `worktreeCreated` is false and whose `baseCommit` is the
 commit its branch was on.
+For parking, `delivery.json` also records the `reason` and
+`park: { needs, next, budgets: { repairs: { used, max }, reviewRounds: { used, max } } }`.
+The one-line hold starts `Parked on <branch>: ` followed by the first line of
+`park.txt`, then `Needs: ...`, `Worktree kept at ...`, and ends `Evidence: <directory>`.
+The receipt, note, and summary use the same needs text, capped at 600 characters
+plus an ellipsis when truncated. The full reason remains in the receipt and note.
 `result.json` keeps the helper's vocabulary: its `outcome` is `blocked` for
-`handedOff` and `abandoned`, its `repairs` counts every round across budgets,
-and its `decisions` list every Human answer.
+`parked`, `handedOff`, and `abandoned`; `repairs` counts gate retries and
+`reviewRounds` counts review revisions, each cumulative across renewals;
+`decisions` lists every Human answer.
 
 Limits: a run waiting in a Human state keeps its worktree and branch until it is
 answered. `resume` adopts only an uncommitted candidate on the ticket's own

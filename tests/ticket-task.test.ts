@@ -38,7 +38,7 @@ type Fixture = ReturnType<typeof fixture>;
 const input = (f: Fixture, repository = {}, extra = {}) => ({
   ticket: { id: "PROJ-12", title: "Add a greeting", body: "## Goal\nWrite hello to greeting.txt.\n\n## Scope\n- greeting.txt\n\n## Acceptance\n- greeting.txt contains hello\n\n## Forbidden\n- nothing beyond the scope above", source: "tk", metadata: { priority: 2 } },
   repository: { name: "widgets", path: f.repo, checks: [command()], output: "branch", ...repository },
-  worktreeRoot: join(f.root, "worktrees"), evidenceRoot: f.evidence, ...extra,
+  worktreeRoot: join(f.root, "worktrees"), evidenceRoot: f.evidence, stuck: "ask", ...extra,
 });
 /** A local bare repository stands in for the remote; nothing leaves the machine. */
 function remote(f: Fixture) {
@@ -138,6 +138,27 @@ function handedOff(f: Fixture, result: { state: unknown; output: any; states: st
   assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.delivery.archive], [true, false, null, undefined]);
   return run;
 }
+/** Parking never asks a Human or changes the candidate; its note and hold share the same brief. */
+function parked(f: Fixture, result: { state: unknown; output: any; states: string[] }, reason: RegExp, human: { requests: Ask[] }) {
+  assert.equal(result.state, "parked"); assert.deepEqual(result.states.slice(-3), ["stuck", "park", "parked"]);
+  assert.equal(result.states.includes("decide"), false); assert.deepEqual(human.requests, []);
+  const run = held(f, result, new RegExp(`^Parked on ${branch}: `, "u")); untouched(f);
+  assert.equal(run.result.outcome, "blocked"); assert.equal(run.delivery.outcome, "parked");
+  assert.match(run.delivery.reason, reason); assert.match(run.delivery.park.needs, reason);
+  assert.equal(run.delivery.park.next, "Add the answer to the ticket body, then run the ticket again with resume: true; the run continues from the kept worktree with fresh budgets.");
+  assert.deepEqual(run.result.decisions, []); assert.equal(run.delivery.decision, undefined);
+  assert.equal(git(f.repo, "rev-parse", branch), f.head); assert.equal(git(f.worktree, "symbolic-ref", "HEAD"), `refs/heads/${branch}`);
+  assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.delivery.archive], [true, false, null, undefined]);
+  assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
+  assert.ok(result.output.summary.includes(`Worktree kept at ${f.worktree}. Evidence: `));
+  const note = readFileSync(join(run.directory, "park.txt"), "utf8");
+  assert.ok(result.output.summary.startsWith(`Parked on ${branch}: ${note.split("\n")[0]} Needs: ${run.delivery.park.needs}`));
+  assert.ok(note.includes(`Needs: ${run.delivery.park.needs}\n`)); assert.ok(note.includes(run.delivery.park.next));
+  assert.ok(note.includes(`Worktree: ${f.worktree}\nBranch: ${branch}\nEvidence: ${run.directory}`));
+  assert.ok(note.includes(`Stopped in ${result.states.at(-4)}.`));
+  return run;
+}
+
 /** An abandoned run leaves neither its worktree nor its branch, and the source checkout as it was; an archive leaves its own branch beside it. */
 function abandoned(f: Fixture, result: { state: unknown; output: any; states: string[] }, decision: string) {
   assert.equal(result.state, "abandoned"); assert.deepEqual(result.states.slice(-3), ["remove", "abandon", "abandoned"]);
@@ -331,7 +352,7 @@ for (const change of ["different blocker", "new findings"]) {
       },
     });
     assert.equal(result.state, "delivered"); assert.deepEqual([edits, reviews], [3, 3]);
-    assert.equal(result.states.filter(state => state === "repairBudget").length, 2); assert.equal(result.states.includes("decide"), false);
+    assert.equal(result.states.filter(state => state === "reviewBudget").length, 2); assert.equal(result.states.includes("decide"), false);
   });
 }
 
@@ -379,7 +400,7 @@ for (const repair of ["blocker", "unmet criterion"]) {
 
 test("a discussion absent from the next review gets a repair when it returns in round three", async context => {
   const f = fixture(context); let edits = 0; let reviews = 0;
-  const result = await execute(input(f), {
+  const result = await execute(input(f, {}, { maxReviewRounds: 3 }), {
     implementer: request => { edits++; return implement(request); },
     reviewer: () => {
       if (++reviews === 4) return review();
@@ -390,7 +411,7 @@ test("a discussion absent from the next review gets a repair when it returns in 
     },
   });
   assert.equal(result.state, "delivered"); assert.deepEqual([edits, reviews], [4, 4]);
-  assert.equal(result.states.filter(state => state === "repairBudget").length, 3); assert.equal(result.states.includes("decide"), false);
+  assert.equal(result.states.filter(state => state === "reviewBudget").length, 3); assert.equal(result.states.includes("decide"), false);
 });
 
 test("a reviewer blocked event needs only its summary and does not require a structured report", async context => {
@@ -634,7 +655,7 @@ test("an implementer blocker waits for a decision without checks, review, or a c
 
 test("checks failing until the repair budget is exhausted wait for a decision, and commit and push nothing", async context => {
   const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); let edits = 0; const human = person("hand off");
-  const result = await execute(input(f, { output: "pr", checks: [command("process.exit(1)")] }, { maxRepairs: 2 }), {
+  const result = await execute(input(f, { output: "pr", checks: [command("process.exit(1)")] }, { maxRepairs: 2, maxReviewRounds: 2 }), {
     implementer: request => { edits++; return implement(request); }, reviewer: () => assert.fail(),
   }, human);
   const run = handedOff(f, result, /budget exhausted \(2\)/u, human);
@@ -654,7 +675,7 @@ test("review feedback is repaired once through fresh checks and another review",
     reviewer: () => ++reviews === 1 ? review("revise", "Handle the empty case") : review("approved"),
   });
   assert.equal(result.state, "delivered"); assert.deepEqual([edits, reviews], [2, 2]);
-  const run = evidence(f); assert.equal(run.result.repairs, 1); assert.equal(run.result.checks.length, 2);
+  const run = evidence(f); assert.equal(run.result.repairs, 0); assert.equal(run.result.reviewRounds, 1); assert.equal(run.result.checks.length, 2);
   assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello 2"); assert.equal(git(f.repo, "rev-list", "--count", `main..${branch}`), "1");
 });
 
@@ -670,14 +691,26 @@ test("a reviewer blocker waits for a decision", async context => {
   handedOff(f, result, /contradicts the existing contract/u, human);
 });
 
-test("the default budget allows three repairs before review feedback waits for a decision", async context => {
+test("the default gate budget allows three repairs before failing checks wait for a decision", async context => {
+  const f = fixture(context); const human = person("hand off"); let edits = 0;
+  const result = await execute(input(f, { checks: [command("process.exit(1)")] }), {
+    implementer: request => { edits++; return implement(request); }, reviewer: () => assert.fail(),
+  }, human);
+  const run = handedOff(f, result, /Repair budget exhausted \(3\)/u, human);
+  assert.deepEqual([edits, run.result.repairs, run.result.reviewRounds, run.result.checksPassed], [4, 3, 0, false]);
+  assert.deepEqual(run.result.checks.map(check => check.passed), [false, false, false, false]);
+  assert.equal(human.requests.length, 1);
+  assert.ok(human.requests[0]!.prompt.includes("Repair rounds used: 3 of 3."));
+});
+
+test("the default review budget allows two rounds before review feedback waits for a decision", async context => {
   const f = fixture(context); const human = person("hand off"); let edits = 0; let reviews = 0;
   const result = await execute(input(f), {
     implementer: request => { edits++; return implement(request); }, reviewer: () => review("revise", `Finding ${++reviews}`),
   }, human);
-  const run = handedOff(f, result, /budget exhausted \(3\)\. Finding 4/u, human);
-  assert.deepEqual([edits, reviews, run.result.repairs, run.result.checksPassed], [4, 4, 3, true]);
-  assert.ok(human.requests[0]!.prompt.includes("Repair rounds used: 3 of 3."));
+  const run = handedOff(f, result, /budget exhausted \(2\)\. Finding 3/u, human);
+  assert.deepEqual([edits, reviews, run.result.repairs, run.result.reviewRounds, run.result.checksPassed], [3, 3, 0, 2, true]);
+  assert.ok(human.requests[0]!.prompt.includes("Review rounds used: 2 of 2."));
 });
 
 test("a base that does not resolve still ends blocked in prepare without a Human step", async context => {
@@ -691,20 +724,20 @@ test("a base that does not resolve still ends blocked in prepare without a Human
 
 test("more rounds restarts the budget with the standing findings, and an approval then delivers", async context => {
   const f = fixture(context); const human = person("more rounds"); const prompts: string[] = []; let reviews = 0;
-  const result = await execute(input(f, {}, { maxRepairs: 1 }), {
+  const result = await execute(input(f, {}, { maxRepairs: 1, maxReviewRounds: 1 }), {
     implementer: request => { prompts.push(request.prompt); writeFileSync(join(request.cwd, "greeting.txt"), `hello ${prompts.length}\n`); return ok(); },
     reviewer: () => ++reviews < 3 ? review("revise", `Finding ${reviews}`) : review("approved", "Greeting matches the ticket"),
   }, human);
   assert.equal(result.state, "delivered"); assert.deepEqual([prompts.length, reviews, human.requests.length], [3, 3, 1]);
-  assert.deepEqual(result.states.slice(-11), ["repairBudget", "decide", "change", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
-  assert.ok(human.requests[0]!.prompt.includes("Repair budget exhausted (1). Finding 2"));
+  assert.deepEqual(result.states.slice(-12), ["reviewBudget", "stuck", "decide", "change", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
+  assert.ok(human.requests[0]!.prompt.includes("Review budget exhausted (1). Finding 2"));
   // The pass a person granted is briefed exactly as the ordinary repair before it was.
   assert.ok(prompts[1]!.includes("Current failure/feedback: Finding 1")); assert.ok(prompts[2]!.includes("Current failure/feedback: Finding 2"));
   assert.doesNotMatch(prompts[2]!, /budget exhausted/u);
   const commit = git(f.repo, "rev-parse", branch);
   const run = held(f, result, new RegExp(`^Delivered ${branch} at ${commit}\\. Decision: more rounds\\. Evidence: `, "u")); untouched(f);
   assert.deepEqual([run.delivery.outcome, run.delivery.decision, run.delivery.commit, run.delivery.worktreeRemoved], ["delivered", "more rounds", commit, true]);
-  assert.deepEqual([run.result.outcome, run.result.repairs, run.result.agentInvocations], ["completed", 1, 7]);
+  assert.deepEqual([run.result.outcome, run.result.repairs, run.result.reviewRounds, run.result.agentInvocations], ["completed", 0, 1, 7]);
   assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }]);
   assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello 3"); assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head);
   assert.equal(existsSync(f.worktree), false);
@@ -712,7 +745,7 @@ test("more rounds restarts the budget with the standing findings, and an approva
 
 test("more rounds can be chosen again each time the budget runs out", async context => {
   const f = fixture(context); const human = person("more rounds", "more rounds", "hand off"); let edits = 0;
-  const result = await execute(input(f, { checks: [command("process.exit(1)")] }, { maxRepairs: 1 }), {
+  const result = await execute(input(f, { checks: [command("process.exit(1)")] }, { maxRepairs: 1, maxReviewRounds: 1 }), {
     implementer: request => { edits++; return implement(request); }, reviewer: () => assert.fail(),
   }, human);
   const run = handedOff(f, result, /budget exhausted \(1\)/u, human);
@@ -725,14 +758,14 @@ test("more rounds can be chosen again each time the budget runs out", async cont
 
 test("more rounds after a budget of zero still gives the implementer one pass", async context => {
   const f = fixture(context); const human = person("more rounds"); let reviews = 0;
-  const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => ++reviews === 1 ? review("revise", "Handle the empty case") : review("approved") }, human);
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ++reviews === 1 ? review("revise", "Handle the empty case") : review("approved") }, human);
   assert.equal(result.state, "delivered"); assert.equal(reviews, 2); assert.ok(human.requests[0]!.prompt.includes("Repair rounds used: 0 of 0."));
 });
 
 test("hand off leaves the worktree, the branch, and the uncommitted candidate as they were", async context => {
   const f = fixture(context); let before: unknown;
   const human = person(() => { before = candidate(f.worktree); return "hand off"; });
-  const result = await execute(input(f, {}, { maxRepairs: 0 }), {
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), {
     implementer: request => { writeFileSync(join(request.cwd, "code.txt"), "new"); return implement(request); }, reviewer: () => review("revise", "Handle the empty case"),
   }, human);
   const run = handedOff(f, result, /budget exhausted \(0\)\. Handle the empty case/u, human);
@@ -746,7 +779,7 @@ test("archive leaves the tracked and untracked candidate on archive/<slug>, with
   writeFileSync(join(f.repo, "obsolete.txt"), "remove me\n"); git(f.repo, "add", "."); git(f.repo, "commit", "-qm", "obsolete"); f.head = git(f.repo, "rev-parse", "HEAD");
   let before: ReturnType<typeof candidate> | undefined;
   const human = person(() => { before = candidate(f.worktree); return "archive"; });
-  const result = await execute(input(f, {}, { maxRepairs: 0 }), {
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), {
     implementer: request => {
       writeFileSync(join(request.cwd, "code.txt"), "new without a final newline "); rmSync(join(request.cwd, "obsolete.txt"));
       mkdirSync(join(request.cwd, "bin")); writeFileSync(join(request.cwd, "bin/tool.sh"), "#!/bin/sh\necho hi\n", { mode: 0o755 });
@@ -773,7 +806,7 @@ test("archive leaves ignored files out of the archive commit, as delivery leaves
   writeFileSync(join(f.repo, ".gitignore"), "*.log\nbuild/\n"); git(f.repo, "add", "."); git(f.repo, "commit", "-qm", "ignore"); f.head = git(f.repo, "rev-parse", "HEAD");
   let before = "";
   const human = person(() => { before = candidate(f.worktree, true).status; return "archive"; });
-  const result = await execute(input(f, {}, { maxRepairs: 0 }), {
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), {
     implementer: request => {
       writeFileSync(join(request.cwd, "debug.log"), "what the implementer learned\n");
       mkdirSync(join(request.cwd, "build")); writeFileSync(join(request.cwd, "build/out.bin"), Buffer.from([0, 255, 1, 0]), { mode: 0o755 });
@@ -804,7 +837,7 @@ test("an existing archive branch blocks the archive before anything is staged, a
   const f = fixture(context); git(f.repo, "branch", archiveBranch);
   let before: ReturnType<typeof candidate> | undefined; let index = "";
   const human = person(() => { before = candidate(f.worktree); index = git(f.worktree, "ls-files", "--stage"); return "archive"; });
-  const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, human);
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, human);
   const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: branch ${archiveBranch} already exists in .+, and nothing was staged`, "u"));
   assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
   assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]);
@@ -817,7 +850,7 @@ test("a failing commit hook does not prevent the archive", async context => {
   mkdirSync(join(f.repo, ".git/hooks"), { recursive: true });
   for (const hook of ["pre-commit", "commit-msg"]) writeFileSync(join(f.repo, ".git/hooks", hook), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
   assert.throws(() => git(f.repo, "commit", "-q", "--allow-empty", "-m", "refused by the hooks"));
-  const result = await execute(input(f, { checks: [command("process.exit(1)")] }, { maxRepairs: 0 }), { reviewer: () => assert.fail() }, person("archive"));
+  const result = await execute(input(f, { checks: [command("process.exit(1)")] }, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => assert.fail() }, person("archive"));
   abandoned(f, result, "archive");
   assert.equal(git(f.repo, "rev-parse", `${archiveBranch}^`), f.head);
   assert.equal(git(f.repo, "show", "--name-only", "--format=%s", archiveBranch), "Archive: Add a greeting\n\ngreeting.txt");
@@ -825,10 +858,10 @@ test("a failing commit hook does not prevent the archive", async context => {
 
 test("delivery.json and the summary name the archive branch and its commit", async context => {
   const f = fixture(context);
-  const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("archive"));
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("archive"));
   const run = abandoned(f, result, "archive"); const commit = git(f.repo, "rev-parse", archiveBranch);
   assert.deepEqual(run.delivery, {
-    schemaVersion: 1, outcome: "abandoned", reason: "Repair budget exhausted (0). Handle the empty case\nBlocker: Handle the empty case (greeting.txt:1)", decision: "archive",
+    schemaVersion: 1, outcome: "abandoned", reason: "Review budget exhausted (0). Handle the empty case\nBlocker: Handle the empty case (greeting.txt:1)", decision: "archive",
     ticket: "PROJ-12", repository: { name: "widgets", path: f.repo }, branch, baseCommit: f.head, commit: null, output: "branch",
     archive: { branch: archiveBranch, commit }, worktree: f.worktree, worktreeCreated: true, worktreeRemoved: true, reviewNotes: [],
   });
@@ -841,7 +874,7 @@ test("delivery.json and the summary name the archive branch and its commit", asy
 for (const further of [false, true]) {
   test(`archive keeps a commit an Agent made on the ticket branch, ${further ? "below the archive commit of what is still uncommitted" : "as it is when nothing else is uncommitted"}`, async context => {
     const f = fixture(context);
-    const result = await execute(input(f, {}, { maxRepairs: 0 }), {
+    const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), {
       implementer: request => {
         implement(request); git(request.cwd, "add", "."); git(request.cwd, "commit", "-qm", "agent commit");
         if (further) writeFileSync(join(request.cwd, "code.txt"), "new");
@@ -860,7 +893,7 @@ test("a worktree that is not clean after the archive commit ends blocked with no
   const f = fixture(context);
   // --no-verify skips the hooks that can refuse a commit; this one runs after it.
   mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks/post-commit"), "#!/bin/sh\necho late > late.txt\n", { mode: 0o755 });
-  const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("archive"));
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("archive"));
   const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: the worktree is not clean after the archive commit, so ${archiveBranch} would not hold all of the candidate`, "u"), 1);
   assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
   assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
@@ -871,7 +904,7 @@ test("a worktree that is not clean after the archive commit ends blocked with no
 test("a hook that resets HEAD off the archive commit and leaves a clean worktree ends blocked with nothing removed and no archive branch", async context => {
   const f = fixture(context);
   mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks/post-commit"), "#!/bin/sh\ngit reset --quiet --hard HEAD~1\n", { mode: 0o755 });
-  const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("archive"));
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("archive"));
   const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: a commit hook or Git configuration moved HEAD off the archive commit or changed what it holds, so ${archiveBranch} would not hold the candidate; HEAD is at ${f.head}`, "u"));
   assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
   assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
@@ -889,7 +922,7 @@ for (const [changed, script] of [
     const f = fixture(context);
     // --no-verify skips commit-msg, not the hook that prepares the message.
     mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks/prepare-commit-msg"), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
-    const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("archive"));
+    const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("archive"));
     const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: a commit hook or Git configuration changed the archive commit's message, so ${archiveBranch} would not name the ticket; HEAD is at [0-9a-f]{40}, which holds the candidate`, "u"), 1);
     assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
     assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
@@ -903,7 +936,7 @@ for (const [changed, script] of [
 test("a hook that adds to the archive commit's message without changing its subject or ticket does not prevent the archive", async context => {
   const f = fixture(context);
   mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks/prepare-commit-msg"), '#!/bin/sh\nprintf "\\nPrepared-by: hook\\n" >> "$1"\n', { mode: 0o755 });
-  const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("archive"));
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("archive"));
   abandoned(f, result, "archive");
   assert.equal(git(f.repo, "log", "-1", "--format=%B", archiveBranch), "Archive: Add a greeting\n\nTicket: PROJ-12\n\nPrepared-by: hook");
 });
@@ -912,7 +945,7 @@ test("a candidate that cannot be staged ends blocked with nothing removed", asyn
   const f = fixture(context);
   // Git refuses to add an embedded repository that has no commit.
   const human = person(() => { git(f.worktree, "init", "-q", "embedded"); return "archive"; });
-  const result = await execute(input(f, { checks: [command("process.exit(1)")] }, { maxRepairs: 0 }), { reviewer: () => assert.fail() }, human);
+  const result = await execute(input(f, { checks: [command("process.exit(1)")] }, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => assert.fail() }, human);
   const run = blocked(f, result, /candidate could not be archived, so nothing was removed; inspect .+git-add\.log/u);
   assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
   assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.ok(existsSync(join(run.directory, "git-add.log")));
@@ -923,12 +956,25 @@ test("a candidate that cannot be staged ends blocked with nothing removed", asyn
 test("discard then go back returns to the decision with the worktree, branch, and candidate as they were", async context => {
   const f = fixture(context); let before: unknown; let between: unknown;
   const human = person(() => { before = candidate(f.worktree); return "discard"; }, "go back", () => { between = candidate(f.worktree); return "hand off"; });
-  const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, human);
-  assert.deepEqual(result.states.slice(-5), ["decide", "confirmDiscard", "decide", "handOff", "handedOff"]);
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, human);
+  assert.deepEqual(result.states.slice(-6), ["decide", "confirmDiscard", "stuck", "decide", "handOff", "handedOff"]);
   const run = handedOff(f, result, /budget exhausted \(0\)\. Handle the empty case/u, human);
   assert.deepEqual(between, before); assert.deepEqual(candidate(f.worktree), before);
   const [first, confirm, second] = human.requests;
   assert.deepEqual(confirm!.choices, ["confirm discard", "go back"]);
+  assert.equal(first!.prompt.split("\n")[0], "Ticket PROJ-12 is stuck: choose how to go on");
+  assert.equal(confirm!.prompt.split("\n")[0], "Discard the candidate for ticket PROJ-12?");
+  for (const request of [first!, confirm!]) {
+    assert.equal(request.prompt.split("\n")[1], "");
+    assert.match(request.prompt, /Stopped in reviewBudget\./u);
+    assert.match(request.prompt, /Repair rounds used: 0 of 0\./u); assert.match(request.prompt, /Review rounds used: 0 of 0\./u);
+    assert.ok(request.prompt.includes(`Evidence: ${run.directory}`));
+    assert.doesNotMatch(request.prompt, /^#/mu);
+  }
+  assert.ok(first!.prompt.indexOf("hand off:") < first!.prompt.indexOf("more rounds:"));
+  assert.match(first!.prompt, /hand off: .+ \(recommended\)/u);
+  assert.ok(confirm!.prompt.indexOf("confirm discard:") < confirm!.prompt.indexOf("go back:"));
+  assert.doesNotMatch(confirm!.prompt, /Needs:|\(recommended\)/u);
   for (const part of [f.worktree, branch, "will not be saved"]) assert.ok(confirm!.prompt.includes(part), part);
   assert.deepEqual([second!.prompt, second!.choices], [first!.prompt, first!.choices]);
   assert.deepEqual(run.result.decisions.map((made: any) => `${made.stage}: ${made.response}`), ["decide: discard", "confirmDiscard: go back", "decide: hand off"]);
@@ -941,7 +987,7 @@ test("discard removes the worktree and branch only after it is confirmed, and ar
     unconfirmed = existsSync(join(f.worktree, "greeting.txt")) && git(f.repo, "rev-parse", branch) === f.head && git(f.repo, "config", "--local", "--get", `branch.${branch}.ticket`) === "proj-12";
     return "confirm discard";
   });
-  const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, human);
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, human);
   assert.ok(unconfirmed); assert.deepEqual(result.states.slice(-5), ["decide", "confirmDiscard", "remove", "abandon", "abandoned"]);
   const run = abandoned(f, result, "discard");
   // The ticket record goes with the branch.
@@ -954,7 +1000,7 @@ test("discard removes the worktree and branch only after it is confirmed, and ar
 test("a worktree that cannot be removed after a confirmed discard ends blocked with the saved log", async context => {
   const f = fixture(context);
   const human = person("discard", () => { git(f.repo, "worktree", "lock", f.worktree); return "confirm discard"; });
-  const result = await execute(input(f, {}, { maxRepairs: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, human);
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, human);
   const run = blocked(f, result, /git worktree failed; inspect .+git-worktree\.log/u);
   assert.match(readFileSync(join(run.directory, "git-worktree.log"), "utf8"), /locked/u); assert.equal(run.delivery.decision, "discard");
   assert.equal(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), "hello\n"); assert.equal(git(f.repo, "rev-parse", branch), f.head);
@@ -962,7 +1008,7 @@ test("a worktree that cannot be removed after a confirmed discard ends blocked w
 
 /** Ends a first run handed off with its uncommitted candidate, and returns the fixture a second run records its own evidence under. */
 async function handOff(f: Fixture) {
-  const first = await execute(input(f, { setup: [command('console.log("installed")', { name: "install" })] }, { maxRepairs: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("hand off"));
+  const first = await execute(input(f, { setup: [command('console.log("installed")', { name: "install" })] }, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("hand off"));
   assert.equal(first.state, "handedOff");
   return { ...f, evidence: join(f.root, "evidence-resumed") };
 }
@@ -992,8 +1038,8 @@ test("a resumed run whose review asks for changes repairs within a fresh budget"
     reviewer: () => ++reviews === 1 ? review("revise", "Explain the greeting") : review("approved"),
   });
   assert.equal(result.state, "delivered"); assert.deepEqual([edits, reviews], [1, 2]); untouched(f);
-  assert.deepEqual(result.states.slice(0, 9), ["shape", "prepare", "verify", "sealReview", "review", "reviewResult", "repairBudget", "change", "verify"]);
-  assert.equal(evidence(again).result.repairs, 1); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello again");
+  assert.deepEqual(result.states.slice(0, 9), ["shape", "prepare", "verify", "sealReview", "review", "reviewResult", "reviewBudget", "change", "verify"]);
+  assert.equal(evidence(again).result.repairs, 0); assert.equal(evidence(again).result.reviewRounds, 1); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello again");
 });
 
 for (const output of ["branch", "pr"] as const) {
@@ -1418,7 +1464,7 @@ test("a commit that names a ticket does not give that ticket a branch its id and
 test("a ticket retitled after its run is blocked by the branch that run made, and resumes on it", async context => {
   const f = fixture(context); const earlier = "ticket/proj-12-an-earlier-title";
   const ticket = { ...input(f).ticket, id: "PROJ-12", title: "An earlier title" };
-  const first = await execute({ ...input(f, {}, { maxRepairs: 0 }), ticket }, { reviewer: () => review("revise", "Handle the empty case") }, person("hand off"));
+  const first = await execute({ ...input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), ticket }, { reviewer: () => review("revise", "Handle the empty case") }, person("hand off"));
   assert.equal(first.state, "handedOff"); assert.equal(record(f, earlier), "proj-12"); assert.equal(git(f.worktree, "symbolic-ref", "--short", "HEAD"), earlier);
   const second = await execute(input(next(f, 2)), { investigator: () => assert.fail() });
   held(next(f, 2), second, /^Blocked: Branch ticket\/proj-12-an-earlier-title already exists in .+ for this ticket; nothing was changed/u);
@@ -1513,13 +1559,13 @@ test("a review that is a JSON object without a summary never reaches the pull re
 
 test("review findings returned as a JSON object reach the implementer and the Human as prose", async context => {
   const f = fixture(context); const human = person("hand off"); const prompts: string[] = [];
-  const result = await execute(input(f, {}, { maxRepairs: 1 }), {
+  const result = await execute(input(f, {}, { maxRepairs: 1, maxReviewRounds: 1 }), {
     implementer: request => { prompts.push(request.prompt); return implement(request); }, reviewer: () => report("revise", "Handle the empty case"),
   }, human);
   const run = handedOff(f, result, /budget exhausted \(1\)\. Handle the empty case/u, human);
   assert.ok(prompts[1]!.endsWith("Current failure/feedback: Handle the empty case\nBlocker: Handle the empty case (greeting.txt:1)"));
-  assert.equal(run.delivery.reason, "Repair budget exhausted (1). Handle the empty case\nBlocker: Handle the empty case (greeting.txt:1)");
-  assert.ok(result.output.summary.startsWith(`Handed off on ${branch}: Repair budget exhausted (1). Handle the empty case Blocker: Handle the empty case (greeting.txt:1). Decision: hand off.`));
+  assert.equal(run.delivery.reason, "Review budget exhausted (1). Handle the empty case\nBlocker: Handle the empty case (greeting.txt:1)");
+  assert.ok(result.output.summary.startsWith(`Handed off on ${branch}: Review budget exhausted (1). Handle the empty case Blocker: Handle the empty case (greeting.txt:1). Decision: hand off.`));
   assert.deepEqual(run.result.agents.filter((agent: any) => agent.stage === "review").map((agent: any) => agent.summary), ["Handle the empty case", "Handle the empty case"]);
 });
 
@@ -1612,3 +1658,112 @@ test("ticketSections counts a list that starts at a different indent after a sub
   const body = "## Goal\nG\n## Scope\n- s\n## Forbidden\n- f\n## Acceptance\n- one\n\n### Group B\n  - two\n  - three\n\nA paragraph between lists.\n    - four\n";
   assert.deepEqual(mod.ticketSections(body).acceptance, ["one", "two", "three", "four"]);
 });
+
+
+for (const policy of ["park", undefined]) {
+  for (const cause of ["triage", "implementer", "gates", "review budget", "reviewer", "discussion", "criterion", "triage drift", "review drift"]) {
+    test(`${policy ?? "default"} stuck policy parks on ${cause} without a Human and preserves the candidate`, async context => {
+      const f = fixture(context); const human = person(); let before: unknown; let reviews = 0;
+      const reason = cause === "gates" ? /Repair budget exhausted \(0\)/u : cause === "review budget" ? /Review budget exhausted \(0\)/u
+        : cause === "discussion" ? /Which locale\?/u : cause === "criterion" ? /criteria remain unmet: greeting.txt contains hello/u
+          : cause.endsWith("drift") ? /read-only stage/u : /Specify the greeting language/u;
+      const data = input(f, { checks: [command(cause === "gates" ? "process.exit(1)" : undefined)] }, {
+        maxRepairs: 0, maxReviewRounds: cause === "review budget" ? 0 : 2,
+      });
+      if (policy === undefined) Reflect.deleteProperty(data, "stuck"); else data.stuck = policy;
+      const result = await execute(data, {
+        investigator: request => {
+          if (cause === "triage drift") writeFileSync(join(request.cwd, "code.txt"), "triage edit");
+          before = candidate(request.cwd);
+          return ok(cause === "triage" ? "blocked" : "ready", "Specify the greeting language");
+        },
+        implementer: request => {
+          implement(request); before = candidate(request.cwd);
+          return ok(cause === "implementer" ? "blocked" : "completed", "Specify the greeting language");
+        },
+        reviewer: request => {
+          reviews++;
+          if (cause === "review drift") { writeFileSync(join(request.cwd, "greeting.txt"), "review edit"); before = candidate(request.cwd); return review(); }
+          if (cause === "discussion") return review("approved", "Owner question", { findings: [{ severity: "discussion", text: "Which locale?", where: "greeting.txt:1" }] });
+          if (cause === "criterion") return review("approved", "Still unmet", { criteria: [{ text: criterion, met: false, evidence: "greeting.txt:1" }], newSinceLastRound: "none" });
+          return cause === "review budget" ? review("revise", "Specify the greeting language") : ok("blocked", "Specify the greeting language");
+        },
+      }, human);
+      const run = parked(f, result, reason, human); assert.deepEqual(candidate(f.worktree), before);
+      if (cause !== "triage" && cause !== "triage drift") assert.ok(candidate(f.worktree).status.includes("greeting.txt"));
+      if (cause === "discussion" || cause === "criterion") assert.equal(reviews, 2);
+      assert.deepEqual(run.delivery.park.budgets, {
+        repairs: { used: 0, max: 0 }, reviewRounds: { used: cause === "discussion" || cause === "criterion" ? 1 : 0, max: cause === "review budget" ? 0 : 2 },
+      });
+    });
+  }
+}
+
+test("parking caps a long blocker consistently in the receipt, note, and hold summary", async context => {
+  const f = fixture(context); const human = person(); let before: unknown;
+  const reason = `Specify the greeting language.\n${"More context.\n".repeat(230)}`.trim();
+  const result = await execute(input(f, {}, { stuck: "park" }), {
+    reviewer: request => { before = candidate(request.cwd); return ok("blocked", reason); },
+  }, human);
+  const run = parked(f, result, /Specify the greeting language/u, human);
+  const needs = `Clarify how to resolve this blocker: ${reason.replace(/\s+/gu, " ")}`.slice(0, 600) + "…";
+  assert.equal(run.delivery.park.needs, needs);
+  assert.equal(run.delivery.reason, reason);
+  assert.equal(Object.keys(run.delivery)[0], "schemaVersion");
+  const note = readFileSync(join(run.directory, "park.txt"), "utf8");
+  assert.equal(note.split("\n").find(line => line.startsWith("Needs: ")), `Needs: ${needs}`);
+  assert.equal(result.output.summary, `Parked on ${branch}: ${note.split("\n")[0]} Needs: ${needs} Worktree kept at ${f.worktree}. Evidence: ${run.directory}`);
+  assert.deepEqual(candidate(f.worktree), before);
+});
+
+for (const exhausted of ["review", "gates"]) {
+  test(`${exhausted} budget exhausts independently after two retries of the other kind`, async context => {
+    const f = fixture(context); const human = person(); let edits = 0; let reviews = 0; let before: unknown;
+    const result = await execute(input(f, { checks: [command('process.exit(require("fs").readFileSync("greeting.txt", "utf8") === "fail" ? 1 : 0)')] }, {
+      stuck: "park", maxRepairs: exhausted === "gates" ? 2 : 3, maxReviewRounds: exhausted === "review" ? 2 : 3,
+    }), {
+      implementer: request => {
+        edits++;
+        writeFileSync(join(request.cwd, "greeting.txt"), (exhausted === "review" ? edits <= 2 : edits >= 3) ? "fail" : "hello\n");
+        before = candidate(request.cwd); return ok();
+      },
+      reviewer: () => review("revise", `Finding ${++reviews}`),
+    }, human);
+    const run = parked(f, result, exhausted === "review" ? /Review budget exhausted \(2\)/u : /Repair budget exhausted \(2\)/u, human);
+    assert.match(run.delivery.park.needs, /^Explain how to resolve the remaining findings: /u);
+    assert.deepEqual([edits, reviews], [5, exhausted === "review" ? 3 : 2]);
+    assert.deepEqual([run.result.repairs, run.result.reviewRounds], [2, 2]);
+    assert.deepEqual(run.delivery.park.budgets, {
+      repairs: { used: 2, max: exhausted === "gates" ? 2 : 3 }, reviewRounds: { used: 2, max: exhausted === "review" ? 2 : 3 },
+    });
+    assert.deepEqual(run.result.checks.map(check => check.passed), exhausted === "review" ? [false, false, true, true, true] : [true, true, false, false, false]);
+    assert.deepEqual(candidate(f.worktree), before);
+  });
+}
+
+test("a parked candidate resumes with fresh budgets and an approving reviewer delivers it", async context => {
+  const f = fixture(context); const human = person();
+  const first = await execute(input(f, {}, { stuck: "park", maxReviewRounds: 0 }), { reviewer: () => review("revise", "Which language?") }, human);
+  parked(f, first, /Review budget exhausted \(0\)/u, human);
+  const again = { ...f, evidence: join(f.root, "evidence-resumed") };
+  const data = input(again, { setup: [command("process.exit(1)")] }, { resume: true, stuck: "park" });
+  data.ticket.body += "\n\nThe greeting language is English.";
+  const result = await execute(data, {
+    investigator: () => assert.fail(), implementer: () => assert.fail(),
+    reviewer: request => { assert.match(request.prompt, /The greeting language is English/u); assert.equal(readFileSync(join(request.cwd, "greeting.txt"), "utf8"), "hello\n"); return review(); },
+  }, human);
+  assert.equal(result.state, "delivered");
+  assert.deepEqual(result.states, ["shape", "prepare", "verify", "sealReview", "review", "reviewResult", "commit", "deliver", "success", "delivered"]);
+  const run = held(again, result, /^Delivered/u); untouched(f);
+  assert.deepEqual([run.result.repairs, run.result.reviewRounds, run.delivery.resumed, run.delivery.worktreeRemoved], [0, 0, true, true]);
+  assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello");
+  assert.equal(existsSync(f.worktree), false); assert.deepEqual(human.requests, []);
+});
+
+for (const extra of [{ stuck: "wait" }, { stuck: null }, ...[null, -1, 6, 1.5, "2"].map(maxReviewRounds => ({ maxReviewRounds }))]) {
+  test(`invalid stuck policy or review budget ${JSON.stringify(extra)} fails before effects`, context => {
+    const f = fixture(context);
+    assert.throws(() => mod.default(runtime, input(f, {}, extra)));
+    assert.deepEqual(readdirSync(f.root), ["widgets"]);
+  });
+}

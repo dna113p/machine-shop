@@ -143,7 +143,7 @@ is not one of the ten defaults and the selective installer does not install it;
 run it from source or wrap it in a project Machine that supplies trusted paths
 and commands. It takes one local ticket for one Git repository and carries it
 from an isolated worktree to a delivered branch, patch, or draft pull request,
-stopping for a person only when the work is stuck:
+parking stuck work immediately by default, with an optional Human decision:
 
 ```sh
 machine run /absolute/machine-shop/ticket-task.ts \
@@ -173,7 +173,7 @@ stay within the current section.
 Reviews report a verdict and evidence for each acceptance criterion, tagged
 findings, and what changed since the previous round. The Machine requires
 repairs for unmet criteria or blocker findings, escalates malformed reports,
-non-converging repairs, and repeated owner questions to `decide`, and accepts
+non-converging repairs, and repeated owner questions through the stuck policy, and accepts
 minor findings without another round. Minor findings from every review are
 kept in `delivery.json` as `reviewNotes` and in a pull request's `## Review notes`
 section, deduplicated by trimmed, case-insensitive text and location. Pull request
@@ -181,15 +181,22 @@ notes occupy one line each and omit empty locations. A reviewer `blocked` event
 needs only its summary. Repeated questions escalate only when no criteria or
 blockers need repair. Full reports are saved as `review-<n>.json` in the evidence directory.
 
-A ticket run can wait for a person. Failed checks and review findings are
-repaired within `maxRepairs`, which defaults to 3 here (0-3 accepted). When that
-budget is exhausted, or triage, the implementer, or the reviewer reports a
-blocker or a read-only stage edits the worktree, the run enters the Human state
-`decide` instead of ending. Its prompt gives the ticket, the reason, the repair
-rounds used, the worktree, and the branch, and offers exactly four choices:
+A stuck ticket parks by default (`stuck: "park"`): the run ends `parked`
+immediately, keeping the worktree, branch, and uncommitted candidate unchanged.
+It writes `park.txt` and `delivery.json` with what needs an answer and how to
+resume. Failed gates use `maxRepairs` (0–3, default 3); review revisions use
+`maxReviewRounds` (0–5, default 2). The budgets are independent.
 
-- `more rounds`: restart the repair budget and send the standing findings back
-  to the implementer. It can be chosen every time the budget runs out.
+When either budget is exhausted, or triage, implementation, or review blocks,
+the `stuck` Operation chooses parking or, with `stuck: "ask"`, the Human state
+`decide`. Read-only stage edits also go through this policy. Every Human prompt
+and park note uses one brief helper: decision first (at most ten words), then
+the ticket's standing, stopped state, reason, both budgets, evidence locations,
+and options. In `decide`, `hand off` is recommended and listed first; the four
+choices remain:
+
+- `more rounds`: restart both budgets and send the standing findings back
+  to the implementer. It can be chosen every time a budget runs out.
 - `hand off`: end `handedOff` with the worktree and branch kept, uncommitted,
   for another workflow or a person.
 - `archive`: commit what delivery would have committed and keep that commit as
@@ -206,13 +213,20 @@ rounds used, the worktree, and the branch, and offers exactly four choices:
 
 Failures while preparing the worktree, committing, or delivering still end
 `blocked` without asking. `"resume": true` starts a new run in the uncommitted
-worktree a `hand off` left behind: it skips triage and setup, and goes straight
-to the checks, review, commit, and delivery with a fresh repair budget. The
+worktree a park or `hand off` left behind: it skips triage and setup, and goes straight
+to the checks, review, commit, and delivery with fresh budgets. The
 base branch may have moved forward in the meantime: the ticket branch must point
 at the base commit or an ancestor of it, with no commit of its own, and the run
 delivers on the commit the branch is on without rebasing.
 
-The run ends `delivered`, `handedOff`, `abandoned`, or `blocked`, and its output
+To resume parked work: add the answer to the ticket body, then run the ticket
+again with `resume: true`. The hold summary starts `Parked on <branch>:`, uses
+the note's first line and `Needs: ...`, and ends with `Worktree kept at ...`
+and `Evidence: <directory>`. `delivery.json` records `outcome: "parked"`, the
+reason, and `park: { needs, next, budgets: { repairs: { used, max }, reviewRounds:
+{ used, max } } }`. `result.json` records cumulative `repairs` and `reviewRounds`.
+
+The run ends `delivered`, `parked`, `handedOff`, `abandoned`, or `blocked`, and its output
 is always exactly `{ "action": "hold", "summary": "..." }` so a Machines Dispatch
 ticket stays open until a person merges or closes it. The workflow never
 relaunches itself or another Machine and never edits a ticket. See the

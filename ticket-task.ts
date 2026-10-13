@@ -3,8 +3,9 @@ import { existsSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Event, MachinePrimitives } from "@dna113p/machines";
 import { taskRun, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
+import { brief, firstLine } from "./defaults/_machine-shop/brief.ts";
 
-export const description = "Carry one local ticket for one Git repository from an isolated worktree through triage, implementation, checks, and review to a delivered branch, patch, or draft pull request; a stuck run waits for a Human decision.";
+export const description = "Carry one local ticket for one Git repository from an isolated worktree through triage, implementation, checks, and review to a delivered branch, patch, or draft pull request; a stuck run parks by default or asks for a Human decision.";
 export const agentRoles = {
   investigator: "Decides whether the ticket is actionable as written, without editing",
   implementer: "Implements the ticket and its tests in the worktree",
@@ -17,7 +18,7 @@ const confirmations = ["confirm discard", "go back"] as const;
 
 export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const { machine, operation, agent, human, final } = p;
-  const { ticket, repository, prefix, worktree, evidenceRoot, resume, work, branch: named } = parseTicket(input);
+  const { ticket, repository, prefix, worktree, evidenceRoot, resume, stuck, work, branch: named } = parseTicket(input);
   // A resumed run continues on the branch its worktree is already on, whatever title named it.
   let branch = named;
   let baseCommit = "";
@@ -26,6 +27,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let adopted = false;
   let removed = false;
   let decision = "";
+  let stoppedIn = "";
   let discardConfirmed = false;
   let archived: { branch: string; commit: string } | undefined;
   let reviewSummary = "";
@@ -252,26 +254,52 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
 
   /** Where an archive keeps the candidate: this run's branch name with archive/ in place of ticket/. */
   const archiveBranch = () => `archive/${branch.slice("ticket/".length)}`;
-  const stuckPrompt = () => {
-    const { reason, repairs, totalRepairs, maxRepairs } = work.status();
+  const standing = () => {
+    const { reason, repairs, totalRepairs, maxRepairs, reviewRounds, totalReviewRounds, maxReviewRounds } = work.status();
     return [
-      `Ticket ${ticket.id}: ${ticket.title}`,
-      `This run is stuck and needs a decision: ${reason}`,
+      `Ticket ${ticket.id}: ${ticket.title}. Stopped in ${stoppedIn}.`,
+      `This run is stuck and needs a decision: ${reason}\n`,
       `Repair rounds used: ${repairs} of ${maxRepairs}${totalRepairs > repairs ? ` in this budget, ${totalRepairs} in all` : ""}.`,
-      `Worktree: ${worktree}\nBranch: ${branch}\nEvidence: ${work.open()}`,
-      [
-        "more rounds: restart the repair budget and send the standing findings back to the implementer.",
-        "hand off: stop here and keep the worktree and branch exactly as they are, with nothing committed, for another workflow or a person.",
-        `archive: commit the candidate as delivery would have and keep that commit as the branch ${archiveBranch()}, then remove the worktree and delete ${branch}. Ignored files are not kept.`,
-        "discard: remove the worktree and delete the branch without saving the candidate; asks for confirmation first.",
-      ].join("\n"),
-    ].join("\n\n");
+      `Review rounds used: ${reviewRounds} of ${maxReviewRounds}${totalReviewRounds > reviewRounds ? ` in this budget, ${totalReviewRounds} in all` : ""}.`,
+    ].join("\n");
   };
-  const discardPrompt = () => [
-    `Discard the candidate for ticket ${ticket.id}: ${ticket.title}?`,
-    `This removes the worktree ${worktree} and deletes the branch ${branch} in ${repository.path}.`,
-    "The candidate will not be saved: no archive branch is made, and its uncommitted and committed work on that branch is lost.",
-  ].join("\n\n");
+  const locations = () => [`Worktree: ${worktree}`, `Branch: ${branch}`, `Evidence: ${work.open()}`];
+  const stuckPrompt = () => brief({
+    decision: `Ticket ${ticket.id} is stuck: choose how to go on`, standing: standing(), evidence: locations(),
+    options: [
+      { name: "more rounds", does: "restart the repair budget and send the standing findings back to the implementer." },
+      { name: "hand off", does: "stop here and keep the worktree and branch exactly as they are, with nothing committed, for another workflow or a person.", recommended: true },
+      { name: "archive", does: `commit the candidate as delivery would have and keep that commit as the branch ${archiveBranch()}, then remove the worktree and delete ${branch}. Ignored files are not kept.` },
+      { name: "discard", does: "remove the worktree and delete the branch without saving the candidate; asks for confirmation first." },
+    ],
+  });
+  const discardPrompt = () => brief({
+    decision: `Discard the candidate for ticket ${ticket.id}?`,
+    standing: `${standing()}\nThe candidate will not be saved: no archive branch is made, and its uncommitted and committed work on that branch is lost.`,
+    evidence: locations(),
+    options: [
+      { name: "confirm discard", does: `remove the worktree ${worktree} and delete the branch ${branch} in ${repository.path}.` },
+      { name: "go back", does: "return to the decision with the candidate kept." },
+    ],
+  });
+  const parkNext = "Add the answer to the ticket body, then run the ticket again with resume: true; the run continues from the kept worktree with fresh budgets.";
+  function parkDetails() {
+    const { reason, repairs, maxRepairs, reviewRounds, maxReviewRounds } = work.status();
+    // Ask for one owner response while preserving the actual question or criterion as context.
+    const why = flat(reason);
+    const needs = /^(Repair|Review) budget exhausted/u.test(why)
+      ? `Explain how to resolve the remaining findings: ${why}`
+      : why.startsWith("Ticket owner must settle repeated discussion: ")
+        ? `Answer the open question: ${why.slice("Ticket owner must settle repeated discussion: ".length)}`
+        : `Clarify how to resolve this blocker: ${why}`;
+    return { needs: needs.replace(/^(.{600}).+$/u, "$1…"), next: parkNext,
+      budgets: { repairs: { used: repairs, max: maxRepairs }, reviewRounds: { used: reviewRounds, max: maxReviewRounds } } };
+  }
+  const parkNote = () => brief({
+    decision: `Ticket ${ticket.id} is parked: answer what is needed`, standing: standing(),
+    needs: parkDetails().needs, evidence: locations(), options: [{ name: "resume", does: parkNext, recommended: true }],
+  });
+  const stopped = (state: string, run: () => Event) => () => { stoppedIn = state; return run(); };
 
   /** Saves what delivery would have committed as a commit on a branch of its own, which outlives the worktree and the ticket branch. */
   function archive(): Event {
@@ -320,7 +348,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: "removed" };
   }
 
-  function conclude(wanted: "completed" | "blocked" | "handed-off" | "abandoned"): Event {
+  function conclude(wanted: "completed" | "blocked" | "handed-off" | "abandoned" | "parked"): Event {
     const result = `${branch} at ${commitHash}${prUrl ? `, pull request ${prUrl}` : ""}${patches.length ? `, patch ${patches.join(", ")}` : ""}`;
     // The branch outlives the worktree; a blocked run keeps both for inspection, and a worktree that stays behind is not a delivery.
     if (wanted === "completed") {
@@ -336,14 +364,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const reason = finished ? "" : String(work.output()?.reason);
     writeFileSync(join(directory, "delivery.json"), JSON.stringify({
       schemaVersion: 1, outcome, ...(finished ? {} : { reason }), ...(decision ? { decision } : {}),
+      ...(outcome === "parked" ? { park: parkDetails() } : {}),
       ticket: ticket.id, repository: { name: repository.name, path: repository.path }, branch,
       baseCommit: baseCommit || null, commit: commitHash || null, output: repository.output,
       ...(prUrl ? { prUrl } : {}), ...(patches.length ? { patches } : {}), ...(archived ? { archive: archived } : {}),
       worktree, ...(adopted ? { resumed: true } : {}), worktreeCreated: created, worktreeRemoved: removed, reviewNotes,
     }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-    const brief = flat(reason).replace(/^(.{600}).+$/u, "$1…").replace(/[^.!?…]$/u, "$&.");
+    const reasonBrief = flat(reason).replace(/^(.{600}).+$/u, "$1…").replace(/[^.!?…]$/u, "$&.");
     held = { action: "hold", summary: [
-      { delivered: `Delivered ${result}.`, blocked: `Blocked: ${brief}`, "handed-off": `Handed off on ${branch}: ${brief}`, abandoned: `Abandoned: ${brief}` }[outcome],
+      { delivered: `Delivered ${result}.`, blocked: `Blocked: ${reasonBrief}`, "handed-off": `Handed off on ${branch}: ${reasonBrief}`, abandoned: `Abandoned: ${reasonBrief}`, parked: `Parked on ${branch}: ${firstLine(parkNote())} Needs: ${parkDetails().needs}` }[outcome],
       ...(decision ? [`Decision: ${decision}.`] : []),
       ...(archived ? [`Candidate archived on ${archived.branch} at ${archived.commit}.`] : []),
       ...(outcome === "abandoned" ? [`Worktree and ${branch} removed${archived ? "" : " without saving the candidate"}.`] : []),
@@ -353,7 +382,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: outcome === "handed-off" ? "handedOff" : outcome };
   }
 
-  const record = (stage: string) => ({ event }: { event: Event }) => work.capture(stage, event);
+  const record = (stage: string) => ({ event }: { event: Event }) => { stoppedIn = stage; work.capture(stage, event); };
   const recordReview = ({ event }: { event: Event }) => {
     reviewSummary = work.capture("review", event);
     reviews.push(event);
@@ -421,9 +450,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       start: operation(work.start, { started: "triage" }),
       triage: agent(() => work.prompt("Decide whether this ticket is actionable as written. Do not edit any file. Read the relevant code and judge whether the request, scope, and acceptance criteria are specific enough to implement and test in this repository. Return ready with a short implementation plan as the summary, or blocked with exactly what is missing."), {
         ready: { target: "triageResult", actions: record("triage") },
-        blocked: { target: "decide", actions: record("triage") },
+        blocked: { target: "stuck", actions: record("triage") },
       }, { using: "investigator", cwd: worktree }),
-      triageResult: operation(work.unchanged, { unchanged: "change", changed: "decide" }),
+      triageResult: operation(stopped("triageResult", work.unchanged), { unchanged: "change", changed: "stuck" }),
       change: agent(() => work.prompt([
         "Implement the ticket and its tests, following the triage plan in the stage reports. Keep the change focused. Do not weaken checks or expand scope. Leave your changes uncommitted; the workflow commits and delivers them.",
         "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
@@ -431,7 +460,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         "Resolve discussion findings or explain why they need the ticket owner in your summary.",
       ].join("\n")), {
         completed: { target: "verify", actions: record("change") },
-        blocked: { target: "decide", actions: record("change") },
+        blocked: { target: "stuck", actions: record("change") },
       }, { using: "implementer", cwd: worktree }),
       verify: operation(() => work.checks(), { passed: "sealReview", failed: "repairBudget" }),
       sealReview: operation(work.seal, { sealed: "review" }),
@@ -448,9 +477,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         revise: { target: "reviewResult", actions: recordReview },
         blocked: { target: "reviewResult", actions: recordReview },
       }, { using: "reviewer", cwd: worktree }),
-      reviewResult: operation(reviewResult, { approved: "commit", revise: "repairBudget", blocked: "decide" }),
-      repairBudget: operation(work.repair, { retry: "change", exhausted: "decide" }),
-      // Stuck work waits for a person; preparation, commit, and delivery failures still end blocked by themselves.
+      reviewResult: operation(stopped("reviewResult", reviewResult), { approved: "commit", revise: "reviewBudget", blocked: "stuck" }),
+      repairBudget: operation(stopped("repairBudget", work.repair), { retry: "change", exhausted: "stuck" }),
+      reviewBudget: operation(stopped("reviewBudget", work.reviewRound), { retry: "change", exhausted: "stuck" }),
+      // Preparation, commit, and delivery failures still end blocked by themselves.
+      stuck: operation(() => ({ type: stuck }), { ask: "decide", park: "park" }),
+      park: operation(() => {
+        writeFileSync(join(work.open(), "park.txt"), parkNote() + "\n", { flag: "wx", mode: 0o600 });
+        return conclude("parked");
+      }, { parked: "parked" }),
       decide: human(stuckPrompt, {
         submitted: [
           { guard: chose("more rounds"), target: "change", actions: (args: { event: Event }) => {
@@ -466,7 +501,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       confirmDiscard: human(discardPrompt, {
         submitted: [
           { guard: chose("confirm discard"), target: "remove", actions: ({ event }: { event: Event }) => { work.choice("confirmDiscard", event, confirmations); discardConfirmed = true; } },
-          { target: "decide", actions: ({ event }: { event: Event }) => { work.choice("confirmDiscard", event, confirmations); } },
+          { target: "stuck", actions: ({ event }: { event: Event }) => { work.choice("confirmDiscard", event, confirmations); } },
         ],
       }, { choices: confirmations }),
       archive: operation(archive, { archived: "remove", blocked: "failure" }),
@@ -477,7 +512,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       failure: operation(() => conclude("blocked"), { delivered: "delivered", blocked: "blocked" }),
       handOff: operation(() => conclude("handed-off"), { handedOff: "handedOff" }),
       abandon: operation(() => conclude("abandoned"), { abandoned: "abandoned" }),
-      delivered: final(), blocked: final(), handedOff: final(), abandoned: final(),
+      delivered: final(), blocked: final(), handedOff: final(), abandoned: final(), parked: final(),
     },
   });
 }
@@ -563,7 +598,7 @@ export function ticketSections(body: string) {
 
 function parseTicket(input: unknown) {
   const value: unknown = typeof input === "string" ? JSON.parse(input) : input;
-  const data = object(value, "input", ["ticket", "repository", "worktreeRoot", "evidenceRoot", "maxRepairs", "resume"]);
+  const data = object(value, "input", ["ticket", "repository", "worktreeRoot", "evidenceRoot", "maxRepairs", "maxReviewRounds", "resume", "stuck"]);
   // Trackers attach their own fields (source, metadata) to a ticket; only id, title, and body are read.
   const ticket = object(data.ticket, "ticket", Object.keys(data.ticket ?? {}));
   const id = text(ticket.id, "ticket.id");
@@ -574,6 +609,9 @@ function parseTicket(input: unknown) {
     throw new Error("ticket.id must yield a non-empty slug that is usable as a branch and directory name");
   }
   if (data.resume !== undefined && typeof data.resume !== "boolean") throw new Error("resume must be a boolean");
+
+  const stuck = data.stuck === undefined ? "park" : data.stuck;
+  if (stuck !== "ask" && stuck !== "park") throw new Error('stuck must be "ask" or "park"');
 
   const repo = object(data.repository, "repository", ["name", "path", "base", "setup", "checks", "output", "remote", "draft"]);
   const name = text(repo.name, "repository.name");
@@ -594,13 +632,13 @@ function parseTicket(input: unknown) {
   separate(path, worktree, evidenceRoot);
   const work = taskRun("ticket-task", {
     task: [`Ticket ${id}: ${title}`, ...(ticket.body?.trim() ? [ticket.body] : [])].join("\n\n"),
-    workspace: worktree, checks: repo.checks, maxRepairs: data.maxRepairs ?? 3,
+    workspace: worktree, checks: repo.checks, maxRepairs: data.maxRepairs ?? 3, maxReviewRounds: data.maxReviewRounds,
   }, { checks: true, git: "clean", evidenceRoot });
   const prefix = `ticket/${slug}`;
   const titled = titleSlug(title);
   return {
     ticket: { id, slug, title, summary: firstParagraph(ticket.body ?? ""), sections: ticketSections(ticket.body ?? "") }, prefix, branch: titled ? `${prefix}-${titled}` : prefix,
-    worktree, evidenceRoot, work, resume: data.resume === true,
+    worktree, evidenceRoot, work, resume: data.resume === true, stuck,
     repository: { name, path, base, setup, output, remote, draft: repo.draft !== false,
       checks: (repo.checks as { name: string }[]).map(c => c.name) },
   };

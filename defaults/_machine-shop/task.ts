@@ -15,6 +15,7 @@ interface Assignment {
   workspace: string;
   checks: Check[];
   maxRepairs: number;
+  maxReviewRounds: number;
   regression?: Regression;
 }
 interface Evidence {
@@ -47,6 +48,8 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
   let accepted = false;
   let repairs = 0;
   let renewed = 0;
+  let reviewRounds = 0;
+  let renewedReviews = 0;
   let standing: string | undefined;
   let retired = false;
   let reason = "";
@@ -208,10 +211,21 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     repairs += 1;
     return { type: "retry" };
   }
+  function reviewRound(): Event {
+    if (reviewRounds >= assignment.maxReviewRounds) {
+      standing = reason;
+      reason = `Review budget exhausted (${assignment.maxReviewRounds}). ${reason}`;
+      return { type: "exhausted" };
+    }
+    reviewRounds += 1;
+    return { type: "retry" };
+  }
   /** For a definition whose Human grants another budget: the count restarts and the findings that exhausted the last one stand as the feedback. */
   function renew(): void {
     renewed += repairs;
     repairs = 0;
+    renewedReviews += reviewRounds;
+    reviewRounds = 0;
     if (standing !== undefined) reason = standing;
     standing = undefined;
   }
@@ -246,7 +260,7 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     }
     result = {
       schemaVersion: 1, workflow: name, outcome, workspace, task: assignment.task,
-      startedAt, finishedAt: new Date().toISOString(), repairs: renewed + repairs, agentInvocations: reports.length,
+      startedAt, finishedAt: new Date().toISOString(), repairs: renewed + repairs, reviewRounds: renewedReviews + reviewRounds, agentInvocations: reports.length,
       checksPassed: lastChecksPassed, reason: outcome === "completed" ? "" : reason || (outcome === "rejected" ? "Human rejected the candidate" : "Work did not satisfy its completion conditions"),
       checks: evidence, agents: reports, decisions, report: join(directory, "result.json"),
     };
@@ -254,9 +268,10 @@ export function taskRun(name: string, input: unknown, policy: Policy) {
     console.log(`Machine Shop result: ${join(directory, "result.json")}`);
     return { type: outcome };
   }
-  return { start, open, check, checks, regression, capture, decision, choice, prompt, seal, unchanged, review, repair, renew, block, accept, retire, finish,
+  return { start, open, check, checks, regression, capture, decision, choice, prompt, seal, unchanged, review, repair, reviewRound, renew, block, accept, retire, finish,
     workspace, output: () => result,
-    status: () => ({ reason, repairs, totalRepairs: renewed + repairs, maxRepairs: assignment.maxRepairs }),
+    status: () => ({ reason, repairs, totalRepairs: renewed + repairs, maxRepairs: assignment.maxRepairs,
+      reviewRounds, totalReviewRounds: renewedReviews + reviewRounds, maxReviewRounds: assignment.maxReviewRounds }),
     humanPrompt: (decision: string) => `${decision}\n\n${reports.at(-1)?.summary ?? ""}\nWorkspace: ${workspace}\nEvidence: ${directory}\nApprove only this candidate, not publication or deployment.`,
   };
 }
@@ -276,12 +291,13 @@ export function resultStates(work: TaskRun, { operation, final }: MachinePrimiti
 
 function parseAssignment(input: unknown, policy: Policy): Assignment {
   const value: unknown = typeof input === "string" ? JSON.parse(input) : input;
-  const data = object(value, "input", ["task", "workspace", "checks", "maxRepairs", "regression"]);
+  const data = object(value, "input", ["task", "workspace", "checks", "maxRepairs", "maxReviewRounds", "regression"]);
   const task = text(data.task, "task");
   const workspace = text(data.workspace, "workspace");
   if (!isAbsolute(workspace)) throw new Error("workspace must be an absolute path");
   if (task.length > 20_000) throw new Error("task must be at most 20000 characters");
   const maxRepairs = integer(data.maxRepairs ?? 1, "maxRepairs", 0, 3);
+  const maxReviewRounds = integer(data.maxReviewRounds === undefined ? 2 : data.maxReviewRounds, "maxReviewRounds", 0, 5);
   if (data.checks !== undefined && !Array.isArray(data.checks)) throw new Error("checks must be an array");
   const checks = ((data.checks ?? []) as unknown[]).map((entry, i) => parseCheck(entry, `checks[${i}]`));
   if (checks.length > 20 || (policy.checks && checks.length === 0)) throw new Error("Provide between 1 and 20 explicit checks for this workflow");
@@ -297,7 +313,7 @@ function parseAssignment(input: unknown, policy: Policy): Assignment {
   if (policy.regression && !regression) throw new Error("fix-bug requires regression with failureExitCode and failureIncludes");
   if (!policy.regression && regression) throw new Error("regression is only supported by fix-bug");
   if (!policy.checks && checks.length > 0) throw new Error("This read-only workflow does not run checks; use verify-checks separately");
-  return { task, workspace: resolve(workspace), checks, maxRepairs, ...(regression ? { regression } : {}) };
+  return { task, workspace: resolve(workspace), checks, maxRepairs, maxReviewRounds, ...(regression ? { regression } : {}) };
 }
 export function parseCheck(value: unknown, name: string): Check {
   const data = object(value, name, ["name", "command", "timeoutMs"]);

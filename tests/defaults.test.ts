@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { pathToFileURL } from "node:url";
+import { brief, firstLine } from "../defaults/_machine-shop/brief.ts";
+import { taskRun } from "../defaults/_machine-shop/task.ts";
 import { runtime } from "./runtime.ts";
 
 const names = ["verify-checks", "implement-task", "fix-bug", "refactor", "add-tests", "review-code", "investigate", "update-docs", "upgrade-dependency", "prepare-release"];
@@ -380,3 +382,58 @@ test("a report captured as a JSON object yields its summary, and any other text 
     assert.equal(result.output.agents[0].summary, summary);
   }
 });
+
+test("brief keeps the decision to ten whole words on its first line", () => {
+  for (const count of [1, 10, 11, 20]) {
+    const words = Array.from({ length: count }, (_, index) => `word${index}`);
+    const note = brief({ decision: words.join(" \n "), standing: "Standing", evidence: [] });
+    assert.equal(firstLine(note), words.slice(0, 10).join(" ") + (count > 10 ? "…" : ""));
+    assert.equal(note.split("\n")[1], "");
+    assert.ok(firstLine(note).split(/\s+/u).length <= 10);
+  }
+  assert.equal(firstLine("First\r\nSecond"), "First");
+});
+
+test("brief includes each part once and puts recommended options first without mutating them", () => {
+  const parts = {
+    decision: "Choose the next step", standing: "The criterion is unmet", changed: "The check now passes",
+    needs: "Which locale?", evidence: ["/worktree", "ticket/branch", "/evidence"],
+    options: [{ name: "retry", does: "Try again" }, { name: "hand off", does: "Keep the candidate", recommended: true }, { name: "discard", does: "Confirm removal" }],
+  };
+  const before = structuredClone(parts);
+  assert.equal(brief(parts), [
+    parts.decision, "", parts.standing, `Since last time: ${parts.changed}`, `Needs: ${parts.needs}`, ...parts.evidence,
+    "hand off: Keep the candidate (recommended)", "retry: Try again", "discard: Confirm removal",
+  ].join("\n"));
+  assert.deepEqual(parts, before);
+  assert.equal(brief({ decision: "Decide", standing: "Ready", evidence: [] }), "Decide\n\nReady");
+});
+
+test("taskRun resets both independent budgets and records their cumulative counts", context => {
+  const workspace = repo(context);
+  const work = taskRun("budget-test", { task: "Budget test", workspace, maxRepairs: 1, maxReviewRounds: 2 }, { git: "none" });
+  work.start(); work.block("Standing finding");
+  assert.equal(work.repair().type, "retry");
+  assert.equal(work.reviewRound().type, "retry"); assert.equal(work.reviewRound().type, "retry");
+  assert.equal(work.reviewRound().type, "exhausted");
+  assert.deepEqual(work.status(), { reason: "Review budget exhausted (2). Standing finding", repairs: 1, totalRepairs: 1, maxRepairs: 1, reviewRounds: 2, totalReviewRounds: 2, maxReviewRounds: 2 });
+  work.renew();
+  assert.deepEqual(work.status(), { reason: "Standing finding", repairs: 0, totalRepairs: 1, maxRepairs: 1, reviewRounds: 0, totalReviewRounds: 2, maxReviewRounds: 2 });
+  assert.equal(work.repair().type, "retry"); assert.equal(work.reviewRound().type, "retry");
+  assert.equal(work.repair().type, "exhausted"); assert.equal(work.status().reason, "Repair budget exhausted (1). Standing finding");
+  work.renew(); assert.equal(work.status().reason, "Standing finding");
+  work.finish("blocked");
+  assert.equal(work.output()!.repairs, 2); assert.equal(work.output()!.reviewRounds, 3);
+  const receipt = JSON.parse(readFileSync(String(work.output()!.report), "utf8"));
+  assert.equal(receipt.repairs, 2); assert.equal(receipt.reviewRounds, 3);
+});
+
+for (const maxReviewRounds of [0, 5]) {
+  test(`defaults accept maxReviewRounds ${maxReviewRounds} while retaining their existing repair budget`, async context => {
+    const result = await execute("implement-task", input(repo(context), { maxRepairs: 1, maxReviewRounds }), {
+      implementer: () => ok(), reviewer: () => ok("revise"),
+    });
+    assert.equal(result.state, "blocked"); assert.equal(result.output.repairs, 1); assert.equal(result.output.reviewRounds, 0);
+    assert.match(result.output.reason, /Repair budget exhausted \(1\)/u);
+  });
+}
