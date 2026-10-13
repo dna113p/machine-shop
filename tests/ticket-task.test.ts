@@ -137,6 +137,14 @@ function evidence(f: Fixture) {
   const read = (name: string) => JSON.parse(readFileSync(join(runs, id!, name), "utf8"));
   return { directory: join(runs, id!), result: read("result.json"), delivery: read("delivery.json") };
 }
+/** The evidence files that hold every one of these texts, as a report kept whole beside its stage report does. */
+function holding(directory: string, texts: readonly string[]) {
+  return readdirSync(directory).filter(name => statSync(join(directory, name)).isFile()
+    && texts.every(text => readFileSync(join(directory, name), "utf8").includes(text)));
+}
+/** The Agent states and the decisions a run went through, in order. */
+const route = (states: string[]) => states.filter(state => ["falsify", "plan", "planReview", "test", "change", "review", "decide"].includes(state));
+const oneLine = (text: string) => text.replace(/\s+/gu, " ").trim();
 /** The source checkout keeps its branch, HEAD, index, and files; the run's evidence is elsewhere. */
 function untouched(f: Fixture) {
   assert.equal(git(f.repo, "symbolic-ref", "--short", "HEAD"), "main"); assert.equal(git(f.repo, "rev-parse", "HEAD"), f.head);
@@ -208,7 +216,7 @@ function parked(f: Fixture, result: { state: unknown; output: any; states: strin
   assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
   assert.ok(result.output.summary.includes(`Worktree kept at ${f.worktree}. Evidence: `));
   const note = readFileSync(join(run.directory, "park.txt"), "utf8");
-  // Falsify parks carry every need in the hold; review questions carry a count and the first question.
+  // A stop without owner questions carries its whole need in the hold; open questions, from falsify or a review, carry a count and the first.
   const needs: string[] = run.delivery.park.needs.split("\n");
   const questions: { text: string; where: string }[] = run.delivery.park.questions ?? [];
   if (questions.length) {
@@ -851,9 +859,16 @@ for (const policy of ["park", undefined]) {
       plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
     }, human);
     const run = parked(f, result, /\S/u, human);
-    assert.deepEqual(run.delivery.park.needs.split("\n"), questions);
-    assert.ok(readFileSync(join(run.directory, "park.txt"), "utf8").includes(`Needs: ${questions[0]}\n${questions[1]}\n`));
-    for (const question of questions) assert.ok(result.output.summary.includes(question), question);
+    // The investigator's questions go to the owner as a review's do: numbered, with no location, and counted in the hold.
+    const lines = questions.map((question, index) => `${index + 1}. ${question}`);
+    assert.deepEqual(run.delivery.park.questions, questions.map(text => ({ text, where: "" })));
+    const needs: string[] = run.delivery.park.needs.split("\n");
+    assert.match(needs[0]!, openQuestions); assert.deepEqual(needs.slice(1), lines);
+    assert.ok(readFileSync(join(run.directory, "park.txt"), "utf8").includes(`Needs: ${needs[0]}\n${lines.join("\n")}\nWorktree: ${f.worktree}\n`));
+    assert.ok(result.output.summary.includes(` Needs: ${counted(2)}; the first: ${questions[0]} Worktree kept at ${f.worktree}. `));
+    assert.equal(result.output.summary.includes(questions[1]!), false);
+    for (const question of questions) assert.ok(run.delivery.reason.includes(question), question);
+    assert.deepEqual(run.result.agents, [{ stage: "falsify", outcome: "questions", summary: "The ticket leaves two things open" }]);
     assert.equal(result.states[3], "falsify"); assert.equal(result.states.some(state => state === "plan" || state === "planReview" || state === "test" || state === "change"), false);
     assert.deepEqual(candidate(f.worktree), { status: "", files: [["code.txt", 0, Buffer.from("old").toString("base64")]] });
     assert.deepEqual(run.result.checks, []);
@@ -865,7 +880,31 @@ test("ten questions are the most a falsified ticket parks with, and all ten are 
   const questions = Array.from({ length: 10 }, (_, index) => `What does part ${index + 1} of the greeting say?`);
   const result = await execute(input(f, {}, { stuck: "park" }), { falsify: () => ({ type: "questions", summary: "The ticket leaves ten things open", questions }), plan: () => assert.fail() }, human);
   const run = parked(f, result, /\S/u, human);
-  assert.deepEqual(run.delivery.park.needs.split("\n"), questions);
+  assert.deepEqual(run.delivery.park.questions, questions.map(text => ({ text, where: "" })));
+  assert.deepEqual(run.delivery.park.needs.split("\n").slice(1), questions.map((question, index) => `${index + 1}. ${question}`));
+  assert.ok(result.output.summary.includes(` Needs: ${counted(10)}; the first: ${questions[0]} Worktree kept at `));
+});
+
+test("a falsify question that runs over several lines and 600 characters takes one capped line of the park note, and the hold stays one line", async context => {
+  const f = fixture(context); const human = person();
+  const long = `Which language is the greeting in?\n${"The ticket names none,\nand the product ships in several. ".repeat(14)}`.trim();
+  const short = "Does greeting.txt replace code.txt\nor stand beside it?";
+  const result = await execute(input(f, {}, { stuck: "park" }), {
+    falsify: () => ({ type: "questions", summary: "The ticket leaves two things open", questions: [long, short] }),
+    plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+  }, human);
+  const run = parked(f, result, /Which language is the greeting in\?/u, human);
+  const whole = oneLine(long); const cut = `${whole.slice(0, 600)}…`;
+  assert.ok(whole.length > 700); assert.ok(long.includes("\n"));
+  // The receipt keeps each question as it was asked; the note gives each one line of at most 600 characters.
+  assert.deepEqual(run.delivery.park.questions, [{ text: long, where: "" }, { text: short, where: "" }]);
+  const needs: string[] = run.delivery.park.needs.split("\n");
+  assert.match(needs[0]!, openQuestions); assert.deepEqual(needs.slice(1), [`1. ${cut}`, `2. ${oneLine(short)}`]);
+  assert.ok(readFileSync(join(run.directory, "park.txt"), "utf8").includes(`Needs: ${run.delivery.park.needs}\nWorktree: `));
+  // The reason is never cut.
+  assert.ok(oneLine(run.delivery.reason).includes(whole));
+  assert.doesNotMatch(result.output.summary, /\n/u);
+  assert.ok(result.output.summary.includes(` Needs: ${counted(2)}; the first: ${cut} Worktree kept at ${f.worktree}. `));
 });
 
 for (const [label, questions] of [
@@ -882,6 +921,12 @@ for (const [label, questions] of [
     // Nothing the Agent wrote says "questions", so the word can only be the Machine naming the field.
     const run = parked(f, result, /\bquestions\b/u, human);
     assert.doesNotMatch(run.delivery.park.needs, /What does part 11/u);
+    // The report is a stage report before it is judged, so a refused one is still what the investigator said.
+    const stage = { stage: "falsify", outcome: "questions", summary: "The ticket leaves the language open" };
+    assert.deepEqual([run.result.agents, run.result.agentInvocations], [[stage], 1]);
+    assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "agent-1.json"), "utf8")), stage);
+    // Too many questions are still the investigator's: all of them are kept with the evidence, none in the note.
+    if (Array.isArray(questions) && questions.length === 11) assert.notDeepEqual(holding(run.directory, questions as string[]), []);
     assert.equal(candidate(f.worktree).status, ""); assert.deepEqual(run.result.checks, []);
   });
 }
@@ -921,6 +966,23 @@ test("a plan the reviewer sends back twice parks with the reviewer's summary as 
   assert.equal(candidate(f.worktree).status, ""); assert.deepEqual(run.result.checks, []);
 });
 
+test("a second plan revision whose summary runs over several lines and 600 characters parks with needs capped on one line, as any other blocker", async context => {
+  const f = fixture(context); const human = person(); let planReviews = 0;
+  const feedback = `The plan still names no test.\n${"Say which file proves the greeting.\n".repeat(30)}`.trim();
+  const result = await execute(input(f, {}, { stuck: "park" }), {
+    planReview: () => ok("revise", ++planReviews === 1 ? "Name the test that proves the greeting" : feedback),
+    tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+  }, human);
+  const run = parked(f, result, /The plan still names no test/u, human);
+  const needs = `Clarify how to resolve this blocker: ${oneLine(feedback)}`.slice(0, 600) + "…";
+  assert.equal(run.delivery.park.needs, needs); assert.equal(run.delivery.park.questions, undefined);
+  // The full reason stays in the receipt.
+  assert.equal(run.delivery.reason, feedback);
+  const note = readFileSync(join(run.directory, "park.txt"), "utf8");
+  assert.equal(note.split("\n").find(line => line.startsWith("Needs: ")), `Needs: ${needs}`);
+  assert.equal(result.output.summary, `Parked on ${branch}: ${note.split("\n")[0]} Needs: ${needs} Worktree kept at ${f.worktree}. Evidence: ${run.directory}`);
+});
+
 test("a plan of 4000 characters is carried whole, and one of 4001 never reaches the tester or the implementer", async context => {
   for (const length of [4000, 4001]) {
     const f = fixture(context); const long = "p".repeat(length); let edits = 0;
@@ -934,6 +996,143 @@ test("a plan of 4000 characters is carried whole, and one of 4001 never reaches 
   }
 });
 
+for (const [label, answer] of [
+  ["the whole event as JSON text in its summary", () => ({ type: "planned", summary: JSON.stringify({ type: "planned", summary: plan }) })],
+  ["the plan only as its message", () => ({ type: "planned", message: plan })],
+  ["the whole event as JSON text in its message", () => ({ type: "planned", message: JSON.stringify({ type: "planned", summary: plan }, null, 2) })],
+] as const) {
+  test(`a runner that hands back ${label} gives the reviewer, the tester, and the implementer the prose plan the stage report holds`, async context => {
+    const f = fixture(context); const prompts: Record<string, string> = {};
+    const result = await execute(input(f, {}, { stuck: "park" }), {
+      plan: answer,
+      planReview: request => { prompts.planReview = request.prompt; return planning.planReview!.answer(request); },
+      tester: request => { prompts.tester = request.prompt; return tester(request); },
+      implementer: request => { prompts.implementer = request.prompt; return implement(request); },
+    });
+    assert.equal(result.state, "delivered", evidence(f).delivery.reason);
+    const run = held(f, result, /^Delivered/u);
+    const reported: string = run.result.agents[1].summary;
+    assert.deepEqual(run.result.agents[1], { stage: "plan", outcome: "planned", summary: plan });
+    for (const stage of ["planReview", "tester", "implementer"]) {
+      // The plan follows its heading as it was written, not as the JSON that carried it.
+      assert.ok(planIn(prompts[stage]!).startsWith(`${reported}\n`), stage);
+      assert.equal(planIn(prompts[stage]!).trimStart().startsWith("{"), false, stage);
+    }
+  });
+}
+
+test("the 4000-character limit is measured on the prose plan, not on the JSON a runner wrapped it in", async context => {
+  for (const length of [4000, 4001]) {
+    const f = fixture(context); const long = "p".repeat(length); let edits = 0;
+    const counted = (work: Runner): Runner => request => { edits++; assert.ok(planIn(request.prompt).startsWith(`${long}\n`)); return work(request); };
+    const result = await execute(input(f, {}, { stuck: "park" }), {
+      plan: () => ({ type: "planned", summary: JSON.stringify({ type: "planned", summary: long }) }), tester: counted(tester), implementer: counted(implement),
+    });
+    if (length === 4000) { assert.deepEqual([result.state, edits], ["delivered", 2], evidence(f).delivery.reason); continue; }
+    assert.deepEqual([result.state, edits], ["parked", 0]); assert.match(evidence(f).delivery.reason, /4000/u);
+    // The plan that was too long is still the stage report of the state that returned it.
+    assert.deepEqual(evidence(f).result.agents.map((agent: any) => agent.stage), ["falsify", "plan"]);
+    assert.equal(candidate(f.worktree).status, "");
+  }
+});
+
+/** The outcomes each planning state can return, every one of which needs a summary. */
+const reporting: Record<string, string[]> = { falsify: ["sound", "questions"], plan: ["planned"], planReview: ["approved", "revise"] };
+for (const policy of ["park", "ask"] as const) {
+  for (const [label, summary] of [["no summary", {}], ["an empty summary", { summary: "" }], ["a blank summary", { summary: " \n" }]] as const) {
+    test(`with stuck ${policy}, a report with ${label} from falsify, plan, or planReview stops for the owner with the state and the summary named`, async context => {
+      for (const [state, outcomes] of Object.entries(reporting)) for (const outcome of outcomes) {
+        const f = fixture(context); const human = person(...(policy === "ask" ? ["hand off"] : [])); const calls: string[] = [];
+        const reading = (name: string): Runner => request => {
+          calls.push(name);
+          if (name !== state) return planning[name]!.answer(request);
+          return { type: outcome, ...summary, ...(outcome === "questions" ? { questions: ["Which language is the greeting in?"] } : {}) };
+        };
+        // A run that fails outright, as with "Operation failed in state", stops for nobody.
+        const result = await execute(input(f, {}, { stuck: policy }), {
+          falsify: reading("falsify"), plan: reading("plan"), planReview: reading("planReview"),
+          tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+        }, human).catch(error => assert.fail(`${state} returning ${outcome} failed the run: ${error.message}`));
+        const run = policy === "park" ? parked(f, result, /\bsummary\b/u, human) : handedOff(f, result, /\bsummary\b/u, human);
+        assert.match(run.delivery.reason, new RegExp(`\\b${state}\\b`, "u"), `${state} returning ${outcome}`);
+        assert.doesNotMatch(run.delivery.reason, /Operation failed/u);
+        assert.equal(result.states.at(policy === "park" ? -4 : -5), `${state}Result`);
+        assert.deepEqual(calls, upTo(state)); assert.equal(candidate(f.worktree).status, "");
+      }
+    });
+  }
+}
+
+test("more rounds after falsify questions returns to falsify, and a ticket then found sound is planned, reviewed, and tested before it is implemented", async context => {
+  const f = fixture(context); const human = person("more rounds"); const prompts: Record<string, string> = {}; let falsified = 0;
+  const result = await execute(input(f), {
+    falsify: request => ++falsified === 1
+      ? { type: "questions", summary: "The ticket leaves the language open", questions: ["Which language is the greeting in?"] } : planning.falsify!.answer(request),
+    plan: request => {
+      assert.doesNotMatch(request.prompt, /Current failure\/feedback:/u, "sound clears the settled falsify questions");
+      return planning.plan!.answer(request);
+    },
+    tester: request => { prompts.tester = request.prompt; return tester(request); },
+    implementer: request => { assert.ok(prompts.tester, "the tester runs before the implementer"); prompts.implementer = request.prompt; return implement(request); },
+  }, human);
+  assert.equal(result.state, "delivered");
+  assert.deepEqual(route(result.states), ["falsify", "decide", "falsify", "plan", "planReview", "test", "change", "review"]);
+  assert.match(human.requests[0]!.prompt, /Which language is the greeting in\?/u); assert.equal(human.requests.length, 1);
+  assert.match(human.requests[0]!.prompt, /return to falsify with the standing feedback/u);
+  for (const role of ["tester", "implementer"]) assert.ok(planIn(prompts[role]!).startsWith(`${plan}\n`), role);
+  const run = held(f, result, /^Delivered/u);
+  assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }]);
+  assert.deepEqual(run.result.agents.map((agent: any) => `${agent.stage}: ${agent.outcome}`),
+    ["falsify: questions", "falsify: sound", "plan: planned", "planReview: approved", "test: completed", "change: completed", "review: approved"]);
+  const reports = [1, 2].map(round => JSON.parse(readFileSync(join(run.directory, `falsify-${round}.json`), "utf8")));
+  assert.deepEqual(reports.map(report => report.type), ["questions", "sound"]);
+  assert.deepEqual(reports[0].questions, ["Which language is the greeting in?"]);
+});
+
+test("more rounds after a second plan revision returns to plan with the reviewer's feedback, and the plan then approved goes to the tester before the implementer", async context => {
+  const f = fixture(context); const human = person("more rounds"); const plans: string[] = []; const prompts: Record<string, string> = {}; let planReviews = 0;
+  const result = await execute(input(f), {
+    plan: request => { plans.push(request.prompt); return ok("planned", `Attempt ${plans.length}: add greeting.txt.`); },
+    planReview: () => ++planReviews === 1 ? ok("revise", "Name the test that proves the greeting")
+      : planReviews === 2 ? ok("revise", "The plan still names no test") : ok("approved", "The plan now names its test"),
+    tester: request => { prompts.tester = request.prompt; return tester(request); },
+    implementer: request => { assert.ok(prompts.tester, "the tester runs before the implementer"); prompts.implementer = request.prompt; return implement(request); },
+  }, human);
+  assert.equal(result.state, "delivered");
+  assert.deepEqual(route(result.states), ["falsify", "plan", "planReview", "plan", "planReview", "decide", "plan", "planReview", "test", "change", "review"]);
+  assert.match(human.requests[0]!.prompt, /The plan still names no test/u); assert.equal(human.requests.length, 1);
+  assert.match(human.requests[0]!.prompt, /return to plan with the standing feedback/u);
+  // The planner a person sent back to is briefed with what the reviewer last said, as on the first revision.
+  assert.ok(plans[2]!.includes("Current failure/feedback: The plan still names no test"));
+  for (const role of ["tester", "implementer"]) assert.ok(planIn(prompts[role]!).startsWith("Attempt 3: add greeting.txt.\n"), role);
+  const run = held(f, result, /^Delivered/u);
+  assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }]);
+  for (const round of [1, 2, 3]) {
+    const report = JSON.parse(readFileSync(join(run.directory, `plan-${round}.json`), "utf8"));
+    const reviewed = JSON.parse(readFileSync(join(run.directory, `planReview-${round}.json`), "utf8"));
+    assert.deepEqual(report, ok("planned", `Attempt ${round}: add greeting.txt.`));
+    assert.equal(reviewed.type, round === 3 ? "approved" : "revise");
+  }
+});
+
+for (const state of ["falsify", "plan"]) {
+  test(`more rounds after a stop in ${state} that stops again asks again, and never reaches the tester or the implementer`, async context => {
+    const f = fixture(context); const human = person("more rounds", "hand off"); let planReviews = 0;
+    const result = await execute(input(f), {
+      ...(state === "falsify" ? { falsify: () => ({ type: "questions", summary: "The ticket leaves the language open", questions: ["Which language is the greeting in?"] }) }
+        : { planReview: () => ok("revise", `The plan names no test, round ${++planReviews}`) }),
+      tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+    }, human);
+    handedOff(f, result, state === "falsify" ? /Which language is the greeting in\?/u : /The plan names no test, round \d/u, human);
+    const went = route(result.states); const first = went.indexOf("decide");
+    assert.deepEqual(went.slice(0, first + 1), state === "falsify" ? ["falsify", "decide"] : ["falsify", "plan", "planReview", "plan", "planReview", "decide"]);
+    // The grant goes back to the state that stopped; without an approved plan nothing after it is one that edits.
+    assert.equal(went[first + 1], state); assert.equal(went.at(-1), "decide");
+    assert.equal(went.some(visited => visited === "test" || visited === "change" || visited === "review"), false);
+    assert.equal(candidate(f.worktree).status, "");
+  });
+}
+
 for (const state of ["falsify", "plan", "planReview"]) {
   test(`${state} editing the worktree waits for a decision before any later Agent`, async context => {
     const f = fixture(context); const human = person("hand off"); const calls: string[] = [];
@@ -946,9 +1145,12 @@ for (const state of ["falsify", "plan", "planReview"]) {
       falsify: reading("falsify"), plan: reading("plan"), planReview: reading("planReview"),
       tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
     }, human);
-    handedOff(f, result, /read-only stage/u, human);
+    const run = handedOff(f, result, /read-only stage/u, human);
     assert.deepEqual(calls, upTo(state));
     assert.equal(readFileSync(join(f.worktree, "code.txt"), "utf8"), "edited");
+    // What the state reported is kept before its guard runs, so the one that edited is among the stage reports.
+    assert.deepEqual(run.result.agents.map((agent: any) => agent.stage), upTo(state));
+    assert.equal(run.result.agentInvocations, upTo(state).length);
   });
 }
 
@@ -2511,7 +2713,13 @@ for (const policy of ["park", undefined]) {
       }, human);
       const run = parked(f, result, reason, human); assert.deepEqual(candidate(f.worktree), before);
       assert.equal(candidate(f.worktree).status.includes("greeting.txt"), !early);
-      if (early) assert.deepEqual(result.states.filter(isPlanning), upTo(cause.split(" ")[0]!));
+      if (early) {
+        assert.deepEqual(result.states.filter(isPlanning), upTo(cause.split(" ")[0]!));
+        // The read-only state that edited still reported, and its report is counted with the others.
+        assert.deepEqual(run.result.agents.map((agent: any) => agent.stage), upTo(cause.split(" ")[0]!));
+        assert.equal(run.result.agentInvocations, upTo(cause.split(" ")[0]!).length);
+        assert.ok(existsSync(join(run.directory, `agent-${run.result.agentInvocations}.json`)));
+      }
       if (cause === "discussion" || cause === "criterion") assert.equal(reviews, 2);
       if (cause === "discussion") assert.deepEqual(run.delivery.park.questions, [{ text: "Which locale?", where: "greeting.txt:1" }]);
       assert.deepEqual(run.delivery.park.budgets, {
@@ -2581,6 +2789,45 @@ test("a parked candidate resumes with fresh budgets and an approving reviewer de
   assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello");
   assert.equal(existsSync(f.worktree), false); assert.deepEqual(human.requests, []);
 });
+
+for (const [label, stop] of [
+  ["falsify questions", { falsify: () => ({ type: "questions", summary: "The ticket leaves the language open", questions: ["Which language is the greeting in?"] }) }],
+  ["a second plan revision", { planReview: () => ok("revise", "The plan names no test") }],
+] as const) {
+  test(`a run parked on ${label} leaves no change, and resume starts again at falsify with the amended ticket instead of going to scopeAfterChange`, async context => {
+    const f = fixture(context); const human = person();
+    const first = await execute(input(f, { setup: [command('console.log("installed")', { name: "install" })] }, { stuck: "park" }), {
+      ...stop, tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+    }, human);
+    parked(f, first, /\S/u, human);
+    // Nothing to resume from: the branch is at its base and the worktree holds what the base holds.
+    assert.deepEqual(candidate(f.worktree), { status: "", files: [["code.txt", 0, Buffer.from("old").toString("base64")]] });
+    assert.equal(git(f.worktree, "rev-parse", "HEAD"), f.head);
+    const again = { ...f, evidence: join(f.root, "evidence-resumed") };
+    // The worktree was set up when it was made; a resumed run does not set it up again.
+    const data = input(again, { setup: [command("process.exit(1)", { name: "install" })] }, { resume: true, stuck: "park" });
+    data.ticket.body += "\n\nThe greeting language is English.";
+    const prompts: Record<string, string> = {};
+    const result = await execute(data, {
+      falsify: request => { prompts.falsify = request.prompt; return planning.falsify!.answer(request); },
+      plan: request => { prompts.plan = request.prompt; return planning.plan!.answer(request); },
+      tester: request => { prompts.tester = request.prompt; return tester(request); },
+      implementer: request => { prompts.implementer = request.prompt; return implement(request); },
+    }, human);
+    assert.equal(result.state, "delivered", evidence(again).delivery.reason);
+    assert.deepEqual(result.states.slice(0, 2), ["shape", "prepare"]); assert.notEqual(result.states[2], "scopeAfterChange");
+    assert.deepEqual(route(result.states), ["falsify", "plan", "planReview", "test", "change", "review"]);
+    // The ticket may have changed while it was parked, so it is falsified and planned as it reads now.
+    for (const state of ["falsify", "plan"]) assert.match(prompts[state]!, /The greeting language is English/u, state);
+    for (const role of ["tester", "implementer"]) assert.ok(planIn(prompts[role]!).startsWith(`${plan}\n`), role);
+    const run = held(again, result, /^Delivered/u); untouched(f);
+    assert.deepEqual([run.delivery.outcome, run.delivery.resumed, run.delivery.worktreeCreated, run.delivery.worktreeRemoved], ["delivered", true, false, true]);
+    assert.equal(run.result.checks.some((check: any) => check.phase === "setup"), false);
+    assert.deepEqual(run.result.agents.map((agent: any) => agent.stage), ["falsify", "plan", "planReview", "test", "change", "review"]);
+    assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head); assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+    assert.equal(existsSync(f.worktree), false); assert.deepEqual(human.requests, []);
+  });
+}
 
 for (const extra of [{ stuck: "wait" }, { stuck: null }, ...[null, -1, 6, 1.5, "2"].map(maxReviewRounds => ({ maxReviewRounds }))]) {
   test(`invalid stuck policy or review budget ${JSON.stringify(extra)} fails before effects`, context => {
@@ -2809,3 +3056,21 @@ test("the catalog and the README describe rebase, reverify, rebasedFrom, and the
   const prose = catalog.replace(/\s+/gu, " ");
   assert.match(prose, /moved back|rewritten/iu); assert.match(prose, /by hand/iu);
 });
+
+/** The sentences and table rows of a document, each on one line, so that a claim is looked for where it is made and not across the file. */
+const statements = (text: string) => text.split(/\n(?=\|)|\n{2,}/u).flatMap(block => block.replace(/\s+/gu, " ").split(/(?<=\.)\s/u));
+for (const path of ["docs/catalog.md", "README.md"]) {
+  test(`${path} no longer says planning needs are kept in full, and gives falsify questions the limits of any open question`, () => {
+    const text = readFileSync(resolve(path), "utf8");
+    assert.doesNotMatch(text.replace(/\s+/gu, " "), /questions are kept in full|reviewer's summary in full|exact questions as `needs`|exact `needs`/iu, `${path} still says planning needs are kept in full`);
+    assert.ok(statements(text).some(said => /falsif|planning questions?/iu.test(said) && /\b600\b|\bnumbered\b|\bcapped\b|\bsame (?:limits?|caps?)\b/iu.test(said)),
+      `${path} must say in one sentence or table row that falsify questions are numbered and capped at 600 characters like any open question`);
+  });
+  test(`${path} says a resumed worktree that holds no change starts again at falsify`, () => {
+    const text = readFileSync(resolve(path), "utf8");
+    assert.ok(statements(text).some(said => /resum/iu.test(said) && /falsif/iu.test(said)
+      && /\bclean\b|\bno (?:uncommitted )?changes?\b|\bholds? no(?:thing)?\b|\bno candidate\b|\bwithout a candidate\b|\bat its base\b/iu.test(said)),
+      `${path} must say in one sentence or table row that resume starts again at falsify when the worktree is clean at its base, with no candidate`);
+    assert.doesNotMatch(text.replace(/\s+/gu, " "), /a resumed run goes straight to|it skips `falsify`/iu, `${path} still says every resumed run skips falsify`);
+  });
+}

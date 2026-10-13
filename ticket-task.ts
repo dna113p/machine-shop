@@ -48,13 +48,14 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let checkedBase = "";
   let patches: string[] = [];
   let held: { action: "hold"; summary: string } | undefined;
-  let repairing: "test" | "change" = "change";
+  type PlanningStage = "falsify" | "plan" | "planReview";
+  let repairing: PlanningStage | "test" | "change" = "change";
   let scopeChecks = 0;
   let provedRed = false;
   let planningReport: Event = { type: "sound" };
+  const planningReports: Record<PlanningStage, number> = { falsify: 0, plan: 0, planReview: 0 };
   let plan = "";
   let planRevisions = 0;
-  let planningNeeds: string | undefined;
   let ownerQuestions: { text: string; where: string }[] | undefined;
 
   function scope(stage: "test" | "change"): Event {
@@ -130,7 +131,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (repository.output === "pr" && !published()) return { type: "blocked" };
     if (resume) {
       adopted = true;
-      return { type: "resumed" };
+      return { type: pending() === "" ? "prepared" : "resumed" };
     }
     const owners = new Map(git(repository.path, "for-each-ref", "--format=%(refname)", "refs/heads/ticket/").split("\n")
       .map(ref => ref.slice("refs/heads/".length)).filter(fits).map(name => [name, owner(name)]));
@@ -191,7 +192,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       + "and the pull request would carry them. The base must be pushed first; nothing was changed.");
   }
 
-  /** A resumed run takes over the uncommitted candidate an earlier run left behind; every condition is read, never repaired. */
+  /** A resumed run adopts the worktree an earlier run left behind, with or without a candidate; every condition is read, never repaired. */
   function adopt(): Event {
     if (!existsSync(worktree) || !statSync(worktree).isDirectory()) return work.block(`Cannot resume: worktree directory ${worktree} does not exist; nothing was changed.`);
     const top = run("git", ["rev-parse", "--show-toplevel"], worktree);
@@ -431,7 +432,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const stuckPrompt = () => brief({
     decision: `Ticket ${ticket.id} is stuck: choose how to go on`, standing: standing(), evidence: locations(),
     options: [
-      { name: "more rounds", does: "restart the repair budget and send the standing findings back to the implementer." },
+      { name: "more rounds", does: repairing === "falsify" || repairing === "plan" || repairing === "planReview"
+        ? `restart the repair budget and return to ${repairing} with the standing feedback.`
+        : "restart the repair budget and send the standing findings back to the implementer." },
       { name: "hand off", does: "stop here and keep the worktree and branch exactly as they are, with nothing committed, for another workflow or a person.", recommended: true },
       { name: "archive", does: `commit the candidate as delivery would have and keep that commit as the branch ${archiveBranch()}, then remove the worktree and delete ${branch}. Ignored files are not kept.` },
       { name: "discard", does: "remove the worktree and delete the branch without saving the candidate; asks for confirmation first." },
@@ -462,7 +465,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       : `Clarify how to resolve this blocker: ${why}`;
     return { needs: ownerQuestions
       ? `Answer the open question${ownerQuestions.length === 1 ? "" : "s"}:\n${questionLines(600)}`
-      : planningNeeds ?? needs.replace(/^(.{600}).+$/u, "$1…"),
+      : needs.replace(/^(.{600}).+$/u, "$1…"),
       ...(ownerQuestions ? { questions: ownerQuestions } : {}), next: parkNext,
       budgets: { repairs: { used: repairs, max: maxRepairs }, reviewRounds: { used: reviewRounds, max: maxReviewRounds } } };
   }
@@ -557,11 +560,24 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
 
   const record = (stage: string) => ({ event }: { event: Event }) => { stoppedIn = stage; work.capture(stage, event); };
   const rememberPlanning = ({ event }: { event: Event }) => { planningReport = event; };
+  /** Keep the raw report even if its summary is refused; guards and validation run only after capture. */
+  function keep(stage: PlanningStage): { summary: string } | { refusal: string } {
+    repairing = stage;
+    writeFileSync(join(work.open(), `${stage}-${++planningReports[stage]}.json`), JSON.stringify(planningReport, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    try {
+      return { summary: work.capture(stage, planningReport) };
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith(`Agent ${stage} must return a non-empty summary`)) return { refusal: error.message };
+      throw error;
+    }
+  }
   function falsifyResult(): Event {
+    const kept = keep("falsify");
     if (work.unchanged().type === "changed") return { type: "blocked" };
+    if ("refusal" in kept) return work.block(kept.refusal);
     const event = planningReport;
     if (event.type === "sound") {
-      work.capture("falsify", event);
+      work.block("");
       return { type: "sound" };
     }
     const questions = event.questions;
@@ -569,29 +585,31 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       || questions.some(question => typeof question !== "string" || !question.trim())) {
       return work.block("Malformed falsify report: questions must be an array of 1–10 non-empty strings.");
     }
-    planningNeeds = questions.join("\n");
-    work.capture("falsify", { ...event, summary: typeof event.summary === "string" && event.summary.trim() ? event.summary : planningNeeds });
-    return work.block(planningNeeds);
+    ownerQuestions = questions.map(text => ({ text, where: "" }));
+    return work.block(`Ticket owner must settle ${questionCount()}:\n${questionLines()}`);
   }
   function planResult(): Event {
+    const kept = keep("plan");
     if (work.unchanged().type === "changed") return { type: "blocked" };
-    if (typeof planningReport.summary !== "string" || !planningReport.summary.trim() || planningReport.summary.length > 4000) {
+    if ("refusal" in kept) return work.block(kept.refusal);
+    if (kept.summary.length > 4000) {
       return work.block("Malformed plan report: summary must be a non-empty plan of at most 4000 characters.");
     }
-    plan = planningReport.summary;
-    work.capture("plan", planningReport);
+    plan = kept.summary;
     return { type: "planned" };
   }
   function planReviewResult(): Event {
+    const kept = keep("planReview");
     if (work.unchanged().type === "changed") return { type: "blocked" };
-    const summary = work.capture("planReview", planningReport);
+    if ("refusal" in kept) return work.block(kept.refusal);
     if (planningReport.type === "approved") {
+      repairing = "change";
       work.block("");
       return { type: "approved" };
     }
     if (planRevisions++ === 0) return { type: "revise" };
-    planningNeeds = summary;
-    return work.block(summary);
+    repairing = "plan";
+    return work.block(kept.summary);
   }
   const recordReview = ({ event }: { event: Event }) => {
     reviewSummary = work.capture("review", event);
@@ -658,7 +676,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     initial: "shape", output: () => held,
     states: {
       shape: operation(shape, { prepared: "prepare", blocked: "failure" }),
-      // A resumed candidate is held to the Scope as a fresh one is; red cannot be proved again once it is implemented.
+      // A clean resume starts planning afresh. A resumed candidate is held to Scope; red cannot be proved again once implemented.
       prepare: operation(prepare, { prepared: "start", resumed: "scopeAfterChange", blocked: "failure" }),
       start: operation(work.start, { started: "falsify" }),
       falsify: agent(() => work.prompt("Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 non-empty strings giving the exact questions a person must answer."), {
@@ -727,7 +745,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }, { using: "reviewer", cwd: worktree }),
       reviewResult: operation(stopped("reviewResult", reviewResult), { approved: "commit", revise: "reviewBudget", blocked: "stuck" }),
       repairBudget: operation(stopped("repairBudget", work.repair), { retry: "repairTarget", exhausted: "stuck" }),
-      repairTarget: operation(() => ({ type: repairing }), { test: "test", change: "change" }),
+      repairTarget: operation(() => ({ type: repairing }), { falsify: "falsify", plan: "plan", planReview: "planReview", test: "test", change: "change" }),
       reviewBudget: operation(stopped("reviewBudget", work.reviewRound), { retry: "change", exhausted: "stuck" }),
       // Preparation, commit, and delivery failures still end blocked by themselves.
       stuck: operation(() => ({ type: stuck }), { ask: "decide", park: "park" }),
@@ -737,10 +755,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }, { parked: "parked" }),
       decide: human(stuckPrompt, {
         submitted: [
-          // Back to whichever stage was being repaired: the tester after a failed red, else the implementer.
+          // Back to planning when it stopped there, the tester after a failed red, else the implementer.
           { guard: chose("more rounds"), target: "repairTarget", actions: (args: { event: Event }) => {
             decide(args); work.renew();
-            planningNeeds = undefined;
             ownerQuestions = undefined;
             if (standingReview !== undefined) work.block(standingReview);
             standingReview = undefined;

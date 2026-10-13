@@ -161,7 +161,9 @@ both budgets to zero allows at most eight calls, or seven with `redGreen: false`
 The single permitted plan revision consumes neither budget. A moved base that
 changes the approved patch adds a fresh review outside these budgets.
 With `stuck: "ask"`, each `more rounds` decision
-renews both budgets and grants another implementation pass. The default
+renews both budgets and returns to the planning or editing stage that needs work;
+after a second plan revision it grants one more plan and review with the reviewer's
+feedback. The default
 `stuck: "park"` ends unattended runs immediately with their candidate kept.
 
 ```json
@@ -302,14 +304,14 @@ is.
 | State | Work |
 | --- | --- |
 | `shape` | Validate the checkout and root paths; open evidence and block missing ticket sections or empty required lists before any Agent or worktree |
-| `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch instead and go to `scopeAfterChange`, then `verify` |
+| `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch instead: no uncommitted change goes through `start` to `falsify`, a candidate to `scopeAfterChange`, then `verify` |
 | `start` | Open the helper's run on the worktree, which must be clean |
 | `falsify` | Read-only investigator tries to show the ticket is wrong, already done, impossible here, or underspecified; returns `sound` with a one-paragraph summary or `questions` with 1–10 non-empty strings a person must answer |
-| `falsifyResult` | Guard the unchanged worktree and validate `questions`; a sound ticket goes to `plan`, questions go through the stuck policy with those exact questions as `needs`, one per line |
+| `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; a sound ticket goes to `plan`, questions go through the stuck policy with numbered needs, each flattened and capped at 600 characters plus an ellipsis |
 | `plan` | Read-only investigator returns `planned` with the complete plan as a summary of at most 4000 characters, recorded as stage `plan` |
-| `planResult` | Guard the unchanged worktree and validate the plan length before `planReview` |
+| `planResult` | Capture the report before guarding the unchanged worktree and validating the captured prose plan's length before `planReview` |
 | `planReview` | Read-only reviewer returns `approved` or `revise` with a summary; the prompt includes the plan verbatim |
-| `planReviewResult` | Guard the unchanged worktree; first `revise` returns to `plan`, second `revise` goes through the stuck policy with the reviewer's summary as `needs`; `approved` continues to `test` or, with `redGreen: false`, `change` |
+| `planReviewResult` | Capture the report before guarding the unchanged worktree; first `revise` returns to `plan`, second `revise` goes through the stuck policy with the reviewer's summary as the reason and the usual capped blocker needs; `approved` continues to `test` or, with `redGreen: false`, `change` |
 | `test` | With `redGreen: true`, the tester writes only tests for every acceptance criterion inside Scope, leaving them uncommitted; its summary is recorded as stage `test` |
 | `scopeAfterTest`, `red` | Check changed paths against Scope, then run the named red check; failures consume the repair budget and return to `test` |
 | `change` | The implementer edits the worktree and leaves the changes uncommitted, making the tester's tests pass without weakening or deleting them |
@@ -325,14 +327,19 @@ is.
 | `confirmDiscard` | Human: `confirm discard` or `go back`, asked before a discard removes anything |
 | `archive`, `remove` | Commit the candidate and keep that commit as the branch `archive/<slug>`; `git worktree remove --force` and `git branch -D` for this run's own worktree and ticket branch |
 
-New runs begin with `falsify` → `plan` → `planReview`, with an unchanged-worktree
-guard after each read-only Agent. A plan sent back once is re-planned with the
+New runs begin with `falsify` → `plan` → `planReview`, capturing each report before
+its unchanged-worktree guard or validation. A missing or empty summary in any
+planning state goes through the stuck policy, with the state and missing summary
+named in the reason. A plan sent back once is re-planned with the
 reviewer's feedback and reviewed again; a second revision stops before editing.
 Malformed questions or a plan over 4000 characters go through the stuck policy.
 After plan approval, new runs go through `test` → `scopeAfterTest` → `red` →
 `change` → `scopeAfterChange` → `verify`. With `redGreen: false`, they skip
-`test`, `scopeAfterTest`, and `red`. Resumed runs skip them too, since red cannot be proved again once the change exists, but are held to the Scope at `scopeAfterChange` before `verify`.
-Both the tester and implementer receive the approved plan verbatim under a `Plan:`
+`test`, `scopeAfterTest`, and `red`. Resumed runs with a candidate skip them too,
+since red cannot be proved again once the change exists, but are held to the Scope
+at `scopeAfterChange` before `verify`. A resumed worktree with no uncommitted change
+starts again at `falsify` with the current ticket, then plans and tests afresh.
+The reviewer, tester, and implementer receive the captured prose plan verbatim under a `Plan:`
 heading. The tester receives the acceptance and Scope lists and must write one or more
 tests per criterion without implementing behavior or editing non-test files.
 Red requires a non-empty Git status excluding `.machine-runs` and a nonzero
@@ -521,7 +528,7 @@ has a two-minute timeout and also runs for a resumed `pr` run. `branch` and
 `patch` runs make no network call.
 
 Stuck work goes to the `stuck` Operation. This covers falsify returning
-`questions`, malformed planning reports, a second plan review revision, any read-only
+`questions`, malformed planning reports (including missing or empty summaries), a second plan review revision, any read-only
 planning stage having edited files, the tester or implementer returning `blocked`,
 the reviewer returning `blocked` or having edited files, review non-convergence,
 open owner questions, malformed review reports, either budget exhausting,
@@ -529,6 +536,7 @@ and the recoverable rebase stops described above.
 With the default `stuck: "park"`, `park` writes `park.txt` and a delivery receipt
 and ends `parked` immediately, without a Human request, commit, archive, or
 removal. The worktree, branch, and uncommitted candidate stay exactly as they are.
+A planning park leaves no candidate unless a read-only Agent edited the worktree.
 The note names the answer needed from the reason and gives this next step:
 "Add the answer to the ticket body, then run the ticket again with resume: true;
 the run continues from the kept worktree with fresh budgets."
@@ -542,7 +550,7 @@ recommended and listed first in the decision prompt. The restricted choices are:
 
 | Choice | Effect | Final state |
 | --- | --- | --- |
-| `more rounds` | Both used budget counts return to zero and the run goes back to `change`; the implementer is briefed with the standing findings as in any repair. It can be chosen again every time a budget runs out | continues |
+| `more rounds` | Both used budget counts return to zero; return to the planning state that stopped, or to `plan` with the reviewer's feedback after a second revision. Otherwise return to the responsible editing stage with the standing findings. A plan must be approved before testing and implementation. It can be chosen again every time a budget runs out | continues |
 | `hand off` | Nothing is touched: the worktree and the branch stay, uncommitted, for another workflow or a person to work in | `handedOff` |
 | `archive` | What delivery would have committed, tracked and untracked files without ignored files or `.machine-runs`, is committed and kept as the branch `archive/<slug>`; then the worktree is removed and the ticket branch deleted | `abandoned` |
 | `discard` | After confirmation, the worktree is removed and the branch deleted without saving the candidate | `abandoned` |
@@ -592,7 +600,7 @@ Human primitive with restricted choices. How they are presented, and how long a
 run may wait, belongs to whichever surface runs the Machine.
 
 With `"resume": true`, `prepare` adopts the existing worktree instead of
-creating one, for the candidate a park or `hand off` left. It requires all of: the
+creating one, whether or not a park or `hand off` left a candidate. It requires all of: the
 worktree directory exists and is a Git worktree of `repository.path`; its `HEAD`
 is a symbolic ref to a branch that belongs to this ticket by the rule above; and
 that branch points at the resolved base commit or at an ancestor of it, so
@@ -611,9 +619,13 @@ A worktree on a branch whose ownership is unresolved, or that belongs to another
 ticket, is not adopted; for the first the message gives the `git config` command
 that records it. If any of these fails
 the run ends `blocked` with a message naming the condition, changing nothing.
-Setup commands are not run again and `falsify`, `plan`, and `planReview` are skipped:
-a resumed run goes straight to `scopeAfterChange`, then `verify`, review, commit, rebase, and deliver as usual, with fresh
-budgets and the normal repair loop if review asks for changes. The base
+Setup commands are not run again. With a candidate, resume skips `falsify`, `plan`,
+and `planReview` and goes to `scopeAfterChange`, then `verify`, review, commit,
+rebase, and deliver as usual, with fresh budgets and the normal repair loop if
+review asks for changes. Without a candidate, resume goes through `start` to
+`falsify` and plans and tests the current ticket afresh. This includes a worktree
+left clean by a failed setup in `prepare`; resolve the setup problem in the kept
+worktree before resuming. The base
 must resolve to the commit the first run started from or to a descendant of it,
 so name `repository.base` explicitly, or leave the source checkout on the branch
 it was on. Even after a post-rebase setup failure, resume does not rerun setup
@@ -656,7 +668,9 @@ repository through a symlink, and unexpected exceptions are runtime failures.
 Evidence is written to `<evidenceRoot>/.machine-runs/machine-shop/<id>/`, outside
 the repository and the commit: the helper's `started.json`, check and setup
 logs (including red), `scope-<n>.json` path checks, Agent summaries, full
-structured reviews as `review-<n>.json`, each Human answer as `human-<n>.json`, and `result.json`,
+planning events as `<stage>-<n>.json` (`falsify`, `plan`, `planReview`, numbered per
+stage even on retries), structured reviews as `review-<n>.json`, each Human answer
+as `human-<n>.json`, and `result.json`,
 plus `delivery.json` with the ticket id, repository name and path, branch, base
 commit, commit hash, output mode, pull request URL or patch paths, worktree
 path, whether the worktree was removed, and `reviewNotes: [{text, where}]` in
@@ -674,26 +688,27 @@ For parking, `delivery.json` also records the `reason` and
 `park: { needs, next, budgets: { repairs: { used, max }, reviewRounds: { used, max } } }`.
 The one-line hold starts `Parked on <branch>: ` followed by the first line of
 `park.txt`, then `Needs: ...`, `Worktree kept at ...`, and ends `Evidence: <directory>`.
-For open review questions, `park.questions` is the current review's ordered array
-of `{text, where}`. The reason and needs list every question on its own numbered
+For open review or falsification questions, `park.questions` is the report's
+ordered array of `{text, where}`; falsification questions use an empty `where`.
+The reason and needs list every question on its own numbered
 line with its location. Needs cap each question's flattened text separately at
 600 characters plus an ellipsis, keeping its location; the list itself is not
 capped. The one-line hold instead uses `Needs: N open questions; the first:
 <text> (<where>)`, with the same cap on the first question. Empty locations omit
 the parentheses. Other stops use the same needs text in the receipt, note, and
 summary, with whitespace flattened in the single-line summary and no
-`park.questions` field. Falsification questions are kept in full, one per line
-in the receipt and note; a second plan review revision uses the reviewer's summary
-in full. Other blockers are capped at 600 characters plus an ellipsis when
-truncated. The full reason remains in the receipt and note.
+`park.questions` field. Falsification questions follow the same limits as review
+questions; a second plan review revision uses the usual blocker needs, capped at
+600 characters plus an ellipsis when truncated. The full reason remains in the
+receipt and note, and raw planning events preserve even malformed reports.
 `result.json` keeps the helper's vocabulary: its `outcome` is `blocked` for
 `parked`, `handedOff`, and `abandoned`; `repairs` counts red, scope, and green
 gate retries and `reviewRounds` counts review revisions, each cumulative across renewals;
 `decisions` lists every Human answer.
 
 Limits: a run waiting in a Human state keeps its worktree and branch until it is
-answered. `resume` adopts only an uncommitted candidate on the ticket's own
-worktree and branch; it does not restore an archive branch, continue a branch
+answered. `resume` adopts only the ticket's own worktree and branch, either clean
+at its base or holding an uncommitted candidate; it does not restore an archive branch, continue a branch
 that already holds a commit, or accept a base rewritten away from its history.
 Without `resume`, a second run of the same ticket is blocked while any branch
 of that ticket exists; resume it, or delete

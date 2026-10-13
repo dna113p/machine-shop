@@ -173,13 +173,16 @@ stay within the current section.
 Before editing, `falsify` asks the investigator to show that the ticket is wrong,
 already done, impossible here, or underspecified. It returns `sound` with a
 one-paragraph summary or `questions` with 1–10 non-empty questions a person must
-answer. Questions go through the stuck policy and become the park note's exact
-`needs`, one per line. A sound ticket proceeds to `plan`: the investigator returns
+answer. Falsification questions go through the stuck policy and become numbered
+`needs`, each flattened to one line and capped at 600 characters plus an ellipsis.
+A sound ticket proceeds to `plan`: the investigator returns
 `planned` with a plan of at most 4000 characters, recorded as stage `plan`.
 In `planReview`, the reviewer approves it or requests one revision; a second
-`revise` goes through the stuck policy with the reviewer's summary as `needs`.
-An unchanged-worktree guard follows each of these read-only stages.
-The tester and implementer receive the approved plan verbatim under `Plan:`.
+`revise` goes through the stuck policy with the reviewer's summary as the reason
+and the usual capped blocker needs. Each planning report is captured before its
+unchanged-worktree guard or validation; full events are saved as `<stage>-<n>.json`.
+A missing or empty summary in any planning state goes through the stuck policy.
+The reviewer, tester, and implementer receive the captured prose plan verbatim under `Plan:`.
 
 By default (`redGreen: true`), a `tester` then writes acceptance tests first. The
 Machine checks their paths against Scope and proves they fail using the named
@@ -219,8 +222,10 @@ the ticket's standing, stopped state, reason, both budgets, evidence locations,
 and options. In `decide`, `hand off` is recommended and listed first; the four
 choices remain:
 
-- `more rounds`: restart both budgets and send the standing findings back
-  to the implementer. It can be chosen every time a budget runs out.
+- `more rounds`: restart both budgets and return to the planning state that
+  stopped, or to `plan` with the reviewer's feedback after a second revision.
+  Otherwise return to the responsible editing stage with the standing findings.
+  It can be chosen every time a budget runs out.
 - `hand off`: end `handedOff` with the worktree and branch kept, uncommitted,
   for another workflow or a person.
 - `archive`: commit what delivery would have committed and keep that commit as
@@ -237,8 +242,11 @@ choices remain:
 
 Failures while preparing the worktree, committing, or delivering still end
 `blocked` without asking. `"resume": true` starts a new run in the uncommitted
-worktree a park or `hand off` left behind: it skips `falsify`, `plan`, `planReview`, and setup, and goes straight
-to the checks, review, commit, rebase, and delivery with fresh budgets. The
+worktree a park or `hand off` left behind, with fresh budgets and without rerunning
+setup. A resumed worktree with no uncommitted change starts again at `falsify`,
+then plans, reviews the plan, and tests the current ticket before implementation.
+A worktree with a candidate skips planning and the tester and goes straight to
+scope checks, verification, review, commit, rebase, and delivery. The
 base branch may have moved forward in the meantime: the ticket branch must point
 at the base commit or an ancestor of it, with no commit of its own.
 
@@ -268,9 +276,10 @@ the note's first line and `Needs: ...`, and ends with `Worktree kept at ...`
 and `Evidence: <directory>`. `delivery.json` records `outcome: "parked"`, the
 reason, and `park: { needs, next, budgets: { repairs: { used, max }, reviewRounds:
 { used, max } } }`. `result.json` records cumulative `repairs` and `reviewRounds`.
-For open review questions, `park.questions` is the current review's ordered array
-of `{text, where}`. The reason and `park.needs` list every question on its own
-numbered line with its location; needs cap each question's text separately at 600
+For open review or falsification questions, `park.questions` is the report's
+ordered array of `{text, where}`; falsification questions use an empty `where`.
+The reason and `park.needs` list every question on its own
+numbered line with its location; needs cap each question's flattened text separately at 600
 characters plus an ellipsis, keeping its location. The reason stays full. The
 one-line hold uses `Needs: N open questions; the first: <text> (<where>)`, with
 the same cap on that first question. Empty locations omit the parentheses.
