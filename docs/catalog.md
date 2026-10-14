@@ -158,12 +158,12 @@ budgets. Required Agent roles are `investigator`, `tester`, `implementer`, and
 `reviewer`. Failed red, scope, and green gates use `maxRepairs` (0–3, default 3
 here); review revisions use
 `maxReviewRounds` (0–5, default 2). Neither consumes the other's budget. With a
-stable base this allows at most 16 Agent calls before the stuck policy applies (one falsify,
+stable base this allows at most 17 Agent calls before the stuck policy applies (up to two falsify calls,
 up to three plans and two plan reviews, one initial tester pass, up to six implementation passes, and three implementation reviews;
 tester retries share the repair budget with implementation retries). Setting
-both budgets to zero allows at most nine calls, or eight with `redGreen: false`.
-The single permitted plan revision and the separate one-time return for length
-consume neither budget. A moved base that
+both budgets to zero allows at most ten calls, or nine with `redGreen: false`.
+The single permitted plan revision and the separate one-time returns for plan
+length and malformed falsify questions consume neither budget. A moved base that
 changes the approved patch adds a fresh review outside these budgets.
 With `stuck: "ask"`, each `more rounds` decision
 renews both budgets and returns to the planning or editing stage that stopped,
@@ -313,8 +313,8 @@ is.
 | `shape` | Validate the checkout and root paths; open evidence and block missing ticket sections or empty required lists before any Agent or worktree |
 | `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch instead: no uncommitted change goes through `start` to `falsify`, a candidate to `scopeAfterChange`, then `verify`; with no worktree, a recorded delivered commit is recreated and set up, then continues at `rebase` |
 | `start` | Open the helper's run on the worktree, which must be clean |
-| `falsify` | Read-only investigator tries to show the ticket is wrong, already done, impossible here, or underspecified; returns `sound` with a one-paragraph summary or `questions` with 1–10 entries containing text, options, recommended, assumable, and why |
-| `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; a sound ticket goes to `plan`, as does an entirely assumable report with `assume: true`; remaining questions go through the stuck policy with numbered needs, flattened with question text, each option, and why capped separately at 600 characters plus an ellipsis |
+| `falsify` | Read-only investigator tries to show the ticket is wrong, already done, impossible here, or underspecified; returns `sound` with a one-paragraph summary or `questions` with 1–10 entries containing text, options, recommended, assumable, and why in the report's `questions` field, not its summary or message; a return for malformed questions includes the validation reason and repeats where the questions go |
+| `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; missing or malformed questions return to `falsify` once per run, then go through the stuck policy with the reason and report's evidence file; a sound ticket goes to `plan`, as does an entirely assumable report with `assume: true`; remaining questions go through the stuck policy with numbered needs, flattened with question text, each option, and why capped separately at 600 characters plus an ellipsis |
 | `plan` | Read-only investigator returns `planned` with the complete plan as a summary of at most 4000 characters, recorded as stage `plan`; a return for length names the previous length and limit and asks for the same plan in fewer words, naming files and tests without restating the ticket |
 | `planResult` | Capture the report before guarding the unchanged worktree and validating the captured prose plan's length before `planReview`; a captured plan over 4000 characters returns to `plan` once per run, separately from the reviewer's revision; a second goes through the stuck policy with its length, the limit, and a plain explanation |
 | `planReview` | Read-only reviewer returns `approved` or `revise` with a summary; the prompt includes the plan verbatim |
@@ -347,12 +347,20 @@ goes through the stuck policy with its length against 4000, saying it was sent
 back once and that the ticket may be too broad for one run. Neither over-long
 plan is truncated or passed onward under `Plan:`; both remain captured evidence.
 An empty plan or one over the capture limit of 16000 characters is refused without
-a return for length. Malformed questions go through the stuck policy.
+a return for length. Missing or malformed falsify questions return to `falsify`
+once per run with the validation reason and instructions to put the questions
+in the report's `questions` field, not its summary or message. The field is the
+only source of questions. This allowance is separate from the plan-length
+return and reviewer's revision and consumes neither budget. A second malformed
+report goes through the stuck policy, parking by default with a note saying
+the questions were missing or malformed twice, giving the validation reason
+and naming the `falsify-<n>.json` evidence file holding that report.
 Each question has the shape
 `{ text, options: string[], recommended: string, assumable: boolean, why }`.
 Text and why must be non-empty strings; options must be a non-empty array of
 non-empty strings, and recommended must copy one of those options exactly.
-A malformed entry stops with its field named, such as `questions[0].options`;
+A malformed entry's reason names its field, such as `questions[0].options`,
+both on the return and on a second malformed report's stop;
 plain strings are no longer valid entries.
 
 The `assume` switch is off by default and applies only in `falsify`; enabling it
@@ -607,7 +615,8 @@ has a two-minute timeout and also runs for a resumed `pr` run. `branch` and
 `patch` runs make no network call.
 
 Stuck work goes to the `stuck` Operation. This covers falsify returning
-questions that the run cannot assume, malformed planning reports (including missing or empty summaries), a second over-long plan, a second plan review revision, any read-only
+questions that the run cannot assume, a second malformed falsify questions report,
+other malformed planning reports (including missing or empty summaries), a second over-long plan, a second plan review revision, any read-only
 planning stage having edited files, the tester or implementer returning `blocked`,
 the reviewer returning `blocked` or having edited files, review non-convergence,
 open owner questions, malformed review reports, either budget exhausting,
