@@ -26,8 +26,9 @@ bounded repairs, and retrievable JSON evidence.
 | `prepare-release` | Check a candidate and obtain sign-off; never publish |
 
 Read the [catalog](docs/catalog.md) for state sequences, role bindings, costs,
-input contracts, exact results, and limitations. These are starting points, not
-an install-everything suite. The project orchestrator selects or adapts the ones
+input contracts, exact results, and limitations, and the
+[workflow diagrams](docs/flows.md) to see each flow state by state. These are
+starting points, not an install-everything suite. The project orchestrator selects or adapts the ones
 that fit its actual work, then records routes in the project's `.machines/README.md`.
 Use the runtime's `machine-project-setup` skill for that decision and
 `machine-delegation` for normal assignments. An existing worker should not repeat
