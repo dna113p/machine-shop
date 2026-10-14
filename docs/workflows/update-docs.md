@@ -39,11 +39,11 @@ From [examples/implementation.json](../../examples/implementation.json):
 🤖 Agent · ⚙️ Operation · 🧪 check gate · 🙋 Human · ⭘ end ([key](README.md#reading-the-diagrams))
 
 ```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
 flowchart TD
-  start["⚙️ <b>start</b><br/>refuses a dirty checkout"]
-  change(["🤖 <b>change</b> · writer<br/>reads the source of truth and<br/>checks every command it documents"])
-  verify{{"🧪 <b>verify</b><br/>the supplied checks"}}
-  seal["⚙️ <b>sealReview</b>"]
+  start["⚙️ <b>start</b><br/>needs a clean checkout"]
+  change(["🤖 <b>change</b> · writer<br/>checks docs against the source"])
+  verify{{"🧪 <b>verify</b>"}}
   review(["🤖 <b>review</b> · reviewer<br/>do the docs match the code?"])
   result["⚙️ <b>reviewResult</b>"]
   budget["⚙️ <b>repairBudget</b>"]
@@ -53,7 +53,7 @@ flowchart TD
   start --> change
   change -->|completed| verify
   change -->|blocked| blocked
-  verify -->|passed| seal --> review --> result
+  verify -->|passed| review --> result
   verify -->|failed| budget
   result -->|approved| done
   result -->|revise| budget
@@ -67,7 +67,7 @@ flowchart TD
   classDef good fill:#dcfce7,stroke:#16a34a,color:#0f172a
   classDef bad fill:#fee2e2,stroke:#dc2626,color:#0f172a
   class change,review agent
-  class start,seal,result,budget op
+  class start,result,budget op
   class verify gate
   class done good
   class blocked bad

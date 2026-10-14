@@ -46,15 +46,15 @@ From [examples/bugfix.json](../../examples/bugfix.json):
 🤖 Agent · ⚙️ Operation · 🧪 check gate · 🙋 Human · ⭘ end ([key](README.md#reading-the-diagrams))
 
 ```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
 flowchart TD
-  start["⚙️ <b>start</b><br/>refuses a dirty checkout"]
-  write(["🤖 <b>writeRegression</b> · tester<br/>a test that reproduces the bug;<br/>no production code yet"])
-  red{{"🧪 <b>proveRed</b><br/>regression must fail with the<br/>stated exit code and message"}}
-  fix(["🤖 <b>fix</b> · implementer<br/>may not weaken the regression"])
-  green{{"🧪 <b>proveGreen</b><br/>the same command now passes"}}
-  verify{{"🧪 <b>verify</b><br/>the supplied checks"}}
-  seal["⚙️ <b>sealReview</b>"]
-  review(["🤖 <b>review</b> · reviewer<br/>reads red and green logs: was the<br/>cause fixed, or the test disabled?"])
+  start["⚙️ <b>start</b><br/>needs a clean checkout"]
+  write(["🤖 <b>writeRegression</b> · tester<br/>reproduces the bug"])
+  red{{"🧪 <b>proveRed</b><br/>must fail as described"}}
+  fix(["🤖 <b>fix</b> · implementer<br/>keeps the regression intact"])
+  green{{"🧪 <b>proveGreen</b><br/>same command passes"}}
+  verify{{"🧪 <b>verify</b>"}}
+  review(["🤖 <b>review</b> · reviewer<br/>cause fixed, or test disabled?"])
   result["⚙️ <b>reviewResult</b>"]
   budget["⚙️ <b>repairBudget</b>"]
   done(("✅ completed"))
@@ -69,7 +69,7 @@ flowchart TD
   fix -->|blocked| blocked
   green -->|passed| verify
   green -->|failed| budget
-  verify -->|passed| seal --> review --> result
+  verify -->|passed| review --> result
   verify -->|failed| budget
   result -->|approved| done
   result -->|revise| budget
@@ -83,7 +83,7 @@ flowchart TD
   classDef good fill:#dcfce7,stroke:#16a34a,color:#0f172a
   classDef bad fill:#fee2e2,stroke:#dc2626,color:#0f172a
   class write,fix,review agent
-  class start,seal,result,budget op
+  class start,result,budget op
   class red,green,verify gate
   class done good
   class blocked bad

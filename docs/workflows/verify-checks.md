@@ -38,10 +38,11 @@ From [examples/verify.json](../../examples/verify.json):
 🤖 Agent · ⚙️ Operation · 🧪 check gate · 🙋 Human · ⭘ end ([key](README.md#reading-the-diagrams))
 
 ```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
 flowchart LR
-  start["⚙️ <b>start</b><br/>opens the evidence folder"]
-  verify{{"🧪 <b>verify</b><br/>runs every check, even<br/>after one fails"}}
-  checkFailure["⚙️ <b>checkFailure</b><br/>records blocked, then fails<br/>the run loudly"]
+  start["⚙️ <b>start</b>"]
+  verify{{"🧪 <b>verify</b><br/>runs every check"}}
+  checkFailure["⚙️ <b>checkFailure</b><br/>saves receipt, fails the run"]
   done(("✅ completed"))
   blocked(("⛔ blocked"))
 

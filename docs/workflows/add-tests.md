@@ -39,12 +39,12 @@ From [examples/implementation.json](../../examples/implementation.json):
 🤖 Agent · ⚙️ Operation · 🧪 check gate · 🙋 Human · ⭘ end ([key](README.md#reading-the-diagrams))
 
 ```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
 flowchart TD
-  start["⚙️ <b>start</b><br/>refuses a dirty checkout"]
-  baseline{{"🧪 <b>baseline</b><br/>must be green before any edit"}}
-  change(["🤖 <b>change</b> · tester<br/>tests that would catch a real<br/>regression; production untouched"])
+  start["⚙️ <b>start</b><br/>needs a clean checkout"]
+  baseline{{"🧪 <b>baseline</b><br/>must be green first"}}
+  change(["🤖 <b>change</b> · tester<br/>real tests, no prod changes"])
   verify{{"🧪 <b>verify</b>"}}
-  seal["⚙️ <b>sealReview</b>"]
   review(["🤖 <b>review</b> · reviewer<br/>are the assertions vacuous?"])
   result["⚙️ <b>reviewResult</b>"]
   budget["⚙️ <b>repairBudget</b>"]
@@ -56,7 +56,7 @@ flowchart TD
   baseline -->|failed| blocked
   change -->|completed| verify
   change -->|blocked| blocked
-  verify -->|passed| seal --> review --> result
+  verify -->|passed| review --> result
   verify -->|failed| budget
   result -->|approved| done
   result -->|revise| budget
@@ -70,7 +70,7 @@ flowchart TD
   classDef good fill:#dcfce7,stroke:#16a34a,color:#0f172a
   classDef bad fill:#fee2e2,stroke:#dc2626,color:#0f172a
   class change,review agent
-  class start,seal,result,budget op
+  class start,result,budget op
   class baseline,verify gate
   class done good
   class blocked bad

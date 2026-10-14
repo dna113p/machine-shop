@@ -33,7 +33,8 @@ The installer copies these into a project on request.
 
 Each diagram is drawn from the state names in the source. Nodes carry a short
 note where the name alone does not say what the state does, and edges are
-labeled with the event that takes them.
+labeled with the event that takes them. The `sealReview` and `sealPlan` states,
+which only fingerprint the checkout before a read-only stage, are left out.
 
 | Shape | Kind | What it means |
 | --- | --- | --- |

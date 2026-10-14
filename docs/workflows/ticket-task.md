@@ -64,134 +64,121 @@ It runs from source; the installer never copies it.
 
 🤖 Agent · ⚙️ Operation · 🧪 check gate · 🙋 Human · ⭘ end ([key](README.md#reading-the-diagrams))
 
-Any setup, commit, archive, or delivery failure ends ⛔ blocked; those edges are
-left out to keep the picture readable.
+To keep the picture small, two kinds of edge are left out. An Agent that
+blocks, and a planning or review result that cannot go on, both go to ⏸ stuck.
+A setup, commit, or delivery failure ends ⛔ blocked.
 
 ```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
 flowchart TD
-  subgraph setup [Setup]
-    shape["⚙️ <b>shape</b><br/>has Goal, Scope,<br/>Acceptance, Forbidden?"]
-    prepare["⚙️ <b>prepare</b><br/>new worktree and ticket branch,<br/>setup commands; pr mode checks<br/>the base is pushed"]
-    start["⚙️ <b>start</b>"]
-  end
-
-  subgraph planning [Planning · read-only]
-    falsify(["🤖 <b>falsify</b> · investigator<br/>tries to show the ticket is wrong,<br/>done already, or too vague"])
-    falsifyResult["⚙️ <b>falsifyResult</b><br/>open questions stop the run;<br/>with assume on, safe ones are<br/>answered and recorded"]
-    plan(["🤖 <b>plan</b> · investigator<br/>files, tests, checks;<br/>4000 characters at most"])
-    planResult["⚙️ <b>planResult</b><br/>too long? sent back once"]
-    planReview(["🤖 <b>planReview</b> · reviewer"])
-    planReviewResult["⚙️ <b>planReviewResult</b><br/>one revision allowed"]
-  end
-
-  subgraph build [Build]
-    test(["🤖 <b>test</b> · tester<br/>failing tests, one or more<br/>per acceptance criterion"])
-    scopeAfterTest{{"🧪 <b>scopeAfterTest</b><br/>only Scope paths touched?"}}
-    red{{"🧪 <b>red</b><br/>the new tests must fail now"}}
-    change(["🤖 <b>change</b> · implementer<br/>makes the tests pass without<br/>weakening them"])
-    scopeAfterChange{{"🧪 <b>scopeAfterChange</b>"}}
-    verify{{"🧪 <b>verify</b><br/>the repository's gates"}}
-    sealReview["⚙️ <b>sealReview</b>"]
-    review(["🤖 <b>review</b> · reviewer<br/>each criterion met, with evidence;<br/>findings: blocker, discussion, minor"])
-    reviewResult["⚙️ <b>reviewResult</b><br/>Machine judges the report; same<br/>blockers twice means stuck"]
-    repairBudget["⚙️ <b>repairBudget</b>"]
-    reviewBudget["⚙️ <b>reviewBudget</b><br/>maxReviewRounds, default 2"]
-    repairTarget["⚙️ <b>repairTarget</b><br/>back to the stage that stopped"]
-  end
-
-  subgraph ship [Deliver]
-    commit["⚙️ <b>commit</b>"]
-    rebase["⚙️ <b>rebase</b><br/>base moved? replay and<br/>re-run the gates"]
-    deliver["⚙️ <b>deliver</b><br/>branch, patch, or pull request"]
-  end
-
-  subgraph stuckZone [When stuck]
-    stuck["⚙️ <b>stuck</b><br/>park by default; ask if<br/>stuck is ask"]
-    park["⚙️ <b>park</b><br/>keeps the worktree and writes<br/>park.txt: what is needed"]
-    decide[/"🙋 <b>decide</b><br/>more rounds, hand off,<br/>archive, or discard"/]
-    confirmDiscard[/"🙋 <b>confirmDiscard</b><br/>a second yes before deleting"/]
-    archive["⚙️ <b>archive</b><br/>saves the candidate on<br/>a branch of its own"]
-    remove["⚙️ <b>remove</b><br/>worktree and ticket branch"]
-  end
-
+  shape["⚙️ <b>shape</b><br/>all four sections?"]
+  prepare["⚙️ <b>prepare</b><br/>worktree, branch, setup"]
+  falsify(["🤖 <b>falsify</b> · investigator<br/>is the ticket wrong or vague?"])
+  falsifyResult["⚙️ <b>falsifyResult</b><br/>questions stop, or are assumed"]
+  plan(["🤖 <b>plan</b> · investigator<br/>4000 characters at most"])
+  planResult["⚙️ <b>planResult</b><br/>too long? sent back once"]
+  planReview(["🤖 <b>planReview</b> · reviewer"])
+  planReviewResult["⚙️ <b>planReviewResult</b><br/>one revision allowed"]
+  test(["🤖 <b>test</b> · tester<br/>a failing test per criterion"])
+  scopeAfterTest{{"🧪 <b>scopeAfterTest</b><br/>only Scope paths touched?"}}
+  red{{"🧪 <b>red</b><br/>new tests must fail"}}
+  change(["🤖 <b>change</b> · implementer<br/>makes the tests pass"])
+  scopeAfterChange{{"🧪 <b>scopeAfterChange</b>"}}
+  verify{{"🧪 <b>verify</b><br/>the repository's gates"}}
+  review(["🤖 <b>review</b> · reviewer<br/>criteria and tagged findings"])
+  reviewResult["⚙️ <b>reviewResult</b><br/>the Machine judges it"]
+  reviewBudget["⚙️ <b>reviewBudget</b><br/>maxReviewRounds, default 2"]
+  repairBudget["⚙️ <b>repairBudget</b><br/>maxRepairs, default 3"]
+  repairTarget["⚙️ <b>repairTarget</b><br/>to the stage that stopped"]
+  commit["⚙️ <b>commit</b>"]
+  rebase["⚙️ <b>rebase</b><br/>replays onto a moved base"]
+  deliver["⚙️ <b>deliver</b><br/>branch, patch, or pull request"]
   delivered(("✅ delivered"))
   blocked(("⛔ blocked"))
-  parked(("🅿️ parked"))
-  handedOff(("🤝 handedOff"))
-  abandoned(("🗑️ abandoned"))
+  stuck(("⏸ stuck"))
 
   shape -->|prepared| prepare
   shape -->|"missing sections"| blocked
-  prepare -->|prepared| start
+  prepare -->|prepared| falsify
   prepare -->|"resumed with edits"| scopeAfterChange
-  prepare -->|"redeliver"| rebase
-  start --> falsify --> falsifyResult
+  prepare -->|redeliver| rebase
+  falsify --> falsifyResult
+  falsifyResult -->|"malformed, once"| falsify
   falsifyResult -->|"sound, or assumed"| plan
   falsifyResult -->|"open questions"| stuck
   plan --> planResult
-  planResult -->|planned| planReview
   planResult -->|shorten| plan
-  planResult -->|blocked| stuck
-  planReview --> planReviewResult
+  planResult -->|planned| planReview --> planReviewResult
+  planReviewResult -->|revise| plan
   planReviewResult -->|approved| test
   planReviewResult -.->|"approved, redGreen off"| change
-  planReviewResult -->|revise| plan
-  planReviewResult -->|blocked| stuck
-
-  test -->|completed| scopeAfterTest
-  test -->|blocked| stuck
+  test --> scopeAfterTest
   scopeAfterTest -->|passed| red
-  scopeAfterTest -->|failed| repairBudget
   red -->|"proved red"| change
-  red -->|"already passing"| repairBudget
-  change -->|completed| scopeAfterChange
-  change -->|blocked| stuck
+  change --> scopeAfterChange
   scopeAfterChange -->|passed| verify
-  scopeAfterChange -->|failed| repairBudget
-  verify -->|passed| sealReview --> review --> reviewResult
-  verify -->|failed| repairBudget
-  reviewResult -->|approved| commit
+  verify -->|passed| review --> reviewResult
   reviewResult -->|revise| reviewBudget
-  reviewResult -->|blocked| stuck
   reviewBudget -->|retry| change
-  reviewBudget -->|exhausted| stuck
-  repairBudget -->|retry| repairTarget
-  repairBudget -->|exhausted| stuck
-  repairTarget --> test
-  repairTarget --> change
-  repairTarget -.->|"after more rounds"| planning
-
-  commit --> rebase
-  rebase -->|"current, or rebased"| deliver
-  rebase -->|"patch changed: review again"| verify
+  reviewResult -->|approved| commit --> rebase
+  rebase -->|"current, or rebased"| deliver --> delivered
+  rebase -->|"patch changed"| verify
+  scopeAfterTest & red & scopeAfterChange & verify -->|failed| repairBudget
   rebase -->|"gates failed"| repairBudget
-  rebase -->|stuck| stuck
-  deliver -->|delivered| delivered
-
-  stuck -->|park| park --> parked
-  stuck -->|ask| decide
-  decide -->|"more rounds"| repairTarget
-  decide -->|"hand off"| handedOff
-  decide -->|archive| archive --> remove
-  decide -->|discard| confirmDiscard
-  confirmDiscard -->|"confirm discard"| remove
-  confirmDiscard -->|"no"| stuck
-  remove --> abandoned
+  repairBudget -->|retry| repairTarget
+  repairTarget --> test & change
+  repairBudget & reviewBudget -->|exhausted| stuck
 
   classDef agent fill:#dbeafe,stroke:#2563eb,color:#0f172a
   classDef op fill:#f1f5f9,stroke:#64748b,color:#0f172a
   classDef gate fill:#ede9fe,stroke:#7c3aed,color:#0f172a
-  classDef human fill:#fef3c7,stroke:#d97706,color:#0f172a
   classDef good fill:#dcfce7,stroke:#16a34a,color:#0f172a
   classDef bad fill:#fee2e2,stroke:#dc2626,color:#0f172a
   classDef no fill:#fde68a,stroke:#b45309,color:#0f172a
   class falsify,plan,planReview,test,change,review agent
-  class shape,prepare,start,falsifyResult,planResult,planReviewResult,sealReview,reviewResult,repairBudget,reviewBudget,repairTarget,commit,rebase,deliver,stuck,park,archive,remove op
+  class shape,prepare,falsifyResult,planResult,planReviewResult,reviewResult,reviewBudget,repairBudget,repairTarget,commit,rebase,deliver op
   class scopeAfterTest,red,scopeAfterChange,verify gate
-  class decide,confirmDiscard human
   class delivered good
   class blocked bad
+  class stuck no
+```
+
+### When stuck
+
+By default the run parks. With `"stuck": "ask"`, a person decides instead.
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
+flowchart LR
+  stuck["⚙️ <b>stuck</b>"]
+  park["⚙️ <b>park</b><br/>writes park.txt"]
+  decide[/"🙋 <b>decide</b><br/>more rounds, hand off,<br/>archive, or discard"/]
+  confirmDiscard[/"🙋 <b>confirmDiscard</b><br/>a second yes before deleting"/]
+  archive["⚙️ <b>archive</b><br/>keeps an archive branch"]
+  remove["⚙️ <b>remove</b><br/>deletes worktree and branch"]
+  again(["↩ the stage that stopped,<br/>with fresh budgets"])
+  parked(("🅿️ parked"))
+  handedOff(("🤝 handedOff"))
+  abandoned(("🗑️ abandoned"))
+
+  stuck -->|park| park --> parked
+  stuck -->|ask| decide
+  decide -->|"more rounds"| again
+  decide -->|"hand off"| handedOff
+  decide -->|archive| archive --> remove
+  decide -->|discard| confirmDiscard
+  confirmDiscard -->|"confirm discard"| remove
+  confirmDiscard -->|"go back"| stuck
+  remove --> abandoned
+
+  classDef op fill:#f1f5f9,stroke:#64748b,color:#0f172a
+  classDef human fill:#fef3c7,stroke:#d97706,color:#0f172a
+  classDef no fill:#fde68a,stroke:#b45309,color:#0f172a
+  classDef back fill:#dbeafe,stroke:#2563eb,color:#0f172a,stroke-dasharray:4 3
+  class stuck,park,archive,remove op
+  class decide,confirmDiscard human
   class parked,handedOff,abandoned no
+  class again back
 ```
 
 ## Results

@@ -34,11 +34,12 @@ machine run /absolute/machine-shop/chatgpt-thread.ts "https://chatgpt.com/c/<id>
 🤖 Agent · ⚙️ Operation · 🧪 check gate · 🙋 Human · ⭘ end ([key](README.md#reading-the-diagrams))
 
 ```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
 flowchart LR
   input{"input is a ChatGPT<br/>conversation URL?"}
-  start(["🤖 <b>start</b> · chatgpt-web<br/>opens a fresh chat with the task"])
-  reply[/"🙋 <b>reply</b><br/>shows ChatGPT's handoff;<br/>type a reply, or done"/]
-  send["⚙️ <b>send</b><br/>one attempt per reply, never<br/>retried; a failure comes back here"]
+  start(["🤖 <b>start</b> · chatgpt-web<br/>opens a fresh chat"])
+  reply[/"🙋 <b>reply</b><br/>your reply, or done"/]
+  send["⚙️ <b>send</b><br/>one try, never retried"]
   done(("✅ done"))
 
   input -->|no| start

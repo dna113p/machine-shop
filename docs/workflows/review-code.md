@@ -36,10 +36,11 @@ From [examples/review.json](../../examples/review.json):
 🤖 Agent · ⚙️ Operation · 🧪 check gate · 🙋 Human · ⭘ end ([key](README.md#reading-the-diagrams))
 
 ```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
 flowchart LR
-  start["⚙️ <b>start</b><br/>fingerprints the checkout,<br/>dirty or not"]
-  review(["🤖 <b>review</b> · reviewer<br/>findings with paths, lines,<br/>and impact"])
-  integrity["⚙️ <b>integrity</b><br/>same fingerprint as before?"]
+  start["⚙️ <b>start</b><br/>fingerprints the checkout"]
+  review(["🤖 <b>review</b> · reviewer<br/>findings with file:line"])
+  integrity["⚙️ <b>integrity</b><br/>checkout unchanged?"]
   done(("✅ completed"))
   blocked(("⛔ blocked"))
 

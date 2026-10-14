@@ -20,6 +20,7 @@ machine run /absolute/machine-shop/smoke.ts "hello"
 ## Flow
 
 ```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
 flowchart LR
   run["⚙️ <b>run</b><br/>prints the input"] --> done(("✅ done"))
 

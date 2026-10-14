@@ -38,11 +38,11 @@ From [examples/release.json](../../examples/release.json):
 🤖 Agent · ⚙️ Operation · 🧪 check gate · 🙋 Human · ⭘ end ([key](README.md#reading-the-diagrams))
 
 ```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
 flowchart TD
-  start["⚙️ <b>start</b><br/>refuses a dirty checkout"]
-  verify{{"🧪 <b>verify</b><br/>the supplied checks"}}
-  seal["⚙️ <b>sealReview</b>"]
-  review(["🤖 <b>review</b> · reviewer<br/>drafts release notes and a<br/>readiness checklist"])
+  start["⚙️ <b>start</b><br/>needs a clean checkout"]
+  verify{{"🧪 <b>verify</b>"}}
+  review(["🤖 <b>review</b> · reviewer<br/>drafts notes and checklist"])
   result["⚙️ <b>reviewResult</b>"]
   approval[/"🙋 <b>approval</b><br/>sign off on the candidate?"/]
   done(("✅ completed"))
@@ -50,7 +50,7 @@ flowchart TD
   rejected(("🚫 rejected"))
 
   start --> verify
-  verify -->|passed| seal --> review
+  verify -->|passed| review
   verify -->|failed| blocked
   review -->|approved| result
   review -->|"blocked: evidence too thin"| blocked
@@ -67,7 +67,7 @@ flowchart TD
   classDef bad fill:#fee2e2,stroke:#dc2626,color:#0f172a
   classDef no fill:#fde68a,stroke:#b45309,color:#0f172a
   class review agent
-  class start,seal,result op
+  class start,result op
   class verify gate
   class approval human
   class done good

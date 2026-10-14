@@ -39,18 +39,17 @@ From [examples/upgrade.json](../../examples/upgrade.json):
 🤖 Agent · ⚙️ Operation · 🧪 check gate · 🙋 Human · ⭘ end ([key](README.md#reading-the-diagrams))
 
 ```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
 flowchart TD
-  start["⚙️ <b>start</b><br/>refuses a dirty checkout"]
-  baseline{{"🧪 <b>baseline</b><br/>green before the upgrade"}}
-  sealPlan["⚙️ <b>sealPlan</b>"]
-  assess(["🤖 <b>assess</b> · analyst<br/>versions from primary sources,<br/>migration, risk, rollback; no edits"])
-  planIntegrity["⚙️ <b>planIntegrity</b><br/>the analyst edited nothing?"]
+  start["⚙️ <b>start</b><br/>needs a clean checkout"]
+  baseline{{"🧪 <b>baseline</b><br/>must be green first"}}
+  assess(["🤖 <b>assess</b> · analyst<br/>plan from primary sources"])
+  planIntegrity["⚙️ <b>planIntegrity</b><br/>checkout unchanged?"]
   approval[/"🙋 <b>approval</b><br/>approve or reject the plan"/]
   approvalIntegrity["⚙️ <b>approvalIntegrity</b><br/>nothing changed while waiting?"]
   upgrade(["🤖 <b>upgrade</b> · implementer<br/>only the approved plan"])
   verify{{"🧪 <b>verify</b>"}}
-  seal["⚙️ <b>sealReview</b>"]
-  review(["🤖 <b>review</b> · reviewer<br/>compares the result with the plan"])
+  review(["🤖 <b>review</b> · reviewer<br/>matches the plan?"])
   result["⚙️ <b>reviewResult</b>"]
   budget["⚙️ <b>repairBudget</b>"]
   done(("✅ completed"))
@@ -58,7 +57,7 @@ flowchart TD
   rejected(("🚫 rejected"))
 
   start --> baseline
-  baseline -->|passed| sealPlan --> assess
+  baseline -->|passed| assess
   baseline -->|failed| blocked
   assess -->|completed| planIntegrity
   assess -->|"blocked: no version evidence"| blocked
@@ -70,7 +69,7 @@ flowchart TD
   approvalIntegrity -->|changed| blocked
   upgrade -->|completed| verify
   upgrade -->|blocked| blocked
-  verify -->|passed| seal --> review --> result
+  verify -->|passed| review --> result
   verify -->|failed| budget
   result -->|approved| done
   result -->|revise| budget
@@ -86,7 +85,7 @@ flowchart TD
   classDef bad fill:#fee2e2,stroke:#dc2626,color:#0f172a
   classDef no fill:#fde68a,stroke:#b45309,color:#0f172a
   class assess,upgrade,review agent
-  class start,sealPlan,planIntegrity,approvalIntegrity,seal,result,budget op
+  class start,planIntegrity,approvalIntegrity,result,budget op
   class baseline,verify gate
   class approval human
   class done good

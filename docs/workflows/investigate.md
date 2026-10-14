@@ -37,11 +37,12 @@ From [examples/review.json](../../examples/review.json):
 🤖 Agent · ⚙️ Operation · 🧪 check gate · 🙋 Human · ⭘ end ([key](README.md#reading-the-diagrams))
 
 ```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
 flowchart TD
   start["⚙️ <b>start</b><br/>fingerprints the checkout"]
-  investigate(["🤖 <b>investigate</b> · investigator<br/>evidence, alternatives, and the<br/>smallest next experiment"])
+  investigate(["🤖 <b>investigate</b> · investigator<br/>evidence and next experiment"])
   integrity["⚙️ <b>researchIntegrity</b><br/>nothing was edited?"]
-  challenge(["🤖 <b>challenge</b> · reviewer<br/>checks claims against the source;<br/>fact or assumption?"])
+  challenge(["🤖 <b>challenge</b> · reviewer<br/>fact or assumption?"])
   result["⚙️ <b>challengeResult</b>"]
   budget["⚙️ <b>repairBudget</b>"]
   done(("✅ completed"))
