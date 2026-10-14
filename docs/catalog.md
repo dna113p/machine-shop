@@ -7,7 +7,8 @@ for one task. Small direct changes can remain direct.
 
 ## Defaults
 
-[Workflow diagrams](flows.md) draws each of these flows state by state.
+Each workflow also has [its own page](workflows/README.md) with its input and a
+diagram of its states.
 Names below are source names in `defaults/`. Installation adds the `dev-` prefix
 so these do not replace project-specific names such as `verify`.
 

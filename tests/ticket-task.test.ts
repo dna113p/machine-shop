@@ -3837,7 +3837,8 @@ test("the tester and the implementer are told that checks they cannot run are th
   assert.match(prompts.implementer!, /Scope \(the only paths you may change; the workflow checks them\):\n- greeting\.txt/u);
 });
 
-for (const path of ["docs/catalog.md", "README.md"]) {
+// The catalog is the ticket-task reference; the README summarizes it and links there.
+for (const path of ["docs/catalog.md"]) {
   test(`${path} describes one round for discussions followed by all open owner questions and park.questions`, () => {
     const prose = readFileSync(resolve(path), "utf8").replace(/\s+/gu, " ");
     assert.doesNotMatch(prose, /repeated (?:discussion|owner questions|questions)|repeating the question/iu, `${path} still describes escalation by repeated text`);
@@ -3863,26 +3864,23 @@ test("the catalog and the README describe falsify, plan, and planReview where th
   }
 });
 
-test("the catalog and the README describe rebase, reverify, rebasedFrom, and the invariant that no stop leaves a commit", () => {
-  const catalog = readFileSync(resolve("docs/catalog.md"), "utf8"); const readme = readFileSync(resolve("README.md"), "utf8");
+test("the catalog describes rebase, reverify, rebasedFrom, and the invariant that no stop leaves a commit", () => {
+  const catalog = readFileSync(resolve("docs/catalog.md"), "utf8");
   const named = catalog.split("\n").filter(line => line.startsWith("| `")).flatMap(line => line.split("|")[1]!.split(",").map(name => name.trim()));
   assert.ok(named.includes("`rebase`"), "rebase has no row in the state table");
-  for (const [name, text] of [["docs/catalog.md", catalog], ["README.md", readme]] as const) {
-    // Prose wraps where it will; the words are looked for across line breaks.
-    const prose = text.replace(/\s+/gu, " ");
-    for (const described of [/`rebase`/u, /`reverify`/u, /`rebasedFrom`/u]) assert.match(prose, described, name);
-    assert.match(prose, /never stops with (?:\S+ ){1,4}commit on the ticket branch/iu, `${name} does not state the invariant`);
-    // A base that moved is rebased onto now, so neither file may still say the candidate is delivered on the older commit as it is.
-    assert.doesNotMatch(prose, /without rebasing|nothing is rebased|or rebase a candidate onto a base that moved/iu, name);
-  }
-  // A rewritten or moved-back base ends blocked for delivery by hand, and adopt goes on refusing such a branch.
+  // Prose wraps where it will; the words are looked for across line breaks.
   const prose = catalog.replace(/\s+/gu, " ");
+  for (const described of [/`rebase`/u, /`reverify`/u, /`rebasedFrom`/u]) assert.match(prose, described);
+  assert.match(prose, /never stops with (?:\S+ ){1,4}commit on the ticket branch/iu, "the catalog does not state the invariant");
+  // A base that moved is rebased onto now, so the catalog may not still say the candidate is delivered on the older commit as it is.
+  assert.doesNotMatch(prose, /without rebasing|nothing is rebased|or rebase a candidate onto a base that moved/iu);
+  // A rewritten or moved-back base ends blocked for delivery by hand, and adopt goes on refusing such a branch.
   assert.match(prose, /moved back|rewritten/iu); assert.match(prose, /by hand/iu);
 });
 
 /** The sentences and table rows of a document, each on one line, so that a claim is looked for where it is made and not across the file. */
 const statements = (text: string) => text.split(/\n(?=\|)|\n{2,}/u).flatMap(block => block.replace(/\s+/gu, " ").split(/(?<=\.)\s/u));
-for (const path of ["docs/catalog.md", "README.md"]) {
+for (const path of ["docs/catalog.md"]) {
   test(`${path} no longer says planning needs are kept in full, and gives falsify questions the limits of any open question`, () => {
     const text = readFileSync(resolve(path), "utf8");
     assert.doesNotMatch(text.replace(/\s+/gu, " "), /questions are kept in full|reviewer's summary in full|exact questions as `needs`|exact `needs`/iu, `${path} still says planning needs are kept in full`);
@@ -3940,13 +3938,6 @@ test("the catalog's more rounds row says the work returns to the editing stage t
   const row = readFileSync(resolve("docs/catalog.md"), "utf8").split("\n").find(line => line.startsWith("| `more rounds` |")) ?? "";
   assert.ok(statements(row).some(one => /\btester\b/u.test(one) && /\bimplementer\b/u.test(one) && /\bstopped\b|\bblocked\b/iu.test(one)),
     "the `more rounds` row must say in one sentence that it returns to the editing stage that stopped, naming the tester and the implementer");
-});
-
-test("the README's more rounds choice says the work returns to the editing stage that stopped, the tester or the implementer, as the catalog's row does", () => {
-  // The choice's own list item, taken a sentence at a time: `the responsible editing stage` does not say which stage that is.
-  const item = /^- `more rounds`:[^]*?(?=\n- `|\n\n)/mu.exec(readFileSync(resolve("README.md"), "utf8"))?.[0] ?? "";
-  assert.ok(statements(item).some(one => /\btester\b/u.test(one) && /\bimplementer\b/u.test(one) && /\bstopped\b|\bblocked\b/iu.test(one)),
-    "the `more rounds` item must say in one sentence that it returns to the editing stage that stopped, naming the tester and the implementer");
 });
 
 /** The Git directory of the ticket worktree itself: outside the working tree, never staged or committed, and gone with the worktree. */
@@ -4696,7 +4687,7 @@ for (const [label, arrange, reason] of refusals) {
   });
 }
 
-for (const path of ["docs/catalog.md", "README.md"]) {
+for (const path of ["docs/catalog.md"]) {
   test(`${path} describes, where it describes resume, taking up a delivered ticket whose worktree is gone: the record it needs, the road to rebase, and what the receipt says`, () => {
     const text = readFileSync(resolve(path), "utf8"); const prose = text.replace(/\s+/gu, " ");
     assert.ok(statements(text).some(said => /\bresum/iu.test(said) && /\bdelivered\b/iu.test(said) && /`rebase`/u.test(said)),
