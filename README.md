@@ -176,8 +176,14 @@ already done, impossible here, or underspecified. It returns `sound` with a
 one-paragraph summary or `questions` with 1–10 entries shaped as
 `{ text, options: string[], recommended: string, assumable: boolean, why }`.
 Text and why must be non-empty strings; options must be a non-empty array of
-non-empty strings, with recommended copied exactly from one of them. Malformed
-entries go through the stuck policy with the bad field named. Falsification
+non-empty strings, with recommended copied exactly from one of them. Questions
+come only from the report's `questions` field, never its summary or message.
+A missing or malformed field returns to `falsify` once per run, with the
+validation reason and instructions on where the questions go. This allowance
+is separate from the plan-length return and reviewer's revision and uses neither
+budget. A second malformed report goes through the stuck policy, parking by
+default with the reason, the bad field named, and the `falsify-<n>.json` evidence
+file holding that report. Falsification
 questions become numbered `needs`, each flattened to one line with its question
 text, each option (recommended first and marked), and why capped separately at
 600 characters plus an ellipsis.

@@ -63,6 +63,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let planRevisions = 0;
   let lengthReturned = false;
   let overLimit = 0;
+  let questionsReturned = false;
+  let questionsFault = "";
   let ownerQuestions: { text: string; where: string; options?: string[]; recommended?: string; why?: string }[] | undefined;
   let wouldAssume: FalsifyQuestion[] = [];
   let assumptions: Assumption[] = [];
@@ -750,11 +752,19 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if ("refusal" in kept) return work.block(kept.refusal);
     const event = planningReport;
     if (event.type === "sound") {
+      questionsFault = "";
       work.block("");
       return { type: "sound" };
     }
     const malformed = questionField(event.questions);
-    if (malformed) return work.block(`Malformed falsify report: ${malformed}.`);
+    questionsFault = malformed ?? "";
+    if (malformed) {
+      if (!questionsReturned) {
+        questionsReturned = true;
+        return { type: "reask" };
+      }
+      return work.block(`The falsify report's questions were missing or malformed twice: ${malformed}. The report is kept in ${join(work.open(), `falsify-${planningReports.falsify}.json`)}.`);
+    }
     const questions = event.questions as FalsifyQuestion[];
     const open = assume ? questions.filter(question => !question.assumable) : questions;
     if (!open.length) {
@@ -867,11 +877,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       // A clean resume starts planning afresh. A resumed candidate is held to Scope; red cannot be proved again once implemented.
       prepare: operation(prepare, { prepared: "start", resumed: "scopeAfterChange", redeliver: "rebase", blocked: "failure" }),
       start: operation(work.start, { started: "falsify" }),
-      falsify: agent(() => work.prompt("Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 entries shaped as { text, options: string[], recommended: string, assumable: boolean, why }, giving the exact questions a person could answer. text and why must be non-empty strings; options must be a non-empty array of non-empty strings; recommended must copy one of those options exactly. Mark assumable true only for a gap whose conservative answer loses nothing if wrong: it stops, refuses, or keeps more. A product decision, a change of scope, or anything irreversible is never assumable."), {
+      falsify: agent(() => work.prompt([
+        "Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 entries shaped as { text, options: string[], recommended: string, assumable: boolean, why }, giving the exact questions a person could answer. text and why must be non-empty strings; options must be a non-empty array of non-empty strings; recommended must copy one of those options exactly. Mark assumable true only for a gap whose conservative answer loses nothing if wrong: it stops, refuses, or keeps more. A product decision, a change of scope, or anything irreversible is never assumable.",
+        ...(questionsFault ? [`Your last report's questions were missing or malformed: ${questionsFault}.`] : []),
+        "Put the questions in the report's questions field, not in the summary or message.",
+      ].join("\n")), {
         sound: { target: "falsifyResult", actions: rememberPlanning },
         questions: { target: "falsifyResult", actions: rememberPlanning },
       }, { using: "investigator", cwd: worktree }),
-      falsifyResult: operation(stopped("falsifyResult", falsifyResult), { sound: "plan", assumed: "plan", blocked: "stuck" }),
+      falsifyResult: operation(stopped("falsifyResult", falsifyResult), { sound: "plan", assumed: "plan", reask: "falsify", blocked: "stuck" }),
       plan: agent(() => work.prompt([
         "Plan the implementation of this sound ticket. Do not edit any file. Cover the acceptance criteria, tests, permitted paths, and required checks. Address any plan review feedback in the stage reports. Return planned with the complete plan as the summary, at most 4000 characters.",
         ...(overLimit ? [`Your last plan was ${overLimit} characters; the limit is 4000. Say the same plan in fewer words: name the files and the tests, and do not restate the ticket.`] : []),

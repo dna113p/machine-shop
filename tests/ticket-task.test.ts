@@ -967,51 +967,159 @@ test("a falsify question that runs over several lines and 600 characters takes o
 });
 
 const without = (asked: Gap, field: keyof Gap) => Object.fromEntries(Object.entries(asked).filter(([key]) => key !== field));
+/** What questionField says of a report whose questions field is not a list it can use. */
+const notAList = "questions must be an array of 1–10 entries";
+/** Where the falsify prompt says the questions go. */
+const questionsGo = [/\bquestions field\b/u, /\bnot (?:in )?the summary or (?:the )?message\b/u];
 // Each report has one thing wrong. Where an entry is at fault it is the second, after one that is sound and assumable.
-for (const [label, questions, named] of [
-  ["left out", undefined, /\bquestions\b/u],
-  ["a string rather than an array", "Which language is the greeting in?", /\bquestions\b/u],
-  ["an empty array", [], /\bquestions\b/u],
-  ["an array of eleven", Array.from({ length: 11 }, (_, index) => gap(`What does part ${index + 1} of the greeting say?`)), /\bquestions\b/u],
-  ["an array of plain strings, as it was before a question carried its options", ["Which language is the greeting in?"], /\bquestions\[0\]/u],
-  ["an array holding a value that is not an object", [beside, 7], /\bquestions\[1\]/u],
-  ["an array holding an entry with a blank text", [beside, { ...language, text: " \n" }], /\bquestions\[1\]\.text\b/u],
-  ["an array holding an entry whose text is not a string", [beside, { ...language, text: 7 }], /\bquestions\[1\]\.text\b/u],
-  ["an array holding an entry without options", [beside, without(language, "options")], /\bquestions\[1\]\.options\b/u],
-  ["an array holding an entry whose options are not an array", [beside, { ...language, options: "English" }], /\bquestions\[1\]\.options\b/u],
-  ["an array holding an entry with no options to choose from", [beside, { ...language, options: [] }], /\bquestions\[1\]\.options\b/u],
-  ["an array holding an entry with a blank option", [beside, { ...language, options: ["English", " "] }], /\bquestions\[1\]\.options\b/u],
-  ["an array holding an entry with an option that is not a string", [beside, { ...language, options: ["English", 7] }], /\bquestions\[1\]\.options\b/u],
-  ["an array holding an entry without a recommended answer", [beside, without(language, "recommended")], /\bquestions\[1\]\.recommended\b/u],
-  ["an array holding an entry whose recommended answer is not one of its options", [beside, { ...language, options: ["english", "French"] }], /\bquestions\[1\]\.recommended\b/u],
-  ["an array holding an entry that does not say whether it is assumable", [beside, without(language, "assumable")], /\bquestions\[1\]\.assumable\b/u],
-  ["an array holding an entry whose assumable is not a boolean", [beside, { ...language, assumable: "true" }], /\bquestions\[1\]\.assumable\b/u],
-  ["an array holding an entry without a why", [beside, without(language, "why")], /\bquestions\[1\]\.why\b/u],
-  ["an array holding an entry with a blank why", [beside, { ...language, why: " " }], /\bquestions\[1\]\.why\b/u],
-] as [string, unknown, RegExp][]) {
+for (const [label, questions, named, reason] of [
+  ["left out", undefined, /\bquestions\b/u, notAList],
+  ["a string rather than an array", "Which language is the greeting in?", /\bquestions\b/u, notAList],
+  ["an empty array", [], /\bquestions\b/u, notAList],
+  ["an array of eleven", Array.from({ length: 11 }, (_, index) => gap(`What does part ${index + 1} of the greeting say?`)), /\bquestions\b/u, notAList],
+  ["an array of plain strings, as it was before a question carried its options", ["Which language is the greeting in?"], /\bquestions\[0\]/u, "questions[0] must be an object"],
+  ["an array holding a value that is not an object", [beside, 7], /\bquestions\[1\]/u, "questions[1] must be an object"],
+  ["an array holding an entry with a blank text", [beside, { ...language, text: " \n" }], /\bquestions\[1\]\.text\b/u, "questions[1].text must be a non-empty string"],
+  ["an array holding an entry whose text is not a string", [beside, { ...language, text: 7 }], /\bquestions\[1\]\.text\b/u, "questions[1].text must be a non-empty string"],
+  ["an array holding an entry without options", [beside, without(language, "options")], /\bquestions\[1\]\.options\b/u, "questions[1].options must be a non-empty array of non-empty strings"],
+  ["an array holding an entry whose options are not an array", [beside, { ...language, options: "English" }], /\bquestions\[1\]\.options\b/u, "questions[1].options must be a non-empty array of non-empty strings"],
+  ["an array holding an entry with no options to choose from", [beside, { ...language, options: [] }], /\bquestions\[1\]\.options\b/u, "questions[1].options must be a non-empty array of non-empty strings"],
+  ["an array holding an entry with a blank option", [beside, { ...language, options: ["English", " "] }], /\bquestions\[1\]\.options\b/u, "questions[1].options must be a non-empty array of non-empty strings"],
+  ["an array holding an entry with an option that is not a string", [beside, { ...language, options: ["English", 7] }], /\bquestions\[1\]\.options\b/u, "questions[1].options must be a non-empty array of non-empty strings"],
+  ["an array holding an entry without a recommended answer", [beside, without(language, "recommended")], /\bquestions\[1\]\.recommended\b/u, "questions[1].recommended must be one of its options"],
+  ["an array holding an entry whose recommended answer is not one of its options", [beside, { ...language, options: ["english", "French"] }], /\bquestions\[1\]\.recommended\b/u, "questions[1].recommended must be one of its options"],
+  ["an array holding an entry that does not say whether it is assumable", [beside, without(language, "assumable")], /\bquestions\[1\]\.assumable\b/u, "questions[1].assumable must be a boolean"],
+  ["an array holding an entry whose assumable is not a boolean", [beside, { ...language, assumable: "true" }], /\bquestions\[1\]\.assumable\b/u, "questions[1].assumable must be a boolean"],
+  ["an array holding an entry without a why", [beside, without(language, "why")], /\bquestions\[1\]\.why\b/u, "questions[1].why must be a non-empty string"],
+  ["an array holding an entry with a blank why", [beside, { ...language, why: " " }], /\bquestions\[1\]\.why\b/u, "questions[1].why must be a non-empty string"],
+] as [string, unknown, RegExp, string][]) {
   for (const assume of [false, true]) {
-    test(`a falsify report whose questions field is ${label} parks with the field named${assume ? ", with assume on as with it off" : ""}`, async context => {
-      const f = fixture(context); const human = person();
+    test(`a falsify report whose questions field is ${label}, given twice, parks with the field named${assume ? ", with assume on as with it off" : ""}`, async context => {
+      const f = fixture(context); const human = person(); const prompts: string[] = [];
       const result = await execute(input(f, {}, { stuck: "park", ...(assume ? { assume } : {}) }), {
-        falsify: () => ({ type: "questions", summary: "The ticket leaves the language open", ...(questions === undefined ? {} : { questions }) }),
+        falsify: request => { prompts.push(request.prompt); return { type: "questions", summary: "The ticket leaves the language open", ...(questions === undefined ? {} : { questions }) }; },
         plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
       }, human);
-      // Nothing the Agent wrote says "questions", so the word can only be the Machine naming the field.
+      // The note's own words say "questions", so the field is named by questionField's reason, which it gives whole.
       const run = parked(f, result, named, human);
+      for (const said of [run.delivery.park.needs, run.delivery.reason, result.output.summary]) {
+        assert.ok(said.includes(reason), said); assert.match(said, /\bmissing or malformed twice\b/u); assert.doesNotMatch(said, /Malformed/u);
+      }
+      // The first report went back once with the same reason; the second is the one the note sends a person to.
+      assert.equal(prompts.length, 2); assert.ok(prompts[1]!.includes(reason)); assert.equal(prompts[0]!.includes(reason), false);
+      assert.ok(run.delivery.park.needs.includes(join(run.directory, "falsify-2.json")));
       // A report that is not well formed asks the owner nothing and assumes nothing, the sound entry beside the bad one included.
       assert.equal(run.delivery.park.questions, undefined);
       assert.doesNotMatch(run.delivery.park.needs, /What does part 11|would have assumed/iu);
       assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
-      // The report is a stage report before it is judged, so a refused one is still what the investigator said.
+      // Each report is a stage report before it is judged, so a refused one is still what the investigator said.
       const stage = { stage: "falsify", outcome: "questions", summary: "The ticket leaves the language open" };
-      assert.deepEqual([run.result.agents, run.result.agentInvocations], [[stage], 1]);
-      assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "agent-1.json"), "utf8")), stage);
+      assert.deepEqual([run.result.agents, run.result.agentInvocations], [[stage, stage], 2]);
+      for (const name of ["agent-1.json", "agent-2.json"]) assert.deepEqual(JSON.parse(readFileSync(join(run.directory, name), "utf8")), stage);
       // Too many questions are still the investigator's: all of them are kept with the evidence, none in the note.
       if (Array.isArray(questions) && questions.length === 11) assert.notDeepEqual(holding(run.directory, (questions as Gap[]).map(question => question.text)), []);
       assert.equal(candidate(f.worktree).status, ""); assert.deepEqual(run.result.checks, []);
     });
   }
 }
+
+for (const [assumable, asked] of [[true, beside], [false, language]] as const) {
+  test(`a falsify report with no questions field goes back to the investigator once with the reason and where the questions go, and ${assumable ? "an assumable" : "a not assumable"} question that follows ${assumable ? "is assumed and planned from" : "parks on that question"}`, async context => {
+    const f = fixture(context); const human = person(); const prompts: string[] = [];
+    const reports = [{ type: "questions", summary: "The ticket leaves the language open" }, gaps([asked])];
+    const result = await execute(input(f, {}, { stuck: "park", assume: true }), {
+      falsify: request => { prompts.push(request.prompt); return reports[prompts.length - 1]!; },
+      ...(assumable ? {} : { plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() }),
+    }, human);
+    assert.equal(prompts.length, 2);
+    // Only the second prompt says what was wrong, in questionField's words; both say where the questions go.
+    assert.equal(prompts[0]!.includes(notAList), false); assert.ok(prompts[1]!.includes(notAList));
+    for (const prompt of prompts) for (const rule of questionsGo) assert.match(prompt, rule);
+    if (assumable) {
+      assert.equal(result.state, "delivered", evidence(f).delivery.reason);
+      assert.deepEqual(route(result.states).slice(0, 3), ["falsify", "falsify", "plan"]);
+      for (const state of ["stuck", "park", "decide"]) assert.equal(result.states.includes(state), false, state);
+      const run = held(f, result, /^Delivered/u);
+      assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "assumptions.json"), "utf8")), assumed([asked]));
+      assert.deepEqual(run.delivery.assumptions, assumed([asked]));
+      // The return spent no budget.
+      assert.deepEqual([run.result.repairs, run.result.reviewRounds], [0, 0]);
+    } else {
+      const run = parked(f, result, /Which language is the greeting in\?/u, human);
+      assert.deepEqual(run.delivery.park.questions, [{ text: asked.text, where: "" }]);
+      optionsFirst(run.delivery.park.needs.split("\n")[1]!, 1, asked);
+      assert.doesNotMatch(run.delivery.park.needs, /missing or malformed/iu);
+      assert.equal(existsSync(join(run.directory, "assumptions.json")), false);
+    }
+    // The malformed report is kept as every planning report is.
+    const run = evidence(f);
+    assert.equal(Object.hasOwn(JSON.parse(readFileSync(join(run.directory, "falsify-1.json"), "utf8")), "questions"), false);
+    assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "falsify-2.json"), "utf8")).questions, [asked]);
+  });
+}
+
+test("two malformed falsify reports park after the second in plain words, with its reason and the evidence file that holds it", async context => {
+  const f = fixture(context); const human = person(); const prompts: string[] = [];
+  const second = "questions[0].why must be a non-empty string";
+  const reports = [{ type: "questions", summary: "The ticket leaves the language open" }, gaps([without(language, "why")])];
+  const result = await execute(input(f, {}, { stuck: "park", assume: true }), {
+    falsify: request => { prompts.push(request.prompt); return reports[prompts.length - 1]!; },
+    plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+  }, human);
+  const run = parked(f, result, /\bmissing or malformed twice\b/u, human);
+  assert.equal(prompts.length, 2); assert.equal(result.states.at(-4), "falsifyResult");
+  assert.deepEqual(result.states.filter(isPlanning), ["falsify", "falsify"]);
+  assert.ok(prompts[1]!.includes(notAList));
+  const file = join(run.directory, "falsify-2.json");
+  for (const said of [readFileSync(join(run.directory, "park.txt"), "utf8"), run.delivery.park.needs, run.delivery.reason, result.output.summary]) {
+    assert.ok(said.includes(second), said); assert.ok(said.includes(file), said); assert.doesNotMatch(said, /Malformed/u);
+  }
+  // The file named holds the questions as the investigator wrote them, for a person to read.
+  assert.ok(readFileSync(file, "utf8").includes(language.text));
+  assert.equal(run.delivery.park.questions, undefined); assert.equal(existsSync(join(run.directory, "assumptions.json")), false);
+  assert.equal(run.result.agentInvocations, 2); assert.equal(candidate(f.worktree).status, "");
+});
+
+for (const valid of [false, true]) {
+  test(`more rounds after ${valid ? "a corrected" : "a second malformed"} falsify report keeps the one-return allowance spent and ${valid ? "clears" : "updates"} the validation feedback`, async context => {
+    const f = fixture(context); const human = person("more rounds", "hand off"); const prompts: string[] = [];
+    const missing = { type: "questions", summary: "The questions are missing" };
+    const secondReason = "questions[0].why must be a non-empty string";
+    const reports = [missing, gaps([valid ? language : without(language, "why")]), missing];
+    const result = await execute(input(f, {}, { stuck: "ask", maxRepairs: 0, maxReviewRounds: 0 }), {
+      falsify: request => { prompts.push(request.prompt); return reports[prompts.length - 1]!; },
+      plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+    }, human);
+    assert.equal(result.state, "handedOff");
+    assert.equal(prompts.length, 3); assert.equal(human.requests.length, 2);
+    assert.ok(prompts[1]!.includes(`Your last report's questions were missing or malformed: ${notAList}.`));
+    if (valid) assert.doesNotMatch(prompts[2]!, /Your last report's questions were missing or malformed/u);
+    else assert.ok(prompts[2]!.includes(`Your last report's questions were missing or malformed: ${secondReason}.`));
+    const run = held(f, result, /missing or malformed twice/u);
+    assert.ok(run.delivery.reason.includes(notAList));
+    assert.ok(run.delivery.reason.includes(join(run.directory, "falsify-3.json")));
+    assert.deepEqual([run.result.repairs, run.result.reviewRounds], [0, 0]);
+    assert.equal(run.result.agentInvocations, 3);
+    assert.equal(candidate(f.worktree).status, "");
+  });
+}
+
+test("a valid falsify questions report first is judged at once, with no return to the investigator", async context => {
+  for (const [assumable, asked] of [[true, beside], [false, language]] as const) {
+    const f = fixture(context); const human = person(); let falsified = 0;
+    const result = await execute(input(f, {}, { stuck: "park", assume: true }), {
+      falsify: () => { falsified++; return gaps([asked]); },
+    }, human);
+    assert.equal(falsified, 1);
+    assert.equal(result.states.filter(state => state === "falsify").length, 1);
+    if (assumable) assert.equal(result.state, "delivered", evidence(f).delivery.reason);
+    else {
+      const run = parked(f, result, /Which language is the greeting in\?/u, human);
+      assert.equal(run.result.agentInvocations, 1);
+      assert.deepEqual(run.delivery.park.questions, [{ text: asked.text, where: "" }]);
+    }
+  }
+});
 
 test("the falsify prompt asks for each question's text, options, recommended answer, whether it is assumable, and why, with assume on as with it off", async context => {
   const asks: string[][] = [];
@@ -1026,6 +1134,8 @@ test("the falsify prompt asks for each question's text, options, recommended ans
   for (const ask of asks) {
     const prompt = ask.join("\n\n");
     for (const field of ["text", "options", "recommended", "assumable", "why"]) assert.match(prompt, new RegExp(`\\b${field}\\b`, "u"), field);
+    // The questions go in the report's questions field, not in its summary or message.
+    for (const rule of questionsGo) assert.match(prompt, rule);
     // Assumable is for a gap whose conservative answer loses nothing if wrong; a product decision, a change of scope, or anything irreversible never is.
     for (const rule of [/\bconservative\b/iu, /\bloses? nothing\b|\bnothing (?:is )?lost\b/iu, /\bproduct decision\b/iu, /\bchange of scope\b|\bscope change\b|\bchang\w+ (?:the |its )?scope\b/iu, /\birreversibl/iu]) {
       assert.match(prompt, rule);
@@ -3961,10 +4071,10 @@ for (const damaged of [false, true]) {
   });
 }
 
-for (const [label, extra, report] of [
-  ["asks its question with assume left out", {}, gaps([newline], "One thing is open")],
-  ["parks on a question that is not assumable beside one that is", { assume: true }, gaps([language, newline], "Two gaps, one of them the owner's")],
-  ["returns a report that is not well formed", { assume: true }, gaps("Does the greeting end with a line break?", "One thing is open")],
+for (const [label, extra, report, calls] of [
+  ["asks its question with assume left out", {}, gaps([newline], "One thing is open"), 1],
+  ["parks on a question that is not assumable beside one that is", { assume: true }, gaps([language, newline], "Two gaps, one of them the owner's"), 1],
+  ["returns a report that is not well formed twice", { assume: true }, gaps("Does the greeting end with a line break?", "One thing is open"), 2],
 ] as const) {
   test(`a resumed run with a clean worktree whose own falsify ${label} assumed nothing: the saved assumptions are deleted, and its park carries none of the earlier answers`, async context => {
     const f = fixture(context); const file = await assumedThenParkedClean(f);
@@ -3972,7 +4082,7 @@ for (const [label, extra, report] of [
     const result = await execute(input(again, {}, { resume: true, stuck: "park", ...extra }), {
       falsify: () => report, plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
     }, human);
-    assert.equal(result.state, "parked"); assert.deepEqual(route(result.states), ["falsify"]); assert.deepEqual(human.requests, []);
+    assert.equal(result.state, "parked"); assert.deepEqual(route(result.states), Array.from({ length: calls }, () => "falsify")); assert.deepEqual(human.requests, []);
     assert.equal(existsSync(file), false, "the earlier run's answers are still saved though this run's falsify assumed nothing"); assert.deepEqual(savedIn(f), []);
     const run = held(again, result, new RegExp(`^Parked on ${branch}: `, "u"));
     assert.deepEqual([run.delivery.outcome, run.delivery.resumed], ["parked", true]);
