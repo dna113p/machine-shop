@@ -1373,12 +1373,12 @@ test("a second plan revision whose summary runs over several lines and 600 chara
 
 /** What the planner is told when its last plan was sent back for length, and what a run says when a second one is as long. */
 const lastPlanWas = (length: number) => new RegExp(`\\blast plan was ${length} characters\\b`, "u");
-const limitNamed = /\blimit (?:is|of) 4000\b/u;
-const overLimit = (length: number) => new RegExp(`\\b${length} characters against a limit of 4000\\b`, "u");
+const limitNamed = /\blimit (?:is|of) 6000\b/u;
+const overLimit = (length: number) => new RegExp(`\\b${length} characters against a limit of 6000\\b`, "u");
 
-test("a plan of 4001 characters goes back to the planner once with its length and the limit, and the plan of 4000 that follows is the one reviewed and worked from", async context => {
+test("a plan of 6001 characters goes back to the planner once with its length and the limit, and the plan of 6000 that follows is the one reviewed and worked from", async context => {
   const f = fixture(context); const plans: string[] = []; const later: Record<string, string[]> = { planReview: [], tester: [], implementer: [] };
-  const [first, second] = ["a".repeat(4001), "b".repeat(4000)];
+  const [first, second] = ["a".repeat(6001), "b".repeat(6000)];
   const seen = (stage: string, work: Runner): Runner => request => { later[stage]!.push(request.prompt); return work(request); };
   const result = await execute(input(f, {}, { stuck: "park", maxRepairs: 0, maxReviewRounds: 0 }), {
     plan: request => { plans.push(request.prompt); return ok("planned", plans.length === 1 ? first : second); },
@@ -1389,7 +1389,7 @@ test("a plan of 4001 characters goes back to the planner once with its length an
   assert.deepEqual(result.states.slice(0, result.states.indexOf("test")).filter(isPlanning), ["falsify", "plan", "plan", "planReview"]);
   // Only the second prompt says a plan was too long: by how much, against what, and what to do about it.
   assert.doesNotMatch(plans[0]!, /\blast plan was\b/u); assert.doesNotMatch(plans[0]!, limitNamed);
-  assert.match(plans[1]!, lastPlanWas(4001)); assert.match(plans[1]!, limitNamed); assert.match(plans[1]!, /\bfewer words\b/u);
+  assert.match(plans[1]!, lastPlanWas(6001)); assert.match(plans[1]!, limitNamed); assert.match(plans[1]!, /\bfewer words\b/u);
   // The plan that fits follows the heading whole; the one that did not is never the plan worked from.
   for (const prompt of Object.values(later).flat()) { assert.ok(planIn(prompt).startsWith(`${second}\n`)); assert.equal(planIn(prompt).startsWith(first), false); }
   // The run did not stop, and the return spent neither budget.
@@ -1402,30 +1402,30 @@ test("a plan of 4001 characters goes back to the planner once with its length an
   assert.deepEqual(["plan-1.json", "plan-2.json"].map(name => JSON.parse(readFileSync(join(run.directory, name), "utf8")).summary), [first, second]);
 });
 
-test("a second plan over 4000 characters parks in plain words with its own length and the limit, before any plan is reviewed", async context => {
+test("a second plan over 6000 characters parks in plain words with its own length and the limit, before any plan is reviewed", async context => {
   const f = fixture(context); const human = person(); let plans = 0;
   const result = await execute(input(f, {}, { stuck: "park" }), {
-    plan: () => ok("planned", "p".repeat(++plans === 1 ? 4001 : 4500)),
+    plan: () => ok("planned", "p".repeat(++plans === 1 ? 6001 : 6500)),
     planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
   }, human);
-  const run = parked(f, result, overLimit(4500), human);
+  const run = parked(f, result, overLimit(6500), human);
   assert.equal(plans, 2); assert.equal(result.states.at(-4), "planResult");
   assert.deepEqual(result.states.filter(isPlanning), ["falsify", "plan", "plan"]);
   const note = readFileSync(join(run.directory, "park.txt"), "utf8");
   for (const said of [note, run.delivery.park.needs, run.delivery.reason, result.output.summary]) {
-    assert.match(said, overLimit(4500)); assert.match(said, /\bsent back once\b/u); assert.match(said, /\btoo broad for one run\b/u);
+    assert.match(said, overLimit(6500)); assert.match(said, /\bsent back once\b/u); assert.match(said, /\btoo broad for one run\b/u);
     // The length is the second plan's, and nothing calls a plan that was only long a malformed report.
-    assert.doesNotMatch(said, /malformed/iu); assert.doesNotMatch(said, /\b4001 characters\b/u);
+    assert.doesNotMatch(said, /malformed/iu); assert.doesNotMatch(said, /\b6001 characters\b/u);
   }
   assert.equal(run.delivery.park.questions, undefined);
-  assert.deepEqual(run.result.agents.map((agent: any) => [agent.stage, agent.summary.length]).slice(1), [["plan", 4001], ["plan", 4500]]);
+  assert.deepEqual(run.result.agents.map((agent: any) => [agent.stage, agent.summary.length]).slice(1), [["plan", 6001], ["plan", 6500]]);
   assert.equal(candidate(f.worktree).status, ""); assert.deepEqual(run.result.checks, []);
 });
 
 test("a plan sent back for length still has the reviewer's one revision, and a second revise parks as it does without that return", async context => {
   const f = fixture(context); const human = person(); const plans: string[] = []; const planReviews: string[] = [];
   const result = await execute(input(f, {}, { stuck: "park" }), {
-    plan: request => { plans.push(request.prompt); return ok("planned", plans.length === 1 ? "p".repeat(4001) : `Attempt ${plans.length}: add greeting.txt.`); },
+    plan: request => { plans.push(request.prompt); return ok("planned", plans.length === 1 ? "p".repeat(6001) : `Attempt ${plans.length}: add greeting.txt.`); },
     planReview: request => { planReviews.push(request.prompt); return ok("revise", planReviews.length === 1 ? "Name the test that proves the greeting" : "The plan still names no test"); },
     tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
   }, human);
@@ -1434,16 +1434,16 @@ test("a plan sent back for length still has the reviewer's one revision, and a s
   assert.deepEqual(result.states.filter(isPlanning), ["falsify", "plan", "plan", "planReview", "plan", "planReview"]);
   // The reviewer reads the plans that fit; the third planning answers the review, not a length that no longer stands.
   assert.ok(planIn(planReviews[0]!).startsWith("Attempt 2: add greeting.txt.\n")); assert.ok(planIn(planReviews[1]!).startsWith("Attempt 3: add greeting.txt.\n"));
-  assert.match(plans[1]!, lastPlanWas(4001)); assert.doesNotMatch(plans[2]!, /\blast plan was\b/u);
+  assert.match(plans[1]!, lastPlanWas(6001)); assert.doesNotMatch(plans[2]!, /\blast plan was\b/u);
   assert.ok(plans[2]!.includes("Name the test that proves the greeting"));
   assert.ok(run.delivery.park.needs.includes("The plan still names no test")); assert.ok(result.output.summary.includes("The plan still names no test"));
-  assert.doesNotMatch(run.delivery.park.needs, /Name the test that proves the greeting/u); assert.doesNotMatch(run.delivery.park.needs, /4001 characters/u);
+  assert.doesNotMatch(run.delivery.park.needs, /Name the test that proves the greeting/u); assert.doesNotMatch(run.delivery.park.needs, /6001 characters/u);
   assert.equal(candidate(f.worktree).status, ""); assert.deepEqual(run.result.checks, []);
 });
 
-test("a plan the reviewer sent back that comes back over 4000 characters is sent back once for length, and the plan that then fits is reviewed and worked from", async context => {
+test("a plan the reviewer sent back that comes back over 6000 characters is sent back once for length, and the plan that then fits is reviewed and worked from", async context => {
   const f = fixture(context); const plans: string[] = []; const planReviews: string[] = []; const prompts: string[] = [];
-  const [first, over] = ["Add greeting.txt and nothing else.", "r".repeat(4001)];
+  const [first, over] = ["Add greeting.txt and nothing else.", "r".repeat(6001)];
   const result = await execute(input(f, {}, { stuck: "park", maxRepairs: 0, maxReviewRounds: 0 }), {
     plan: request => { plans.push(request.prompt); return ok("planned", [first, over, plan][plans.length - 1]!); },
     planReview: request => { planReviews.push(request.prompt); return planReviews.length === 1 ? ok("revise", "Name the test that proves the greeting") : ok("approved", "The plan now names its test"); },
@@ -1454,7 +1454,7 @@ test("a plan the reviewer sent back that comes back over 4000 characters is sent
   assert.deepEqual(result.states.slice(0, result.states.indexOf("test")).filter(isPlanning), ["falsify", "plan", "planReview", "plan", "plan", "planReview"]);
   // The revision is told what the reviewer wants; the plan after it is told its length as well.
   assert.doesNotMatch(plans[1]!, /\blast plan was\b/u); assert.ok(plans[1]!.includes("Name the test that proves the greeting"));
-  assert.match(plans[2]!, lastPlanWas(4001)); assert.match(plans[2]!, limitNamed); assert.ok(plans[2]!.includes("Name the test that proves the greeting"));
+  assert.match(plans[2]!, lastPlanWas(6001)); assert.match(plans[2]!, limitNamed); assert.ok(plans[2]!.includes("Name the test that proves the greeting"));
   assert.ok(planIn(planReviews[0]!).startsWith(`${first}\n`)); assert.ok(planIn(planReviews[1]!).startsWith(`${plan}\n`));
   for (const prompt of prompts) { assert.ok(planIn(prompt).startsWith(`${plan}\n`)); assert.equal(planIn(prompt).startsWith(over), false); }
   const run = held(f, result, /^Delivered/u);
@@ -1462,14 +1462,14 @@ test("a plan the reviewer sent back that comes back over 4000 characters is sent
   assert.deepEqual(run.result.agents.filter((agent: any) => agent.stage === "plan").map((agent: any) => agent.summary), [first, over, plan]);
 });
 
-test("a run sends a plan back for length once only: one over 4000 characters after the reviewer's revision parks with its length", async context => {
+test("a run sends a plan back for length once only: one over 6000 characters after the reviewer's revision parks with its length", async context => {
   const f = fixture(context); const human = person(); let plans = 0; let planReviews = 0;
   const result = await execute(input(f, {}, { stuck: "park" }), {
-    plan: () => ok("planned", [() => "p".repeat(4001), () => "Add greeting.txt and nothing else.", () => "p".repeat(4200)][plans++]!()),
+    plan: () => ok("planned", [() => "p".repeat(6001), () => "Add greeting.txt and nothing else.", () => "p".repeat(6200)][plans++]!()),
     planReview: () => { planReviews++; return ok("revise", "Name the test that proves the greeting"); },
     tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
   }, human);
-  const run = parked(f, result, overLimit(4200), human);
+  const run = parked(f, result, overLimit(6200), human);
   assert.deepEqual([plans, planReviews], [3, 1]); assert.equal(result.states.at(-4), "planResult");
   assert.deepEqual(result.states.filter(isPlanning), ["falsify", "plan", "plan", "planReview", "plan"]);
   assert.match(run.delivery.park.needs, /\bsent back once\b/u); assert.doesNotMatch(run.delivery.park.needs, /malformed/iu);
@@ -1490,8 +1490,8 @@ test("a plan over 16000 characters is refused as an empty one is, with no return
   assert.equal(candidate(f.worktree).status, "");
 });
 
-test("a plan of 4000 characters is carried whole, and one of 4001 never reaches the tester or the implementer", async context => {
-  for (const length of [4000, 4001]) {
+test("a plan of 6000 characters is carried whole, and one of 6001 never reaches the tester or the implementer", async context => {
+  for (const length of [6000, 6001]) {
     const f = fixture(context); const long = "p".repeat(length); let edits = 0; let plans = 0; let planReviews = 0;
     const counted = (work: Runner): Runner => request => { edits++; assert.ok(planIn(request.prompt).startsWith(`${long}\n`)); return work(request); };
     // Whether the run fails outright or the stuck policy takes it is the Machine's choice; either way it says the limit and edits nothing.
@@ -1500,9 +1500,9 @@ test("a plan of 4000 characters is carried whole, and one of 4001 never reaches 
       planReview: request => { planReviews++; assert.ok(planIn(request.prompt).startsWith(`${long}\n`)); return planning.planReview!.answer(request); },
       tester: counted(tester), implementer: counted(implement),
     }).then(done => [done.state, evidence(f).delivery.reason ?? ""], error => ["failed", String(error.message)]);
-    if (length === 4000) { assert.deepEqual([state, edits, plans, planReviews], ["delivered", 2, 1, 1]); continue; }
+    if (length === 6000) { assert.deepEqual([state, edits, plans, planReviews], ["delivered", 2, 1, 1]); continue; }
     // The planner is asked once more before the run stops, and a second plan as long ends it: no one reviews or works from either.
-    assert.notEqual(state, "delivered"); assert.deepEqual([edits, plans, planReviews], [0, 2, 0]); assert.match(said, /4000/u);
+    assert.notEqual(state, "delivered"); assert.deepEqual([edits, plans, planReviews], [0, 2, 0]); assert.match(said, /6000/u);
     assert.equal(candidate(f.worktree).status, ""); assert.equal(git(f.repo, "rev-parse", branch), f.head);
   }
 });
@@ -1532,17 +1532,17 @@ for (const [label, answer] of [
   });
 }
 
-test("the 4000-character limit is measured on the prose plan, not on the JSON a runner wrapped it in", async context => {
-  for (const length of [4000, 4001]) {
+test("the 6000-character limit is measured on the prose plan, not on the JSON a runner wrapped it in", async context => {
+  for (const length of [6000, 6001]) {
     const f = fixture(context); const long = "p".repeat(length); let edits = 0; let plans = 0;
     const counted = (work: Runner): Runner => request => { edits++; assert.ok(planIn(request.prompt).startsWith(`${long}\n`)); return work(request); };
     const result = await execute(input(f, {}, { stuck: "park" }), {
       plan: () => { plans++; return { type: "planned", summary: JSON.stringify({ type: "planned", summary: long }) }; }, tester: counted(tester), implementer: counted(implement),
     });
-    if (length === 4000) { assert.deepEqual([result.state, edits, plans], ["delivered", 2, 1], evidence(f).delivery.reason); continue; }
-    assert.deepEqual([result.state, edits, plans], ["parked", 0, 2]); assert.match(evidence(f).delivery.reason, /4000/u);
+    if (length === 6000) { assert.deepEqual([result.state, edits, plans], ["delivered", 2, 1], evidence(f).delivery.reason); continue; }
+    assert.deepEqual([result.state, edits, plans], ["parked", 0, 2]); assert.match(evidence(f).delivery.reason, /6000/u);
     // The length the note gives is the prose plan's, not that of the JSON around it.
-    assert.match(evidence(f).delivery.reason, /\b4001 characters\b/u);
+    assert.match(evidence(f).delivery.reason, /\b6001 characters\b/u);
     // Each plan that was too long is still the stage report of the state that returned it.
     assert.deepEqual(evidence(f).result.agents.map((agent: any) => agent.stage), ["falsify", "plan", "plan"]);
     assert.deepEqual(evidence(f).result.agents.slice(1).map((agent: any) => agent.summary), [long, long]);

@@ -119,7 +119,7 @@ A missing section blocks before any Agent runs. A run then goes
    or too vague. Open questions stop the run for the owner. With
    `"assume": true`, questions whose cautious answer loses nothing are answered
    and recorded instead.
-2. **Plan and plan review.** A plan of at most 4000 characters, with one
+2. **Plan and plan review.** A plan of at most 6000 characters, with one
    revision allowed.
 3. **Tests first.** A tester writes failing tests for each acceptance criterion
    and the Machine proves they fail. `"redGreen": false` skips this step.
