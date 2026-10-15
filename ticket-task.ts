@@ -15,6 +15,8 @@ export const agentRoles = {
 };
 
 const publishTimeoutMs = 120_000;
+// The longest prose plan a run works from; a longer one goes back once to be shortened.
+const planLimit = 6000;
 // A sandboxed harness may be unable to start the project's checks at all. That is not a blocker: the checks are the workflow's to run.
 const cannotRun = "Run the checks you can. If your environment cannot run them, as when a sandbox refuses to start processes, say which and why in your summary and still return completed: the workflow runs every required check itself after you return. Return blocked only for something a person must decide or supply.";
 const decisions = ["more rounds", "hand off", "archive", "discard"] as const;
@@ -785,13 +787,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     overLimit = 0;
     if (work.unchanged().type === "changed") return { type: "blocked" };
     if ("refusal" in kept) return work.block(kept.refusal);
-    if (kept.summary.length > 4000) {
+    if (kept.summary.length > planLimit) {
       if (!lengthReturned) {
         lengthReturned = true;
         overLimit = kept.summary.length;
         return { type: "shorten" };
       }
-      return work.block(`The plan was ${kept.summary.length} characters against a limit of 4000 after being sent back once to be shortened. A ticket whose plan does not fit may be too broad for one run.`);
+      return work.block(`The plan was ${kept.summary.length} characters against a limit of ${planLimit} after being sent back once to be shortened. A ticket whose plan does not fit may be too broad for one run.`);
     }
     plan = kept.summary;
     return { type: "planned" };
@@ -887,8 +889,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }, { using: "investigator", cwd: worktree }),
       falsifyResult: operation(stopped("falsifyResult", falsifyResult), { sound: "plan", assumed: "plan", reask: "falsify", blocked: "stuck" }),
       plan: agent(() => work.prompt([
-        "Plan the implementation of this sound ticket. Do not edit any file. Cover the acceptance criteria, tests, permitted paths, and required checks. Address any plan review feedback in the stage reports. Return planned with the complete plan as the summary, at most 4000 characters.",
-        ...(overLimit ? [`Your last plan was ${overLimit} characters; the limit is 4000. Say the same plan in fewer words: name the files and the tests, and do not restate the ticket.`] : []),
+        `Plan the implementation of this sound ticket. Do not edit any file. Cover the acceptance criteria, tests, permitted paths, and required checks. Address any plan review feedback in the stage reports. Return planned with the complete plan as the summary, at most ${planLimit} characters.`,
+        ...(overLimit ? [`Your last plan was ${overLimit} characters; the limit is ${planLimit}. Say the same plan in fewer words: name the files and the tests, and do not restate the ticket.`] : []),
         ...assumptionsPrompt(),
       ].join("\n")), {
         planned: { target: "planResult", actions: rememberPlanning },

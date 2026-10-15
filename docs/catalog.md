@@ -316,8 +316,8 @@ is.
 | `start` | Open the helper's run on the worktree, which must be clean |
 | `falsify` | Read-only investigator tries to show the ticket is wrong, already done, impossible here, or underspecified; returns `sound` with a one-paragraph summary or `questions` with 1–10 entries containing text, options, recommended, assumable, and why in the report's `questions` field, not its summary or message; a return for malformed questions includes the validation reason and repeats where the questions go |
 | `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; missing or malformed questions return to `falsify` once per run, then go through the stuck policy with the reason and report's evidence file; a sound ticket goes to `plan`, as does an entirely assumable report with `assume: true`; remaining questions go through the stuck policy with numbered needs, flattened with question text, each option, and why capped separately at 600 characters plus an ellipsis |
-| `plan` | Read-only investigator returns `planned` with the complete plan as a summary of at most 4000 characters, recorded as stage `plan`; a return for length names the previous length and limit and asks for the same plan in fewer words, naming files and tests without restating the ticket |
-| `planResult` | Capture the report before guarding the unchanged worktree and validating the captured prose plan's length before `planReview`; a captured plan over 4000 characters returns to `plan` once per run, separately from the reviewer's revision; a second goes through the stuck policy with its length, the limit, and a plain explanation |
+| `plan` | Read-only investigator returns `planned` with the complete plan as a summary of at most 6000 characters, recorded as stage `plan`; a return for length names the previous length and limit and asks for the same plan in fewer words, naming files and tests without restating the ticket |
+| `planResult` | Capture the report before guarding the unchanged worktree and validating the captured prose plan's length before `planReview`; a captured plan over 6000 characters returns to `plan` once per run, separately from the reviewer's revision; a second goes through the stuck policy with its length, the limit, and a plain explanation |
 | `planReview` | Read-only reviewer returns `approved` or `revise` with a summary; the prompt includes the plan verbatim |
 | `planReviewResult` | Capture the report before guarding the unchanged worktree; first `revise` returns to `plan`, second `revise` goes through the stuck policy with the reviewer's summary as the reason and the usual capped blocker needs; `approved` continues to `test` or, with `redGreen: false`, `change` |
 | `test` | With `redGreen: true`, the tester writes only tests for every acceptance criterion inside Scope, leaving them uncommitted; its summary is recorded as stage `test` |
@@ -340,11 +340,11 @@ its unchanged-worktree guard or validation. A missing or empty summary in any
 planning state goes through the stuck policy, with the state and missing summary
 named in the reason. A plan sent back once by the reviewer is re-planned with the
 reviewer's feedback and reviewed again; a second revision stops before editing.
-Separately, a captured prose plan over 4000 characters returns to `plan` once per
+Separately, a captured prose plan over 6000 characters returns to `plan` once per
 run with its length and the limit. The planner must say the same plan in fewer
 words, naming files and tests without restating the ticket. This return is also
 available after a reviewer revision if not already used. A second over-long plan
-goes through the stuck policy with its length against 4000, saying it was sent
+goes through the stuck policy with its length against 6000, saying it was sent
 back once and that the ticket may be too broad for one run. Neither over-long
 plan is truncated or passed onward under `Plan:`; both remain captured evidence.
 An empty plan or one over the capture limit of 16000 characters is refused without
