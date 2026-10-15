@@ -58,7 +58,7 @@ It runs from source; the installer never copies it.
 | `redGreen` | no | `true` | Write failing tests first. `false` skips the tester and the red check. |
 | `assume` | no | `false` | Let `falsify` answer questions whose cautious answer loses nothing, and record them, instead of stopping. |
 | `stuck` | no | `"park"` | `stuck` no longer changes anything: both `"park"` and `"ask"` sleep on the same Human question. |
-| `resume` | no | `false` | Pick up the worktree a park or hand-off left, or a delivered commit whose worktree is gone. |
+| `resume` | no | `false` | Pick up the worktree a hand-off or block left, or a delivered commit whose worktree is gone. |
 
 ## Flow
 
@@ -159,14 +159,20 @@ flowchart TD
 
 ### When stuck
 
-The question carries the park note's context: what stopped the run, what is
-needed, open questions, budgets, and evidence locations. The four decisions
+The question describes what stopped the run, what is needed, open questions,
+budgets, and evidence locations. Each question is written as `question-<n>.txt`
+in the evidence directory, numbered from 1 across re-asks and continuation
+after sleep. The four decisions
 are suggestions. Any other reply is an answer and works like `more rounds`:
 it renews both budgets, clears the owner questions, and returns to the stage
 that stopped in the same worktree. An answer also clears the plan-length return.
 Answers remain under
 `Answers from the ticket owner:` in later Agent prompts, including the planner
 after a falsify question. Discard still requires its second confirmation.
+The four decisions match ignoring case, surrounding whitespace and trailing
+punctuation (`. , ; : ! ? …`). The raw reply is kept in the Human evidence,
+and the canonical decision is recorded in `delivery.json`; `confirm discard`
+and `go back` stay exact.
 
 ```mermaid
 %%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
@@ -222,7 +228,6 @@ reason or decision. Read that later receipt if cleanup fails after delivery.
 
 - ✅ **`delivered`**: committed and delivered as a branch or patch.
 - ✅ **`merged`**: the pull request merged and the ticket branch was deleted locally and remotely.
-- 🅿️ **`parked`**: retained for compatibility with earlier runs and their `park.txt` notes; current stuck runs do not reach it.
 - 🤝 **`handedOff`**: a person chose to hand the work to someone else; after pull request delivery, the worktree is already gone and the branch is kept.
 - 🗑️ **`abandoned`**: archived to `archive/<slug>` and removed, or discarded after a second confirmation.
 - ⛔ **`blocked`**: the ticket's shape, setup, commit, delivery, or branch cleanup failed.

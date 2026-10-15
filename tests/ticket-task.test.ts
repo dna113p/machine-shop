@@ -332,9 +332,20 @@ function questioned(f: Fixture, result: { state: unknown; output: any; states: s
   const needs = stuckQuestion(f, request, result.states.at(-5)!);
   assert.ok(request!.prompt.includes(`Evidence: ${run.directory}`)); assert.match(needs, reason);
   assert.equal(existsSync(join(run.directory, "park.txt")), false); assert.equal(Object.hasOwn(run.delivery, "park"), false);
+  asksWritten(run.directory, [request!]);
   assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "hand off" }]);
   assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
   return Object.assign(run, { prompt: request!.prompt, needs });
+}
+/** Each time a stuck run asks, the question's text goes to the evidence as `question-<n>.txt`, numbered from 1 across the run, and no park note is written. */
+function asksWritten(directory: string, requests: readonly Ask[], from = 1) {
+  requests.forEach((request, index) => {
+    const name = `question-${from + index}.txt`;
+    assert.ok(existsSync(join(directory, name)), `${name} was written`);
+    assert.equal(readFileSync(join(directory, name), "utf8"), `${request.prompt}\n`, name);
+  });
+  assert.equal(existsSync(join(directory, `question-${from + requests.length}.txt`)), false, `no question-${from + requests.length}.txt`);
+  assert.equal(existsSync(join(directory, "park.txt")), false);
 }
 /** What a stuck run's question says above what it needs: the decision line, why it stopped, and the budgets. */
 const standingOf = (prompt: string) => prompt.slice(0, prompt.indexOf("\nNeeds: "));
@@ -1655,6 +1666,8 @@ for (const reply of ["hand off", "discard"] as const) {
     assert.deepEqual([again!.prompt, again!.suggestions], [first!.prompt, first!.suggestions]);
     const run = abandoned(f, result, "discard");
     assert.deepEqual(run.result.decisions.map((made: any) => `${made.stage}: ${made.response}`), ["decide: discard", "confirmDiscard: go back", "decide: discard", "confirmDiscard: confirm discard"]);
+    // Going back asks the question again, and that ask is written as the next question.
+    asksWritten(run.directory, [first!, again!]);
   });
 }
 
@@ -1666,7 +1679,8 @@ test("a blank reply to the question asks it again", async context => {
   const [first, again] = human.requests;
   assert.deepEqual([again!.prompt, again!.suggestions], [first!.prompt, first!.suggestions]);
   stuckQuestion(f, first, "planResult");
-  handedOff(f, result, overLimit(6500), human);
+  const run = handedOff(f, result, overLimit(6500), human);
+  asksWritten(run.directory, [first!, again!]);
 });
 
 test("stuck park, ask, or left out all take a stuck run to the same question, and none of them parks", async context => {
@@ -1691,6 +1705,8 @@ test("under the sleep option a stuck run sleeps on its question with nothing end
   // Nothing has ended: no receipt and no note, and the worktree is kept on its branch.
   const runs = join(f.evidence, ".machine-runs/machine-shop"); const [id, ...others] = readdirSync(runs); assert.deepEqual(others, []);
   for (const name of ["delivery.json", "result.json", "park.txt"]) assert.equal(existsSync(join(runs, id!, name)), false, name);
+  // The question it sleeps on is already in the evidence.
+  asksWritten(join(runs, id!), slept);
   assert.equal(git(f.worktree, "symbolic-ref", "HEAD"), `refs/heads/${branch}`);
   // A later process continues the run at its question with the owner's answer.
   const checkpoint = saves.saved.decide; assert.ok(checkpoint, "a checkpoint was saved on entering decide");
@@ -1701,6 +1717,95 @@ test("under the sleep option a stuck run sleeps on its question with nothing end
   assert.equal(plans.length, 3); assert.ok(answersIn(plans[2]!).includes(answer), plans[2]);
   const run = held(f, continued, /^Delivered/u); untouched(f);
   assert.deepEqual(run.result.decisions, [{ stage: "decide", response: answer }]);
+  // Continuing at the question does not write it again.
+  asksWritten(run.directory, slept);
+});
+
+test("a run continued at its question with a blank reply asks again and writes question-2.txt beside the first, which stays as it was", async context => {
+  const f = fixture(context); const plans: string[] = []; const slept: Ask[] = [];
+  const agents = { plan: tooLongTwice(plans), ...editsNothing };
+  const saves = checkpointed();
+  const first = await execute(input(f), agents, person(), { ...saves.options, onHumanSleep: request => { slept.push(request); } });
+  assert.equal(String(first.state), "decide"); assert.equal(slept.length, 1);
+  const runs = join(f.evidence, ".machine-runs/machine-shop"); const [id] = readdirSync(runs);
+  asksWritten(join(runs, id!), slept);
+  // The count of questions is carried in the saved data, so the continued run numbers its next ask 2.
+  const checkpoint = saves.saved.decide!; const rest = checkpointed(checkpoint); const human = person("hand off");
+  const continued = await execute(input(f), agents, human, { ...rest.options, continueAt: { value: checkpoint.value, context: checkpoint.context }, answer: " \n" });
+  assert.deepEqual(continued.states.slice(0, 2), ["decide", "stuck"]);
+  assert.equal(human.requests.length, 1); stuckQuestion(f, human.requests[0], "planResult");
+  const run = handedOff(f, continued, overLimit(6500), human);
+  asksWritten(run.directory, [slept[0]!, human.requests[0]!]);
+  assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "hand off" }]);
+});
+
+test("no state of the run parks, whatever stuck is: there is neither a park nor a parked state, and nothing writes park.txt", context => {
+  const f = fixture(context);
+  for (const stuck of ["park", "ask", undefined]) {
+    const data = input(f); if (stuck === undefined) Reflect.deleteProperty(data, "stuck"); else data.stuck = stuck;
+    const states = Object.keys(mod.default(runtime, data).states);
+    for (const state of ["park", "parked"]) assert.equal(states.includes(state), false, `${state} with stuck ${stuck}`);
+    for (const state of ["stuck", "decide", "handOff", "handedOff"]) assert.ok(states.includes(state), `${state} with stuck ${stuck}`);
+  }
+  const source = readFileSync(resolve("ticket-task.ts"), "utf8");
+  assert.doesNotMatch(source, /park\.txt/u, "ticket-task.ts still writes park.txt");
+  assert.doesNotMatch(source, /["']parked["']/u, "ticket-task.ts still has a parked outcome");
+});
+
+for (const reply of ["Hand off", " hand off. ", "HAND OFF!", "hand off…", "Hand off?!", "\thand off ;"]) {
+  test(`the reply ${JSON.stringify(reply)} is the hand off decision, matched ignoring case, surrounding whitespace and trailing punctuation`, async context => {
+    const f = fixture(context); const plans: string[] = []; const human = person(reply);
+    const result = await execute(input(f), { plan: tooLongTwice(plans), ...editsNothing }, human);
+    assert.equal(plans.length, 2, "the reply is not taken as an answer that sends the run back to plan");
+    // handedOff checks that delivery.json and the summary record the decision as hand off.
+    const run = handedOff(f, result, overLimit(6500), human);
+    assert.deepEqual(result.states.slice(-4), ["stuck", "decide", "handOff", "handedOff"]);
+    // The reply is kept as the owner gave it.
+    assert.deepEqual(run.result.decisions, [{ stage: "decide", response: reply }]);
+    asksWritten(run.directory, human.requests);
+  });
+}
+
+test("Discard. asks for confirmation as discard does, and confirm discard there stays exact: Confirm discard is refused", async context => {
+  const f = fixture(context); const human = person("Discard.", "Confirm discard");
+  await assert.rejects(execute(input(f), { plan: tooLongTwice([]), ...editsNothing }, human), /Expected one of: confirm discard, go back/u);
+  assert.equal(human.requests.length, 2); assert.deepEqual(human.requests[1]!.choices, ["confirm discard", "go back"]);
+  assert.ok(existsSync(f.worktree), "nothing was removed");
+});
+
+test("DISCARD! then confirm discard abandons the run with the decision recorded as discard", async context => {
+  const f = fixture(context); const human = person("DISCARD!", "confirm discard");
+  const result = await execute(input(f), { plan: tooLongTwice([]), ...editsNothing }, human);
+  const run = abandoned(f, result, "discard");
+  assert.deepEqual(run.result.decisions.map((made: any) => `${made.stage}: ${made.response}`), ["decide: DISCARD!", "confirmDiscard: confirm discard"]);
+});
+
+test("Archive. is the archive decision, and is recorded as archive", async context => {
+  const f = fixture(context); const human = person("Archive.");
+  const result = await execute(input(f), { plan: tooLongTwice([]), ...editsNothing }, human);
+  assert.deepEqual(result.states.slice(result.states.indexOf("decide"), result.states.indexOf("decide") + 2), ["decide", "archive"]);
+  // Nothing was edited, so there is nothing to archive and the run ends blocked with the decision it was given.
+  assert.equal(result.state, "blocked"); const run = evidence(f);
+  assert.equal(run.delivery.decision, "archive"); assert.match(run.delivery.reason, /nothing to archive/u);
+});
+
+test("More rounds? is the more rounds decision: it goes back to plan without becoming an answer", async context => {
+  const f = fixture(context); const plans: string[] = []; const human = person("More rounds?");
+  const result = await execute(input(f), { plan: tooLongTwice(plans) }, human);
+  assert.equal(result.state, "delivered", evidence(f).delivery.reason);
+  assert.equal(plans.length, 3);
+  for (const prompt of plans) assert.equal(prompt.includes("More rounds?"), false, prompt);
+  assert.equal(answersIn(plans[2]!), "", "more rounds carries no answer");
+  const run = held(f, result, /^Delivered.* Decision: more rounds\. /u);
+  assert.equal(run.delivery.decision, "more rounds");
+  assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "More rounds?" }]);
+});
+
+test("a reply that only begins with a decision is still an answer", async context => {
+  const f = fixture(context); const plans: string[] = []; const answer = "hand off please"; const human = person(answer);
+  const result = await execute(input(f), { plan: tooLongTwice(plans) }, human);
+  assert.equal(result.state, "delivered", evidence(f).delivery.reason);
+  assert.equal(plans.length, 3); assert.ok(answersIn(plans[2]!).includes(answer), plans[2]);
 });
 
 test("an answer to a spent review budget renews the budgets as more rounds does and goes back to the implementer with the findings that stopped the run and the answer", async context => {
@@ -2102,6 +2207,7 @@ test("more rounds restarts the budget with the standing findings, and an approva
   assert.deepEqual([run.delivery.outcome, run.delivery.decision, run.delivery.commit, run.delivery.worktreeRemoved], ["delivered", "more rounds", commit, true]);
   assert.deepEqual([run.result.outcome, run.result.repairs, run.result.reviewRounds, run.result.agentInvocations], ["completed", 0, 1, 10]);
   assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }]);
+  asksWritten(run.directory, human.requests);
   assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello 3"); assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head);
   assert.equal(existsSync(f.worktree), false);
 });
@@ -4411,6 +4517,14 @@ for (const path of ["docs/catalog.md", "docs/workflows/ticket-task.md", "README.
       `${path} must say in one sentence or table row that \`stuck\` no longer changes anything`);
     // Nothing tells a reader that a stuck run still parks, or to rerun a parked ticket with resume to answer it.
     assert.doesNotMatch(text.replace(/\s+/gu, " "), /stuck run parks|parks by default|`"park"` stops at once|ends unattended runs immediately/iu, `${path} still says a stuck run parks`);
+  });
+  test(`${path} names question-<n>.txt, no longer describes the parked ending or park.txt, and says a decision matches ignoring case and trailing punctuation`, () => {
+    const text = readFileSync(resolve(path), "utf8"); const said = statements(text);
+    assert.ok(said.some(one => /`question-<n>\.txt`/u.test(one) && /\bquestion\b/iu.test(one)), `${path} must say in one sentence or table row that each question is written to \`question-<n>.txt\``);
+    assert.doesNotMatch(text, /`parked`/u, `${path} still describes the parked final state`);
+    assert.doesNotMatch(text, /park\.txt/u, `${path} still describes park.txt`);
+    assert.ok(said.some(one => /\bdecisions?\b/iu.test(one) && /\bcase\b/iu.test(one) && /\bwhitespace\b/iu.test(one) && /\bpunctuation\b/iu.test(one)),
+      `${path} must say in one sentence or table row that a decision matches ignoring case, surrounding whitespace and trailing punctuation`);
   });
 }
 
