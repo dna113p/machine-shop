@@ -6,7 +6,7 @@ import { taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject 
 import { brief, firstLine } from "./defaults/_machine-shop/brief.ts";
 import { outsideScope } from "./defaults/_machine-shop/scope.ts";
 
-export const description = "Carry one local ticket for one Git repository from an isolated worktree through planning, implementation, checks, and review to a branch, patch, or pull request; sleep until the pull request merges, then delete its branch and complete the ticket; a stuck run parks or asks for a Human decision.";
+export const description = "Carry one local ticket for one Git repository from an isolated worktree through falsification, planning, plan review, implementation, checks, and review to a delivered branch, patch, or pull request; a pull request is then watched until it merges, when its branch is deleted and the ticket completes; a stuck run parks by default or asks for a Human decision.";
 export const agentRoles = {
   investigator: "Tries to falsify the ticket, then plans its implementation without editing",
   tester: "Writes failing tests for the ticket's acceptance criteria before implementation",
@@ -753,14 +753,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }
     const detail = checked.ok ? `Unexpected gh state: ${JSON.stringify(checked.stdout)}` : checked.detail || checked.stdout || "gh exited unsuccessfully without a message";
     const log = join(work.open(), `gh-pr-view-${saved.mergeChecks}.log`);
-    writeFileSync(log, `gh ${args.join(" ")}\n${checked.stdout}\n${detail}\n`, { flag: "wx", mode: 0o600 });
+    // A state continued from its checkpoint runs again, so this log may already exist.
+    writeFileSync(log, `gh ${args.join(" ")}\n${checked.stdout}\n${detail}\n`, { mode: 0o600 });
     if (++saved.ghFailures < 3) return { type: "waiting" };
     saved.mergeReason = `gh failed 3 times in a row: ${detail}; inspect ${log}`;
     return { type: "decide" };
   }
 
   function dropLocal(): Event {
-    if (!attempt("git", ["branch", "-D", saved.branch], repository.path).ok) return { type: "blocked" };
+    // A run continued after a crash may find the branch already deleted.
+    const present = run("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${saved.branch}`], repository.path).ok;
+    if (present && !attempt("git", ["branch", "-D", saved.branch], repository.path).ok) return { type: "blocked" };
     saved.localDeleted = true;
     return { type: "removed" };
   }
@@ -778,7 +781,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         // The host can delete the branch between our query and push. Only a successful empty query excuses the failed push.
         const remaining = attempt("git", listArgs, repository.path, publishTimeoutMs);
         const log = join(work.open(), "git-push.log");
-        writeFileSync(log, `git ${args.join(" ")}\n${deleted.stdout}\n${deleted.detail}\n`, { flag: "wx", mode: 0o600 });
+        writeFileSync(log, `git ${args.join(" ")}\n${deleted.stdout}\n${deleted.detail}\n`, { mode: 0o600 });
         if (!remaining.ok) return { type: "blocked" };
         if (remaining.stdout) return work.block(`git push failed deleting ${saved.branch}; inspect ${log}`);
       }
@@ -796,11 +799,11 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       schemaVersion: 1, outcome, prUrl: saved.prUrl, branch: saved.branch, checks: saved.mergeChecks,
       ghFailures: saved.ghFailures, localDeleted: saved.localDeleted, remoteDeleted: saved.remoteDeleted,
       ...(reason ? { reason } : {}), ...(saved.mergeDecision ? { decision: saved.mergeDecision } : {}),
-    }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    }, null, 2) + "\n", { mode: 0o600 });
     const ending = {
-      merged: `Merged ${saved.prUrl}; deleted ${saved.branch} locally and on ${saved.checked}.`,
-      handedOff: `Handed off ${saved.prUrl} on ${saved.branch}: ${flat(reason)} Branch kept locally and on ${saved.checked}.`,
-      abandoned: `Abandoned ${saved.prUrl}: ${flat(reason)} Deleted ${saved.branch} locally; the pushed branch is kept on ${saved.checked}.`,
+      merged: `Merged ${saved.prUrl}; deleted ${saved.branch} locally and on ${repository.remote}.`,
+      handedOff: `Handed off ${saved.prUrl} on ${saved.branch}: ${flat(reason)} Branch kept locally and on ${repository.remote}.`,
+      abandoned: `Abandoned ${saved.prUrl}: ${flat(reason)} Deleted ${saved.branch} locally; the pushed branch is kept on ${repository.remote}.`,
       blocked: `Blocked after delivering ${saved.prUrl} on ${saved.branch}: ${flat(reason)} Local branch ${saved.localDeleted ? "deleted" : "kept"}; remote branch ${saved.remoteDeleted ? "deleted" : "not confirmed deleted"}.`,
     }[outcome];
     saved.held = { action: outcome === "merged" ? "complete" : "hold", summary: `${ending} Evidence: ${directory}` };
