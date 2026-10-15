@@ -15,8 +15,6 @@ export const agentRoles = {
 };
 
 const publishTimeoutMs = 120_000;
-// The longest prose plan a run works from; a longer one goes back once to be shortened.
-const planLimit = 6000;
 // A sandboxed harness may be unable to start the project's checks at all. That is not a blocker: the checks are the workflow's to run.
 const cannotRun = "Run the checks you can. If your environment cannot run them, as when a sandbox refuses to start processes, say which and why in your summary and still return completed: the workflow runs every required check itself after you return. Return blocked only for something a person must decide or supply.";
 const decisions = ["more rounds", "hand off", "archive", "discard"] as const;
@@ -75,8 +73,6 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     planningReports: { falsify: 0, plan: 0, planReview: 0 } as Record<PlanningStage, number>,
     plan: "",
     planRevisions: 0,
-    lengthReturned: false,
-    overLimit: 0,
     questionsReturned: false,
     questionsFault: "",
     ownerQuestions: null as { text: string; where: string; options?: string[]; recommended?: string; why?: string }[] | null,
@@ -888,17 +884,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   }
   function planResult(): Event {
     const kept = keep("plan");
-    saved.overLimit = 0;
     if (work.unchanged().type === "changed") return { type: "blocked" };
     if ("refusal" in kept) return work.block(kept.refusal);
-    if (kept.summary.length > planLimit) {
-      if (!saved.lengthReturned) {
-        saved.lengthReturned = true;
-        saved.overLimit = kept.summary.length;
-        return { type: "shorten" };
-      }
-      return work.block(`The plan was ${kept.summary.length} characters against a limit of ${planLimit} after being sent back once to be shortened. A ticket whose plan does not fit may be too broad for one run.`);
-    }
     saved.plan = kept.summary;
     return { type: "planned" };
   }
@@ -910,6 +897,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       saved.repairing = "change";
       work.block("");
       return { type: "approved" };
+    }
+    if (saved.planningReport.type === "tooBroad") {
+      saved.repairing = "plan";
+      return work.block(`Plan review found the ticket too broad for one run. Suggested split:\n${kept.summary}`);
     }
     if (saved.planRevisions++ === 0) return { type: "revise" };
     saved.repairing = "plan";
@@ -982,8 +973,6 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     saved.decision = decisionOf(reply) ?? reply;
     if (saved.decision !== "more rounds") {
       saved.answers.push(saved.decision);
-      saved.lengthReturned = false;
-      saved.overLimit = 0;
     }
     work.renew();
     saved.ownerQuestions = null;
@@ -1009,20 +998,20 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }, { using: "investigator", cwd: worktree }),
       falsifyResult: operation(stopped("falsifyResult", falsifyResult), { sound: "plan", assumed: "plan", reask: "falsify", blocked: "stuck" }),
       plan: agent(() => prompt([
-        `Plan the implementation of this sound ticket. Do not edit any file. Cover the acceptance criteria, tests, permitted paths, and required checks. Address any plan review feedback in the stage reports. Return planned with the complete plan as the summary, at most ${planLimit} characters.`,
-        ...(saved.overLimit ? [`Your last plan was ${saved.overLimit} characters; the limit is ${planLimit}. Say the same plan in fewer words: name the files and the tests, and do not restate the ticket.`] : []),
+        "Plan the implementation of this sound ticket. Do not edit any file. Cover the acceptance criteria, tests, permitted paths, and required checks. Address any plan review feedback in the stage reports. Return planned with the complete plan as the summary. Keep it concise: name the files and the tests, and do not restate the ticket.",
         ...assumptionsPrompt(),
       ].join("\n")), {
         planned: { target: "planResult", actions: rememberPlanning },
       }, { using: "investigator", cwd: worktree }),
-      planResult: operation(stopped("planResult", planResult), { planned: "planReview", shorten: "plan", blocked: "stuck" }),
+      planResult: operation(stopped("planResult", planResult), { planned: "planReview", blocked: "stuck" }),
       planReview: agent(() => prompt([
-        "Review the plan against the ticket, relevant code, scope, acceptance criteria, and tests. Do not edit any file. Return approved with a summary if it is ready to implement, or revise with a summary of what must change. Only one revision of the plan is allowed.",
+        "Review the plan against the ticket, relevant code, scope, acceptance criteria, and tests. Do not edit any file. Return approved with a summary if it is ready to implement, or revise with a summary of what must change. Prefer concise plans: send back as revise a plan that restates the ticket or carries detail the implementer does not need. Return tooBroad if the ticket is too broad for one run, with a summary suggesting a split into smaller tickets, one per line. Only one revision of the plan is allowed.",
         ...assumptionsPrompt(),
         "Plan:", saved.plan,
       ].join("\n")), {
         approved: { target: "planReviewResult", actions: rememberPlanning },
         revise: { target: "planReviewResult", actions: rememberPlanning },
+        tooBroad: { target: "planReviewResult", actions: rememberPlanning },
       }, { using: "reviewer", cwd: worktree }),
       planReviewResult: operation(stopped("planReviewResult", planReviewResult), { approved: redGreen ? "test" : "change", revise: "plan", blocked: "stuck" }),
       test: agent(() => {
@@ -1088,7 +1077,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       reviewBudget: operation(stopped("reviewBudget", work.reviewRound), { retry: "change", exhausted: "stuck" }),
       // Preparation, commit, and delivery failures still end blocked by themselves.
       stuck: operation(() => {
-        writeFileSync(join(work.open(), `question-${++saved.questions}.txt`), stuckPrompt() + "\n", { flag: "wx", mode: 0o600 });
+        writeFileSync(join(work.open(), `question-${++saved.questions}.txt`), stuckPrompt() + "\n", { mode: 0o600 });
         return { type: "ask" };
       }, { ask: "decide" }),
       decide: human(stuckPrompt, {

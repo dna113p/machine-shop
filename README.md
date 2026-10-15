@@ -119,8 +119,8 @@ A missing section blocks before any Agent runs. A run then goes
    or too vague. Open questions stop the run for the owner. With
    `"assume": true`, questions whose cautious answer loses nothing are answered
    and recorded instead.
-2. **Plan and plan review.** A plan of at most 6000 characters, with one
-   revision allowed.
+2. **Plan and plan review.** A concise plan naming files and tests, with one
+   revision allowed; the reviewer can find the ticket too broad and suggest a split.
 3. **Tests first.** A tester writes failing tests for each acceptance criterion
    and the Machine proves they fail. `"redGreen": false` skips this step.
 4. **Implement.** A change outside the ticket's Scope is sent back.
@@ -133,8 +133,7 @@ A stuck run sleeps on one Human question, keeping its worktree and branch.
 The prompt says what is needed, lists open questions and evidence, and suggests
 `more rounds`, `hand off`, `archive`, and `discard`; discard still asks for confirmation.
 Any other reply is an answer: like `more rounds`, it renews both budgets, clears
-the owner questions, and returns to the stage that stopped. An answer also
-clears the plan-length return.
+the owner questions, and returns to the stage that stopped.
 The answer stays in later Agent prompts. `stuck` no longer changes anything:
 both `"park"` (the default) and `"ask"` are accepted.
 Each question is saved as `question-<n>.txt` in the evidence directory, numbered

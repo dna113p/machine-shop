@@ -75,8 +75,8 @@ flowchart TD
   prepare["⚙️ <b>prepare</b><br/>worktree, branch, setup"]
   falsify(["🤖 <b>falsify</b> · investigator<br/>is the ticket wrong or vague?"])
   falsifyResult["⚙️ <b>falsifyResult</b><br/>questions stop, or are assumed"]
-  plan(["🤖 <b>plan</b> · investigator<br/>4000 characters at most"])
-  planResult["⚙️ <b>planResult</b><br/>too long? sent back once"]
+  plan(["🤖 <b>plan</b> · investigator<br/>concise files and tests"])
+  planResult["⚙️ <b>planResult</b><br/>capture and guard worktree"]
   planReview(["🤖 <b>planReview</b> · reviewer"])
   planReviewResult["⚙️ <b>planReviewResult</b><br/>one revision allowed"]
   test(["🤖 <b>test</b> · tester<br/>a failing test per criterion"])
@@ -107,9 +107,9 @@ flowchart TD
   falsifyResult -->|"sound, or assumed"| plan
   falsifyResult -->|"open questions"| stuck
   plan --> planResult
-  planResult -->|shorten| plan
   planResult -->|planned| planReview --> planReviewResult
   planReviewResult -->|revise| plan
+  planReviewResult -->|tooBroad| stuck
   planReviewResult -->|approved| test
   planReviewResult -.->|"approved, redGreen off"| change
   test --> scopeAfterTest
@@ -159,13 +159,18 @@ flowchart TD
 
 ### When stuck
 
+The plan reviewer prefers concise plans and sends back unnecessary detail as
+an ordinary revision. A `tooBroad` verdict stops the run with a suggested split
+into smaller tickets in the question; answering or choosing `more rounds`
+returns to the planner.
+
 The question describes what stopped the run, what is needed, open questions,
 budgets, and evidence locations. Each question is written as `question-<n>.txt`
 in the evidence directory, numbered from 1 across re-asks and continuation
 after sleep. The four decisions
 are suggestions. Any other reply is an answer and works like `more rounds`:
 it renews both budgets, clears the owner questions, and returns to the stage
-that stopped in the same worktree. An answer also clears the plan-length return.
+that stopped in the same worktree.
 Answers remain under
 `Answers from the ticket owner:` in later Agent prompts, including the planner
 after a falsify question. Discard still requires its second confirmation.
