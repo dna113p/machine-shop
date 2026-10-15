@@ -329,6 +329,11 @@ is.
 | `commit` | One commit of everything except `.machine-runs`, even if an Agent staged it: subject is the ticket title, body is `Ticket: <id>` |
 | `rebase` | Resolve the current base; replay exactly the approved ticket commit onto a forward tip. Rerun setup, then `reverify` for an equal patch (`verify` on a resumed delivered commit) or `verify` and fresh review for a changed patch. An unchanged-base delivered resume runs `verify` without replay. Undo the replayed commit before any new stop, repair, or re-review; if ignore rules on the tip would drop added files, restore the candidate on its original base through `stuck` |
 | `deliver` | `branch`: keep the branch. `patch`: `git format-patch` for base..HEAD into the evidence directory. `pr`: `git push --no-follow-tags <remote URL>` of the approved commit to the ticket branch alone, then `gh pr create --repo <host/owner/repository>`. After these succeed, every mode records `branch.<name>.ticketDelivered` in local Git configuration |
+| `success` | Remove the worktree and write the delivery receipts once; branch and patch end `delivered`, pull requests go to `checkMerge` |
+| `checkMerge`, `awaitMerge` | Ask `gh pr view <url>` for the pull request state every 10 minutes; an open request or fewer than three consecutive failures waits again |
+| `cleanUp` | Only after `MERGED`, delete the remote ticket branch and then the local one; an already absent remote branch counts as deleted, other failures end `blocked` with a log |
+| `mergeDecide`, `confirmMergeDiscard` | Human, regardless of `stuck`: a closed pull request or three consecutive check failures offers only `hand off` and `discard`; discard needs a second confirmation, and `go back` returns to `mergeDecide` |
+| `dropLocal`, `mergeHandOff`, `mergeAbandon`, `mergeFailure` | Confirmed discard deletes only the local branch and ends `abandoned`; hand off keeps it and ends `handedOff`; cleanup failure ends `blocked`; each writes `merge.json` with `hold` output |
 | `repairBudget`, `repairTarget`, `reviewBudget` | Count gate retries and review revisions separately; gate retries route to the responsible editing stage, review retries to `change`; exhaustion goes to `stuck` |
 | `stuck`, `park` | Select the input policy: `ask` goes to `decide`; `park` writes a note and receipt, keeps the candidate, and ends `parked` |
 | `decide` | Human, only with `stuck: "ask"`: stuck work waits for one of `more rounds`, `hand off`, `archive`, or `discard` |
@@ -782,19 +787,32 @@ removed after delivery; or, after a decision, the candidate cannot be archived
 or the worktree or branch cannot be removed. A failed Git or `gh` step
 saves its output as a log in the evidence directory.
 
-Final states are `delivered`, `parked`, `handedOff`, `abandoned`, and `blocked`. In every
-case the Machine output is exactly `{ "action": "hold", "summary": "<text>" }`
-with no other field, the strict shape Machines Dispatch accepts for a ticket
-that must stay open until a person merges or closes it. The workflow never
+After pull request delivery removes the worktree, the run sleeps while waiting
+for the merge when started with the sleep option, as Dispatch does. It saves its
+state and checks again when due. A successful `OPEN` answer resets the failure
+counter. Failed `gh` checks, including unexpected output, write numbered
+`gh-pr-view-<n>.log` files; three consecutive failures go to `mergeDecide` with
+the message. A `CLOSED` answer goes there immediately with the reason that the
+pull request was closed without merging, regardless of `stuck`. Both decisions
+keep the pushed remote branch. There is no worktree to archive or repair.
+Remote deletion runs only after `MERGED` and uses the URL recorded at delivery.
+If a failed delete is followed by a successful query showing the branch gone,
+cleanup continues; any other deletion failure ends `blocked` with `hold` and a log.
+
+Final states are `delivered`, `merged`, `parked`, `handedOff`, `abandoned`, and `blocked`.
+The `merged` final returns exactly `{ "action": "complete", "summary": "<text>" }`
+after deleting the local and remote ticket branch, so Machines Dispatch closes
+the ticket. All other finals return exactly `{ "action": "hold", "summary": "<text>" }`
+with no other field, keeping the ticket open. The workflow never
 relaunches itself, launches another Machine, or edits or closes a ticket file.
-The one-line summary names the branch, commit, and pull request URL or patch
+The one-line delivery summary names the branch, commit, and pull request URL or patch
 path on success, or the reason otherwise; then the decision if one was made, the
 archive branch and its commit after `archive`, the worktree if it was kept
-(always for `parked` and `handedOff`, and for `blocked` once it exists), and the evidence
+(always for `parked`, and before delivery for `handedOff` and `blocked` once it exists), and the evidence
 directory. Read
 the final state, not the action, to tell the endings apart. `delivered` means
-the worktree was removed and the branch kept; `parked` and `handedOff` keep the
-worktree and branch for inspection or further work. A `blocked` run also keeps
+the worktree was removed and the branch or patch delivered; before delivery,
+`parked` and `handedOff` keep the worktree and branch for inspection or further work. A pre-delivery `blocked` run also keeps
 them unless delivered-candidate adoption was refused before recreation or its
 recreated worktree was withdrawn; `abandoned` means both are
 gone, with the candidate on its archive branch after `archive`. A worktree that
@@ -803,6 +821,11 @@ evidence, ends `blocked` with a reason naming the branch, commit, and pull
 request or patch already produced. Invalid input, a `repository.path` that is
 not a checkout root, a worktree or evidence root that resolves into the
 repository through a symlink, and unexpected exceptions are runtime failures.
+
+After pull request delivery, the worktree is already gone for every ending:
+`handedOff` keeps both branches, confirmed discard ends `abandoned` keeping
+only the remote branch, and `blocked` records which deletions succeeded.
+`merged` removes both branches and the local branch's ticket configuration.
 
 Evidence is written to `<evidenceRoot>/.machine-runs/machine-shop/<id>/`, outside
 the repository and the commit: the helper's `started.json`, check and setup
@@ -856,13 +879,21 @@ question and answer separately at 600 characters plus an ellipsis. A second plan
 review revision uses the usual blocker needs, capped at 600 characters plus an
 ellipsis when truncated. The full stop reason remains in the receipt and the
 note's standing section, and raw planning events preserve even malformed reports.
-`result.json` keeps the helper's vocabulary: its `outcome` is `blocked` for
+For pull requests, `delivery.json` and `result.json` describe delivery before
+the merge wait and are never rewritten. The later `merge.json` records
+`schemaVersion`, `outcome`, `prUrl`, `branch`, `checks`, `ghFailures`,
+`localDeleted`, `remoteDeleted`, and any `reason` or `decision`. It and the
+Machine output carry the final merge outcome even when `result.json` says
+`completed` but cleanup later blocks. Human answers after delivery are still
+recorded separately as `human-<n>.json`.
+
+`result.json` keeps the helper's vocabulary: before the merge wait, its `outcome` is `blocked` for
 `parked`, `handedOff`, and `abandoned`; `repairs` counts red, scope, and green
 gate retries and `reviewRounds` counts review revisions, each cumulative across renewals;
 `decisions` lists every Human answer.
 
-Limits: a run waiting in a Human state keeps its worktree and branch until it is
-answered. `resume` adopts only the ticket's own worktree and branch, either clean
+Limits: a run waiting in a Human state before delivery keeps its worktree and
+branch until it is answered. `resume` adopts only the ticket's own worktree and branch, either clean
 at its base or holding an uncommitted candidate, or recreates a missing worktree
 for the recorded delivered commit under the conditions above; it does not
 restore an archive branch, adopt any other committed candidate, or accept a

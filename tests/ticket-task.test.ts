@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -55,7 +55,11 @@ function remote(f: Fixture) {
   git(f.repo, "push", "-q", "origin", "main");
   const refs = () => git(bare, "for-each-ref", "--format=%(refname) %(objectname)").split("\n").filter(Boolean);
   const published = refs();
-  return () => refs().filter(ref => !published.includes(ref)).join("\n");
+  const beyond = (held: string[]) => held.filter(ref => !published.includes(ref)).join("\n");
+  return Object.assign(() => beyond(refs()), {
+    /** What the remote held beyond the base when the run last asked gh about its pull request, before any cleanup; "" when it never asked. */
+    atCheck: () => existsSync(join(f.root, "bin", "remote-at-view")) ? beyond(readFileSync(join(f.root, "bin", "remote-at-view"), "utf8").split("\n").filter(Boolean)) : "",
+  });
 }
 /** A recording git placed first on PATH that passes every call on to the real one. */
 function recordGit(context: TestContext, f: Fixture) {
@@ -67,14 +71,39 @@ function recordGit(context: TestContext, f: Fixture) {
   context.after(() => { process.env.PATH = path; });
   return () => readFileSync(join(bin, "calls"), "utf8").trimEnd().split("\n");
 }
-/** A recording gh placed first on PATH; the real gh is never started. */
-function fakeGh(context: TestContext, f: Fixture, exitCode = 0) {
+/**
+ * A recording gh placed first on PATH; the real gh is never started. `pr create` records its arguments and prints the pull request URL.
+ * `pr view` answers the pull request's state from `views` in turn, repeating the last one: OPEN, MERGED, or CLOSED, or `fail` for a gh
+ * that cannot answer. A delivered pull request is merged unless a test says otherwise, so a run without a sleep option never waits.
+ */
+function fakeGh(context: TestContext, f: Fixture, exitCode = 0, views: readonly string[] = ["MERGED"]) {
   const bin = join(f.root, "bin"); mkdirSync(bin);
-  writeFileSync(join(bin, "gh"), `#!/bin/sh\nprintf '%s\\n' "$@" > "${bin}/args"\necho "Creating pull request for ${branch}"\necho ${url}\nexit ${exitCode}\n`, { mode: 0o755 });
+  // The real git, so a recording one put on PATH later does not count the fake's own look at the remote.
+  const real = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  writeFileSync(join(bin, "views"), `${views.join("\n")}\n`);
+  writeFileSync(join(bin, "gh"), [
+    "#!/bin/sh",
+    'if [ "$1" = pr ] && [ "$2" = view ]; then',
+    `  printf '%s\\n' "$*" >> "${bin}/views.log"`,
+    `  n=$(wc -l < "${bin}/views.log" | tr -d ' ')`,
+    `  state=$(sed -n "\${n}p" "${bin}/views"); [ -n "$state" ] || state=$(tail -n 1 "${bin}/views")`,
+    `  if [ -d "${f.root}/remote.git" ]; then "${real}" --git-dir="${f.root}/remote.git" for-each-ref --format='%(refname) %(objectname)' > "${bin}/remote-at-view"; fi`,
+    '  if [ "$state" = fail ]; then echo "gh: boom" >&2; exit 1; fi',
+    `  case " $* " in *" --jq "*|*" -q "*|*" --template "*|*" -t "*) echo "$state" ;; *" --json "*) printf '{"state":"%s"}\\n' "$state" ;; *) echo "$state" ;; esac`,
+    "  exit 0",
+    "fi",
+    `printf '%s\\n' "$@" > "${bin}/args"`,
+    `echo "Creating pull request for ${branch}"`,
+    `echo ${url}`,
+    `exit ${exitCode}`,
+  ].join("\n") + "\n", { mode: 0o755 });
   const path = process.env.PATH;
   process.env.PATH = `${bin}${delimiter}${path}`;
   context.after(() => { process.env.PATH = path; });
-  return () => existsSync(join(bin, "args")) ? readFileSync(join(bin, "args"), "utf8").trimEnd().split("\n") : undefined;
+  return Object.assign(() => existsSync(join(bin, "args")) ? readFileSync(join(bin, "args"), "utf8").trimEnd().split("\n") : undefined, {
+    /** The arguments of every `gh pr view`, in order. */
+    views: () => existsSync(join(bin, "views.log")) ? readFileSync(join(bin, "views.log"), "utf8").trimEnd().split("\n") : [],
+  });
 }
 const tester = (request: { cwd: string }) => {
   writeFileSync(join(request.cwd, "greeting.test.txt"), 'require("node:assert/strict").ok(require("node:fs").existsSync("greeting.txt"));\n');
@@ -107,7 +136,7 @@ function person(...answers: (string | (() => string))[]) {
     return typeof next === "string" ? next : next();
   }, { requests });
 }
-type RunHooks = Pick<NonNullable<Parameters<typeof runtime.run>[1]>, "continueAt" | "onEnter" | "onBeforeStep">;
+type RunHooks = Pick<NonNullable<Parameters<typeof runtime.run>[1]>, "continueAt" | "onEnter" | "onBeforeStep" | "onSleep">;
 /**
  * Agents are given by role, where `reviewer` is the review of the implementation, or by state name for falsify, plan, and planReview;
  * `investigator` stands for both of that role's states, which is how a test says that neither may run.
@@ -159,6 +188,32 @@ function held(f: Fixture, result: { output: any }, summary: RegExp) {
   assert.match(result.output.summary, summary); assert.doesNotMatch(result.output.summary, /\n/u);
   const run = evidence(f); assert.ok(result.output.summary.endsWith(`Evidence: ${run.directory}`));
   return run;
+}
+/** The one ending that completes: a merged pull request, with the strict output on which Machines Dispatch closes the ticket. */
+function complete(f: Fixture, result: { output: any }, summary: RegExp) {
+  assert.deepEqual(result.output, { action: "complete", summary: result.output.summary });
+  assert.match(result.output.summary, summary); assert.doesNotMatch(result.output.summary, /\n/u);
+  const run = evidence(f); assert.ok(result.output.summary.endsWith(`Evidence: ${run.directory}`));
+  return run;
+}
+/**
+ * A delivered pull request that was then merged: the run checked it after delivery, deleted the ticket branch here and on the remote,
+ * and completed, naming the pull request and the branch. The delivery receipt is the one written when the pull request was opened.
+ */
+function merged(f: Fixture, result: { state: unknown; output: any; states: string[] }, name = branch) {
+  assert.equal(result.state, "merged"); assert.deepEqual(result.states.slice(-3), ["checkMerge", "cleanUp", "merged"]);
+  assert.ok(result.states.indexOf("success") < result.states.indexOf("checkMerge"), "the pull request is checked only after delivery");
+  const run = complete(f, result, /\S/u);
+  for (const part of [url, name]) assert.ok(result.output.summary.includes(part), part);
+  assert.deepEqual([run.delivery.outcome, run.delivery.prUrl, run.result.outcome], ["delivered", url, "completed"]);
+  assert.equal(git(f.repo, "branch", "--list", name), ""); assert.equal(existsSync(f.worktree), false);
+  return run;
+}
+/** How a delivery ends: a branch or a patch is delivered and held as before, and a pull request is merged here, as the fake gh reports by default. */
+function ended(f: Fixture, result: { state: unknown; output: any; states: string[] }, output: string, summary = /^Delivered/u) {
+  if (output === "pr") return merged(f, result);
+  assert.equal(result.state, "delivered");
+  return held(f, result, summary);
 }
 function blocked(f: Fixture, result: { state: unknown; output: any }, reason: RegExp, commits = 0) {
   assert.equal(result.state, "blocked");
@@ -395,8 +450,8 @@ for (const output of ["branch", "patch", "pr"]) {
       implementer: request => { edits++; return implement(request); },
       reviewer: () => review("revise", "The greeting satisfies the ticket", { findings: notes.map(note => ({ severity: "minor", ...note })) }),
     });
-    assert.equal(result.state, "delivered"); assert.equal(edits, 1); assert.equal(result.states.includes("repairBudget"), false);
-    const run = held(f, result, /^Delivered/u); assert.deepEqual(run.delivery.reviewNotes, notes);
+    assert.equal(edits, 1); assert.equal(result.states.includes("repairBudget"), false);
+    const run = ended(f, result, output); assert.deepEqual(run.delivery.reviewNotes, notes);
     if (output === "pr") {
       const args = gh()!; const path = args[args.indexOf("--body-file") + 1]!;
       assert.equal(path, join(run.directory, "pull-request.md"));
@@ -649,8 +704,8 @@ test("minor notes deduplicate by trimmed case-insensitive text and location and 
         : [{ severity: "minor", text: "CONSIDER\nA CLEARER NAME", where: "greeting.TXT:1" }, { severity: "minor", ...elsewhere }, { severity: "minor", ...noLocation }],
     }),
   });
-  assert.equal(result.state, "delivered"); assert.equal(reviews, 2);
-  const run = held(f, result, /^Delivered/u);
+  assert.equal(reviews, 2);
+  const run = merged(f, result);
   assert.deepEqual(run.delivery.reviewNotes, [note, elsewhere, noLocation]);
   const body = readFileSync(join(run.directory, "pull-request.md"), "utf8");
   assert.equal(body.split("## Review notes\n\n")[1], "- Consider a clearer name (Greeting.txt:1)\n- Consider a clearer name (greeting.txt:2)\n- Explain the choice\n\nTicket: PROJ-12\n");
@@ -666,8 +721,8 @@ test("resolved discussions approve and minor notes accumulate across review roun
         : [{ severity: "minor", ...notes[1] }], newSinceLastRound: "none",
     }),
   });
-  assert.equal(result.state, "delivered"); assert.deepEqual([edits, reviews], [2, 2]);
-  const run = held(f, result, /^Delivered/u); assert.deepEqual(run.delivery.reviewNotes, notes);
+  assert.deepEqual([edits, reviews], [2, 2]);
+  const run = merged(f, result); assert.deepEqual(run.delivery.reviewNotes, notes);
   const body = readFileSync(join(run.directory, "pull-request.md"), "utf8");
   for (const note of notes) assert.ok(body.includes(`- ${note.text} (${note.where})`));
 });
@@ -719,17 +774,18 @@ for (const output of ["branch", "patch", "pr"]) {
       implementer: request => { assert.equal(request.cwd, f.worktree); assert.ok(planIn(request.prompt).startsWith(`${plan}\n`)); assert.match(request.prompt, /without weakening or deleting them/u); assert.match(request.prompt, /If a test is wrong, say so in the summary/u); assert.match(request.prompt, /uncommitted/u); return implement(request); },
       reviewer: request => { assert.equal(request.cwd, f.worktree); assert.match(request.prompt, /Do not edit/u); assert.match(request.prompt, /Machine saw them fail/u); return review("approved", "Greeting matches the ticket"); },
     });
-    assert.equal(result.state, "delivered");
     assert.deepEqual(result.states.slice(0, 4), ["shape", "prepare", "start", "falsify"]);
     // The Operations that follow the three read-only states are the Machine's own; the ticket names only the Agent states and their order.
     assert.deepEqual(result.states.slice(0, result.states.indexOf("test")).filter(isPlanning), ["falsify", "plan", "planReview"]);
-    assert.deepEqual(result.states.slice(result.states.indexOf("test")), ["test", "scopeAfterTest", "red", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "delivered"]);
-    const commit = git(f.repo, "rev-parse", branch);
-    const run = held(f, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
-    assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", branch), "Add a greeting\nTicket: PROJ-12");
-    assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head);
-    assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
-    assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello");
+    assert.deepEqual(result.states.slice(result.states.indexOf("test")), ["test", "scopeAfterTest", "red", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success",
+      ...(output === "pr" ? ["checkMerge", "cleanUp", "merged"] : ["delivered"])]);
+    // A merged pull request's branch is gone; its commit is the one the receipt names.
+    const commit = output === "pr" ? evidence(f).delivery.commit : git(f.repo, "rev-parse", branch);
+    const run = ended(f, result, output, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
+    assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", commit), "Add a greeting\nTicket: PROJ-12");
+    assert.equal(git(f.repo, "rev-parse", `${commit}^`), f.head);
+    assert.equal(git(f.repo, "show", "--name-only", "--format=", commit), "greeting.test.txt\ngreeting.txt");
+    assert.equal(git(f.repo, "show", `${commit}:greeting.txt`), "hello");
     assert.ok(run.directory.startsWith(join(f.evidence, ".machine-runs")));
     assert.equal(existsSync(join(f.repo, ".machine-runs")), false);
     assert.equal(existsSync(f.worktree), false); assert.equal(git(f.repo, "worktree", "list").split("\n").length, 1);
@@ -751,12 +807,12 @@ for (const output of ["branch", "patch", "pr"]) {
       assert.match(patch, /Subject: \[PATCH\] Add a greeting/u); assert.match(patch, /\+hello/u);
       assert.ok(result.output.summary.includes(run.delivery.patches[0]));
     }
-    if (output !== "pr") { assert.equal(pushed(), ""); assert.equal(gh(), undefined); return; }
-    assert.equal(pushed(), `refs/heads/${branch} ${commit}`);
+    if (output !== "pr") { assert.equal(pushed(), ""); assert.equal(gh(), undefined); assert.deepEqual(gh.views(), []); return; }
+    assert.equal(pushed.atCheck(), `refs/heads/${branch} ${commit}`); assert.equal(pushed(), "");
     const body = join(run.directory, "pull-request.md");
     assert.deepEqual(gh(), ["pr", "create", "--repo", slug, "--draft", "--base", "main", "--head", branch, "--title", "Add a greeting", "--body-file", body]);
     assert.equal(readFileSync(body, "utf8"), "Add a greeting\n\n## Summary\n\nWrite hello to greeting.txt.\n\n## Checks\n\n- tests: passed\n\n## Review\n\nGreeting matches the ticket\n\nTicket: PROJ-12\n");
-    assert.ok(result.output.summary.includes(`pull request ${url}`));
+    assert.equal(gh.views().length, 1);
   });
 }
 
@@ -764,8 +820,8 @@ test("an explicit branch base starts the worktree there and becomes the pull req
   const f = fixture(context); remote(f); const gh = fakeGh(context, f);
   git(f.repo, "branch", "release"); git(f.repo, "push", "-q", "origin", "release"); writeFileSync(join(f.repo, "code.txt"), "newer"); git(f.repo, "commit", "-qam", "newer"); f.head = git(f.repo, "rev-parse", "HEAD");
   const result = await execute(input(f, { output: "pr", base: "release", draft: false }));
-  assert.equal(result.state, "delivered");
-  assert.equal(git(f.repo, "rev-parse", `${branch}^`), git(f.repo, "rev-parse", "release")); assert.equal(evidence(f).delivery.baseCommit, git(f.repo, "rev-parse", "release"));
+  const run = merged(f, result);
+  assert.equal(git(f.repo, "rev-parse", `${run.delivery.commit}^`), git(f.repo, "rev-parse", "release")); assert.equal(run.delivery.baseCommit, git(f.repo, "rev-parse", "release"));
   assert.deepEqual(gh()!.slice(0, 8), ["pr", "create", "--repo", slug, "--base", "release", "--head", branch]);
   assert.equal(readFileSync(join(f.repo, "code.txt"), "utf8"), "newer");
 });
@@ -773,7 +829,7 @@ test("an explicit branch base starts the worktree there and becomes the pull req
 test("a base that is a commit rather than a branch opens the pull request against the remote's default branch by name", async context => {
   const f = fixture(context); remote(f); const gh = fakeGh(context, f);
   const result = await execute(input(f, { output: "pr", base: f.head }));
-  assert.equal(result.state, "delivered"); assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "main", "--head", branch]);
+  merged(f, result); assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "main", "--head", branch]);
 });
 
 test("gh is given the checked base by name, so a configured gh-merge-base cannot turn the pull request elsewhere", async context => {
@@ -784,10 +840,10 @@ test("gh is given the checked base by name, so a configured gh-merge-base cannot
   const result = await execute(input(f, { output: "pr" }), {
     implementer: request => { git(request.cwd, "config", "branch.main.gh-merge-base", "release"); return implement(request); },
   });
-  assert.equal(result.state, "delivered"); untouched(f);
-  assert.equal(git(f.repo, "config", "--get", `branch.${branch}.gh-merge-base`), "release");
-  assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head);
-  assert.deepEqual(pushed().split("\n"), [`refs/heads/release ${git(f.repo, "rev-parse", "release")}`, `refs/heads/${branch} ${git(f.repo, "rev-parse", branch)}`]);
+  const commit = merged(f, result).delivery.commit; untouched(f);
+  assert.equal(git(f.repo, "rev-parse", `${commit}^`), f.head);
+  assert.deepEqual(pushed.atCheck().split("\n"), [`refs/heads/release ${git(f.repo, "rev-parse", "release")}`, `refs/heads/${branch} ${commit}`]);
+  assert.equal(pushed(), `refs/heads/release ${git(f.repo, "rev-parse", "release")}`);
   assert.deepEqual(gh()!.slice(0, 9), ["pr", "create", "--repo", slug, "--draft", "--base", "main", "--head", branch]);
 });
 
@@ -795,14 +851,14 @@ test("the default branch gh is given is the one the remote names, and a remote t
   const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const bare = join(f.root, "remote.git");
   git(f.repo, "push", "-q", "origin", "main:trunk"); git(bare, "symbolic-ref", "HEAD", "refs/heads/trunk");
   const result = await execute(input(f, { output: "pr" }));
-  assert.equal(result.state, "delivered"); assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "trunk", "--head", branch]);
-  const before = pushed(); rmSync(join(f.root, "bin", "args"));
+  merged(f, result); assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "trunk", "--head", branch]);
+  const before = pushed(); const views = gh.views(); rmSync(join(f.root, "bin", "args"));
   // A detached HEAD on the remote still has a commit to compare with, but no branch for gh to be given.
   git(bare, "update-ref", "--no-deref", "HEAD", f.head); const second = { ...f, evidence: join(f.root, "evidence-2") };
   const unnamed = await execute({ ...input(second, { output: "pr" }), ticket: { ...input(f).ticket, id: "PROJ-13", title: "Add a farewell" } }, { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
   assert.equal(unnamed.state, "blocked"); assert.deepEqual(unnamed.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
   held(second, unnamed, /^Blocked: Remote origin does not say which branch is its default, so the pull request base cannot be named\. Set repository\.base to a branch; nothing was changed\. Evidence: /u);
-  assert.equal(pushed(), before); assert.equal(gh(), undefined); assert.equal(git(f.repo, "branch", "--list", "ticket/proj-13*"), "");
+  assert.equal(pushed(), before); assert.equal(gh(), undefined); assert.deepEqual(gh.views(), views); assert.equal(git(f.repo, "branch", "--list", "ticket/proj-13*"), "");
 });
 
 test("setup commands run in the worktree before any Agent and are kept as evidence", async context => {
@@ -916,6 +972,30 @@ function checkpointed(from?: Checkpoint) {
     },
   };
   return { options: { primitives, ...hooks }, saved, unsaveable, data: () => live as Record<string, any> | undefined };
+}
+/**
+ * Runs a ticket as Machines Dispatch does with its sleep option: a run that sleeps at a timed wait ends there, and is continued from its
+ * checkpoint as a later process would continue it once the wait is due. No input says how long a wait is. Returns how the last run ended,
+ * every state the runs went through, each sleep with the time its wait began, and any state whose working data was not plain JSON.
+ */
+async function untilEnd(assignment: unknown, agents: Record<string, Runner> = {}, human: (request: Ask) => string = person(), onEnter?: RunHooks["onEnter"]) {
+  const states: string[] = []; const sleeps: { enteredAt: string; due: string }[] = []; const unsaveable: string[] = [];
+  let saves = checkpointed(); let continueAt: RunHooks["continueAt"]; let waiting = "";
+  for (let runs = 1; ; runs++) {
+    assert.ok(runs <= 10, "the run kept sleeping");
+    const result = await execute(assignment, agents, human, {
+      ...saves.options, ...(continueAt ? { continueAt } : {}),
+      onEnter: entry => { saves.options.onEnter!(entry); if (entry.kind === "wait") waiting = entry.enteredAt; onEnter?.(entry); },
+      onSleep: due => { sleeps.push({ enteredAt: waiting, due }); },
+    });
+    // A continued run first reports the state it starts in, which the run before it reported last.
+    states.push(...(continueAt ? result.states.slice(1) : result.states)); unsaveable.push(...saves.unsaveable);
+    if (sleeps.length < runs) return { ...result, states, sleeps, unsaveable };
+    const checkpoint = saves.saved[String(result.state)];
+    assert.ok(checkpoint, `a checkpoint was saved on entering ${String(result.state)}, where the run slept`);
+    continueAt = { value: checkpoint.value, context: checkpoint.context, due: new Date(0).toISOString() };
+    saves = checkpointed(checkpoint);
+  }
 }
 
 test("a run stopped in plan review continues from its checkpoint with its branch, base commit, and plan, and finishes as an uninterrupted run does", async context => {
@@ -1280,10 +1360,10 @@ test("with assume on, a report whose every question is assumable goes on to plan
     plan: keeping("plan", planning.plan!.answer), planReview: keeping("planReview", planning.planReview!.answer),
     tester: keeping("tester", tester), implementer: keeping("implementer", implement), reviewer: keeping("reviewer", () => review()),
   });
-  assert.equal(result.state, "delivered", evidence(f).delivery.reason);
+  assert.equal(result.state, "merged", evidence(f).delivery.reason);
   assert.deepEqual(calls, ["falsify", "plan", "planReview", "tester", "implementer", "reviewer"]);
   assert.deepEqual(route(result.states), ["falsify", "plan", "planReview", "test", "change", "review"]); assert.equal(result.states.includes("stuck"), false);
-  const run = held(f, result, /^Delivered/u);
+  const run = merged(f, result);
   // The evidence directory holds the answers the run went on with.
   const file = readFileSync(join(run.directory, "assumptions.json"), "utf8");
   assert.deepEqual(JSON.parse(file), assumed(questions));
@@ -1305,7 +1385,7 @@ test("with assume on, a report whose every question is assumable goes on to plan
     assert.ok(at >= 0 && listed[index]!.indexOf(oneLine(asked.recommended), at + oneLine(asked.text).length) > at, listed[index]);
   }
   assert.deepEqual(run.delivery.assumptions, assumed(questions));
-  assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+  assert.equal(git(f.repo, "show", "--name-only", "--format=", run.delivery.commit), "greeting.test.txt\ngreeting.txt");
 });
 
 for (const assume of [undefined, true]) {
@@ -1316,9 +1396,9 @@ for (const assume of [undefined, true]) {
       falsify: keeping(planning.falsify!.answer), plan: keeping(planning.plan!.answer), planReview: keeping(planning.planReview!.answer),
       tester: keeping(tester), implementer: keeping(implement), reviewer: keeping(() => review()),
     });
-    assert.equal(result.state, "delivered", evidence(f).delivery.reason); assert.equal(prompts.length, 6);
+    assert.equal(result.state, "merged", evidence(f).delivery.reason); assert.equal(prompts.length, 6);
     for (const prompt of prompts) assert.doesNotMatch(prompt, /^Assumptions:/mu);
-    const run = held(f, result, /^Delivered/u);
+    const run = merged(f, result);
     const args = gh()!;
     assert.doesNotMatch(readFileSync(args[args.indexOf("--body-file") + 1]!, "utf8"), /## Assumptions/u);
     assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
@@ -2209,6 +2289,8 @@ const phases = (run: { result: any }): string[] => run.result.checks.map((check:
 const others = (f: Fixture) => git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)").split("\n").filter(ref => !ref.startsWith(`refs/heads/${branch} `)).join("\n");
 /** A reason names a commit by its hash, in full or abbreviated. */
 const names = (reason: string, commit: string) => reason.includes(commit.slice(0, 7));
+/** A push that deletes a remote branch rather than sending a commit. */
+const deletes = (call: string) => /(?:^|\s)(?:--delete|-d)(?:\s|$)|(?:^|\s):refs\/heads\//u.test(call);
 /** No replay and no push is forced, whatever else a run asks Git. */
 function unforced(calls: string[]) {
   for (const call of calls.filter(call => /(?:^|\s)(?:rebase|push)(?:\s|$)/u.test(call))) assert.doesNotMatch(call, /(?:^|\s)(?:-f|--force\S*|--no-ff|\+\S+)(?:\s|$)/u);
@@ -2251,12 +2333,14 @@ function rebasedFrom(f: Fixture, run: { delivery: any }, started: string): strin
   assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", from.commit), "Add a greeting\nTicket: PROJ-12");
   return from.commit;
 }
-/** The delivered branch holds exactly the ticket commit above a base tip. */
-function onTip(f: Fixture, tip: string) {
-  assert.equal(git(f.repo, "rev-list", "--count", `${tip}..${branch}`), "1"); assert.equal(git(f.repo, "rev-parse", `${branch}^`), tip);
-  assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", branch), "Add a greeting\nTicket: PROJ-12");
-  return git(f.repo, "rev-parse", branch);
+/** The delivered branch holds exactly the ticket commit above a base tip; a merged pull request's branch is gone, so its delivered commit is given instead. */
+function onTip(f: Fixture, tip: string, ref = branch) {
+  assert.equal(git(f.repo, "rev-list", "--count", `${tip}..${ref}`), "1"); assert.equal(git(f.repo, "rev-parse", `${ref}^`), tip);
+  assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", ref), "Add a greeting\nTicket: PROJ-12");
+  return git(f.repo, "rev-parse", ref);
 }
+/** What a delivery left to look at: the ticket branch, or the commit the receipt names once a merged pull request took the branch away. */
+const deliveredRef = (f: Fixture, output: string) => output === "pr" ? evidence(f).delivery.commit as string : branch;
 
 for (const output of ["branch", "patch", "pr"] as const) {
   test(`a base that moved forward under review gets the approved commit replayed onto its tip, set up, and verified again before ${output} delivery`, async context => {
@@ -2272,12 +2356,13 @@ for (const output of ["branch", "patch", "pr"] as const) {
         refs = others(f); return review();
       },
     });
-    assert.equal(result.state, "delivered");
-    assert.deepEqual(result.states.slice(result.states.indexOf("reviewResult")), ["reviewResult", "commit", "rebase", "deliver", "success", "delivered"]);
+    assert.deepEqual(result.states.slice(result.states.indexOf("reviewResult")), ["reviewResult", "commit", "rebase", "deliver", "success",
+      ...(output === "pr" ? ["checkMerge", "cleanUp", "merged"] : ["delivered"])]);
     // Exactly the ticket commit lies above the new tip, under the ticket's message, and no other ref moved.
-    const commit = onTip(f, tip); const run = held(f, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
-    assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
-    assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", branch), "code.txt\ngreeting.test.txt\ngreeting.txt\nlater.txt\nlatest.txt");
+    const ref = deliveredRef(f, output);
+    const commit = onTip(f, tip, ref); const run = ended(f, result, output, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
+    assert.equal(git(f.repo, "show", "--name-only", "--format=", ref), "greeting.test.txt\ngreeting.txt");
+    assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", ref), "code.txt\ngreeting.test.txt\ngreeting.txt\nlater.txt\nlatest.txt");
     assert.equal(others(f), refs);
     assert.ok(calls().some(call => /(?:^|\s)rebase\s/u.test(call) && call.includes(`--onto ${tip} ${started}`)), "git rebase --onto <tip> <baseCommit>");
     assert.ok(calls().some(call => /(?:^|\s)patch-id\s(?:.*\s)?--stable(?:\s|$)/u.test(call)), "git patch-id --stable");
@@ -2299,8 +2384,12 @@ for (const output of ["branch", "patch", "pr"] as const) {
     // The tip was asked about at the remote prepare checked, whose URL was read once; then the rebased commit was pushed there.
     assert.ok(network.length >= 2); for (const call of network) assert.ok(call.includes(`${hosted}.git`), call);
     assert.equal(calls().filter(call => call.startsWith("config --get remote.origin.url")).length, 1);
-    assert.deepEqual(calls().filter(call => call.startsWith("push --no-follow-tags")), [`push --no-follow-tags ${hosted}.git ${commit}:refs/heads/${branch}`]);
-    assert.equal(pushed(), `refs/heads/main ${tip}\nrefs/heads/${branch} ${commit}`);
+    // The only commit pushed is the rebased one; deleting the merged branch afterwards goes to the same remote.
+    // The test publishes the base to origin by name; the run pushes to the URL prepare read.
+    const pushes = calls().filter(call => /^push\b/u.test(call) && !call.startsWith("push -q origin "));
+    assert.deepEqual(pushes.filter(call => !deletes(call)), [`push --no-follow-tags ${hosted}.git ${commit}:refs/heads/${branch}`]);
+    for (const call of pushes.filter(deletes)) assert.ok(call.includes(`${hosted}.git`) && call.includes(branch), call);
+    assert.equal(pushed.atCheck(), `refs/heads/main ${tip}\nrefs/heads/${branch} ${commit}`); assert.equal(pushed(), `refs/heads/main ${tip}`);
     assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "main", "--head", branch]);
   });
 }
@@ -2926,9 +3015,10 @@ test("a pr run whose base moved to a tip that is not published puts the candidat
   git(f.repo, "remote", "set-url", "origin", `${hosted}.git`); git(f.repo, "push", "-q", "origin", "main");
   const again = next(f, 2);
   const second = await execute(input(again, { output: "pr" }, { resume: true, stuck: "park" }), { investigator: () => assert.fail(), implementer: () => assert.fail() }, human);
-  assert.equal(second.state, "delivered"); accepted(second.states); const commit = onTip(f, tip);
+  merged(again, second); accepted(second.states); const commit = onTip(f, tip, evidence(again).delivery.commit);
   assert.deepEqual([phases(evidence(again)), evidence(again).delivery.baseCommit], [["verify", "reverify"], tip]); rebasedFrom(f, evidence(again), started);
-  assert.equal(pushed(), `refs/heads/main ${tip}\nrefs/heads/${branch} ${commit}`); assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "main", "--head", branch]);
+  assert.equal(pushed.atCheck(), `refs/heads/main ${tip}\nrefs/heads/${branch} ${commit}`); assert.equal(pushed(), `refs/heads/main ${tip}`);
+  assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "main", "--head", branch]);
   assert.deepEqual(human.requests, []);
 });
 
@@ -2939,8 +3029,8 @@ test("the tip is looked for on the pull request base prepare recorded, the remot
     // The later commit is published on trunk, the pull request base, and not on the remote branch that shares the local one's name.
     reviewer: () => { tip = advance(f); git(f.repo, "push", "-q", "origin", "main:trunk"); return review(); },
   });
-  assert.equal(result.state, "delivered"); untouched(f); const commit = onTip(f, tip); rebasedFrom(f, evidence(f), started);
-  assert.equal(pushed(), `refs/heads/${branch} ${commit}\nrefs/heads/trunk ${tip}`); assert.equal(git(bare, "rev-parse", "main"), started);
+  merged(f, result); untouched(f); const commit = onTip(f, tip, evidence(f).delivery.commit); rebasedFrom(f, evidence(f), started);
+  assert.equal(pushed.atCheck(), `refs/heads/${branch} ${commit}\nrefs/heads/trunk ${tip}`); assert.equal(pushed(), `refs/heads/trunk ${tip}`); assert.equal(git(bare, "rev-parse", "main"), started);
   assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "trunk", "--head", branch]);
 });
 
@@ -2953,18 +3043,19 @@ for (const output of ["branch", "pr"] as const) {
       investigator: () => assert.fail(), implementer: () => assert.fail(),
       reviewer: request => { assert.deepEqual(readdirSync(request.cwd).sort(), [".git", "code.txt", "greeting.test.txt", "greeting.txt"]); return review("approved", "Greeting matches the ticket"); },
     });
-    assert.equal(result.state, "delivered");
-    assert.deepEqual(result.states, ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "delivered"]);
-    const commit = onTip(f, f.head);
-    const run = held(again, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
-    assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
-    assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", branch), "code.txt\ngreeting.test.txt\ngreeting.txt\nlater.txt");
+    assert.deepEqual(result.states, ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success",
+      ...(output === "pr" ? ["checkMerge", "cleanUp", "merged"] : ["delivered"])]);
+    const ref = deliveredRef(again, output); const commit = onTip(f, f.head, ref);
+    const run = ended(again, result, output, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
+    assert.equal(git(f.repo, "show", "--name-only", "--format=", ref), "greeting.test.txt\ngreeting.txt");
+    assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", ref), "code.txt\ngreeting.test.txt\ngreeting.txt\nlater.txt");
     assert.deepEqual([run.delivery.baseCommit, run.delivery.commit, run.delivery.resumed, run.delivery.worktreeRemoved], [f.head, commit, true, true]);
     // The base this run started from is the commit its branch was on.
     rebasedFrom(f, run, older);
     assert.deepEqual([run.result.outcome, run.result.checksPassed, phases(run)], ["completed", true, ["verify", "reverify"]]);
-    if (output !== "pr") { assert.equal(pushed(), ""); assert.equal(gh(), undefined); return; }
-    assert.equal(pushed(), `refs/heads/main ${f.head}\nrefs/heads/${branch} ${commit}`); assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "main", "--head", branch]);
+    if (output !== "pr") { assert.equal(pushed(), ""); assert.equal(gh(), undefined); assert.deepEqual(gh.views(), []); return; }
+    assert.equal(pushed.atCheck(), `refs/heads/main ${f.head}\nrefs/heads/${branch} ${commit}`); assert.equal(pushed(), `refs/heads/main ${f.head}`);
+    assert.deepEqual(gh()!.slice(4, 9), ["--draft", "--base", "main", "--head", branch]);
   });
 }
 
@@ -3089,12 +3180,13 @@ test("a hook that moves the ticket branch off the approved commit blocks before 
 
 test("the pull request is opened in the pushed repository whatever GH_REPO says, with a message-only review in its body", async context => {
   const f = fixture(context); remote(f); const gh = fakeGh(context, f);
-  const bin = join(f.root, "bin");
-  writeFileSync(join(bin, "gh"), `#!/bin/sh\nprintf '%s\\n' "$@" > "${bin}/args"\nprintf '%s' "$GH_REPO" > "${bin}/gh-repo"\necho ${url}\n`, { mode: 0o755 });
+  // Every gh call, the pull request's and each check of it, records what GH_REPO it was given and then answers as the fake does.
+  const bin = join(f.root, "bin"); renameSync(join(bin, "gh"), join(bin, "gh-fake"));
+  writeFileSync(join(bin, "gh"), `#!/bin/sh\nprintf '%s|' "$GH_REPO" >> "${bin}/gh-repo"\nexec "${bin}/gh-fake" "$@"\n`, { mode: 0o755 });
   process.env.GH_REPO = "someone/else"; context.after(() => { delete process.env.GH_REPO; });
   const result = await execute(input(f, { output: "pr" }), { reviewer: () => ({ ...review(), summary: undefined, message: "Prose-only approval" }) });
-  assert.equal(result.state, "delivered");
-  assert.deepEqual(gh()!.slice(2, 4), ["--repo", slug]); assert.equal(readFileSync(join(bin, "gh-repo"), "utf8"), "");
+  merged(f, result);
+  assert.deepEqual(gh()!.slice(2, 4), ["--repo", slug]); assert.equal(readFileSync(join(bin, "gh-repo"), "utf8"), "|".repeat(1 + gh.views().length));
   const body = readFileSync(join(evidence(f).directory, "pull-request.md"), "utf8");
   assert.match(body, /Prose-only approval/u); assert.doesNotMatch(body, /undefined/u);
 });
@@ -3122,8 +3214,9 @@ test("a separate pushurl cannot send the commit to a different repository than t
   const f = fixture(context); const pushed = remote(f); fakeGh(context, f);
   const other = join(f.root, "other.git"); git(f.root, "init", "-q", "--bare", other); git(f.repo, "config", "remote.origin.pushurl", other);
   const result = await execute(input(f, { output: "pr" }));
-  assert.equal(result.state, "delivered");
-  assert.equal(pushed(), `refs/heads/${branch} ${git(f.repo, "rev-parse", branch)}`); assert.equal(git(other, "for-each-ref"), "");
+  const run = merged(f, result);
+  // Neither the push nor the deletion after the merge went to the pushurl.
+  assert.equal(pushed.atCheck(), `refs/heads/${branch} ${run.delivery.commit}`); assert.equal(pushed(), ""); assert.equal(git(other, "for-each-ref"), "");
 });
 
 test("a remote reconfigured after the base was checked gets neither the push nor the pull request", async context => {
@@ -3134,9 +3227,9 @@ test("a remote reconfigured after the base was checked gets neither the push nor
   const result = await execute(input(f, { output: "pr" }), {
     implementer: request => { git(request.cwd, "remote", "set-url", "origin", elsewhere); git(request.cwd, "remote", "add", "upstream", elsewhere); return implement(request); },
   });
-  assert.equal(result.state, "delivered"); assert.equal(git(f.repo, "config", "--get", "remote.origin.url"), elsewhere);
-  const commit = git(f.repo, "rev-parse", branch);
-  assert.equal(pushed(), `refs/heads/${branch} ${commit}`); assert.equal(git(other, "for-each-ref", "--format=%(refname)"), "refs/heads/main");
+  const commit = merged(f, result).delivery.commit; assert.equal(git(f.repo, "config", "--get", "remote.origin.url"), elsewhere);
+  // The merged branch is deleted where it was pushed, not at the remote the configuration names now.
+  assert.equal(pushed.atCheck(), `refs/heads/${branch} ${commit}`); assert.equal(pushed(), ""); assert.equal(git(other, "for-each-ref", "--format=%(refname)"), "refs/heads/main");
   assert.deepEqual(gh()!.slice(0, 4), ["pr", "create", "--repo", slug]);
 });
 
@@ -3147,13 +3240,13 @@ for (const [base, forget] of [["release", ["branch", "-D", "release"]], ["origin
     git(f.repo, "checkout", "-q", "-b", "release"); git(f.repo, "commit", "-q", "--allow-empty", "-m", "released"); git(f.repo, "push", "-q", "origin", "release");
     const release = git(f.repo, "rev-parse", "release"); git(f.repo, "checkout", "-q", "main");
     const result = await execute(input(f, { output: "pr", base }), { implementer: request => { git(request.cwd, ...forget); return implement(request); } });
-    assert.equal(result.state, "delivered"); untouched(f);
+    const commit = merged(f, result).delivery.commit; untouched(f);
     assert.throws(() => git(f.repo, "rev-parse", "--verify", "--quiet", `${base}^{commit}`));
     // rebase has no tip to compare the base commit with, so it goes on to delivery as the candidate was approved, with nothing verified again.
-    assert.deepEqual(result.states.slice(-5), ["commit", "rebase", "deliver", "success", "delivered"]);
+    assert.deepEqual(result.states.slice(-7), ["commit", "rebase", "deliver", "success", "checkMerge", "cleanUp", "merged"]);
     assert.deepEqual([phases(evidence(f)), evidence(f).delivery.baseCommit, evidence(f).delivery.rebasedFrom], [["red", "verify"], release, undefined]);
-    const commit = git(f.repo, "rev-parse", branch); assert.equal(git(f.repo, "rev-parse", `${branch}^`), release);
-    assert.deepEqual(pushed().split("\n"), [`refs/heads/release ${release}`, `refs/heads/${branch} ${commit}`]);
+    assert.equal(git(f.repo, "rev-parse", `${commit}^`), release);
+    assert.deepEqual(pushed.atCheck().split("\n"), [`refs/heads/release ${release}`, `refs/heads/${branch} ${commit}`]); assert.equal(pushed(), `refs/heads/release ${release}`);
     assert.deepEqual(gh()!.slice(0, 9), ["pr", "create", "--repo", slug, "--draft", "--base", "release", "--head", branch]);
   });
 }
@@ -3162,7 +3255,7 @@ test("pr delivery pushes no tag even when Git is configured to follow tags", asy
   const f = fixture(context); const pushed = remote(f); fakeGh(context, f);
   git(f.repo, "config", "push.followTags", "true"); git(f.repo, "tag", "-am", "release", "v1");
   const result = await execute(input(f, { output: "pr" }));
-  assert.equal(result.state, "delivered"); assert.equal(pushed(), `refs/heads/${branch} ${git(f.repo, "rev-parse", branch)}`);
+  assert.equal(pushed.atCheck(), `refs/heads/${branch} ${merged(f, result).delivery.commit}`); assert.equal(pushed(), "");
 });
 
 test("a failing push blocks, keeps the committed local branch, and never starts gh", async context => {
@@ -3181,6 +3274,127 @@ test("a failing gh blocks after the push and keeps the local branch", async cont
   const run = blocked(f, result, /gh pr failed; inspect .+gh-pr\.log/u, 1);
   assert.equal(pushed(), `refs/heads/${branch} ${run.delivery.commit}`); assert.equal(run.delivery.prUrl, undefined);
   assert.ok(gh()!.includes("--draft")); assert.doesNotMatch(result.output.summary, /example\.invalid/u);
+});
+
+/** Each `gh pr view` a run made asked about the pull request it opened. */
+const viewed = (gh: ReturnType<typeof fakeGh>, times: number) => {
+  const views = gh.views(); assert.equal(views.length, times, views.join("; "));
+  for (const view of views) assert.ok(view.startsWith("pr view ") && view.includes(url), view);
+};
+const checks = (states: string[]) => states.filter(state => state === "checkMerge").length;
+
+test("a delivered pull request is checked until gh reports it merged, sleeping ten minutes between checks; then the ticket branch is deleted here and on the remote, and the run completes", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f, 0, ["OPEN", "MERGED"]);
+  const result = await untilEnd(input(f, { output: "pr" }, { stuck: "park" }));
+  const run = merged(f, result); untouched(f);
+  // Two checks, and one sleep between them that is due ten minutes after the wait began.
+  viewed(gh, 2); assert.equal(checks(result.states), 2);
+  assert.equal(result.sleeps.length, 1); assert.equal(Date.parse(result.sleeps[0]!.due) - Date.parse(result.sleeps[0]!.enteredAt), 10 * 60_000);
+  assert.deepEqual(result.unsaveable, [], "every state's working data is plain JSON");
+  // The branch was on the remote when gh reported the merge, and is deleted there and here only after that.
+  const commit = run.delivery.commit;
+  assert.equal(pushed.atCheck(), `refs/heads/${branch} ${commit}`); assert.equal(pushed(), "");
+  assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", commit), "Add a greeting\nTicket: PROJ-12"); assert.equal(git(f.repo, "rev-parse", `${commit}^`), f.head);
+  assert.deepEqual(gh()!.slice(0, 2), ["pr", "create"]);
+});
+
+test("a merged pull request whose remote branch is already gone, as when the host deletes it on merge, still ends merged", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f, 0, ["OPEN", "MERGED"]);
+  const result = await untilEnd(input(f, { output: "pr" }), {}, person(), entry => {
+    if (entry.kind === "wait") git(join(f.root, "remote.git"), "update-ref", "-d", `refs/heads/${branch}`);
+  });
+  merged(f, result); untouched(f); viewed(gh, 2);
+  assert.equal(pushed.atCheck(), ""); assert.equal(pushed(), "");
+});
+
+test("a remote that refuses to delete the merged ticket branch ends the run blocked with a hold and a log, and keeps the branch there", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
+  // The remote takes the delivery's push and refuses only a deletion.
+  mkdirSync(join(f.root, "remote.git/hooks"), { recursive: true });
+  writeFileSync(join(f.root, "remote.git/hooks/pre-receive"), '#!/bin/sh\nwhile read old new ref; do case "$new" in *[!0]*) ;; *) echo "deletion of $ref refused" >&2; exit 1 ;; esac; done\n', { mode: 0o755 });
+  const result = await execute(input(f, { output: "pr" }));
+  assert.equal(result.state, "blocked"); assert.ok(result.states.includes("cleanUp")); assert.equal(result.states.includes("merged"), false); viewed(gh, 1);
+  const run = held(f, result, /^Blocked/u); untouched(f);
+  assert.ok(holding(run.directory, ["refused"]).some(name => name.endsWith(".log")), "the refusal is kept in a log");
+  assert.equal(pushed(), `refs/heads/${branch} ${run.delivery.commit}`);
+});
+
+for (const choice of ["hand off", "discard"] as const) {
+  test(`a pull request closed without merging goes to the decision whatever the stuck setting, offering only hand off and discard; ${choice === "hand off" ? "hand off ends handedOff with the branch kept" : "a confirmed discard deletes the local branch only"}`, async context => {
+    const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f, 0, ["CLOSED"]);
+    const human = choice === "hand off" ? person("hand off") : person("discard", "confirm discard");
+    // A stuck run would park without asking; a closed pull request asks all the same.
+    const result = await untilEnd(input(f, { output: "pr" }, { stuck: "park" }), {}, human);
+    viewed(gh, 1); assert.deepEqual(result.sleeps, []); assert.equal(result.states.includes("parked"), false);
+    const [asked, confirmation, ...others] = human.requests; assert.deepEqual(others, []);
+    assert.deepEqual(asked!.choices, ["hand off", "discard"]);
+    assert.match(asked!.prompt, /closed without merging/iu); for (const part of [url, branch]) assert.ok(asked!.prompt.includes(part), part);
+    const commit = evidence(f).delivery.commit; untouched(f); assert.equal(existsSync(f.worktree), false);
+    // Only a merge deletes the pushed branch.
+    assert.equal(pushed(), `refs/heads/${branch} ${commit}`);
+    if (choice === "hand off") {
+      assert.equal(result.state, "handedOff"); held(f, result, /^Handed off/u);
+      assert.equal(confirmation, undefined); assert.equal(git(f.repo, "rev-parse", branch), commit);
+      return;
+    }
+    assert.deepEqual(confirmation!.choices, ["confirm discard", "go back"]);
+    assert.equal(result.state, "abandoned"); held(f, result, /^Abandoned/u);
+    assert.equal(git(f.repo, "branch", "--list", branch), ""); assert.equal(git(f.repo, "cat-file", "-t", commit), "commit");
+  });
+}
+
+test("gh failing three times in a row while the run waits for the merge goes to the decision with gh's message", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f, 0, ["fail"]); const human = person("hand off");
+  const result = await untilEnd(input(f, { output: "pr" }, { stuck: "park" }), {}, human);
+  viewed(gh, 3); assert.equal(checks(result.states), 3); assert.equal(result.sleeps.length, 2);
+  const [asked, ...others] = human.requests; assert.deepEqual(others, []);
+  assert.deepEqual(asked!.choices, ["hand off", "discard"]); assert.match(asked!.prompt, /gh: boom/u);
+  assert.equal(result.state, "handedOff"); held(f, result, /^Handed off/u); untouched(f);
+  const commit = evidence(f).delivery.commit;
+  assert.equal(git(f.repo, "rev-parse", branch), commit); assert.equal(pushed(), `refs/heads/${branch} ${commit}`);
+});
+
+test("gh failures that an answer interrupts are not in a row: the run keeps waiting and ends merged", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f, 0, ["fail", "OPEN", "fail", "fail", "MERGED"]); const human = person();
+  const result = await untilEnd(input(f, { output: "pr" }), {}, human);
+  merged(f, result); viewed(gh, 5); assert.equal(checks(result.states), 5); assert.equal(result.sleeps.length, 4);
+  assert.deepEqual(human.requests, []); assert.equal(pushed(), "");
+});
+
+test("unexpected gh states count as failures and a cancelled discard keeps both branches", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f, 0, ["UNKNOWN"]);
+  const human = person("discard", "go back", "hand off");
+  const result = await untilEnd(input(f, { output: "pr" }, { stuck: "park" }), {}, human);
+  viewed(gh, 3); assert.equal(result.sleeps.length, 2); assert.equal(result.state, "handedOff");
+  const run = held(f, result, /^Handed off/u);
+  assert.match(human.requests[0]!.prompt, /Unexpected gh state: "UNKNOWN"/u);
+  assert.deepEqual(human.requests[2]!.choices, ["hand off", "discard"]);
+  assert.equal(git(f.repo, "rev-parse", branch), run.delivery.commit);
+  assert.equal(pushed(), `refs/heads/${branch} ${run.delivery.commit}`);
+  const receipt = JSON.parse(readFileSync(join(run.directory, "merge.json"), "utf8"));
+  assert.deepEqual([receipt.outcome, receipt.checks, receipt.ghFailures, receipt.localDeleted, receipt.remoteDeleted, receipt.decision],
+    ["handedOff", 3, 3, false, false, "hand off"]);
+  assert.equal(holding(run.directory, ["UNKNOWN"]).filter(name => name.endsWith(".log")).length, 3);
+  assert.equal(readdirSync(run.directory).filter(name => /^human-\d+\.json$/u.test(name)).length, 3);
+  untouched(f);
+});
+
+test("a failed remote deletion counts as deleted only when its recheck confirms the branch disappeared", async context => {
+  const f = fixture(context); const pushed = remote(f); fakeGh(context, f);
+  // Simulate a host deleting the branch after ls-remote but before the deletion push.
+  writeFileSync(join(f.repo, ".git/hooks/pre-push"), [
+    "#!/bin/sh",
+    'while read local_ref local_sha remote_ref remote_sha; do',
+    '  case "$local_sha" in *[!0]*) ;; *)',
+    `    git --git-dir="${join(f.root, "remote.git")}" update-ref -d "$remote_ref"`,
+    '    echo "host deleted the branch concurrently" >&2; exit 1 ;; esac',
+    'done',
+  ].join("\n") + "\n", { mode: 0o755 });
+  const result = await execute(input(f, { output: "pr" }));
+  const run = merged(f, result); assert.equal(pushed(), ""); untouched(f);
+  const receipt = JSON.parse(readFileSync(join(run.directory, "merge.json"), "utf8"));
+  assert.deepEqual([receipt.outcome, receipt.localDeleted, receipt.remoteDeleted, receipt.reason], ["merged", true, true, undefined]);
+  assert.match(readFileSync(join(run.directory, "git-push.log"), "utf8"), /host deleted the branch concurrently/u);
 });
 
 test("a worktree or evidence root that reaches the repository through a symlink fails the run before any effect", async context => {
@@ -3420,13 +3634,13 @@ for (const [name, made] of [["ticket/proj-12", "before branches carried a title 
     git(f.repo, "worktree", "add", "-q", "-b", name, f.worktree); implement({ cwd: f.worktree });
     if (name !== "ticket/proj-12") git(f.repo, "config", `branch.${name}.ticket`, "proj-12");
     const result = await execute(input(f, { output: "pr" }, { resume: true }), { investigator: () => assert.fail(), implementer: () => assert.fail() });
-    assert.equal(result.state, "delivered"); untouched(f);
-    const commit = git(f.repo, "rev-parse", name);
-    const run = held(f, result, new RegExp(`^Delivered ${name} at ${commit}, pull request `, "u"));
-    assert.deepEqual([run.delivery.branch, run.delivery.resumed, run.delivery.commit], [name, true, commit]);
-    assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), `main\n${name}`);
-    assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", name), "Add a greeting\nTicket: PROJ-12");
-    assert.equal(pushed(), `refs/heads/${name} ${commit}`); assert.deepEqual(gh()!.slice(5, 9), ["--base", "main", "--head", name]);
+    untouched(f);
+    // The branch the run adopted is the one it pushed, and the one it deletes once the pull request is merged.
+    const run = merged(f, result, name); const commit = run.delivery.commit;
+    assert.deepEqual([run.delivery.branch, run.delivery.resumed], [name, true]);
+    assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), "main");
+    assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", commit), "Add a greeting\nTicket: PROJ-12");
+    assert.equal(pushed.atCheck(), `refs/heads/${name} ${commit}`); assert.equal(pushed(), ""); assert.deepEqual(gh()!.slice(5, 9), ["--base", "main", "--head", name]);
   });
 }
 
@@ -3447,7 +3661,7 @@ for (const [label, body, summary] of [
       assert.equal(existsSync(f.worktree), false); assert.equal(evidence(f).result.agentInvocations, 0);
       assert.equal(existsSync(join(evidence(f).directory, "pull-request.md")), false); return;
     }
-    assert.equal(result.state, "delivered");
+    merged(f, result);
     assert.equal(readFileSync(join(evidence(f).directory, "pull-request.md"), "utf8"),
       `Add a greeting\n\n${summary ? `## Summary\n\n${summary}\n\n` : ""}## Checks\n\n- tests: passed\n\n## Review\n\nGreeting matches the ticket\n\nTicket: PROJ-12\n`);
   });
@@ -3458,7 +3672,7 @@ const report = (outcome: string, summary: string) => ({ ...review(outcome, summa
 test("a review returned as a JSON object is written as prose in the pull request body and the stage report", async context => {
   const f = fixture(context); remote(f); fakeGh(context, f);
   const result = await execute(input(f, { output: "pr" }), { reviewer: () => report("approved", "Greeting matches the ticket.\n\nNo findings.") });
-  assert.equal(result.state, "delivered");
+  merged(f, result);
   const run = evidence(f);
   assert.equal(readFileSync(join(run.directory, "pull-request.md"), "utf8"),
     "Add a greeting\n\n## Summary\n\nWrite hello to greeting.txt.\n\n## Checks\n\n- tests: passed\n\n## Review\n\nGreeting matches the ticket.\n\nNo findings.\n\nTicket: PROJ-12\n");
@@ -3470,7 +3684,7 @@ test("a review returned as a JSON object is written as prose in the pull request
 test("a review that is a JSON object without a summary never reaches the pull request body", async context => {
   const f = fixture(context); remote(f); fakeGh(context, f);
   const result = await execute(input(f, { output: "pr" }), { reviewer: () => ({ ...review(), summary: undefined, message: '{"outcome":"approved","findings":[]}' }) });
-  assert.equal(result.state, "delivered");
+  merged(f, result);
   const body = readFileSync(join(evidence(f).directory, "pull-request.md"), "utf8");
   assert.match(body, /## Review\n\nThe reviewer approved this change without a written summary; its report is kept with the run evidence\.\n\nTicket: PROJ-12\n$/u);
   assert.doesNotMatch(body, /[{}]|findings/u);
@@ -3548,12 +3762,11 @@ test("a pr run proceeds when its base is on the remote, also behind a tip the re
   assert.throws(() => git(f.repo, "cat-file", "-e", tip));
   const refs = git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)");
   const result = await execute(input(f, { output: "pr" }));
-  assert.equal(result.state, "delivered"); untouched(f);
-  const commit = git(f.repo, "rev-parse", branch);
-  assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head);
-  assert.deepEqual(pushed().split("\n"), [`refs/heads/main ${tip}`, `refs/heads/${branch} ${commit}`]);
-  // Reading the remote's tip moved no local ref and left no FETCH_HEAD behind.
-  assert.equal(git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"), `${refs.replace("refs/remotes", `refs/heads/${branch} ${commit}\nrefs/remotes`)}`);
+  const commit = merged(f, result).delivery.commit; untouched(f);
+  assert.equal(git(f.repo, "rev-parse", `${commit}^`), f.head);
+  assert.deepEqual(pushed.atCheck().split("\n"), [`refs/heads/main ${tip}`, `refs/heads/${branch} ${commit}`]); assert.equal(pushed(), `refs/heads/main ${tip}`);
+  // Reading the remote's tip moved no local ref and left no FETCH_HEAD behind; the ticket branch it made is gone with the merge.
+  assert.equal(git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"), refs);
   assert.equal(existsSync(join(f.repo, ".git/FETCH_HEAD")), false);
 });
 
@@ -3996,6 +4209,21 @@ test("the catalog describes rebase, reverify, rebasedFrom, and the invariant tha
 
 /** The sentences and table rows of a document, each on one line, so that a claim is looked for where it is made and not across the file. */
 const statements = (text: string) => text.split(/\n(?=\|)|\n{2,}/u).flatMap(block => block.replace(/\s+/gu, " ").split(/(?<=\.)\s/u));
+test("the catalog, the ticket-task page, and the README describe waiting for the merge: the merged final state, its complete output, and the sleep between checks", () => {
+  for (const path of ["docs/catalog.md", "docs/workflows/ticket-task.md", "README.md"]) {
+    const text = readFileSync(resolve(path), "utf8"); const prose = text.replace(/\s+/gu, " ");
+    assert.doesNotMatch(prose, /output is always `\{ ?"action": ?"hold"/u, `${path} still says the output is always hold`);
+    assert.match(prose, /"action": ?"complete"/u, `${path} must give the output a merged pull request completes with`);
+    assert.ok(statements(text).some(said => /`merged`/u.test(said) && /\bcomplete\b/u.test(said)), `${path} must say in one sentence or table row that merged ends with complete`);
+    assert.ok(statements(text).some(said => /\bsleeps?\b/iu.test(said) && /\bmerge/iu.test(said)), `${path} must say that the run sleeps while it waits for the merge`);
+  }
+  for (const path of ["docs/catalog.md", "docs/workflows/ticket-task.md"]) {
+    const text = readFileSync(resolve(path), "utf8");
+    assert.ok(statements(text).some(said => /\b(?:10|ten) minutes\b|`10m`/iu.test(said) && /\bgh\b|pull request/iu.test(said)), `${path} must say the pull request is checked every 10 minutes`);
+  }
+  const catalog = readFileSync(resolve("docs/catalog.md"), "utf8");
+  assert.ok(statements(catalog).some(said => /\bfinal states?\b/iu.test(said) && /`merged`/u.test(said)), "the catalog must list merged among the final states");
+});
 for (const path of ["docs/catalog.md"]) {
   test(`${path} no longer says planning needs are kept in full, and gives falsify questions the limits of any open question`, () => {
     const text = readFileSync(resolve(path), "utf8");
@@ -4080,7 +4308,8 @@ function listsAnswers(body: string, questions: Gap[]) {
   }
 }
 const bodyOf = (gh: () => string[] | undefined) => { const args = gh()!; return readFileSync(args[args.indexOf("--body-file") + 1]!, "utf8"); };
-const delivers = ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "delivered"];
+/** A resumed run with a candidate that delivers a pull request, which is then merged. */
+const delivers = ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "checkMerge", "cleanUp", "merged"];
 
 /** A first run with assume on takes the recommended answer to every gap, and then stops with its candidate uncommitted: parked, or handed off by a person. */
 async function assumedThenStopped(f: Fixture, stop: "parked" | "handed off", questions: Gap[], repository = {}) {
@@ -4107,15 +4336,15 @@ for (const [stop, extra] of [["parked", { assume: true }], ["handed off", {}]] a
       investigator: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(),
       reviewer: request => { prompt = request.prompt; return review(); },
     });
-    assert.equal(result.state, "delivered", evidence(again).delivery.reason); assert.deepEqual(result.states, delivers);
-    const run = held(again, result, /^Delivered/u); untouched(f);
+    assert.equal(result.state, "merged", evidence(again).delivery.reason); assert.deepEqual(result.states, delivers);
+    const run = merged(again, result); untouched(f);
     // The reviewer is given the answers under their heading as the run that assumed handed them on, and is told what a disagreement is.
     assert.ok(assumptionsIn(prompt).startsWith(`${written.trimEnd()}\n`), prompt);
     assert.ok(prompt.split("\n").some(line => /\bassum/iu.test(line) && /\bdiscussion\b/iu.test(line)), "the reviewer is told that an assumption it disagrees with is a discussion finding");
     listsAnswers(bodyOf(gh), questions);
     assert.deepEqual([run.delivery.assumptions, run.delivery.resumed], [assumed(questions), true]);
     // The file was never part of the candidate: the ticket commit holds the two greeting files and nothing else.
-    assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+    assert.equal(git(f.repo, "show", "--name-only", "--format=", run.delivery.commit), "greeting.test.txt\ngreeting.txt");
     assert.equal(existsSync(f.worktree), false); assert.equal(existsSync(file), false, "the saved assumptions outlived the worktree they belonged to");
   });
 }
@@ -4131,11 +4360,11 @@ for (const assuming of [false, true]) {
       investigator: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(),
       reviewer: request => { prompt = request.prompt; return review(); },
     });
-    assert.equal(result.state, "delivered", evidence(again).delivery.reason); assert.deepEqual(result.states, delivers);
-    const run = held(again, result, /^Delivered/u);
+    assert.equal(result.state, "merged", evidence(again).delivery.reason); assert.deepEqual(result.states, delivers);
+    const run = merged(again, result);
     assert.ok(prompt); assert.doesNotMatch(prompt, /^Assumptions:/mu); assert.doesNotMatch(bodyOf(gh), /## Assumptions/u);
     assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
-    assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+    assert.equal(git(f.repo, "show", "--name-only", "--format=", run.delivery.commit), "greeting.test.txt\ngreeting.txt");
   });
 }
 
@@ -4167,12 +4396,12 @@ for (const damaged of [false, true]) {
       plan: keeping(request => { left = savedIn(f); return planning.plan!.answer(request); }),
       planReview: keeping(planning.planReview!.answer), tester: keeping(tester), implementer: keeping(implement), reviewer: keeping(() => review()),
     });
-    assert.equal(result.state, "delivered", evidence(again).delivery.reason);
+    assert.equal(result.state, "merged", evidence(again).delivery.reason);
     assert.deepEqual(route(result.states), ["falsify", "plan", "planReview", "test", "change", "review"]);
     assert.deepEqual(left, [], "a falsify that assumed nothing left the earlier run's answers in the worktree's Git directory");
     assert.equal(prompts.length, 6);
     for (const prompt of prompts) { assert.doesNotMatch(prompt, /^Assumptions:/mu); for (const stale of besideAnswered) assert.equal(prompt.includes(stale), false, stale); }
-    const run = held(again, result, /^Delivered/u);
+    const run = merged(again, result);
     assert.doesNotMatch(bodyOf(gh), /## Assumptions/u);
     assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
   });
@@ -4210,11 +4439,11 @@ test("a resumed run with a clean worktree whose own falsify assumes another gap 
     plan: keeping("plan", request => { left = savedIn(f).map(path => [path, JSON.parse(readFileSync(path, "utf8"))]); return planning.plan!.answer(request); }),
     planReview: keeping("planReview", planning.planReview!.answer), tester: keeping("tester", tester), implementer: keeping("implementer", implement), reviewer: keeping("reviewer", () => review()),
   });
-  assert.equal(result.state, "delivered", evidence(again).delivery.reason);
+  assert.equal(result.state, "merged", evidence(again).delivery.reason);
   assert.deepEqual(route(result.states), ["falsify", "plan", "planReview", "test", "change", "review"]);
   // One file still, in the same place, now holding what this run's falsify assumed.
   assert.deepEqual(left, [[file, assumed([newline])]]);
-  const run = held(again, result, /^Delivered/u);
+  const run = merged(again, result);
   const written = readFileSync(join(run.directory, "assumptions.json"), "utf8"); assert.deepEqual(JSON.parse(written), assumed([newline]));
   assert.doesNotMatch(prompts.falsify!, /^Assumptions:/mu);
   for (const stage of ["plan", "planReview", "tester", "implementer", "reviewer"]) assert.ok(assumptionsIn(prompts[stage]!).startsWith(`${written.trimEnd()}\n`), stage);
@@ -4222,7 +4451,7 @@ test("a resumed run with a clean worktree whose own falsify assumes another gap 
   // A pull request never lists an answer its plan did not use.
   const body = bodyOf(gh); listsAnswers(body, [newline]); for (const stale of besideAnswered) assert.equal(body.includes(stale), false, stale);
   assert.deepEqual(run.delivery.assumptions, assumed([newline]));
-  assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+  assert.equal(git(f.repo, "show", "--name-only", "--format=", run.delivery.commit), "greeting.test.txt\ngreeting.txt");
 });
 
 /** What stands where the saved assumptions are kept: a link's target, a directory, or a file's bytes. */
@@ -4530,8 +4759,14 @@ for (const output of ["branch", "patch", "pr"] as const) {
   test(`${output} delivery records the delivered commit with the branch, beside the ticket's id slug, and its hold gains no sentence`, async context => {
     const f = fixture(context); remote(f); fakeGh(context, f);
     const result = await execute(input(f, { output }));
-    assert.equal(result.state, "delivered"); const commit = onTip(f, f.head);
-    const run = held(f, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u"));
+    const commit = onTip(f, f.head, deliveredRef(f, output));
+    if (output === "pr") {
+      // A merged pull request's branch is deleted, and its records go with it: nothing is left for a resume to take up.
+      merged(f, result); assert.equal(deliveredAs(f), "");
+      assert.equal(git(f.repo, "config", "--local", "--default", "", "--get", `branch.${branch}.ticket`), "");
+      return;
+    }
+    const run = ended(f, result, output, new RegExp(`^Delivered ${branch} at ${commit}`, "u"));
     assert.equal(deliveredAs(f), commit, `git config ${deliveredKey} <commit>`);
     assert.equal(git(f.repo, "config", "--local", "--get", `branch.${branch}.ticket`), "proj-12");
     // An ordinary delivery replayed nothing a run had delivered and delivered nothing again: its hold and receipt are as they were.
@@ -4746,16 +4981,21 @@ for (const [label, repository, reason, states, checked] of [
 test("with resume in pr mode, a delivered ticket is not taken up: the run ends blocked saying the pull request is brought up to date at its host, and nothing is changed or asked of the remote", async context => {
   const path = process.env.PATH; const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const calls = recordGit(context, f);
   context.after(() => { process.env.PATH = path; });
-  const delivered = await deliverFirst(f, input(f, { output: "pr" }));
+  // The first pull request was closed without merging and handed off: its branch keeps the delivered commit and its record.
+  writeFileSync(join(f.root, "bin/views"), "CLOSED\n");
+  const first = await execute(input(f, { output: "pr" }), {}, person("hand off"));
+  assert.equal(first.state, "handedOff"); assert.equal(existsSync(f.worktree), false);
+  assert.equal(git(f.repo, "rev-list", "--count", `${f.head}..${branch}`), "1");
+  const delivered = git(f.repo, "rev-parse", branch); assert.equal(deliveredAs(f), delivered);
   // The base moves on and is published, as its owner leaves it: only the output mode stands in the way.
   advance(f); git(f.repo, "push", "-q", "origin", "main");
-  rmSync(join(f.root, "bin/args")); const before = [everything(f), pushed()]; const since = calls().length; const again = next(f, 2);
+  rmSync(join(f.root, "bin/args")); const before = [everything(f), pushed(), gh.views()]; const since = calls().length; const again = next(f, 2);
   const result = await execute(input(again, { output: "pr", setup: [command("process.exit(1)", { name: "install" })] }, { resume: true }), nobody);
   assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
   const run = held(again, result, /^Blocked: .*\bpull request\b.*\bhost\b/iu); assert.doesNotMatch(result.output.summary, /Worktree kept/u);
   assert.deepEqual([run.delivery.outcome, run.delivery.commit, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.result.checks.length, run.result.agentInvocations],
     ["blocked", null, false, false, 0, 0]);
-  assert.deepEqual([everything(f), pushed()], before); assert.equal(git(f.repo, "rev-parse", branch), delivered); assert.equal(gh(), undefined);
+  assert.deepEqual([everything(f), pushed(), gh.views()], before); assert.equal(git(f.repo, "rev-parse", branch), delivered); assert.equal(gh(), undefined);
   assert.deepEqual(calls().slice(since).filter(call => /^(?:ls-remote|fetch|push|worktree add)(?:\s|$)/u.test(call)), []);
 });
 
