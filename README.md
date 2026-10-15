@@ -132,8 +132,15 @@ A missing section blocks before any Agent runs. A run then goes
 A stuck run parks: it stops at once, keeps the worktree, and writes `park.txt`
 saying what it needs. Answer in the ticket and run again with `"resume": true`.
 With `"stuck": "ask"` it waits instead for a person to choose more rounds, hand
-off, archive, or discard. The output is always `{ "action": "hold", … }`, so a
-Machines Dispatch ticket stays open until a person merges or closes it.
+off, archive, or discard. Branch and patch deliveries end `delivered` with
+`{ "action": "hold", "summary": "…" }`, keeping the Dispatch ticket open.
+After opening a pull request and removing the worktree, the run checks with
+`gh` every 10 minutes and sleeps while waiting for the merge when run with
+the sleep option, as Dispatch does. After the merge it deletes the ticket branch
+locally and remotely and ends `merged` with
+`{ "action": "complete", "summary": "…" }`, so Dispatch closes the ticket.
+A closed pull request or three consecutive check failures asks for hand off or
+confirmed local discard; both keep the pushed branch and return `hold`.
 
 Its [page](docs/workflows/ticket-task.md) lists every input field, and the
 [catalog](docs/catalog.md#ticket-delivery) has the resume rules, evidence files,

@@ -121,7 +121,21 @@ flowchart TD
   reviewResult -->|revise| reviewBudget
   reviewBudget -->|retry| change
   reviewResult -->|approved| commit --> rebase
-  rebase -->|"current, or rebased"| deliver --> delivered
+  rebase -->|"current, or rebased"| deliver --> success["⚙️ success<br/>remove worktree, write delivery receipt"]
+  success -->|"branch or patch"| delivered
+  success -->|"pull request"| checkMerge["⚙️ checkMerge<br/>gh pr view"]
+  checkMerge -->|"open, or fewer than 3 failures"| awaitMerge["awaitMerge<br/>sleep 10 minutes"]
+  awaitMerge --> checkMerge
+  checkMerge -->|merged| cleanUp["⚙️ cleanUp<br/>delete remote and local branch"]
+  cleanUp --> merged(("✅ merged"))
+  cleanUp -->|failed| blocked
+  checkMerge -->|"closed, or 3 consecutive failures"| mergeDecide[/"🙋 mergeDecide<br/>hand off or discard"/]
+  mergeDecide -->|"hand off"| handedOff(("🤝 handedOff"))
+  mergeDecide -->|discard| confirmMergeDiscard[/"🙋 confirmMergeDiscard"/]
+  confirmMergeDiscard -->|"go back"| mergeDecide
+  confirmMergeDiscard -->|"confirm discard"| dropLocal["⚙️ dropLocal<br/>keep pushed branch"]
+  dropLocal --> abandoned(("🗑️ abandoned"))
+  dropLocal -->|failed| blocked
   rebase -->|"patch changed"| verify
   scopeAfterTest & red & scopeAfterChange & verify -->|failed| repairBudget
   rebase -->|"gates failed"| repairBudget
@@ -183,16 +197,32 @@ flowchart LR
 
 ## Results
 
-The output is always `{ "action": "hold", "summary": "…" }`, so a Machines
-Dispatch ticket stays open until a person merges or closes it. `delivery.json`
-in the evidence folder records the outcome, branch, commit, and anything assumed.
+After delivery removes the worktree, a pull request run checks `gh pr view`
+every 10 minutes until it merges. With the sleep option, as used by Dispatch,
+the run sleeps while waiting for the merge, saving its state between checks.
+Only a reported merge permits remote branch deletion; an already absent remote
+branch counts as deleted. Any other cleanup failure ends `blocked` with a log.
 
-- ✅ **`delivered`**: committed and delivered as a branch, patch, or pull request.
+A pull request closed without merging, or three consecutive `gh` failures
+(including unexpected states), goes to `mergeDecide` regardless of `stuck`.
+It shows the reason and offers only hand off or discard. Hand off keeps the
+branch; confirmed discard deletes only the local branch and keeps the pushed
+branch. Both leave the ticket open.
+
+The `merged` final returns exactly `{ "action": "complete", "summary": "…" }`,
+so Machines Dispatch closes the ticket. Every other final returns exactly
+`{ "action": "hold", "summary": "…" }`. `delivery.json` and `result.json`
+record delivery once, before waiting; `merge.json` records the later outcome,
+pull request URL, branch, check and failure counts, deletion flags, and any
+reason or decision. Read that later receipt if cleanup fails after delivery.
+
+- ✅ **`delivered`**: committed and delivered as a branch or patch.
+- ✅ **`merged`**: the pull request merged and the ticket branch was deleted locally and remotely.
 - 🅿️ **`parked`**: stuck; the worktree is kept and `park.txt` says what is needed.
   Answer in the ticket and run again with `"resume": true`.
-- 🤝 **`handedOff`**: a person chose to hand the uncommitted work to someone else.
+- 🤝 **`handedOff`**: a person chose to hand the work to someone else; after pull request delivery, the worktree is already gone and the branch is kept.
 - 🗑️ **`abandoned`**: archived to `archive/<slug>` and removed, or discarded after a second confirmation.
-- ⛔ **`blocked`**: the ticket's shape, setup, commit, or delivery failed.
+- ⛔ **`blocked`**: the ticket's shape, setup, commit, delivery, or branch cleanup failed.
 
 The catalog's [ticket delivery](../catalog.md#ticket-delivery) section has the
 resume rules, evidence files, and every stop.

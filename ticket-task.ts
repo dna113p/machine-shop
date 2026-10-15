@@ -6,7 +6,7 @@ import { taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject 
 import { brief, firstLine } from "./defaults/_machine-shop/brief.ts";
 import { outsideScope } from "./defaults/_machine-shop/scope.ts";
 
-export const description = "Carry one local ticket for one Git repository from an isolated worktree through falsification, planning, plan review, implementation, checks, and review to a delivered branch, patch, or draft pull request; a stuck run parks by default or asks for a Human decision.";
+export const description = "Carry one local ticket for one Git repository from an isolated worktree through planning, implementation, checks, and review to a branch, patch, or pull request; sleep until the pull request merges, then delete its branch and complete the ticket; a stuck run parks or asks for a Human decision.";
 export const agentRoles = {
   investigator: "Tries to falsify the ticket, then plans its implementation without editing",
   tester: "Writes failing tests for the ticket's acceptance criteria before implementation",
@@ -21,9 +21,10 @@ const planLimit = 6000;
 const cannotRun = "Run the checks you can. If your environment cannot run them, as when a sandbox refuses to start processes, say which and why in your summary and still return completed: the workflow runs every required check itself after you return. Return blocked only for something a person must decide or supply.";
 const decisions = ["more rounds", "hand off", "archive", "discard"] as const;
 const confirmations = ["confirm discard", "go back"] as const;
+const mergeDecisions = ["hand off", "discard"] as const;
 
 export default function ticketTask(p: MachinePrimitives, input: unknown) {
-  const { machine, operation, agent, human, final } = p;
+  const { machine, operation, agent, human, wait, final } = p;
   type PlanningStage = "falsify" | "plan" | "planReview";
   const saved = p.data({
     branch: "",
@@ -49,12 +50,18 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     reviewsFrom: 0,
     reviewNotes: [] as { text: string; where: string }[],
     prUrl: "",
+    mergeChecks: 0,
+    ghFailures: 0,
+    mergeReason: "",
+    mergeDecision: "",
+    localDeleted: false,
+    remoteDeleted: false,
     // Where prepare found the base published: the remote's URL and the pull request base branch there, its default branch by name when the base names none.
     // The push and the pull request go there, whatever the remote, the local refs, and gh's own configuration are by then.
     checked: "",
     checkedBase: "",
     patches: [] as string[],
-    held: null as { action: "hold"; summary: string } | null,
+    held: null as { action: "hold" | "complete"; summary: string } | null,
     repairing: "change" as PlanningStage | "test" | "change",
     scopeChecks: 0,
     provedRed: false,
@@ -731,6 +738,88 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: outcome === "handed-off" ? "handedOff" : outcome };
   }
 
+  function checkMerge(): Event {
+    const args = ["pr", "view", saved.prUrl, "--json", "state", "--jq", ".state"];
+    const checked = run("gh", args, repository.path, publishTimeoutMs);
+    saved.mergeChecks++;
+    if (checked.ok && ["OPEN", "MERGED", "CLOSED"].includes(checked.stdout)) {
+      saved.ghFailures = 0;
+      if (checked.stdout === "MERGED") return { type: "merged" };
+      if (checked.stdout === "CLOSED") {
+        saved.mergeReason = `Pull request ${saved.prUrl} was closed without merging.`;
+        return { type: "decide" };
+      }
+      return { type: "waiting" };
+    }
+    const detail = checked.ok ? `Unexpected gh state: ${JSON.stringify(checked.stdout)}` : checked.detail || checked.stdout || "gh exited unsuccessfully without a message";
+    const log = join(work.open(), `gh-pr-view-${saved.mergeChecks}.log`);
+    writeFileSync(log, `gh ${args.join(" ")}\n${checked.stdout}\n${detail}\n`, { flag: "wx", mode: 0o600 });
+    if (++saved.ghFailures < 3) return { type: "waiting" };
+    saved.mergeReason = `gh failed 3 times in a row: ${detail}; inspect ${log}`;
+    return { type: "decide" };
+  }
+
+  function dropLocal(): Event {
+    if (!attempt("git", ["branch", "-D", saved.branch], repository.path).ok) return { type: "blocked" };
+    saved.localDeleted = true;
+    return { type: "removed" };
+  }
+
+  /** Only a MERGED answer permits deleting the pushed branch, at the URL used for delivery. */
+  function cleanUp(): Event {
+    const ref = `refs/heads/${saved.branch}`;
+    const listArgs = ["ls-remote", "--heads", saved.checked, ref];
+    const listed = attempt("git", listArgs, repository.path, publishTimeoutMs);
+    if (!listed.ok) return { type: "blocked" };
+    if (listed.stdout) {
+      const args = ["push", "--no-follow-tags", saved.checked, "--delete", ref];
+      const deleted = run("git", args, repository.path, publishTimeoutMs);
+      if (!deleted.ok) {
+        // The host can delete the branch between our query and push. Only a successful empty query excuses the failed push.
+        const remaining = attempt("git", listArgs, repository.path, publishTimeoutMs);
+        const log = join(work.open(), "git-push.log");
+        writeFileSync(log, `git ${args.join(" ")}\n${deleted.stdout}\n${deleted.detail}\n`, { flag: "wx", mode: 0o600 });
+        if (!remaining.ok) return { type: "blocked" };
+        if (remaining.stdout) return work.block(`git push failed deleting ${saved.branch}; inspect ${log}`);
+      }
+    }
+    saved.remoteDeleted = true;
+    if (dropLocal().type === "blocked") return { type: "blocked" };
+    return settle("merged");
+  }
+
+  // Delivery and result receipts were already written before waiting; this receipt records the later ending exactly once.
+  function settle(outcome: "merged" | "handedOff" | "abandoned" | "blocked"): Event {
+    const directory = work.open();
+    const reason = outcome === "blocked" ? work.status().reason : saved.mergeReason;
+    writeFileSync(join(directory, "merge.json"), JSON.stringify({
+      schemaVersion: 1, outcome, prUrl: saved.prUrl, branch: saved.branch, checks: saved.mergeChecks,
+      ghFailures: saved.ghFailures, localDeleted: saved.localDeleted, remoteDeleted: saved.remoteDeleted,
+      ...(reason ? { reason } : {}), ...(saved.mergeDecision ? { decision: saved.mergeDecision } : {}),
+    }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    const ending = {
+      merged: `Merged ${saved.prUrl}; deleted ${saved.branch} locally and on ${saved.checked}.`,
+      handedOff: `Handed off ${saved.prUrl} on ${saved.branch}: ${flat(reason)} Branch kept locally and on ${saved.checked}.`,
+      abandoned: `Abandoned ${saved.prUrl}: ${flat(reason)} Deleted ${saved.branch} locally; the pushed branch is kept on ${saved.checked}.`,
+      blocked: `Blocked after delivering ${saved.prUrl} on ${saved.branch}: ${flat(reason)} Local branch ${saved.localDeleted ? "deleted" : "kept"}; remote branch ${saved.remoteDeleted ? "deleted" : "not confirmed deleted"}.`,
+    }[outcome];
+    saved.held = { action: outcome === "merged" ? "complete" : "hold", summary: `${ending} Evidence: ${directory}` };
+    return { type: outcome };
+  }
+
+  const mergePrompt = (confirm = false) => brief({
+    decision: confirm ? `Discard the local branch for ticket ${ticket.id}?` : `Decide what happens to ticket ${ticket.id}`,
+    standing: `${saved.mergeReason}\nPull request: ${saved.prUrl}\nBranch: ${saved.branch}\nThe worktree has already been removed. The pushed branch will be kept.`,
+    evidence: [`Evidence: ${work.open()}`],
+    options: confirm ? [
+      { name: "confirm discard", does: `delete only the local branch ${saved.branch} in ${repository.path}.` },
+      { name: "go back", does: "return to the decision with the branch kept." },
+    ] : [
+      { name: "hand off", does: "keep the branch and leave the ticket open for someone else.", recommended: true },
+      { name: "discard", does: "delete only the local branch after confirmation and leave the ticket open." },
+    ],
+  });
+
   const record = (stage: string) => ({ event }: { event: Event }) => { saved.stoppedIn = stage; work.capture(stage, event); };
   const rememberPlanning = ({ event }: { event: Event }) => { saved.planningReport = event; };
   /** Keep the raw report even if its summary is refused; guards and validation run only after capture. */
@@ -876,6 +965,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   }
   const chose = (value: string) => ({ event }: { event: Event }) => event.value === value;
   const decide = ({ event }: { event: Event }) => { saved.decision = work.choice("decide", event, decisions); };
+  const mergeDecide = ({ event }: { event: Event }) => { saved.mergeDecision = work.choice("mergeDecide", event, mergeDecisions); };
   return machine({
     initial: "shape", output: () => saved.held ?? undefined,
     states: {
@@ -1001,11 +1091,30 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       commit: operation(commit, { committed: "rebase", blocked: "failure" }),
       rebase: operation(stopped("rebase", rebase), { current: "deliver", rebased: "deliver", review: "verify", failed: "repairBudget", stuck: "stuck", blocked: "failure" }),
       deliver: operation(deliver, { delivered: "success", blocked: "failure" }),
-      success: operation(() => conclude("completed"), { delivered: "delivered", blocked: "blocked" }),
+      success: operation(() => conclude("completed"), { delivered: repository.output === "pr" ? "checkMerge" : "delivered", blocked: "blocked" }),
+      checkMerge: operation(checkMerge, { merged: "cleanUp", waiting: "awaitMerge", decide: "mergeDecide" }),
+      awaitMerge: wait({ every: "10m" }, { due: "checkMerge" }),
+      cleanUp: operation(cleanUp, { merged: "merged", blocked: "mergeFailure" }),
+      mergeDecide: human(() => mergePrompt(), {
+        submitted: [
+          { guard: chose("hand off"), target: "mergeHandOff", actions: mergeDecide },
+          { target: "confirmMergeDiscard", actions: mergeDecide },
+        ],
+      }, { choices: mergeDecisions }),
+      confirmMergeDiscard: human(() => mergePrompt(true), {
+        submitted: [
+          { guard: chose("confirm discard"), target: "dropLocal", actions: ({ event }: { event: Event }) => { work.choice("confirmMergeDiscard", event, confirmations); } },
+          { target: "mergeDecide", actions: ({ event }: { event: Event }) => { work.choice("confirmMergeDiscard", event, confirmations); } },
+        ],
+      }, { choices: confirmations }),
+      dropLocal: operation(dropLocal, { removed: "mergeAbandon", blocked: "mergeFailure" }),
+      mergeHandOff: operation(() => settle("handedOff"), { handedOff: "handedOff" }),
+      mergeAbandon: operation(() => settle("abandoned"), { abandoned: "abandoned" }),
+      mergeFailure: operation(() => settle("blocked"), { blocked: "blocked" }),
       failure: operation(() => conclude("blocked"), { delivered: "delivered", blocked: "blocked" }),
       handOff: operation(() => conclude("handed-off"), { handedOff: "handedOff" }),
       abandon: operation(() => conclude("abandoned"), { abandoned: "abandoned" }),
-      delivered: final(), blocked: final(), handedOff: final(), abandoned: final(), parked: final(),
+      delivered: final(), merged: final(), blocked: final(), handedOff: final(), abandoned: final(), parked: final(),
     },
   });
 }
