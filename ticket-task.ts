@@ -2,7 +2,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { closeSync, existsSync, lstatSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Event, MachinePrimitives } from "@dna113p/machines";
-import { taskRun, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
+import { taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
 import { brief, firstLine } from "./defaults/_machine-shop/brief.ts";
 import { outsideScope } from "./defaults/_machine-shop/scope.ts";
 
@@ -24,57 +24,61 @@ const confirmations = ["confirm discard", "go back"] as const;
 
 export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const { machine, operation, agent, human, final } = p;
-  const { ticket, repository, prefix, worktree, evidenceRoot, resume, redGreen, assume, stuck, work, branch: named } = parseTicket(input);
-  // A resumed run continues on the branch its worktree is already on, whatever title named it.
-  let branch = named;
-  let baseCommit = "";
-  let commitHash = "";
-  let taken = "";
-  let untested = false;
-  let redelivered = false;
-  let firstApproved: { baseCommit: string; commit: string } | undefined;
-  let rebasedFrom: { baseCommit: string; commit: string } | undefined;
-  let rebaseSteps = 0;
-  let created = false;
-  let adopted = false;
-  let removed = false;
-  let decision = "";
-  let stoppedIn = "";
-  let discardConfirmed = false;
-  let archived: { branch: string; commit: string } | undefined;
-  let reviewSummary = "";
-  let standingReview: string | undefined;
-  const reviews: Event[] = [];
-  // Keep evidence across rebases, but compare reports only within the current patch's reviews.
-  let reviewsFrom = 0;
-  const reviewNotes: { text: string; where: string }[] = [];
-  let prUrl = "";
-  // Where prepare found the base published: the remote's URL and the pull request base branch there, its default branch by name when the base names none.
-  // The push and the pull request go there, whatever the remote, the local refs, and gh's own configuration are by then.
-  let checked = "";
-  let checkedBase = "";
-  let patches: string[] = [];
-  let held: { action: "hold"; summary: string } | undefined;
   type PlanningStage = "falsify" | "plan" | "planReview";
-  let repairing: PlanningStage | "test" | "change" = "change";
-  let scopeChecks = 0;
-  let provedRed = false;
-  let planningReport: Event = { type: "sound" };
-  const planningReports: Record<PlanningStage, number> = { falsify: 0, plan: 0, planReview: 0 };
-  let plan = "";
-  let planRevisions = 0;
-  let lengthReturned = false;
-  let overLimit = 0;
-  let questionsReturned = false;
-  let questionsFault = "";
-  let ownerQuestions: { text: string; where: string; options?: string[]; recommended?: string; why?: string }[] | undefined;
-  let wouldAssume: FalsifyQuestion[] = [];
-  let assumptions: Assumption[] = [];
-  let assumptionsJson = "";
-  const assumptionsPrompt = () => assumptionsJson ? ["Assumptions:", assumptionsJson] : [];
+  const saved = p.data({
+    branch: "",
+    baseCommit: "",
+    commitHash: "",
+    taken: "",
+    untested: false,
+    redelivered: false,
+    firstApproved: null as { baseCommit: string; commit: string } | null,
+    rebasedFrom: null as { baseCommit: string; commit: string } | null,
+    rebaseSteps: 0,
+    created: false,
+    adopted: false,
+    removed: false,
+    decision: "",
+    stoppedIn: "",
+    discardConfirmed: false,
+    archived: null as { branch: string; commit: string } | null,
+    reviewSummary: "",
+    standingReview: null as string | null,
+    reviews: [] as Event[],
+    // Keep evidence across rebases, but compare reports only within the current patch's reviews.
+    reviewsFrom: 0,
+    reviewNotes: [] as { text: string; where: string }[],
+    prUrl: "",
+    // Where prepare found the base published: the remote's URL and the pull request base branch there, its default branch by name when the base names none.
+    // The push and the pull request go there, whatever the remote, the local refs, and gh's own configuration are by then.
+    checked: "",
+    checkedBase: "",
+    patches: [] as string[],
+    held: null as { action: "hold"; summary: string } | null,
+    repairing: "change" as PlanningStage | "test" | "change",
+    scopeChecks: 0,
+    provedRed: false,
+    planningReport: { type: "sound" } as Event,
+    planningReports: { falsify: 0, plan: 0, planReview: 0 } as Record<PlanningStage, number>,
+    plan: "",
+    planRevisions: 0,
+    lengthReturned: false,
+    overLimit: 0,
+    questionsReturned: false,
+    questionsFault: "",
+    ownerQuestions: null as { text: string; where: string; options?: string[]; recommended?: string; why?: string }[] | null,
+    wouldAssume: [] as FalsifyQuestion[],
+    assumptions: [] as Assumption[],
+    assumptionsJson: "",
+    task: taskData(),
+  });
+  const { ticket, repository, prefix, worktree, evidenceRoot, resume, redGreen, assume, stuck, work, branch: named } = parseTicket(input, saved.task);
+  // A continued run keeps its saved branch; resume may adopt the worktree's branch.
+  saved.branch ||= named;
+  const assumptionsPrompt = () => saved.assumptionsJson ? ["Assumptions:", saved.assumptionsJson] : [];
 
   function scope(stage: "test" | "change"): Event {
-    repairing = stage;
+    saved.repairing = stage;
     // -z keeps spaces, newlines, and quoted characters literal. Rename records put the new name first, then the old name.
     const entries = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all", "-z"], {
       cwd: worktree, encoding: "utf8", timeout: 30_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
@@ -88,7 +92,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }
     const changed = [...new Set(paths)].filter(path => path !== ".machine-runs" && !path.startsWith(".machine-runs/")).sort();
     const outside = outsideScope(changed, ticket.sections.scope);
-    writeFileSync(join(work.open(), `scope-${++scopeChecks}.json`), JSON.stringify({ stage, changed, outside }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    writeFileSync(join(work.open(), `scope-${++saved.scopeChecks}.json`), JSON.stringify({ stage, changed, outside }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     if (outside.length) {
       work.block(`Paths outside the ticket Scope after ${stage}: ${outside.map(path => JSON.stringify(path)).join(", ")}. Scope: ${ticket.sections.scope.join(", ")}.`);
       return { type: "failed" };
@@ -142,19 +146,19 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   function prepare(): Event {
     const base = run("git", ["rev-parse", "--verify", "--quiet", `${repository.base ?? "HEAD"}^{commit}`], repository.path);
     if (!base.ok) return work.block(`Base ${repository.base ?? "HEAD"} does not resolve to a commit in ${repository.path}.`);
-    baseCommit = base.stdout;
+    saved.baseCommit = base.stdout;
     // A resumed run's base is the commit its branch is on, so the branch is read before the remote is asked about the base.
     if (resume) {
       const adoption = adopt();
       if (adoption.type === "blocked") return adoption;
       if (adoption.type === "redeliver") {
-        adopted = true;
+        saved.adopted = true;
         return adoption;
       }
     }
     if (repository.output === "pr" && !published()) return { type: "blocked" };
     if (resume) {
-      adopted = true;
+      saved.adopted = true;
       return { type: pending() === "" ? "prepared" : "resumed" };
     }
     const owners = branchOwners();
@@ -168,14 +172,14 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const open = first("");
     if (open) return work.block(`Branch ${open} already exists in ${repository.path} with ${unresolved(open)}`);
     // Another ticket's id and title can spell the same name; its branch is left alone.
-    if (owners.has(branch)) {
-      return work.block(`Branch ${branch} already exists in ${repository.path} for ticket ${owners.get(branch)}, whose id and title spell the name this ticket would take; nothing was changed.`);
+    if (owners.has(saved.branch)) {
+      return work.block(`Branch ${saved.branch} already exists in ${repository.path} for ticket ${owners.get(saved.branch)}, whose id and title spell the name this ticket would take; nothing was changed.`);
     }
     if (existsSync(worktree)) return work.block(`Worktree directory ${worktree} already exists; nothing was changed.`);
-    if (!attempt("git", ["worktree", "add", "-b", branch, worktree, baseCommit], repository.path).ok) return { type: "blocked" };
-    created = true;
+    if (!attempt("git", ["worktree", "add", "-b", saved.branch, worktree, saved.baseCommit], repository.path).ok) return { type: "blocked" };
+    saved.created = true;
     // Git keeps the record with the branch: it follows a rename and goes when the branch is deleted.
-    if (!attempt("git", ["config", "--local", `branch.${branch}.ticket`, ticket.slug], repository.path).ok) return { type: "blocked" };
+    if (!attempt("git", ["config", "--local", `branch.${saved.branch}.ticket`, ticket.slug], repository.path).ok) return { type: "blocked" };
     if (!repository.setup.every(command => work.check(command, "setup"))) return { type: "blocked" };
     if (pending() !== "") {
       return work.block("A setup command changed tracked or unignored files in the worktree; they would be committed with the ticket. Ignore its outputs in the repository.");
@@ -190,11 +194,11 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   function published(): boolean {
     const refuse = (why: string) => { work.block(why); return false; };
     // The remote's configured URL, not its name, keeps a separate pushurl from sending the commit elsewhere.
-    checked = run("git", ["config", "--get", `remote.${repository.remote}.url`], repository.path).stdout || repository.remote;
+    saved.checked = run("git", ["config", "--get", `remote.${repository.remote}.url`], repository.path).stdout || repository.remote;
     const name = pullRequestBase();
     // A base that names no branch stands for the remote's default branch, which the remote names with the same answer.
     const ref = name ? `refs/heads/${name}` : "HEAD";
-    const listed = attempt("git", ["ls-remote", "--symref", checked, ref], repository.path, publishTimeoutMs,
+    const listed = attempt("git", ["ls-remote", "--symref", saved.checked, ref], repository.path, publishTimeoutMs,
       `Remote ${repository.remote} could not be reached to check that the base is published; nothing was changed`);
     if (!listed.ok) return false;
     const lines = listed.stdout.split("\n").map(line => line.split("\t"));
@@ -204,13 +208,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (!tip) return refuse(`The pull request base ${where} does not exist, so the base cannot be shown to be published. Push it first; nothing was changed.`);
     // gh is told this branch by name: left to choose, it reads branch.<name>.gh-merge-base before the default branch, and that was never compared.
     if (!name && !head) return refuse(`Remote ${repository.remote} does not say which branch is its default, so the pull request base cannot be named. Set repository.base to a branch; nothing was changed.`);
-    checkedBase = name ?? head!;
+    saved.checkedBase = name ?? head!;
     // A remote that is ahead of every local ref has a tip this repository lacks. Fetching it by URL stores the commits and moves no ref.
     if (!run("git", ["cat-file", "-e", `${tip}^{commit}`], repository.path).ok
-      && !attempt("git", ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", checked, tip], repository.path, publishTimeoutMs,
+      && !attempt("git", ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", saved.checked, tip], repository.path, publishTimeoutMs,
         `The tip of ${where} could not be fetched to check that the base is published; nothing was changed`).ok) return false;
-    if (run("git", ["merge-base", "--is-ancestor", baseCommit, tip], repository.path).ok) return true;
-    const ahead = git(repository.path, "rev-list", "--count", `${tip}..${baseCommit}`);
+    if (run("git", ["merge-base", "--is-ancestor", saved.baseCommit, tip], repository.path).ok) return true;
+    const ahead = git(repository.path, "rev-list", "--count", `${tip}..${saved.baseCommit}`);
     return refuse(`Base ${repository.base ?? "HEAD"} has ${ahead} unpublished local commit${ahead === "1" ? " that is" : "s that are"} not in ${where}, `
       + "and the pull request would carry them. The base must be pushed first; nothing was changed.");
   }
@@ -238,18 +242,18 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const whose = owner(current);
     if (!whose) return work.block(`Cannot resume: HEAD in ${worktree} is on ${current}, which has ${unresolved(current)}`);
     if (whose !== ticket.slug) return work.block(`Cannot resume: HEAD in ${worktree} is on ${current}, which belongs to ticket ${whose}; nothing was changed.`);
-    branch = current;
-    const tip = run("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`], repository.path).stdout;
+    saved.branch = current;
+    const tip = run("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${saved.branch}^{commit}`], repository.path).stdout;
     // Adopt the candidate on its own base; after approval, rebase compares it with the source checkout's current tip.
-    if (!tip || !run("git", ["merge-base", "--is-ancestor", tip, baseCommit], repository.path).ok) {
-      if (!tip || !run("git", ["merge-base", tip, baseCommit], repository.path).ok) {
-        return work.block(`Cannot resume: ${branch} shares no history with the base commit ${baseCommit}; nothing was changed.`);
+    if (!tip || !run("git", ["merge-base", "--is-ancestor", tip, saved.baseCommit], repository.path).ok) {
+      if (!tip || !run("git", ["merge-base", tip, saved.baseCommit], repository.path).ok) {
+        return work.block(`Cannot resume: ${saved.branch} shares no history with the base commit ${saved.baseCommit}; nothing was changed.`);
       }
-      const own = git(repository.path, "rev-list", "--count", `${baseCommit}..${tip}`);
-      return work.block(`Cannot resume: ${branch} holds ${own} commit${own === "1" ? " that is" : "s that are"} not in the base commit ${baseCommit}, `
+      const own = git(repository.path, "rev-list", "--count", `${saved.baseCommit}..${tip}`);
+      return work.block(`Cannot resume: ${saved.branch} holds ${own} commit${own === "1" ? " that is" : "s that are"} not in the base commit ${saved.baseCommit}, `
         + "so something was committed on it or the base moved back; only an uncommitted candidate is resumed, and nothing was changed.");
     }
-    baseCommit = tip;
+    saved.baseCommit = tip;
     // A clean resume plans afresh; only a candidate carries the answers its plan used.
     if (pending() !== "") {
       const directory = run("git", ["rev-parse", "--path-format=absolute", "--git-dir"], worktree);
@@ -258,16 +262,16 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       try {
         // lstat distinguishes an absent file from an unreadable or dangling saved link.
         if (lstatSync(file, { throwIfNoEntry: false })) {
-          const saved: unknown = JSON.parse(readFileSync(file, "utf8"));
-          const malformed = assumptionField(saved);
+          const answers: unknown = JSON.parse(readFileSync(file, "utf8"));
+          const malformed = assumptionField(answers);
           if (malformed) return work.block(`Cannot resume: ${file}: ${malformed}; nothing was changed.`);
-          assumptions = (saved as Assumption[]).map(({ question, answer, options, why }) => ({ question, answer, options, why }));
-          assumptionsJson = JSON.stringify(assumptions, null, 2) + "\n";
+          saved.assumptions = (answers as Assumption[]).map(({ question, answer, options, why }) => ({ question, answer, options, why }));
+          saved.assumptionsJson = JSON.stringify(saved.assumptions, null, 2) + "\n";
         }
       } catch (error) {
         return work.block(`Cannot resume: ${file}: ${String(error)}; nothing was changed.`);
       }
-      if (assumptionsJson) writeFileSync(join(work.open(), "assumptions.json"), assumptionsJson, { flag: "wx", mode: 0o600 });
+      if (saved.assumptionsJson) writeFileSync(join(work.open(), "assumptions.json"), saved.assumptionsJson, { flag: "wx", mode: 0o600 });
     }
     return { type: "resumed" };
   }
@@ -284,10 +288,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }
     const name = names[0]!;
     const tip = git(repository.path, "rev-parse", `refs/heads/${name}`);
-    if (run("git", ["merge-base", "--is-ancestor", tip, baseCommit], repository.path).ok) return missing();
+    if (run("git", ["merge-base", "--is-ancestor", tip, saved.baseCommit], repository.path).ok) return missing();
     const [parent, subject, ...body] = git(repository.path, "log", "-1", "--no-show-signature", "--format=%P%n%s%n%b", tip).split("\n");
-    if (!parent || parent.includes(" ") || !run("git", ["merge-base", "--is-ancestor", parent, baseCommit], repository.path).ok
-      || git(repository.path, "rev-list", "--count", `${baseCommit}..${tip}`) !== "1"
+    if (!parent || parent.includes(" ") || !run("git", ["merge-base", "--is-ancestor", parent, saved.baseCommit], repository.path).ok
+      || git(repository.path, "rev-list", "--count", `${saved.baseCommit}..${tip}`) !== "1"
       || subject !== ticket.title || !body.some(line => line === `Ticket: ${ticket.id}`)) {
       return refuse(`${name} does not hold exactly one ticket commit with the expected parent, subject, and Ticket line above an ancestor of the current base`);
     }
@@ -296,33 +300,33 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (repository.output === "pr") return refuse("the delivered pull request is brought up to date at its host");
     if (!attempt("git", ["worktree", "add", worktree, name], repository.path, undefined,
       "Cannot resume: the worktree could not be recreated; nothing was changed").ok) return { type: "blocked" };
-    created = true;
-    branch = name;
+    saved.created = true;
+    saved.branch = name;
     if (!repository.setup.every(command => work.check(command, "setup"))) return withdraw("setup failed on the delivered commit");
     if (pending() !== "" || git(worktree, "rev-parse", "HEAD") !== tip
-      || run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${branch}`) {
+      || run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${saved.branch}`) {
       return withdraw("setup changed tracked or unignored files, HEAD, or the ticket branch");
     }
-    baseCommit = parent;
-    commitHash = taken = tip;
-    firstApproved = { baseCommit, commit: tip };
-    untested = true;
+    saved.baseCommit = parent;
+    saved.commitHash = saved.taken = tip;
+    saved.firstApproved = { baseCommit: saved.baseCommit, commit: tip };
+    saved.untested = true;
     return { type: "redeliver" };
   }
 
   /** A refusal after recreation removes only the worktree this run made, retaining the recorded delivery. */
   function withdraw(why: string): Event {
-    commitHash = "";
-    untested = false;
+    saved.commitHash = "";
+    saved.untested = false;
     if (!attempt("git", ["worktree", "remove", "--force", worktree], repository.path, undefined,
       `Cannot resume: ${why}; the recreated worktree could not be removed`).ok) return { type: "blocked" };
-    removed = true;
+    saved.removed = true;
     return work.block(`Cannot resume: ${why}; the recreated worktree was removed.`);
   }
 
   function commit(): Event {
-    if (git(worktree, "rev-parse", "HEAD") !== baseCommit || run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${branch}`) {
-      return work.block(`An Agent committed or moved HEAD or ${branch} itself; only this workflow commits. Nothing was delivered.`);
+    if (git(worktree, "rev-parse", "HEAD") !== saved.baseCommit || run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${saved.branch}`) {
+      return work.block(`An Agent committed or moved HEAD or ${saved.branch} itself; only this workflow commits. Nothing was delivered.`);
     }
     if (!work.accept()) return { type: "blocked" };
     // Unstaging afterwards also drops run evidence an Agent staged by force; an exclude pathspec fails outright on an ignored .machine-runs.
@@ -333,45 +337,45 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (!attempt("git", ["commit", "--quiet", "-m", ticket.title, "-m", `Ticket: ${ticket.id}`], worktree).ok) return { type: "blocked" };
     // Commit hooks run, but only the approved tree under the ticket's own message may be delivered.
     const [origin, subject, ...body] = git(worktree, "log", "-1", "--no-show-signature", "--format=%T %P%n%s%n%b").split("\n");
-    if (origin !== `${tree} ${baseCommit}` || pending() !== "" || subject !== ticket.title || !body.some(line => flat(line) === flat(`Ticket: ${ticket.id}`))) {
-      return work.block(`A commit hook or Git configuration changed the approved candidate or its commit message; ${branch} holds that unapproved commit and nothing was delivered.`);
+    if (origin !== `${tree} ${saved.baseCommit}` || pending() !== "" || subject !== ticket.title || !body.some(line => flat(line) === flat(`Ticket: ${ticket.id}`))) {
+      return work.block(`A commit hook or Git configuration changed the approved candidate or its commit message; ${saved.branch} holds that unapproved commit and nothing was delivered.`);
     }
     const head = git(worktree, "rev-parse", "HEAD");
     // A hook can also detach HEAD or reset the branch; the ticket branch itself must hold the approved commit.
-    if (run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${branch}` || git(repository.path, "rev-parse", `refs/heads/${branch}`) !== head) {
-      return work.block(`A commit hook or Git configuration moved HEAD or ${branch} away from the approved commit; nothing was delivered.`);
+    if (run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${saved.branch}` || git(repository.path, "rev-parse", `refs/heads/${saved.branch}`) !== head) {
+      return work.block(`A commit hook or Git configuration moved HEAD or ${saved.branch} away from the approved commit; nothing was delivered.`);
     }
-    commitHash = head;
-    firstApproved ??= { baseCommit, commit: head };
+    saved.commitHash = head;
+    saved.firstApproved ??= { baseCommit: saved.baseCommit, commit: head };
     return { type: "committed" };
   }
 
   /** Every new stop or return to an Agent leaves an uncommitted candidate on the ticket's own branch. */
   function undo(onto: string): void {
-    if (run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${branch}`) {
-      git(worktree, "symbolic-ref", "HEAD", `refs/heads/${branch}`);
+    if (run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${saved.branch}`) {
+      git(worktree, "symbolic-ref", "HEAD", `refs/heads/${saved.branch}`);
     }
     git(worktree, "reset", "--quiet", "--mixed", onto);
-    commitHash = "";
-    untested = false;
-    baseCommit = onto;
+    saved.commitHash = "";
+    saved.untested = false;
+    saved.baseCommit = onto;
     work.reopen();
   }
 
   function rebase(): Event {
     const resolved = run("git", ["rev-parse", "--verify", "--quiet", `${repository.base ?? "HEAD"}^{commit}`], repository.path);
-    if (!resolved.ok || resolved.stdout === baseCommit) {
-      if (untested) {
+    if (!resolved.ok || resolved.stdout === saved.baseCommit) {
+      if (saved.untested) {
         if (!resolved.ok) return withdraw("the current base no longer resolves");
         if (work.checks().type !== "passed" || !work.accept()) return withdraw("verification gates failed on the delivered commit");
-        untested = false;
-        redelivered = true;
+        saved.untested = false;
+        saved.redelivered = true;
       }
       return { type: "current" };
     }
     const tip = resolved.stdout;
-    const original = baseCommit;
-    const approved = commitHash;
+    const original = saved.baseCommit;
+    const approved = saved.commitHash;
     let cleanupFailure = "";
     const stop = (reason: string): Event => {
       work.block(reason + (cleanupFailure ? ` Cleaning leftovers failed, so some may reappear on resume; inspect ${cleanupFailure}.` : ""));
@@ -382,7 +386,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       const done = run("git", args, cwd, timeout);
       let log = "";
       if (!done.ok) {
-        log = join(work.open(), `rebase-${++rebaseSteps}-${args[0]}.log`);
+        log = join(work.open(), `rebase-${++saved.rebaseSteps}-${args[0]}.log`);
         writeFileSync(log, `git ${args.join(" ")}\n${done.stdout}\n${done.detail}\n`, { flag: "wx", mode: 0o600 });
       }
       return { ...done, log };
@@ -392,8 +396,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         git(worktree, "rebase", "--abort");
       }
       // A hook may have detached HEAD or switched branches. Reattach only this ticket's branch before resetting it.
-      if (run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${branch}`) {
-        git(worktree, "symbolic-ref", "HEAD", `refs/heads/${branch}`);
+      if (run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${saved.branch}`) {
+        git(worktree, "symbolic-ref", "HEAD", `refs/heads/${saved.branch}`);
       }
       if (git(worktree, "rev-parse", "HEAD") !== approved || pending() !== "") git(worktree, "reset", "--hard", approved);
       // The approved tree was clean: remove later outputs under its ignore rules before making the candidate untracked.
@@ -406,22 +410,22 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       return work.block(`Base ${original} was rewritten or moved back to ${tip}; the ticket must be delivered by hand.`);
     }
     if (repository.output === "pr") {
-      const ref = `refs/heads/${checkedBase}`;
-      const listed = step(["ls-remote", checked, ref], repository.path, publishTimeoutMs);
+      const ref = `refs/heads/${saved.checkedBase}`;
+      const listed = step(["ls-remote", saved.checked, ref], repository.path, publishTimeoutMs);
       const remoteTip = listed.stdout.split("\n").map(line => line.split("\t"))
         .find(([id, at]) => at === ref && /^[0-9a-f]{40,64}$/u.test(id ?? ""))?.[0];
       const available = listed.ok && remoteTip && (run("git", ["cat-file", "-e", `${remoteTip}^{commit}`], repository.path).ok
-        || step(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", checked, remoteTip], repository.path, publishTimeoutMs).ok);
+        || step(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", saved.checked, remoteTip], repository.path, publishTimeoutMs).ok);
       if (!available || !run("git", ["merge-base", "--is-ancestor", tip, remoteTip!], repository.path).ok) {
         undo(original);
-        return stop(`Base ${tip} cannot be shown to be published on ${checkedBase} at ${checked}; the base must be pushed first. Inspect any rebase logs in ${work.open()}.`);
+        return stop(`Base ${tip} cannot be shown to be published on ${saved.checkedBase} at ${saved.checked}; the base must be pushed first. Inspect any rebase logs in ${work.open()}.`);
       }
     }
     const patchId = (commit: string) => {
       const diff = step(["diff-tree", "-p", "--no-ext-diff", "--no-textconv", `${commit}^`, commit]);
       if (!diff.ok) return "";
       // Retain both patches as evidence and feed Git a file descriptor, without a shell pipeline.
-      const patch = join(work.open(), `rebase-${++rebaseSteps}.patch`);
+      const patch = join(work.open(), `rebase-${++saved.rebaseSteps}.patch`);
       writeFileSync(patch, diff.stdout + "\n", { flag: "wx", mode: 0o600 });
       const fd = openSync(patch, "r");
       try {
@@ -454,18 +458,18 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const [parents, subject, ...body] = git(worktree, "log", "-1", "--no-show-signature", "--format=%P%n%s%n%b").split("\n");
     const after = patchId(head);
     if (count !== "1" || parents !== tip || subject !== ticket.title || !body.some(line => flat(line) === flat(`Ticket: ${ticket.id}`))
-      || pending() !== "" || !after || run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${branch}`) {
+      || pending() !== "" || !after || run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${saved.branch}`) {
       restore();
-      return stop(`Replay onto ${tip} did not leave exactly one clean ticket commit on ${branch} with the expected parent, subject, Ticket line, and patch id; the approved candidate was restored uncommitted on ${original}.`);
+      return stop(`Replay onto ${tip} did not leave exactly one clean ticket commit on ${saved.branch} with the expected parent, subject, Ticket line, and patch id; the approved candidate was restored uncommitted on ${original}.`);
     }
-    rebasedFrom ??= firstApproved;
+    saved.rebasedFrom ??= saved.firstApproved;
     const undoOnTip = (why: string): Event | undefined => {
       // Only added paths become untracked after a mixed reset; modified and deleted paths stay tracked.
       const restoreAndStop = (reason: string) => {
         restore();
         return stop(`${reason} Undo onto ${tip} was needed because ${why}. The approved candidate is uncommitted on its original base ${original}; resume alone will stop again until the candidate or ignore rules are reconciled.`);
       };
-      const paths = join(work.open(), `rebase-${++rebaseSteps}.paths`);
+      const paths = join(work.open(), `rebase-${++saved.rebaseSteps}.paths`);
       // Keep raw output: run() trims whitespace, which can be part of the first filename.
       const added = spawnSync("git", ["diff-tree", "-r", "--no-renames", "--diff-filter=A", "--name-only", "-z", tip, head], {
         cwd: worktree, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", timeout: 30_000, killSignal: "SIGKILL", maxBuffer: 8 * 1024 * 1024,
@@ -499,7 +503,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     // Setup sees a committed, clean tree as it does in prepare, so unignored outputs cannot hide among candidate changes.
     for (const command of repository.setup) {
       const passed = work.check(command, "setup");
-      if (git(worktree, "rev-parse", "HEAD") !== head || run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${branch}`) {
+      if (git(worktree, "rev-parse", "HEAD") !== head || run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${saved.branch}`) {
         restore();
         work.reopen(true);
         return stop(`setup: ${command.name} moved HEAD or the ticket branch on base ${tip}; the approved candidate was restored uncommitted on ${original}.`);
@@ -508,27 +512,27 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         const stopped = undoOnTip(`setup: ${command.name} ${passed ? "changed tracked or unignored files" : "failed"}`);
         work.reopen(true);
         if (stopped) return stopped;
-        reviewsFrom = reviews.length;
+        saved.reviewsFrom = saved.reviews.length;
         return stop(`setup: ${command.name} ${passed ? "changed tracked or unignored files" : "failed"} on base ${tip}; inspect its setup log in ${work.open()}.`);
       }
     }
     if (before !== after) {
       const stopped = undoOnTip("the replayed patch differs from the approved patch");
       if (stopped) return stopped;
-      reviewsFrom = reviews.length;
+      saved.reviewsFrom = saved.reviews.length;
       work.block(`Base moved from ${original} to ${tip} and the replayed patch differs from the approved patch; verify and review this candidate again.`);
       return { type: "review" };
     }
-    if (work.checks(untested ? "verify" : "reverify").type !== "passed" || (untested && !work.accept())) {
+    if (work.checks(saved.untested ? "verify" : "reverify").type !== "passed" || (saved.untested && !work.accept())) {
       const stopped = undoOnTip("reverify gates failed");
       work.reopen(true);
       if (stopped) return stopped;
-      reviewsFrom = reviews.length;
+      saved.reviewsFrom = saved.reviews.length;
       return { type: "failed" };
     }
-    commitHash = head;
-    baseCommit = tip;
-    untested = false;
+    saved.commitHash = head;
+    saved.baseCommit = tip;
+    saved.untested = false;
     return { type: "rebased" };
   }
 
@@ -544,59 +548,59 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   function deliver(): Event {
     const directory = work.open();
     if (repository.output === "patch") {
-      const made = attempt("git", ["format-patch", "--output-directory", directory, `${baseCommit}..HEAD`], worktree);
+      const made = attempt("git", ["format-patch", "--output-directory", directory, `${saved.baseCommit}..HEAD`], worktree);
       if (!made.ok) return { type: "blocked" };
-      patches = made.stdout.split("\n").filter(Boolean);
+      saved.patches = made.stdout.split("\n").filter(Boolean);
     }
     if (repository.output === "pr") {
       // gh must open the pull request in the repository the push went to, whatever GH_REPO or other remotes say.
-      const hosted = hostedRepository(checked);
-      if (!hosted) return work.block(`Remote ${repository.remote} does not name a hosted owner/repository, so a pull request cannot be opened there; ${branch} was not pushed.`);
+      const hosted = hostedRepository(saved.checked);
+      if (!hosted) return work.block(`Remote ${repository.remote} does not name a hosted owner/repository, so a pull request cannot be opened there; ${saved.branch} was not pushed.`);
       // The only ref ever pushed is this run's own branch at the approved commit, without force and whatever push.followTags says.
       // It goes to the URL prepare checked, read once: a remote reconfigured since then, as an Agent can do, is not asked again.
-      if (!attempt("git", ["push", "--no-follow-tags", checked, `${commitHash}:refs/heads/${branch}`], worktree, publishTimeoutMs).ok) return { type: "blocked" };
+      if (!attempt("git", ["push", "--no-follow-tags", saved.checked, `${saved.commitHash}:refs/heads/${saved.branch}`], worktree, publishTimeoutMs).ok) return { type: "blocked" };
       const body = join(directory, "pull-request.md");
       writeFileSync(body, [
         ticket.title,
         ...(ticket.summary ? ["## Summary", ticket.summary] : []),
-        ...(assumptions.length ? ["## Assumptions", assumptions.map(({ question, answer, why }) => `- ${flat(question)} Assumed: ${flat(answer)} (${flat(why)})`).join("\n")] : []),
+        ...(saved.assumptions.length ? ["## Assumptions", saved.assumptions.map(({ question, answer, why }) => `- ${flat(question)} Assumed: ${flat(answer)} (${flat(why)})`).join("\n")] : []),
         "## Checks", repository.checks.map(name => `- ${name}: passed`).join("\n"),
         // The helper has already taken the summary out of a JSON report; one that is still an object is evidence, not text for a reader.
-        "## Review", jsonObject(reviewSummary) ? "The reviewer approved this change without a written summary; its report is kept with the run evidence." : reviewSummary,
-        ...(reviewNotes.length ? ["## Review notes", reviewNotes.map(note => `- ${flat(note.text)}${flat(note.where) ? ` (${flat(note.where)})` : ""}`).join("\n")] : []),
+        "## Review", jsonObject(saved.reviewSummary) ? "The reviewer approved this change without a written summary; its report is kept with the run evidence." : saved.reviewSummary,
+        ...(saved.reviewNotes.length ? ["## Review notes", saved.reviewNotes.map(note => `- ${flat(note.text)}${flat(note.where) ? ` (${flat(note.where)})` : ""}`).join("\n")] : []),
         `Ticket: ${ticket.id}`,
       ].join("\n\n") + "\n", { flag: "wx", mode: 0o600 });
       // The base is always named, and is the one prepare compared with the remote, not one read again from refs or configuration that may have changed since.
-      const opened = attempt("gh", ["pr", "create", "--repo", hosted, ...(repository.draft ? ["--draft"] : []), "--base", checkedBase,
-        "--head", branch, "--title", ticket.title, "--body-file", body], worktree, publishTimeoutMs);
+      const opened = attempt("gh", ["pr", "create", "--repo", hosted, ...(repository.draft ? ["--draft"] : []), "--base", saved.checkedBase,
+        "--head", saved.branch, "--title", ticket.title, "--body-file", body], worktree, publishTimeoutMs);
       if (!opened.ok) return { type: "blocked" };
-      prUrl = opened.stdout.split(/\s+/u).findLast(word => /^https?:\/\/\S+$/u.test(word)) ?? "";
-      if (!prUrl) return work.block(`gh pr create printed no pull request URL; inspect ${branch} on ${repository.remote}.`);
+      saved.prUrl = opened.stdout.split(/\s+/u).findLast(word => /^https?:\/\/\S+$/u.test(word)) ?? "";
+      if (!saved.prUrl) return work.block(`gh pr create printed no pull request URL; inspect ${saved.branch} on ${repository.remote}.`);
     }
-    if (!attempt("git", ["config", "--local", `branch.${branch}.ticketDelivered`, commitHash], repository.path).ok) return { type: "blocked" };
+    if (!attempt("git", ["config", "--local", `branch.${saved.branch}.ticketDelivered`, saved.commitHash], repository.path).ok) return { type: "blocked" };
     return { type: "delivered" };
   }
 
   /** Where an archive keeps the candidate: this run's branch name with archive/ in place of ticket/. */
-  const archiveBranch = () => `archive/${branch.slice("ticket/".length)}`;
+  const archiveBranch = () => `archive/${saved.branch.slice("ticket/".length)}`;
   const standing = () => {
     const { reason, repairs, totalRepairs, maxRepairs, reviewRounds, totalReviewRounds, maxReviewRounds } = work.status();
     return [
-      `Ticket ${ticket.id}: ${ticket.title}. Stopped in ${stoppedIn}.`,
+      `Ticket ${ticket.id}: ${ticket.title}. Stopped in ${saved.stoppedIn}.`,
       `This run is stuck and needs a decision: ${reason}\n`,
       `Repair rounds used: ${repairs} of ${maxRepairs}${totalRepairs > repairs ? ` in this budget, ${totalRepairs} in all` : ""}.`,
       `Review rounds used: ${reviewRounds} of ${maxReviewRounds}${totalReviewRounds > reviewRounds ? ` in this budget, ${totalReviewRounds} in all` : ""}.`,
     ].join("\n");
   };
-  const locations = () => [`Worktree: ${worktree}`, `Branch: ${branch}`, `Evidence: ${work.open()}`];
+  const locations = () => [`Worktree: ${worktree}`, `Branch: ${saved.branch}`, `Evidence: ${work.open()}`];
   const stuckPrompt = () => brief({
     decision: `Ticket ${ticket.id} is stuck: choose how to go on`, standing: standing(), evidence: locations(),
     options: [
-      { name: "more rounds", does: repairing === "falsify" || repairing === "plan" || repairing === "planReview"
-        ? `restart the repair budget and return to ${repairing} with the standing feedback.`
-        : `restart the repair budget and send the standing findings back to the ${repairing === "test" ? "tester" : "implementer"}.` },
+      { name: "more rounds", does: saved.repairing === "falsify" || saved.repairing === "plan" || saved.repairing === "planReview"
+        ? `restart the repair budget and return to ${saved.repairing} with the standing feedback.`
+        : `restart the repair budget and send the standing findings back to the ${saved.repairing === "test" ? "tester" : "implementer"}.` },
       { name: "hand off", does: "stop here and keep the worktree and branch exactly as they are, with nothing committed, for another workflow or a person.", recommended: true },
-      { name: "archive", does: `commit the candidate as delivery would have and keep that commit as the branch ${archiveBranch()}, then remove the worktree and delete ${branch}. Ignored files are not kept.` },
+      { name: "archive", does: `commit the candidate as delivery would have and keep that commit as the branch ${archiveBranch()}, then remove the worktree and delete ${saved.branch}. Ignored files are not kept.` },
       { name: "discard", does: "remove the worktree and delete the branch without saving the candidate; asks for confirmation first." },
     ],
   });
@@ -605,22 +609,22 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     standing: `${standing()}\nThe candidate will not be saved: no archive branch is made, and its uncommitted and committed work on that branch is lost.`,
     evidence: locations(),
     options: [
-      { name: "confirm discard", does: `remove the worktree ${worktree} and delete the branch ${branch} in ${repository.path}.` },
+      { name: "confirm discard", does: `remove the worktree ${worktree} and delete the branch ${saved.branch} in ${repository.path}.` },
       { name: "go back", does: "return to the decision with the candidate kept." },
     ],
   });
   const parkNext = "Add the answer to the ticket body, then run the ticket again with resume: true; the run continues from the kept worktree with fresh budgets.";
-  const questionCount = () => `${ownerQuestions!.length} open question${ownerQuestions!.length === 1 ? "" : "s"}`;
+  const questionCount = () => `${saved.ownerQuestions!.length} open question${saved.ownerQuestions!.length === 1 ? "" : "s"}`;
   const questionText = (question: { text: string; where: string }, cap = Infinity) => {
     const where = flat(question.where);
     return `${capped(question.text, cap)}${where ? ` (${where})` : ""}`;
   };
-  const questionLines = (cap?: number) => ownerQuestions!.map((question, index) => {
+  const questionLines = (cap?: number) => saved.ownerQuestions!.map((question, index) => {
     const options = question.options ? ` Options: ${[`${capped(question.recommended!, cap)} (recommended)`, ...question.options.filter(option => option !== question.recommended).map(option => capped(option, cap))].join("; ")} Why: ${capped(question.why!, cap)}` : "";
     return `${index + 1}. ${questionText(question, cap)}${options}`;
   }).join("\n");
-  const wouldAssumeLines = (cap?: number) => wouldAssume.length
-    ? `\nHad these been the only questions, the run would have assumed:\n${wouldAssume.map(question => `- ${capped(question.text, cap)} → ${capped(question.recommended, cap)}`).join("\n")}` : "";
+  const wouldAssumeLines = (cap?: number) => saved.wouldAssume.length
+    ? `\nHad these been the only questions, the run would have assumed:\n${saved.wouldAssume.map(question => `- ${capped(question.text, cap)} → ${capped(question.recommended, cap)}`).join("\n")}` : "";
   function parkDetails() {
     const { reason, repairs, maxRepairs, reviewRounds, maxReviewRounds } = work.status();
     // Ask for one owner response while preserving the actual question or criterion as context.
@@ -628,17 +632,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const needs = /^(Repair|Review) budget exhausted/u.test(why)
       ? `Explain how to resolve the remaining findings: ${why}`
       : `Clarify how to resolve this blocker: ${why}`;
-    return { needs: ownerQuestions
-      ? `Answer the open question${ownerQuestions.length === 1 ? "" : "s"}:\n${questionLines(600)}${wouldAssumeLines(600)}`
+    return { needs: saved.ownerQuestions
+      ? `Answer the open question${saved.ownerQuestions.length === 1 ? "" : "s"}:\n${questionLines(600)}${wouldAssumeLines(600)}`
       : needs.replace(/^(.{600}).+$/u, "$1…"),
-      ...(ownerQuestions ? { questions: ownerQuestions.map(({ text, where }) => ({ text, where })) } : {}), next: parkNext,
+      ...(saved.ownerQuestions ? { questions: saved.ownerQuestions.map(({ text, where }) => ({ text, where })) } : {}), next: parkNext,
       budgets: { repairs: { used: repairs, max: maxRepairs }, reviewRounds: { used: reviewRounds, max: maxReviewRounds } } };
   }
   const parkNote = () => brief({
     decision: `Ticket ${ticket.id} is parked: answer what is needed`, standing: standing(),
     needs: parkDetails().needs, evidence: locations(), options: [{ name: "resume", does: parkNext, recommended: true }],
   });
-  const stopped = (state: string, run: () => Event) => () => { stoppedIn = state; return run(); };
+  const stopped = (state: string, run: () => Event) => () => { saved.stoppedIn = state; return run(); };
 
   /** Saves what delivery would have committed as a commit on a branch of its own, which outlives the worktree and the ticket branch. */
   function archive(): Event {
@@ -655,7 +659,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const parent = head();
     if (run("git", ["diff", "--cached", "--quiet"], worktree).ok) {
       // Removal without anything saved belongs to a confirmed discard alone. Commits an Agent made on the branch are a candidate, archived as they are.
-      if (parent === baseCommit) return work.block(`${failure}: the candidate does not differ from its base commit ${baseCommit}, so there is nothing to archive; discard removes it.`);
+      if (parent === saved.baseCommit) return work.block(`${failure}: the candidate does not differ from its base commit ${saved.baseCommit}, so there is nothing to archive; discard removes it.`);
     } else {
       const tree = git(worktree, "write-tree"); const title = `Archive: ${ticket.title}`;
       if (!attempt("git", ["commit", "--quiet", "--no-verify", "-m", title, "-m", `Ticket: ${ticket.id}`], worktree, undefined, failure).ok) return { type: "blocked" };
@@ -673,68 +677,68 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (pending() !== "") return work.block(`${failure}: the worktree is not clean after the archive commit, so ${name} would not hold all of the candidate.`);
     const commit = head();
     if (!attempt("git", ["branch", name, commit], worktree, undefined, failure).ok) return { type: "blocked" };
-    archived = { branch: name, commit };
+    saved.archived = { branch: name, commit };
     return { type: "archived" };
   }
 
   /** Removes this run's own worktree and branch, and nothing else, once the candidate is archived or a Human confirmed losing it. */
   function remove(): Event {
-    if (!archived && !discardConfirmed) throw new Error("The worktree and branch are removed only after an archive or a confirmed discard");
+    if (!saved.archived && !saved.discardConfirmed) throw new Error("The worktree and branch are removed only after an archive or a confirmed discard");
     work.retire();
     if (!attempt("git", ["worktree", "remove", "--force", worktree], repository.path).ok) return { type: "blocked" };
-    removed = true;
-    if (!attempt("git", ["branch", "-D", branch], repository.path).ok) return { type: "blocked" };
+    saved.removed = true;
+    if (!attempt("git", ["branch", "-D", saved.branch], repository.path).ok) return { type: "blocked" };
     return { type: "removed" };
   }
 
   function conclude(wanted: "completed" | "blocked" | "handed-off" | "abandoned" | "parked"): Event {
-    const result = `${branch} at ${commitHash}${prUrl ? `, pull request ${prUrl}` : ""}${patches.length ? `, patch ${patches.join(", ")}` : ""}`;
+    const result = `${saved.branch} at ${saved.commitHash}${saved.prUrl ? `, pull request ${saved.prUrl}` : ""}${saved.patches.length ? `, patch ${saved.patches.join(", ")}` : ""}`;
     // The branch outlives the worktree; a blocked run keeps both for inspection, and a worktree that stays behind is not a delivery.
     if (wanted === "completed") {
-      removed = attempt("git", ["worktree", "remove", worktree], repository.path, undefined,
+      saved.removed = attempt("git", ["worktree", "remove", worktree], repository.path, undefined,
         `The worktree could not be removed after delivering ${result}`).ok;
     }
     // A kept worktree the helper cannot fingerprint any more, as with a nested repository, still gets its ending recorded.
     work.retire();
     // The helper's receipt knows completed and blocked; delivery.json carries what a Human decided.
-    const finished = work.finish(wanted === "completed" && removed ? "completed" : "blocked").type === "completed";
+    const finished = work.finish(wanted === "completed" && saved.removed ? "completed" : "blocked").type === "completed";
     const outcome = finished ? "delivered" : wanted === "completed" ? "blocked" : wanted;
     const directory = work.open();
     const reason = finished ? "" : String(work.output()?.reason);
     writeFileSync(join(directory, "delivery.json"), JSON.stringify({
-      schemaVersion: 1, outcome, ...(finished ? {} : { reason }), ...(decision ? { decision } : {}),
+      schemaVersion: 1, outcome, ...(finished ? {} : { reason }), ...(saved.decision ? { decision: saved.decision } : {}),
       ...(outcome === "parked" ? { park: parkDetails() } : {}),
-      ticket: ticket.id, repository: { name: repository.name, path: repository.path }, branch,
-      baseCommit: baseCommit || null, commit: commitHash || null, output: repository.output,
-      ...(rebasedFrom ? { rebasedFrom } : {}),
-      ...(finished && redelivered ? { redelivered: true } : {}),
-      ...(assumptions.length ? { assumptions } : {}),
-      ...(prUrl ? { prUrl } : {}), ...(patches.length ? { patches } : {}), ...(archived ? { archive: archived } : {}),
-      worktree, ...(adopted ? { resumed: true } : {}), worktreeCreated: created, worktreeRemoved: removed, reviewNotes,
+      ticket: ticket.id, repository: { name: repository.name, path: repository.path }, branch: saved.branch,
+      baseCommit: saved.baseCommit || null, commit: saved.commitHash || null, output: repository.output,
+      ...(saved.rebasedFrom ? { rebasedFrom: saved.rebasedFrom } : {}),
+      ...(finished && saved.redelivered ? { redelivered: true } : {}),
+      ...(saved.assumptions.length ? { assumptions: saved.assumptions } : {}),
+      ...(saved.prUrl ? { prUrl: saved.prUrl } : {}), ...(saved.patches.length ? { patches: saved.patches } : {}), ...(saved.archived ? { archive: saved.archived } : {}),
+      worktree, ...(saved.adopted ? { resumed: true } : {}), worktreeCreated: saved.created, worktreeRemoved: saved.removed, reviewNotes: saved.reviewNotes,
     }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     const reasonBrief = flat(reason).replace(/^(.{600}).+$/u, "$1…").replace(/[^.!?…]$/u, "$&.");
-    const needsBrief = ownerQuestions ? `${questionCount()}; the first: ${questionText(ownerQuestions[0]!, 600)}` : flat(parkDetails().needs);
-    held = { action: "hold", summary: [
-      { delivered: `Delivered ${result}.`, blocked: `Blocked: ${reasonBrief}`, "handed-off": `Handed off on ${branch}: ${reasonBrief}`, abandoned: `Abandoned: ${reasonBrief}`, parked: `Parked on ${branch}: ${firstLine(parkNote())} Needs: ${needsBrief}` }[outcome],
-      ...(finished && taken ? [redelivered ? "The base has not moved, so the same commit was delivered again unchanged."
-        : `The delivered commit ${taken} was replayed onto the new base ${baseCommit}.`] : []),
-      ...(decision ? [`Decision: ${decision}.`] : []),
-      ...(archived ? [`Candidate archived on ${archived.branch} at ${archived.commit}.`] : []),
-      ...(outcome === "abandoned" ? [`Worktree and ${branch} removed${archived ? "" : " without saving the candidate"}.`] : []),
-      ...((created || adopted) && !removed ? [`Worktree kept at ${worktree}.`] : []),
+    const needsBrief = saved.ownerQuestions ? `${questionCount()}; the first: ${questionText(saved.ownerQuestions[0]!, 600)}` : flat(parkDetails().needs);
+    saved.held = { action: "hold", summary: [
+      { delivered: `Delivered ${result}.`, blocked: `Blocked: ${reasonBrief}`, "handed-off": `Handed off on ${saved.branch}: ${reasonBrief}`, abandoned: `Abandoned: ${reasonBrief}`, parked: `Parked on ${saved.branch}: ${firstLine(parkNote())} Needs: ${needsBrief}` }[outcome],
+      ...(finished && saved.taken ? [saved.redelivered ? "The base has not moved, so the same commit was delivered again unchanged."
+        : `The delivered commit ${saved.taken} was replayed onto the new base ${saved.baseCommit}.`] : []),
+      ...(saved.decision ? [`Decision: ${saved.decision}.`] : []),
+      ...(saved.archived ? [`Candidate archived on ${saved.archived.branch} at ${saved.archived.commit}.`] : []),
+      ...(outcome === "abandoned" ? [`Worktree and ${saved.branch} removed${saved.archived ? "" : " without saving the candidate"}.`] : []),
+      ...((saved.created || saved.adopted) && !saved.removed ? [`Worktree kept at ${worktree}.`] : []),
       `Evidence: ${directory}`,
     ].join(" ") };
     return { type: outcome === "handed-off" ? "handedOff" : outcome };
   }
 
-  const record = (stage: string) => ({ event }: { event: Event }) => { stoppedIn = stage; work.capture(stage, event); };
-  const rememberPlanning = ({ event }: { event: Event }) => { planningReport = event; };
+  const record = (stage: string) => ({ event }: { event: Event }) => { saved.stoppedIn = stage; work.capture(stage, event); };
+  const rememberPlanning = ({ event }: { event: Event }) => { saved.planningReport = event; };
   /** Keep the raw report even if its summary is refused; guards and validation run only after capture. */
   function keep(stage: PlanningStage): { summary: string } | { refusal: string } {
-    repairing = stage;
-    writeFileSync(join(work.open(), `${stage}-${++planningReports[stage]}.json`), JSON.stringify(planningReport, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    saved.repairing = stage;
+    writeFileSync(join(work.open(), `${stage}-${++saved.planningReports[stage]}.json`), JSON.stringify(saved.planningReport, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     try {
-      return { summary: work.capture(stage, planningReport) };
+      return { summary: work.capture(stage, saved.planningReport) };
     } catch (error) {
       if (error instanceof Error && error.message.startsWith(`Agent ${stage} must return a non-empty summary`)) return { refusal: error.message };
       throw error;
@@ -748,79 +752,79 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     // Even a malformed report replaces the earlier plan's assumptions with none.
     try { rmSync(file, { force: true }); }
     catch (error) { return work.block(`Cannot delete saved assumptions ${file}: ${String(error)}`); }
-    assumptions = [];
-    assumptionsJson = "";
+    saved.assumptions = [];
+    saved.assumptionsJson = "";
     if (work.unchanged().type === "changed") return { type: "blocked" };
     if ("refusal" in kept) return work.block(kept.refusal);
-    const event = planningReport;
+    const event = saved.planningReport;
     if (event.type === "sound") {
-      questionsFault = "";
+      saved.questionsFault = "";
       work.block("");
       return { type: "sound" };
     }
     const malformed = questionField(event.questions);
-    questionsFault = malformed ?? "";
+    saved.questionsFault = malformed ?? "";
     if (malformed) {
-      if (!questionsReturned) {
-        questionsReturned = true;
+      if (!saved.questionsReturned) {
+        saved.questionsReturned = true;
         return { type: "reask" };
       }
-      return work.block(`The falsify report's questions were missing or malformed twice: ${malformed}. The report is kept in ${join(work.open(), `falsify-${planningReports.falsify}.json`)}.`);
+      return work.block(`The falsify report's questions were missing or malformed twice: ${malformed}. The report is kept in ${join(work.open(), `falsify-${saved.planningReports.falsify}.json`)}.`);
     }
     const questions = event.questions as FalsifyQuestion[];
     const open = assume ? questions.filter(question => !question.assumable) : questions;
     if (!open.length) {
-      assumptions = questions.map(({ text, recommended, options, why }) => ({ question: text, answer: recommended, options, why }));
-      assumptionsJson = JSON.stringify(assumptions, null, 2) + "\n";
-      try { writeFileSync(file, assumptionsJson, { flag: "wx", mode: 0o600 }); }
+      saved.assumptions = questions.map(({ text, recommended, options, why }) => ({ question: text, answer: recommended, options, why }));
+      saved.assumptionsJson = JSON.stringify(saved.assumptions, null, 2) + "\n";
+      try { writeFileSync(file, saved.assumptionsJson, { flag: "wx", mode: 0o600 }); }
       catch (error) { return work.block(`Cannot write saved assumptions ${file}: ${String(error)}`); }
-      writeFileSync(join(work.open(), "assumptions.json"), assumptionsJson, { flag: "wx", mode: 0o600 });
+      writeFileSync(join(work.open(), "assumptions.json"), saved.assumptionsJson, { flag: "wx", mode: 0o600 });
       work.block("");
       return { type: "assumed" };
     }
-    ownerQuestions = open.map(({ text, options, recommended, why }) => ({ text, where: "", options, recommended, why }));
-    wouldAssume = assume ? questions.filter(question => question.assumable) : [];
+    saved.ownerQuestions = open.map(({ text, options, recommended, why }) => ({ text, where: "", options, recommended, why }));
+    saved.wouldAssume = assume ? questions.filter(question => question.assumable) : [];
     return work.block(`Ticket owner must settle ${questionCount()}:\n${questionLines()}${wouldAssumeLines()}`);
   }
   function planResult(): Event {
     const kept = keep("plan");
-    overLimit = 0;
+    saved.overLimit = 0;
     if (work.unchanged().type === "changed") return { type: "blocked" };
     if ("refusal" in kept) return work.block(kept.refusal);
     if (kept.summary.length > planLimit) {
-      if (!lengthReturned) {
-        lengthReturned = true;
-        overLimit = kept.summary.length;
+      if (!saved.lengthReturned) {
+        saved.lengthReturned = true;
+        saved.overLimit = kept.summary.length;
         return { type: "shorten" };
       }
       return work.block(`The plan was ${kept.summary.length} characters against a limit of ${planLimit} after being sent back once to be shortened. A ticket whose plan does not fit may be too broad for one run.`);
     }
-    plan = kept.summary;
+    saved.plan = kept.summary;
     return { type: "planned" };
   }
   function planReviewResult(): Event {
     const kept = keep("planReview");
     if (work.unchanged().type === "changed") return { type: "blocked" };
     if ("refusal" in kept) return work.block(kept.refusal);
-    if (planningReport.type === "approved") {
-      repairing = "change";
+    if (saved.planningReport.type === "approved") {
+      saved.repairing = "change";
       work.block("");
       return { type: "approved" };
     }
-    if (planRevisions++ === 0) return { type: "revise" };
-    repairing = "plan";
+    if (saved.planRevisions++ === 0) return { type: "revise" };
+    saved.repairing = "plan";
     return work.block(kept.summary);
   }
   const recordReview = ({ event }: { event: Event }) => {
-    reviewSummary = work.capture("review", event);
-    reviews.push(event);
-    writeFileSync(join(work.open(), `review-${reviews.length}.json`), JSON.stringify(event, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    saved.reviewSummary = work.capture("review", event);
+    saved.reviews.push(event);
+    writeFileSync(join(work.open(), `review-${saved.reviews.length}.json`), JSON.stringify(event, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     // Keep well-formed minor notes even when another part of this round's report blocks delivery.
     if (Array.isArray(event.findings)) for (const finding of event.findings) {
       if (finding?.severity === "minor" && typeof finding.text === "string" && typeof finding.where === "string") {
-        if (!reviewNotes.some(note => note.text.trim().toLowerCase() === finding.text.trim().toLowerCase()
+        if (!saved.reviewNotes.some(note => note.text.trim().toLowerCase() === finding.text.trim().toLowerCase()
           && note.where.trim().toLowerCase() === finding.where.trim().toLowerCase())) {
-          reviewNotes.push({ text: finding.text, where: finding.where });
+          saved.reviewNotes.push({ text: finding.text, where: finding.where });
         }
       }
     }
@@ -828,24 +832,24 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   function reviewResult(): Event {
     // Keep the helper's read-only guard, but judge the report here instead of trusting its event type.
     if (work.unchanged().type === "changed") return { type: "blocked" };
-    const event = reviews.at(-1)!;
-    if (event.type === "blocked") return work.block(reviewSummary);
+    const event = saved.reviews.at(-1)!;
+    if (event.type === "blocked") return work.block(saved.reviewSummary);
     // Even a malformed report can contain useful findings. Keep them apart from the Machine's stop reason.
     const feedback = [
-      reviewSummary,
+      saved.reviewSummary,
       ...(Array.isArray(event.criteria) ? event.criteria.flatMap((criterion, index) => criterion?.met === false && ticket.sections.acceptance[index]
         ? [`Unmet criterion: ${ticket.sections.acceptance[index]}${typeof criterion.evidence === "string" ? ` (${criterion.evidence})` : ""}`] : []) : []),
       ...(Array.isArray(event.findings) ? event.findings.flatMap(finding => (finding?.severity === "blocker" || finding?.severity === "discussion") && typeof finding.text === "string"
         ? [`${finding.severity === "blocker" ? "Blocker" : "Discussion"}: ${finding.text}${typeof finding.where === "string" ? ` (${finding.where})` : ""}`] : []) : []),
     ].join("\n");
-    const stop = (reason: string) => { standingReview = feedback; return work.block(reason); };
+    const stop = (reason: string) => { saved.standingReview = feedback; return work.block(reason); };
     const malformed = reviewField(event, ticket.sections.acceptance);
     if (malformed) return stop(`Malformed review report: ${malformed}.`);
     const report = event as ReviewReport;
     const unmet = report.criteria.flatMap((criterion, index) => criterion.met ? [] : [ticket.sections.acceptance[index]!]);
     const blockers = report.findings.filter(finding => finding.severity === "blocker");
     const discussions = report.findings.filter(finding => finding.severity === "discussion");
-    const previous = reviews.length - 1 > reviewsFrom ? reviews.at(-2) : undefined;
+    const previous = saved.reviews.length - 1 > saved.reviewsFrom ? saved.reviews.at(-2) : undefined;
     const prior = previous && previous.type !== "blocked" && !reviewField(previous, ticket.sections.acceptance) ? previous as ReviewReport : undefined;
     // Decide whether repair is needed first, then whether another repair can make progress.
     if (unmet.length || blockers.length) {
@@ -861,7 +865,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       return { type: "revise" };
     }
     if (discussions.length && prior?.findings.some(finding => finding.severity === "discussion")) {
-      ownerQuestions = discussions.map(({ text, where }) => ({ text, where }));
+      saved.ownerQuestions = discussions.map(({ text, where }) => ({ text, where }));
       return stop(`Ticket owner must settle ${questionCount()}:\n${questionLines()}`);
     }
     if (discussions.length) {
@@ -871,9 +875,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: "approved" };
   }
   const chose = (value: string) => ({ event }: { event: Event }) => event.value === value;
-  const decide = ({ event }: { event: Event }) => { decision = work.choice("decide", event, decisions); };
+  const decide = ({ event }: { event: Event }) => { saved.decision = work.choice("decide", event, decisions); };
   return machine({
-    initial: "shape", output: () => held,
+    initial: "shape", output: () => saved.held ?? undefined,
     states: {
       shape: operation(shape, { prepared: "prepare", blocked: "failure" }),
       // A clean resume starts planning afresh. A resumed candidate is held to Scope; red cannot be proved again once implemented.
@@ -881,7 +885,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       start: operation(work.start, { started: "falsify" }),
       falsify: agent(() => work.prompt([
         "Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 entries shaped as { text, options: string[], recommended: string, assumable: boolean, why }, giving the exact questions a person could answer. text and why must be non-empty strings; options must be a non-empty array of non-empty strings; recommended must copy one of those options exactly. Mark assumable true only for a gap whose conservative answer loses nothing if wrong: it stops, refuses, or keeps more. A product decision, a change of scope, or anything irreversible is never assumable.",
-        ...(questionsFault ? [`Your last report's questions were missing or malformed: ${questionsFault}.`] : []),
+        ...(saved.questionsFault ? [`Your last report's questions were missing or malformed: ${saved.questionsFault}.`] : []),
         "Put the questions in the report's questions field, not in the summary or message.",
       ].join("\n")), {
         sound: { target: "falsifyResult", actions: rememberPlanning },
@@ -890,7 +894,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       falsifyResult: operation(stopped("falsifyResult", falsifyResult), { sound: "plan", assumed: "plan", reask: "falsify", blocked: "stuck" }),
       plan: agent(() => work.prompt([
         `Plan the implementation of this sound ticket. Do not edit any file. Cover the acceptance criteria, tests, permitted paths, and required checks. Address any plan review feedback in the stage reports. Return planned with the complete plan as the summary, at most ${planLimit} characters.`,
-        ...(overLimit ? [`Your last plan was ${overLimit} characters; the limit is ${planLimit}. Say the same plan in fewer words: name the files and the tests, and do not restate the ticket.`] : []),
+        ...(saved.overLimit ? [`Your last plan was ${saved.overLimit} characters; the limit is ${planLimit}. Say the same plan in fewer words: name the files and the tests, and do not restate the ticket.`] : []),
         ...assumptionsPrompt(),
       ].join("\n")), {
         planned: { target: "planResult", actions: rememberPlanning },
@@ -899,18 +903,18 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       planReview: agent(() => work.prompt([
         "Review the plan against the ticket, relevant code, scope, acceptance criteria, and tests. Do not edit any file. Return approved with a summary if it is ready to implement, or revise with a summary of what must change. Only one revision of the plan is allowed.",
         ...assumptionsPrompt(),
-        "Plan:", plan,
+        "Plan:", saved.plan,
       ].join("\n")), {
         approved: { target: "planReviewResult", actions: rememberPlanning },
         revise: { target: "planReviewResult", actions: rememberPlanning },
       }, { using: "reviewer", cwd: worktree }),
       planReviewResult: operation(stopped("planReviewResult", planReviewResult), { approved: redGreen ? "test" : "change", revise: "plan", blocked: "stuck" }),
       test: agent(() => {
-        repairing = "test";
+        saved.repairing = "test";
         return work.prompt([
           "Write only tests that encode the acceptance criteria below, one or more per criterion, inside the Scope paths below. Do not implement anything and do not change non-test files. The tests must fail now and pass once the ticket is implemented. Leave changes uncommitted.",
           ...assumptionsPrompt(),
-          ...(plan ? ["Plan:", plan] : []),
+          ...(saved.plan ? ["Plan:", saved.plan] : []),
           "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
           "Scope:", ...ticket.sections.scope.map(text => `- ${text}`),
           cannotRun,
@@ -921,17 +925,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }, { using: "tester", cwd: worktree }),
       scopeAfterTest: operation(() => scope("test"), { passed: "red", failed: "repairBudget" }),
       red: operation(() => {
-        repairing = "test";
+        saved.repairing = "test";
         const result = work.redCheck(repository.redCheck);
-        provedRed = result.type === "passed";
+        saved.provedRed = result.type === "passed";
         return result;
       }, { passed: "change", failed: "repairBudget" }),
       change: agent(() => {
-        repairing = "change";
+        saved.repairing = "change";
         return work.prompt([
           "Implement the ticket and its tests. Keep the change focused. Do not weaken checks or expand scope. Leave your changes uncommitted; the workflow commits and delivers them.",
           ...assumptionsPrompt(),
-          ...(plan ? ["Plan:", plan] : []),
+          ...(saved.plan ? ["Plan:", saved.plan] : []),
           ...(redGreen ? ["The tester's tests in the stage reports are the contract; make them pass without weakening or deleting them. If a test is wrong, say so in the summary rather than changing its intent."] : []),
           "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
           "Scope (the only paths you may change; the workflow checks them):", ...ticket.sections.scope.map(text => `- ${text}`),
@@ -944,13 +948,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         blocked: { target: "stuck", actions: record("change") },
       }, { using: "implementer", cwd: worktree }),
       scopeAfterChange: operation(() => scope("change"), { passed: "verify", failed: "repairBudget" }),
-      verify: operation(() => { repairing = "change"; return work.checks(); }, { passed: "sealReview", failed: "repairBudget" }),
+      verify: operation(() => { saved.repairing = "change"; return work.checks(); }, { passed: "sealReview", failed: "repairBudget" }),
       sealReview: operation(work.seal, { sealed: "review" }),
       review: agent(() => work.prompt([
         "Review the current diff and verification evidence. Do not edit any file. Check acceptance criteria, regressions, scope, and whether tests actually establish the intended behavior.",
         ...assumptionsPrompt(),
-        ...(assumptions.length ? ["An assumption you disagree with is a discussion finding for the ticket owner."] : []),
-        ...(provedRed ? ["The tests were written before the implementation and the Machine saw them fail; check that the implementation makes them pass for the right reason and that no test was weakened."] : []),
+        ...(saved.assumptions.length ? ["An assumption you disagree with is a discussion finding for the ticket owner."] : []),
+        ...(saved.provedRed ? ["The tests were written before the implementation and the Machine saw them fail; check that the implementation makes them pass for the right reason and that no test was weakened."] : []),
         "Acceptance criteria:", ...ticket.sections.acceptance.map((text, index) => `${index + 1}. ${text}`),
         "Return one criteria entry per acceptance criterion, in order, with its text exactly as given, a boolean met, and evidence as a file:line or command.",
         "Tag findings: blocker = must change before delivery; discussion = a question only the ticket owner can settle; minor = worth noting, not worth a round.",
@@ -964,7 +968,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }, { using: "reviewer", cwd: worktree }),
       reviewResult: operation(stopped("reviewResult", reviewResult), { approved: "commit", revise: "reviewBudget", blocked: "stuck" }),
       repairBudget: operation(stopped("repairBudget", work.repair), { retry: "repairTarget", exhausted: "stuck" }),
-      repairTarget: operation(() => ({ type: repairing }), { falsify: "falsify", plan: "plan", planReview: "planReview", test: "test", change: "change" }),
+      repairTarget: operation(() => ({ type: saved.repairing }), { falsify: "falsify", plan: "plan", planReview: "planReview", test: "test", change: "change" }),
       reviewBudget: operation(stopped("reviewBudget", work.reviewRound), { retry: "change", exhausted: "stuck" }),
       // Preparation, commit, and delivery failures still end blocked by themselves.
       stuck: operation(() => ({ type: stuck }), { ask: "decide", park: "park" }),
@@ -977,9 +981,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           // Back to the planning or editing stage that stopped, including the tester after a failed red.
           { guard: chose("more rounds"), target: "repairTarget", actions: (args: { event: Event }) => {
             decide(args); work.renew();
-            ownerQuestions = undefined;
-            if (standingReview !== undefined) work.block(standingReview);
-            standingReview = undefined;
+            saved.ownerQuestions = null;
+            if (saved.standingReview !== null) work.block(saved.standingReview);
+            saved.standingReview = null;
           } },
           { guard: chose("hand off"), target: "handOff", actions: decide },
           { guard: chose("archive"), target: "archive", actions: decide },
@@ -988,7 +992,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }, { choices: decisions }),
       confirmDiscard: human(discardPrompt, {
         submitted: [
-          { guard: chose("confirm discard"), target: "remove", actions: ({ event }: { event: Event }) => { work.choice("confirmDiscard", event, confirmations); discardConfirmed = true; } },
+          { guard: chose("confirm discard"), target: "remove", actions: ({ event }: { event: Event }) => { work.choice("confirmDiscard", event, confirmations); saved.discardConfirmed = true; } },
           { target: "stuck", actions: ({ event }: { event: Event }) => { work.choice("confirmDiscard", event, confirmations); } },
         ],
       }, { choices: confirmations }),
@@ -1119,7 +1123,7 @@ export function ticketSections(body: string) {
   };
 }
 
-function parseTicket(input: unknown) {
+function parseTicket(input: unknown, saved: TaskData) {
   const value: unknown = typeof input === "string" ? JSON.parse(input) : input;
   const data = object(value, "input", ["ticket", "repository", "worktreeRoot", "evidenceRoot", "maxRepairs", "maxReviewRounds", "resume", "stuck", "redGreen", "assume"]);
   // Trackers attach their own fields (source, metadata) to a ticket; only id, title, and body are read.
@@ -1160,7 +1164,7 @@ function parseTicket(input: unknown) {
   const work = taskRun("ticket-task", {
     task: [`Ticket ${id}: ${title}`, ...(ticket.body?.trim() ? [ticket.body] : [])].join("\n\n"),
     workspace: worktree, checks: repo.checks, maxRepairs: data.maxRepairs ?? 3, maxReviewRounds: data.maxReviewRounds,
-  }, { checks: true, git: "clean", evidenceRoot });
+  }, { checks: true, git: "clean", evidenceRoot }, saved);
   const checks = (repo.checks as { name: string }[]).map(c => c.name);
   if (redGreen && !checks.includes(redCheck)) throw new Error(`repository.redCheck names missing check: ${redCheck}`);
   const prefix = `ticket/${slug}`;

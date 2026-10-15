@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { runtime } from "./runtime.ts";
 
 const mod = await import(pathToFileURL(resolve("ticket-task.ts")).href);
@@ -106,11 +107,13 @@ function person(...answers: (string | (() => string))[]) {
     return typeof next === "string" ? next : next();
   }, { requests });
 }
+type RunHooks = Pick<NonNullable<Parameters<typeof runtime.run>[1]>, "continueAt" | "onEnter" | "onBeforeStep">;
 /**
  * Agents are given by role, where `reviewer` is the review of the implementation, or by state name for falsify, plan, and planReview;
  * `investigator` stands for both of that role's states, which is how a test says that neither may run.
  */
-async function execute(assignment: unknown, agents: Record<string, Runner> = {}, human: (request: Ask) => string = person()) {
+async function execute(assignment: unknown, agents: Record<string, Runner> = {}, human: (request: Ask) => string = person(), options: RunHooks & { primitives?: typeof runtime } = {}) {
+  const { primitives = runtime, ...hooks } = options;
   const states: string[] = [];
   const working: Record<string, Runner> = {
     tester, implementer: implement, reviewer: () => review("approved", "Greeting matches the ticket"),
@@ -125,9 +128,9 @@ async function execute(assignment: unknown, agents: Record<string, Runner> = {},
     assert.equal(role, stage.role, `${state} uses the ${stage.role} role`);
     return (agents[state] ?? (role === "investigator" ? agents.investigator : undefined) ?? stage.answer)(request);
   };
-  const result = await runtime.run(mod.default(runtime, assignment), {
+  const result = await runtime.run(mod.default(primitives, assignment), {
     agents: Object.fromEntries(["tester", "investigator", "implementer", "reviewer"].map(role => [role, staged(role)])),
-    human, onState: state => states.push(String(state)),
+    human, onState: state => states.push(String(state)), ...hooks,
   });
   return { state: result.value, output: result.output as any, states };
 }
@@ -883,6 +886,119 @@ test("a sound ticket is planned, reviewed, and delivered with the approved plan 
   assert.deepEqual(run.result.agents[1], { stage: "plan", outcome: "planned", summary: plan });
   assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "agent-2.json"), "utf8")), { stage: "plan", outcome: "planned", summary: plan });
   assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+});
+
+type Checkpoint = { value: any; context: any; data: any };
+/**
+ * Primitives whose p.data hands the working data back from a checkpoint when one is given, as the launcher does for a continued run,
+ * and hooks that save a checkpoint at every state entry as the launcher does: data captured before the step's input, then written on entry.
+ */
+function checkpointed(from?: Checkpoint) {
+  let live: object | undefined;
+  let captured: { data: any; context: any } | undefined;
+  const saved: Record<string, Checkpoint> = {};
+  // A checkpoint holds plain JSON: an undefined value or a runtime object in the working data would not come back as it was.
+  const unsaveable: string[] = [];
+  const capture = (context: unknown) => {
+    captured = { data: live === undefined ? undefined : JSON.parse(JSON.stringify(live)), context: JSON.parse(JSON.stringify({ context })).context };
+  };
+  const primitives = { ...runtime, data: <T extends object>(initial: T): T => {
+    runtime.data(initial);
+    return (live = from ? structuredClone(from.data) as T : initial) as T;
+  } };
+  const hooks: RunHooks = {
+    onBeforeStep: capture,
+    onEnter: entry => {
+      if (captured === undefined) capture(entry.context);
+      if (live !== undefined && !isDeepStrictEqual(JSON.parse(JSON.stringify(live)), live)) unsaveable.push(String(entry.value));
+      saved[String(entry.value)] = { value: entry.value, ...captured! };
+      captured = undefined;
+    },
+  };
+  return { options: { primitives, ...hooks }, saved, unsaveable, data: () => live as Record<string, any> | undefined };
+}
+
+test("a run stopped in plan review continues from its checkpoint with its branch, base commit, and plan, and finishes as an uninterrupted run does", async context => {
+  /** Every Agent request a run makes, by state, and the runners that answer as the sound-ticket run above does. */
+  const answering = (stopIn?: string) => {
+    const prompts: [string, string][] = [];
+    const answer = (state: string, runner: Runner): Runner => request => {
+      prompts.push([state, request.prompt]);
+      if (state === stopIn) throw new Error(`interrupted in ${state}`);
+      return runner(request);
+    };
+    return { prompts, agents: {
+      ...Object.fromEntries(Object.entries(planning).map(([state, { answer: runner }]) => [state, answer(state, runner)])),
+      tester: answer("test", tester), implementer: answer("change", implement), reviewer: answer("review", () => review()),
+    } };
+  };
+  const finished = (f: Fixture, result: Awaited<ReturnType<typeof execute>>) => {
+    assert.equal(result.state, "delivered");
+    const run = held(f, result, /^Delivered/u);
+    const commit = git(f.repo, "rev-parse", branch);
+    assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head);
+    // Paths and hashes differ between fixtures; what the run did and said does not.
+    const stable = (value: unknown) => JSON.parse(JSON.stringify(value).replaceAll(run.directory, "<evidence>").replaceAll(f.root, "<root>")
+      .replaceAll(commit, "<commit>").replaceAll(f.head, "<base>"));
+    const { startedAt, finishedAt, ...receipt } = run.result;
+    assert.equal(startedAt, JSON.parse(readFileSync(join(run.directory, "started.json"), "utf8")).startedAt);
+    assert.match(finishedAt, /^\d{4}-/u);
+    return {
+      run, result: stable(receipt), delivery: stable(run.delivery), output: stable(result.output),
+      files: readdirSync(run.directory).sort(), tree: git(f.repo, "rev-parse", `${branch}^{tree}`),
+      message: git(f.repo, "log", "-1", "--format=%s%n%b", branch), stable,
+    };
+  };
+
+  // An uninterrupted run on a fixture of its own is the measure.
+  const g = fixture(context); const whole = answering(); const wholeSaves = checkpointed();
+  const uninterrupted = await execute(input(g, {}, { stuck: "park" }), whole.agents, person(), wholeSaves.options);
+  const expected = finished(g, uninterrupted);
+  assert.deepEqual(wholeSaves.unsaveable, [], "every state's working data is plain JSON");
+
+  // The first run stops once plan review has started, after its checkpoint was saved, as a process that ends there would.
+  const f = fixture(context); const first = answering("planReview"); const firstSaves = checkpointed();
+  await assert.rejects(execute(input(f, {}, { stuck: "park" }), first.agents, person(), firstSaves.options), /interrupted in planReview/u);
+  assert.deepEqual(first.prompts.map(([state]) => state), ["falsify", "plan", "planReview"]);
+  assert.deepEqual(firstSaves.unsaveable, [], "every state's working data is plain JSON");
+  const checkpoint = firstSaves.saved.planReview;
+  assert.ok(checkpoint, "a checkpoint was saved on entering planReview");
+  assert.ok(checkpoint.data, "the run keeps its working data in saved data");
+  assert.notEqual(checkpoint.context, undefined);
+  // The branch, base commit, and plan are in the checkpoint as the run had them.
+  assert.equal(checkpoint.data.branch, branch);
+  assert.equal(checkpoint.data.baseCommit, f.head);
+  assert.equal(checkpoint.data.plan, plan);
+  assert.equal(git(f.repo, "rev-parse", branch), f.head);
+  assert.equal(git(f.worktree, "symbolic-ref", "HEAD"), `refs/heads/${branch}`);
+
+  // The continued run is a new Machine from the same input, given the saved data and started at the saved state.
+  const rest = answering(); const restSaves = checkpointed(checkpoint);
+  const continued = await execute(input(f, {}, { stuck: "park" }), rest.agents, person(),
+    { ...restSaves.options, continueAt: { value: checkpoint.value, context: checkpoint.context } });
+  assert.deepEqual(restSaves.unsaveable, [], "every state's working data is plain JSON");
+  const restored = restSaves.data()!;
+  assert.deepEqual([restored.branch, restored.baseCommit, restored.plan], [branch, git(f.repo, "rev-parse", `${branch}^`), plan]);
+
+  // Nothing before plan review runs again, and plan review is asked exactly what it was asked before the stop.
+  assert.deepEqual(continued.states, uninterrupted.states.slice(uninterrupted.states.indexOf("planReview")));
+  assert.equal(rest.prompts[0]![0], "planReview");
+  assert.equal(rest.prompts[0]![1], first.prompts[2]![1]);
+  assert.ok(planIn(rest.prompts[0]![1]).startsWith(plan));
+
+  // It finishes as the uninterrupted run did: one evidence directory whose numbering carries on, the same receipts, hold, and commit.
+  const actual = finished(f, continued);
+  assert.deepEqual(actual.files, expected.files);
+  assert.ok(actual.files.includes("started.json"));
+  assert.deepEqual(actual.result, expected.result);
+  assert.deepEqual(actual.delivery, expected.delivery);
+  assert.deepEqual(actual.output, expected.output);
+  assert.equal(actual.tree, expected.tree);
+  assert.equal(actual.message, expected.message);
+  // Every prompt from plan review on is the one the uninterrupted run built.
+  const fromPlanReview = (prompts: [string, string][], stable: (value: unknown) => unknown) =>
+    stable(prompts.slice(prompts.findIndex(([state]) => state === "planReview")));
+  assert.deepEqual(fromPlanReview(rest.prompts, actual.stable), fromPlanReview(whole.prompts, expected.stable));
 });
 
 for (const [policy, assume] of [["park", undefined], [undefined, undefined], ["park", false], [undefined, false]] as const) {

@@ -6,6 +6,8 @@ import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { pathToFileURL } from "node:url";
 import { brief, firstLine } from "../defaults/_machine-shop/brief.ts";
+// Read through the namespace so an export a test needs and the module lacks fails that test alone.
+import * as task from "../defaults/_machine-shop/task.ts";
 import { taskRun } from "../defaults/_machine-shop/task.ts";
 import { runtime } from "./runtime.ts";
 
@@ -426,6 +428,29 @@ test("taskRun resets both independent budgets and records their cumulative count
   assert.equal(work.output()!.repairs, 2); assert.equal(work.output()!.reviewRounds, 3);
   const receipt = JSON.parse(readFileSync(String(work.output()!.report), "utf8"));
   assert.equal(receipt.repairs, 2); assert.equal(receipt.reviewRounds, 3);
+});
+
+test("taskRun keeps its working data in the saved data it is given, so a helper built again on a JSON copy carries on the same evidence", context => {
+  const cwd = repo(context);
+  const saved = task.taskData();
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(saved)), saved);
+  const first = taskRun("saved-test", input(cwd), { checks: true, git: "clean" }, saved);
+  first.start(); assert.equal(first.checks().type, "passed"); first.capture("change", ok());
+  const directory = first.open();
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(saved)), saved);
+  assert.equal(saved.directory, directory); assert.equal(saved.reports.length, 1); assert.equal(saved.evidence.length, 1);
+  // A continued run gets its data back as JSON, and the helper made from it is the one that stopped.
+  const again = taskRun("saved-test", input(cwd), { checks: true, git: "clean" }, JSON.parse(JSON.stringify(saved)));
+  assert.equal(again.open(), directory);
+  assert.equal(again.accept(), true);
+  again.capture("review", ok("approved", "Looks right"));
+  assert.ok(existsSync(join(directory, "agent-2.json")));
+  assert.equal(again.checks().type, "passed"); assert.ok(existsSync(join(directory, "2.log")));
+  assert.equal(again.finish("completed").type, "completed");
+  const [receipt, ...others] = receipts(cwd); assert.deepEqual(others, []);
+  assert.deepEqual(receipt.agents.map((report: { stage: string }) => report.stage), ["change", "review"]);
+  assert.equal(receipt.checks.length, 2); assert.equal(receipt.checksPassed, true);
+  assert.equal(receipt.startedAt, JSON.parse(readFileSync(join(directory, "started.json"), "utf8")).startedAt);
 });
 
 test("reopen clears the accepted latch so drift counts again, reopen(true) records failed checks, and a baseline alone still establishes nothing", context => {
