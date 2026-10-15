@@ -196,9 +196,9 @@ export function taskRun(name: string, input: unknown, policy: Policy, saved: Tas
   function decision(stage: string, event: Event): void {
     choice(stage, event, ["approve", "reject"]);
   }
-  /** Records one of the restricted choices a definition offered in its own Human state. */
-  function choice(stage: string, event: Event, allowed: readonly string[]): string {
-    if (typeof event.value !== "string" || !allowed.includes(event.value)) throw new Error("Invalid Human decision");
+  /** Records a Human response, enforcing restricted choices when the definition supplies them. */
+  function choice(stage: string, event: Event, allowed?: readonly string[]): string {
+    if (typeof event.value !== "string" || (allowed && !allowed.includes(event.value))) throw new Error("Invalid Human decision");
     saved.decisions.push({ stage, response: event.value });
     writeFileSync(join(saved.directory, `human-${saved.decisions.length}.json`), JSON.stringify(saved.decisions.at(-1)), { flag: "wx", mode: 0o600 });
     return event.value;

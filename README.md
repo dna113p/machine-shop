@@ -129,10 +129,16 @@ A missing section blocks before any Agent runs. A run then goes
 6. **Commit, rebase, deliver.** If the base moved, the commit is replayed onto
    it and checked again.
 
-A stuck run parks: it stops at once, keeps the worktree, and writes `park.txt`
-saying what it needs. Answer in the ticket and run again with `"resume": true`.
-With `"stuck": "ask"` it waits instead for a person to choose more rounds, hand
-off, archive, or discard. Branch and patch deliveries end `delivered` with
+A stuck run sleeps on one Human question, keeping its worktree and branch.
+The prompt says what is needed, lists open questions and evidence, and suggests
+`more rounds`, `hand off`, `archive`, and `discard`; discard still asks for confirmation.
+Any other reply is an answer: like `more rounds`, it renews both budgets, clears
+the owner questions, and returns to the stage that stopped. An answer also
+clears the plan-length return.
+The answer stays in later Agent prompts. `stuck` no longer changes anything:
+both `"park"` (the default) and `"ask"` are accepted.
+
+Branch and patch deliveries end `delivered` with
 `{ "action": "hold", "summary": "…" }`, keeping the Dispatch ticket open.
 After opening a pull request and removing the worktree, the run checks with
 `gh` every 10 minutes and sleeps while waiting for the merge when run with

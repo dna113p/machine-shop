@@ -7,8 +7,8 @@ The big one. Planning is read-only, tests come first by default, and the
 Machine, not the reviewer, decides whether a review passed. Unlike the defaults,
 **it commits**, and with `"output": "pr"` it pushes its own branch and opens a
 pull request. It never merges, tags, force-pushes, or touches the source
-checkout's working tree. A stuck run parks by default: it stops at once, keeps
-the worktree, and writes `park.txt` saying what it needs.
+checkout's working tree. A stuck run sleeps on one Human question, keeping
+the worktree and branch until it is answered.
 
 It runs from source; the installer never copies it.
 
@@ -57,7 +57,7 @@ It runs from source; the installer never copies it.
 | `maxReviewRounds` | no | `2` | Rounds for a `revise` review, 0–5. |
 | `redGreen` | no | `true` | Write failing tests first. `false` skips the tester and the red check. |
 | `assume` | no | `false` | Let `falsify` answer questions whose cautious answer loses nothing, and record them, instead of stopping. |
-| `stuck` | no | `"park"` | `"park"` stops at once; `"ask"` waits for a person to choose more rounds, hand off, archive, or discard. |
+| `stuck` | no | `"park"` | `stuck` no longer changes anything: both `"park"` and `"ask"` sleep on the same Human question. |
 | `resume` | no | `false` | Pick up the worktree a park or hand-off left, or a delivered commit whose worktree is gone. |
 
 ## Flow
@@ -159,25 +159,29 @@ flowchart TD
 
 ### When stuck
 
-By default the run parks. With `"stuck": "ask"`, a person decides instead.
+The question carries the park note's context: what stopped the run, what is
+needed, open questions, budgets, and evidence locations. The four decisions
+are suggestions. Any other reply is an answer and works like `more rounds`:
+it renews both budgets, clears the owner questions, and returns to the stage
+that stopped in the same worktree. An answer also clears the plan-length return.
+Answers remain under
+`Answers from the ticket owner:` in later Agent prompts, including the planner
+after a falsify question. Discard still requires its second confirmation.
 
 ```mermaid
 %%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
 flowchart LR
   stuck["⚙️ <b>stuck</b>"]
-  park["⚙️ <b>park</b><br/>writes park.txt"]
   decide[/"🙋 <b>decide</b><br/>more rounds, hand off,<br/>archive, or discard"/]
   confirmDiscard[/"🙋 <b>confirmDiscard</b><br/>a second yes before deleting"/]
   archive["⚙️ <b>archive</b><br/>keeps an archive branch"]
   remove["⚙️ <b>remove</b><br/>deletes worktree and branch"]
   again(["↩ the stage that stopped,<br/>with fresh budgets"])
-  parked(("🅿️ parked"))
   handedOff(("🤝 handedOff"))
   abandoned(("🗑️ abandoned"))
 
-  stuck -->|park| park --> parked
-  stuck -->|ask| decide
-  decide -->|"more rounds"| again
+  stuck --> decide
+  decide -->|"answer or more rounds"| again
   decide -->|"hand off"| handedOff
   decide -->|archive| archive --> remove
   decide -->|discard| confirmDiscard
@@ -189,9 +193,9 @@ flowchart LR
   classDef human fill:#fef3c7,stroke:#d97706,color:#0f172a
   classDef no fill:#fde68a,stroke:#b45309,color:#0f172a
   classDef back fill:#dbeafe,stroke:#2563eb,color:#0f172a,stroke-dasharray:4 3
-  class stuck,park,archive,remove op
+  class stuck,archive,remove op
   class decide,confirmDiscard human
-  class parked,handedOff,abandoned no
+  class handedOff,abandoned no
   class again back
 ```
 
@@ -218,8 +222,7 @@ reason or decision. Read that later receipt if cleanup fails after delivery.
 
 - ✅ **`delivered`**: committed and delivered as a branch or patch.
 - ✅ **`merged`**: the pull request merged and the ticket branch was deleted locally and remotely.
-- 🅿️ **`parked`**: stuck; the worktree is kept and `park.txt` says what is needed.
-  Answer in the ticket and run again with `"resume": true`.
+- 🅿️ **`parked`**: retained for compatibility with earlier runs and their `park.txt` notes; current stuck runs do not reach it.
 - 🤝 **`handedOff`**: a person chose to hand the work to someone else; after pull request delivery, the worktree is already gone and the branch is kept.
 - 🗑️ **`abandoned`**: archived to `archive/<slug>` and removed, or discarded after a second confirmation.
 - ⛔ **`blocked`**: the ticket's shape, setup, commit, delivery, or branch cleanup failed.
