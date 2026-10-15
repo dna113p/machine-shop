@@ -933,7 +933,7 @@ test("a sound ticket is planned, reviewed, and delivered with the approved plan 
     },
     plan: request => { calls.push("plan"); assert.equal(request.cwd, f.worktree); assert.deepEqual(request.outcomes, ["planned"]); return ok("planned", plan); },
     planReview: request => {
-      calls.push("planReview"); assert.equal(request.cwd, f.worktree); assert.deepEqual([...request.outcomes].sort(), ["approved", "revise"]);
+      calls.push("planReview"); assert.equal(request.cwd, f.worktree); assert.deepEqual([...request.outcomes].sort(), ["approved", "revise", "tooBroad"]);
       assert.ok(request.prompt.includes("Cover it in greeting.test.txt"));
       return ok("approved", "The plan covers the criterion");
     },
@@ -1556,88 +1556,172 @@ test("a second plan revision whose summary runs over several lines and 600 chara
   assert.equal(run.prompt.split("\n").find(line => line.startsWith("Needs: ")), `Needs: ${needs}`);
 });
 
-/** What the planner is told when its last plan was sent back for length, and what a run says when a second one is as long. */
-const lastPlanWas = (length: number) => new RegExp(`\\blast plan was ${length} characters\\b`, "u");
-const limitNamed = /\blimit (?:is|of) 6000\b/u;
-const overLimit = (length: number) => new RegExp(`\\b${length} characters against a limit of 6000\\b`, "u");
+/** A split the plan reviewer suggests for a ticket too broad for one run: one smaller ticket per line. */
+const split = "PROJ-12a: write hello to greeting.txt.\nPROJ-12b: cover greeting.txt in greeting.test.txt.";
+const splitLines = split.split("\n");
+/** What a run stopped by a too broad verdict says: the suggested split, flattened onto one line where the line breaks are dropped. */
+const splitSaid = /PROJ-12a: write hello to greeting\.txt\.\s+PROJ-12b: cover greeting\.txt in greeting\.test\.txt\./u;
+/** A plan reviewer that finds the ticket too broad the first time it is asked, then reviews as the default one does. */
+const broadOnce = (reviews: string[] = []): Runner => request => {
+  reviews.push(request.prompt);
+  return reviews.length === 1 ? ok("tooBroad", split) : planning.planReview!.answer(request);
+};
+/** A planner that keeps every prompt it is given and plans as the default one does. */
+const planner = (plans: string[]): Runner => request => { plans.push(request.prompt); return planning.plan!.answer(request); };
 
-test("a plan of 6001 characters goes back to the planner once with its length and the limit, and the plan of 6000 that follows is the one reviewed and worked from", async context => {
-  const f = fixture(context); const plans: string[] = []; const later: Record<string, string[]> = { planReview: [], tester: [], implementer: [] };
-  const [first, second] = ["a".repeat(6001), "b".repeat(6000)];
-  const seen = (stage: string, work: Runner): Runner => request => { later[stage]!.push(request.prompt); return work(request); };
-  const result = await execute(input(f, {}, { stuck: "park", maxRepairs: 0, maxReviewRounds: 0 }), {
-    plan: request => { plans.push(request.prompt); return ok("planned", plans.length === 1 ? first : second); },
-    planReview: seen("planReview", planning.planReview!.answer), tester: seen("tester", tester), implementer: seen("implementer", implement),
+for (const length of [6001, 9000]) {
+  test(`a plan of ${length} characters goes to plan review whole without being sent back for length, and is the one worked from`, async context => {
+    const f = fixture(context); const long = "p".repeat(length); const plans: string[] = [];
+    const later: Record<string, string[]> = { planReview: [], tester: [], implementer: [] };
+    const seen = (stage: string, work: Runner): Runner => request => { later[stage]!.push(request.prompt); return work(request); };
+    const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), {
+      plan: request => { plans.push(request.prompt); return ok("planned", long); },
+      planReview: seen("planReview", planning.planReview!.answer), tester: seen("tester", tester), implementer: seen("implementer", implement),
+    });
+    assert.equal(result.state, "delivered", evidence(f).delivery.reason);
+    assert.deepEqual([plans.length, later.planReview!.length, later.tester!.length, later.implementer!.length], [1, 1, 1, 1]);
+    assert.deepEqual(result.states.slice(0, result.states.indexOf("test")).filter(isPlanning), ["falsify", "plan", "planReview"]);
+    for (const state of ["stuck", "decide"]) assert.equal(result.states.includes(state), false, state);
+    // The reviewer, the tester, and the implementer all read the whole plan.
+    for (const prompt of Object.values(later).flat()) assert.ok(planIn(prompt).startsWith(`${long}\n`));
+    const run = held(f, result, /^Delivered/u);
+    assert.deepEqual([run.result.repairs, run.result.reviewRounds], [0, 0]);
+    assert.deepEqual(run.result.agents.filter((agent: any) => agent.stage === "plan").map((agent: any) => agent.summary), [long]);
+  });
+}
+
+test("the planner is given no length limit and is asked for a concise plan, and the plan reviewer is told to send back a wordy plan and when to call a ticket too broad", async context => {
+  const f = fixture(context); const prompts: Record<string, string> = {};
+  const result = await execute(input(f), {
+    plan: request => { prompts.plan = request.prompt; return planning.plan!.answer(request); },
+    planReview: request => { prompts.planReview = request.prompt; return planning.planReview!.answer(request); },
   });
   assert.equal(result.state, "delivered", evidence(f).delivery.reason);
-  assert.deepEqual([plans.length, later.planReview!.length, later.tester!.length, later.implementer!.length], [2, 1, 1, 1]);
-  assert.deepEqual(result.states.slice(0, result.states.indexOf("test")).filter(isPlanning), ["falsify", "plan", "plan", "planReview"]);
-  // Only the second prompt says a plan was too long: by how much, against what, and what to do about it.
-  assert.doesNotMatch(plans[0]!, /\blast plan was\b/u); assert.doesNotMatch(plans[0]!, limitNamed);
-  assert.match(plans[1]!, lastPlanWas(6001)); assert.match(plans[1]!, limitNamed); assert.match(plans[1]!, /\bfewer words\b/u);
-  // The plan that fits follows the heading whole; the one that did not is never the plan worked from.
-  for (const prompt of Object.values(later).flat()) { assert.ok(planIn(prompt).startsWith(`${second}\n`)); assert.equal(planIn(prompt).startsWith(first), false); }
-  // The run did not stop, and the return spent neither budget.
-  for (const state of ["stuck", "park", "decide"]) assert.equal(result.states.includes(state), false, state);
+  const asked = prompts.plan!.split(/^Plan:\n/mu)[0]!;
+  assert.doesNotMatch(asked, /\b6000\b|\blimit\b|\bat most \d+ characters\b|\b\d+ characters\b/iu, "the planner is given no length limit");
+  assert.match(asked, /\bconcise\b/iu); assert.match(asked, /\bfiles\b/iu); assert.match(asked, /\btests\b/iu); assert.match(asked, /\b(?:not|never|without) restat\w* the ticket\b/iu);
+  const told = prompts.planReview!.split(/^Plan:\n/mu)[0]!;
+  assert.match(told, /\btooBroad\b/u); assert.match(told, /\bsplit\b/iu); assert.match(told, /\bsmaller tickets\b/iu);
+  // A wordy plan is an ordinary revision.
+  assert.match(told, /\brevise\b/u); assert.match(told, /\brestat\w* the ticket\b/iu); assert.match(told, /\bdetail\b[^.]*\bimplementer\b/iu);
+  assert.doesNotMatch(told, /\b6000\b|\blimit\b/iu);
+});
+
+test("a plan reviewer's revision asking for a shorter plan returns to the planner with that feedback as any revision does, spending no budget", async context => {
+  const f = fixture(context); const plans: string[] = []; const planReviews: string[] = [];
+  const first = `Restating the ticket: ${"Write hello to greeting.txt. ".repeat(40)}Then add greeting.txt and greeting.test.txt.`;
+  const shorter = "The plan restates the ticket and carries detail the implementer does not need; name the files and the tests in fewer words.";
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), {
+    plan: request => { plans.push(request.prompt); return ok("planned", plans.length === 1 ? first : plan); },
+    planReview: request => { planReviews.push(request.prompt); return planReviews.length === 1 ? ok("revise", shorter) : ok("approved", "Concise, and names its files and test"); },
+  });
+  assert.equal(result.state, "delivered", evidence(f).delivery.reason);
+  assert.deepEqual(result.states.slice(0, result.states.indexOf("test")).filter(isPlanning), ["falsify", "plan", "planReview", "plan", "planReview"]);
+  for (const state of ["stuck", "decide"]) assert.equal(result.states.includes(state), false, state);
+  assert.equal(plans[0]!.includes(shorter), false); assert.ok(plans[1]!.includes(shorter), plans[1]);
+  // The planner is asked again for the reviewer's reasons alone: no prompt names a length or a limit.
+  for (const prompt of plans) assert.doesNotMatch(prompt.split(/^Plan:\n/mu)[0]!, /\b6000\b|\blimit\b|\blast plan was\b/iu);
+  assert.ok(planIn(planReviews[0]!).startsWith(`${first}\n`)); assert.ok(planIn(planReviews[1]!).startsWith(`${plan}\n`));
   const run = held(f, result, /^Delivered/u);
-  assert.equal(existsSync(join(run.directory, "park.txt")), false);
   assert.deepEqual([run.result.repairs, run.result.reviewRounds], [0, 0]);
-  // The over-long plan is kept as every planning report is.
-  assert.deepEqual(run.result.agents.filter((agent: any) => agent.stage === "plan").map((agent: any) => agent.summary), [first, second]);
-  assert.deepEqual(["plan-1.json", "plan-2.json"].map(name => JSON.parse(readFileSync(join(run.directory, name), "utf8")).summary), [first, second]);
 });
 
-test("a second plan over 6000 characters is asked about in plain words with its own length and the limit, before any plan is reviewed", async context => {
-  const f = fixture(context); const human = person("hand off"); let plans = 0;
-  const result = await execute(input(f, {}, { stuck: "park" }), {
-    plan: () => ok("planned", "p".repeat(++plans === 1 ? 6001 : 6500)),
-    planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+test("a too broad verdict from plan review stops before anything is edited, and the question it asks holds the suggested split", async context => {
+  const f = fixture(context); const human = person("hand off"); const plans: string[] = []; const planReviews: string[] = [];
+  const result = await execute(input(f), {
+    plan: planner(plans), planReview: broadOnce(planReviews),
+    tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
   }, human);
-  const run = questioned(f, result, overLimit(6500), human);
-  assert.equal(plans, 2); assert.equal(result.states.at(-5), "planResult");
-  assert.deepEqual(result.states.filter(isPlanning), ["falsify", "plan", "plan"]);
-  for (const said of [run.prompt, run.needs, run.delivery.reason, result.output.summary]) {
-    assert.match(said, overLimit(6500)); assert.match(said, /\bsent back once\b/u); assert.match(said, /\btoo broad for one run\b/u);
-    // The length is the second plan's, and nothing calls a plan that was only long a malformed report.
-    assert.doesNotMatch(said, /malformed/iu); assert.doesNotMatch(said, /\b6001 characters\b/u);
+  const run = questioned(f, result, splitSaid, human);
+  assert.deepEqual([plans.length, planReviews.length], [1, 1]); assert.equal(result.states.at(-5), "planReviewResult");
+  assert.deepEqual(result.states.filter(isPlanning), ["falsify", "plan", "planReview"]);
+  // The question, the file it is written to, and the receipt each hold the split; the question and the receipt keep its lines.
+  for (const line of splitLines) {
+    assert.ok(run.prompt.includes(line), line); assert.ok(run.delivery.reason.includes(line), line);
+    assert.ok(readFileSync(join(run.directory, "question-1.txt"), "utf8").includes(line), line);
   }
-  assert.deepEqual(numberedLines(run.needs.split("\n")), []);
-  assert.deepEqual(run.result.agents.map((agent: any) => [agent.stage, agent.summary.length]).slice(1), [["plan", 6001], ["plan", 6500]]);
+  assert.ok(run.delivery.reason.includes(split), "the receipt keeps the split one ticket per line");
+  for (const said of [run.prompt, run.delivery.reason, result.output.summary]) assert.match(said, /\btoo broad\b/iu);
+  assert.doesNotMatch(run.delivery.reason, /\bcharacters\b|\blimit\b|malformed/iu);
   assert.equal(candidate(f.worktree).status, ""); assert.deepEqual(run.result.checks, []);
+  assert.deepEqual([run.result.repairs, run.result.reviewRounds], [0, 0]);
 });
 
-/** A planner whose first two plans are over 6000 characters, the second by 6500, and whose later plans are the given ones in turn. */
-const tooLongTwice = (plans: string[], later: string[] = [plan]): Runner => request => {
-  plans.push(request.prompt);
-  return ok("planned", plans.length === 1 ? "p".repeat(6001) : plans.length === 2 ? "p".repeat(6500) : later[Math.min(plans.length - 3, later.length - 1)]!);
-};
+test("a too broad verdict leaves the reviewer's one revision: after more rounds the plan goes back to plan, a revise is planned again, and an approval goes on", async context => {
+  const f = fixture(context); const human = person("more rounds"); const plans: string[] = []; let planReviews = 0;
+  const result = await execute(input(f), {
+    plan: planner(plans),
+    planReview: () => [() => ok("tooBroad", split), () => ok("revise", "Name the test that proves the greeting"), () => ok("approved", "The plan names its test")][planReviews++]!(),
+  }, human);
+  assert.equal(result.state, "delivered", evidence(f).delivery.reason);
+  assert.deepEqual(route(result.states), ["falsify", "plan", "planReview", "decide", "plan", "planReview", "plan", "planReview", "test", "change", "review"]);
+  const at = result.states.indexOf("decide");
+  assert.deepEqual(result.states.slice(at - 2, at + 3), ["planReviewResult", "stuck", "decide", "repairTarget", "plan"]);
+  assert.equal(human.requests.length, 1); stuckQuestion(f, human.requests[0], "planReviewResult");
+  assert.ok(plans[2]!.includes("Name the test that proves the greeting"), plans[2]);
+  const run = held(f, result, /^Delivered/u);
+  assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }]);
+});
+
+test("a run continued from the checkpoint saved on entering stuck, after its question was written, writes that question again instead of failing", async context => {
+  // A second plan revision stops the run, as it did before plan review could find a ticket too broad.
+  const f = fixture(context); const slept: Ask[] = []; let planReviews = 0;
+  const agents = {
+    planReview: () => ok("revise", ++planReviews === 1 ? "Name the test that proves the greeting" : "The plan still names no test"),
+    tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+  };
+  const saves = checkpointed();
+  const first = await execute(input(f), agents, person(), { ...saves.options, onHumanSleep: request => { slept.push(request); } });
+  assert.equal(String(first.state), "decide"); assert.equal(slept.length, 1);
+  const runs = join(f.evidence, ".machine-runs/machine-shop"); const [id] = readdirSync(runs);
+  asksWritten(join(runs, id!), slept);
+  // The process ends after question-1.txt was written and before the question was put, so the run continues where stuck was entered.
+  const checkpoint = saves.saved.stuck; assert.ok(checkpoint, "a checkpoint was saved on entering stuck");
+  assert.equal(checkpoint.data.questions, 0);
+  const rest = checkpointed(checkpoint); const human = person("hand off");
+  const continued = await execute(input(f), agents, human, { ...rest.options, continueAt: { value: checkpoint.value, context: checkpoint.context } })
+    .catch(error => assert.fail(`continuing at stuck failed: ${error.message}`));
+  assert.deepEqual(continued.states.slice(0, 2), ["stuck", "decide"]);
+  assert.equal(human.requests.length, 1); stuckQuestion(f, human.requests[0], "planReviewResult");
+  const run = handedOff(f, continued, /The plan still names no test/u, human); assert.equal(planReviews, 2);
+  // The question is numbered as it was and rewritten as it is now put; there is no second one.
+  asksWritten(run.directory, [human.requests[0]!]);
+  assert.equal(statSync(join(run.directory, "question-1.txt")).mode & 0o777, 0o600);
+});
+
+test("the source keeps no plan length limit: no planLimit, no shorten outcome, and no length bookkeeping", () => {
+  const source = readFileSync(resolve("ticket-task.ts"), "utf8");
+  for (const gone of [/\bplanLimit\b/u, /\bshorten\b/u, /\blengthReturned\b/u, /\boverLimit\b/u, /\b6000\b/u, /\b6_000\b/u]) assert.doesNotMatch(source, gone);
+});
+
 const editsNothing = { planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() };
 
-test("a second plan over 6000 characters asks one question holding the note's text, and an answer renews the run and goes back to plan in the same worktree with the answer in the planner's prompt", async context => {
+test("a too broad verdict asks one question holding the note's text, and an answer renews the run and goes back to plan in the same worktree with the answer in the planner's prompt", async context => {
   const f = fixture(context); const answer = "Keep it to two files: greeting.txt and greeting.test.txt."; const human = person(answer);
   const plans: string[] = []; const later: Record<string, string[]> = { planReview: [], tester: [], implementer: [], reviewer: [] }; const cwds = new Set<string>();
   const seen = (stage: string, work: Runner): Runner => request => { cwds.add(request.cwd); later[stage]!.push(request.prompt); return work(request); };
-  const planner = tooLongTwice(plans, ["p".repeat(6200), plan]);
+  const planned = planner(plans);
   const result = await execute(input(f), {
-    plan: request => { cwds.add(request.cwd); return planner(request); },
-    planReview: seen("planReview", planning.planReview!.answer), tester: seen("tester", tester), implementer: seen("implementer", implement), reviewer: seen("reviewer", () => review()),
+    plan: request => { cwds.add(request.cwd); return planned(request); },
+    planReview: seen("planReview", broadOnce()), tester: seen("tester", tester), implementer: seen("implementer", implement), reviewer: seen("reviewer", () => review()),
   }, human);
   assert.equal(result.state, "delivered", evidence(f).delivery.reason);
-  assert.deepEqual(route(result.states), ["falsify", "plan", "plan", "decide", "plan", "plan", "planReview", "test", "change", "review"]);
+  assert.deepEqual(route(result.states), ["falsify", "plan", "planReview", "decide", "plan", "planReview", "test", "change", "review"]);
   const at = result.states.indexOf("decide");
-  assert.deepEqual(result.states.slice(at - 2, at + 3), ["planResult", "stuck", "decide", "repairTarget", "plan"]);
+  assert.deepEqual(result.states.slice(at - 2, at + 3), ["planReviewResult", "stuck", "decide", "repairTarget", "plan"]);
   for (const state of ["park", "parked", "handOff", "confirmDiscard"]) assert.equal(result.states.includes(state), false, state);
-  // The one question is the park note's text: the reason with the plan's length and the limit, what is needed, and where to look.
+  // The one question is the park note's text: the reason with the suggested split, what is needed, and where to look.
   assert.equal(human.requests.length, 1);
-  const needs = stuckQuestion(f, human.requests[0], "planResult");
-  assert.match(human.requests[0]!.prompt, overLimit(6500)); assert.match(needs, /^Clarify how to resolve this blocker: /u); assert.match(needs, overLimit(6500));
+  const needs = stuckQuestion(f, human.requests[0], "planReviewResult");
+  assert.match(human.requests[0]!.prompt, splitSaid); assert.match(needs, /^Clarify how to resolve this blocker: /u); assert.match(needs, splitSaid);
   // The planner is asked again with the answer, and so is everyone after it; no prompt before the question had it.
-  assert.equal(plans.length, 4);
-  for (const prompt of plans.slice(0, 2)) assert.equal(prompt.includes(answer), false);
-  for (const prompt of plans.slice(2)) { assert.ok(prompt.includes(answer), prompt); assert.ok(answersIn(prompt).includes(answer), prompt); }
-  for (const [stage, prompts] of Object.entries(later)) assert.ok(prompts.length && prompts.every(prompt => answersIn(prompt).includes(answer)), stage);
-  // The answer renewed the one return for length: a third plan too long went back once more instead of stopping again.
-  assert.match(plans[3]!, lastPlanWas(6200));
+  assert.equal(plans.length, 2);
+  assert.equal(plans[0]!.includes(answer), false); assert.equal(later.planReview![0]!.includes(answer), false);
+  assert.ok(plans[1]!.includes(answer), plans[1]); assert.ok(answersIn(plans[1]!).includes(answer), plans[1]);
+  for (const [stage, prompts] of Object.entries(later)) {
+    const after = stage === "planReview" ? prompts.slice(1) : prompts;
+    assert.ok(after.length && after.every(prompt => answersIn(prompt).includes(answer)), stage);
+  }
   assert.ok(planIn(later.tester![0]!).startsWith(`${plan}\n`));
   // One worktree throughout: every Agent worked in it, and the run made it once and removed it on delivery.
   assert.deepEqual([...cwds], [f.worktree]);
@@ -1651,15 +1735,15 @@ test("a second plan over 6000 characters asks one question holding the note's te
 });
 
 for (const reply of ["hand off", "discard"] as const) {
-  test(`replying ${reply} to the question a second plan over 6000 characters asks ${reply === "hand off" ? "ends handedOff" : "asks for its confirmation, where go back asks the question again"}, as the decision did`, async context => {
+  test(`replying ${reply} to the question a too broad verdict asks ${reply === "hand off" ? "ends handedOff" : "asks for its confirmation, where go back asks the question again"}, as the decision did`, async context => {
     const f = fixture(context); const plans: string[] = [];
     const human = reply === "hand off" ? person("hand off") : person("discard", "go back", "discard", "confirm discard");
-    const result = await execute(input(f), { plan: tooLongTwice(plans), ...editsNothing }, human);
-    assert.equal(plans.length, 2);
-    if (reply === "hand off") { questioned(f, result, overLimit(6500), human); return; }
+    const result = await execute(input(f), { plan: planner(plans), ...editsNothing, planReview: broadOnce() }, human);
+    assert.equal(plans.length, 1);
+    if (reply === "hand off") { questioned(f, result, splitSaid, human); return; }
     assert.deepEqual(result.states.slice(result.states.indexOf("decide")), ["decide", "confirmDiscard", "stuck", "decide", "confirmDiscard", "remove", "abandon", "abandoned"]);
     const [first, confirm, again, confirmed] = human.requests;
-    stuckQuestion(f, first, "planResult"); assert.match(first!.prompt, overLimit(6500));
+    stuckQuestion(f, first, "planReviewResult"); assert.match(first!.prompt, splitSaid);
     for (const request of [confirm!, confirmed!]) {
       assert.deepEqual(request.choices, ["confirm discard", "go back"]); assert.equal(request.prompt.split("\n")[0], "Discard the candidate for ticket PROJ-12?");
     }
@@ -1673,13 +1757,13 @@ for (const reply of ["hand off", "discard"] as const) {
 
 test("a blank reply to the question asks it again", async context => {
   const f = fixture(context); const plans: string[] = []; const human = person(" \n", "hand off");
-  const result = await execute(input(f), { plan: tooLongTwice(plans), ...editsNothing }, human);
-  assert.equal(plans.length, 2); assert.equal(result.states.filter(state => state === "decide").length, 2);
+  const result = await execute(input(f), { plan: planner(plans), ...editsNothing, planReview: broadOnce() }, human);
+  assert.equal(plans.length, 1); assert.equal(result.states.filter(state => state === "decide").length, 2);
   assert.equal(result.states.slice(result.states.indexOf("decide")).some(state => isPlanning(state) || state === "repairTarget"), false);
   const [first, again] = human.requests;
   assert.deepEqual([again!.prompt, again!.suggestions], [first!.prompt, first!.suggestions]);
-  stuckQuestion(f, first, "planResult");
-  const run = handedOff(f, result, overLimit(6500), human);
+  stuckQuestion(f, first, "planReviewResult");
+  const run = handedOff(f, result, splitSaid, human);
   asksWritten(run.directory, [first!, again!]);
 });
 
@@ -1688,8 +1772,8 @@ test("stuck park, ask, or left out all take a stuck run to the same question, an
   for (const policy of ["park", "ask", undefined]) {
     const f = fixture(context); const human = person("hand off"); const plans: string[] = [];
     const data = input(f); if (policy === undefined) Reflect.deleteProperty(data, "stuck"); else data.stuck = policy;
-    const result = await execute(data, { plan: tooLongTwice(plans), ...editsNothing }, human);
-    questioned(f, result, overLimit(6500), human);
+    const result = await execute(data, { plan: planner(plans), ...editsNothing, planReview: broadOnce() }, human);
+    questioned(f, result, splitSaid, human);
     routes.push(result.states);
   }
   assert.deepEqual(routes[1], routes[0]); assert.deepEqual(routes[2], routes[0]);
@@ -1697,11 +1781,11 @@ test("stuck park, ask, or left out all take a stuck run to the same question, an
 
 test("under the sleep option a stuck run sleeps on its question with nothing ended, and continuing it with an answer goes back to plan", async context => {
   const f = fixture(context); const answer = "Keep it to two files."; const plans: string[] = []; const slept: Ask[] = [];
-  const agents = { plan: tooLongTwice(plans) };
+  const agents = { plan: planner(plans), planReview: broadOnce() };
   const saves = checkpointed();
   const first = await execute(input(f), agents, person(), { ...saves.options, onHumanSleep: request => { slept.push(request); } });
   assert.equal(String(first.state), "decide"); assert.equal(first.states.at(-1), "decide"); assert.deepEqual(saves.unsaveable, []);
-  assert.equal(slept.length, 1); stuckQuestion(f, slept[0], "planResult"); assert.match(slept[0]!.prompt, overLimit(6500));
+  assert.equal(slept.length, 1); stuckQuestion(f, slept[0], "planReviewResult"); assert.match(slept[0]!.prompt, splitSaid);
   // Nothing has ended: no receipt and no note, and the worktree is kept on its branch.
   const runs = join(f.evidence, ".machine-runs/machine-shop"); const [id, ...others] = readdirSync(runs); assert.deepEqual(others, []);
   for (const name of ["delivery.json", "result.json", "park.txt"]) assert.equal(existsSync(join(runs, id!, name)), false, name);
@@ -1714,7 +1798,7 @@ test("under the sleep option a stuck run sleeps on its question with nothing end
   const continued = await execute(input(f), agents, person(), { ...rest.options, continueAt: { value: checkpoint.value, context: checkpoint.context }, answer });
   assert.equal(continued.state, "delivered", evidence(f).delivery.reason);
   assert.deepEqual(continued.states.slice(0, 3), ["decide", "repairTarget", "plan"]);
-  assert.equal(plans.length, 3); assert.ok(answersIn(plans[2]!).includes(answer), plans[2]);
+  assert.equal(plans.length, 2); assert.ok(answersIn(plans[1]!).includes(answer), plans[1]);
   const run = held(f, continued, /^Delivered/u); untouched(f);
   assert.deepEqual(run.result.decisions, [{ stage: "decide", response: answer }]);
   // Continuing at the question does not write it again.
@@ -1723,7 +1807,7 @@ test("under the sleep option a stuck run sleeps on its question with nothing end
 
 test("a run continued at its question with a blank reply asks again and writes question-2.txt beside the first, which stays as it was", async context => {
   const f = fixture(context); const plans: string[] = []; const slept: Ask[] = [];
-  const agents = { plan: tooLongTwice(plans), ...editsNothing };
+  const agents = { plan: planner(plans), ...editsNothing, planReview: broadOnce() };
   const saves = checkpointed();
   const first = await execute(input(f), agents, person(), { ...saves.options, onHumanSleep: request => { slept.push(request); } });
   assert.equal(String(first.state), "decide"); assert.equal(slept.length, 1);
@@ -1733,8 +1817,8 @@ test("a run continued at its question with a blank reply asks again and writes q
   const checkpoint = saves.saved.decide!; const rest = checkpointed(checkpoint); const human = person("hand off");
   const continued = await execute(input(f), agents, human, { ...rest.options, continueAt: { value: checkpoint.value, context: checkpoint.context }, answer: " \n" });
   assert.deepEqual(continued.states.slice(0, 2), ["decide", "stuck"]);
-  assert.equal(human.requests.length, 1); stuckQuestion(f, human.requests[0], "planResult");
-  const run = handedOff(f, continued, overLimit(6500), human);
+  assert.equal(human.requests.length, 1); stuckQuestion(f, human.requests[0], "planReviewResult");
+  const run = handedOff(f, continued, splitSaid, human);
   asksWritten(run.directory, [slept[0]!, human.requests[0]!]);
   assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "hand off" }]);
 });
@@ -1755,10 +1839,10 @@ test("no state of the run parks, whatever stuck is: there is neither a park nor 
 for (const reply of ["Hand off", " hand off. ", "HAND OFF!", "hand off…", "Hand off?!", "\thand off ;"]) {
   test(`the reply ${JSON.stringify(reply)} is the hand off decision, matched ignoring case, surrounding whitespace and trailing punctuation`, async context => {
     const f = fixture(context); const plans: string[] = []; const human = person(reply);
-    const result = await execute(input(f), { plan: tooLongTwice(plans), ...editsNothing }, human);
-    assert.equal(plans.length, 2, "the reply is not taken as an answer that sends the run back to plan");
+    const result = await execute(input(f), { plan: planner(plans), ...editsNothing, planReview: broadOnce() }, human);
+    assert.equal(plans.length, 1, "the reply is not taken as an answer that sends the run back to plan");
     // handedOff checks that delivery.json and the summary record the decision as hand off.
-    const run = handedOff(f, result, overLimit(6500), human);
+    const run = handedOff(f, result, splitSaid, human);
     assert.deepEqual(result.states.slice(-4), ["stuck", "decide", "handOff", "handedOff"]);
     // The reply is kept as the owner gave it.
     assert.deepEqual(run.result.decisions, [{ stage: "decide", response: reply }]);
@@ -1768,21 +1852,21 @@ for (const reply of ["Hand off", " hand off. ", "HAND OFF!", "hand off…", "Han
 
 test("Discard. asks for confirmation as discard does, and confirm discard there stays exact: Confirm discard is refused", async context => {
   const f = fixture(context); const human = person("Discard.", "Confirm discard");
-  await assert.rejects(execute(input(f), { plan: tooLongTwice([]), ...editsNothing }, human), /Expected one of: confirm discard, go back/u);
+  await assert.rejects(execute(input(f), { ...editsNothing, planReview: broadOnce() }, human), /Expected one of: confirm discard, go back/u);
   assert.equal(human.requests.length, 2); assert.deepEqual(human.requests[1]!.choices, ["confirm discard", "go back"]);
   assert.ok(existsSync(f.worktree), "nothing was removed");
 });
 
 test("DISCARD! then confirm discard abandons the run with the decision recorded as discard", async context => {
   const f = fixture(context); const human = person("DISCARD!", "confirm discard");
-  const result = await execute(input(f), { plan: tooLongTwice([]), ...editsNothing }, human);
+  const result = await execute(input(f), { ...editsNothing, planReview: broadOnce() }, human);
   const run = abandoned(f, result, "discard");
   assert.deepEqual(run.result.decisions.map((made: any) => `${made.stage}: ${made.response}`), ["decide: DISCARD!", "confirmDiscard: confirm discard"]);
 });
 
 test("Archive. is the archive decision, and is recorded as archive", async context => {
   const f = fixture(context); const human = person("Archive.");
-  const result = await execute(input(f), { plan: tooLongTwice([]), ...editsNothing }, human);
+  const result = await execute(input(f), { ...editsNothing, planReview: broadOnce() }, human);
   assert.deepEqual(result.states.slice(result.states.indexOf("decide"), result.states.indexOf("decide") + 2), ["decide", "archive"]);
   // Nothing was edited, so there is nothing to archive and the run ends blocked with the decision it was given.
   assert.equal(result.state, "blocked"); const run = evidence(f);
@@ -1791,11 +1875,11 @@ test("Archive. is the archive decision, and is recorded as archive", async conte
 
 test("More rounds? is the more rounds decision: it goes back to plan without becoming an answer", async context => {
   const f = fixture(context); const plans: string[] = []; const human = person("More rounds?");
-  const result = await execute(input(f), { plan: tooLongTwice(plans) }, human);
+  const result = await execute(input(f), { plan: planner(plans), planReview: broadOnce() }, human);
   assert.equal(result.state, "delivered", evidence(f).delivery.reason);
-  assert.equal(plans.length, 3);
+  assert.equal(plans.length, 2);
   for (const prompt of plans) assert.equal(prompt.includes("More rounds?"), false, prompt);
-  assert.equal(answersIn(plans[2]!), "", "more rounds carries no answer");
+  assert.equal(answersIn(plans[1]!), "", "more rounds carries no answer");
   const run = held(f, result, /^Delivered.* Decision: more rounds\. /u);
   assert.equal(run.delivery.decision, "more rounds");
   assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "More rounds?" }]);
@@ -1803,9 +1887,9 @@ test("More rounds? is the more rounds decision: it goes back to plan without bec
 
 test("a reply that only begins with a decision is still an answer", async context => {
   const f = fixture(context); const plans: string[] = []; const answer = "hand off please"; const human = person(answer);
-  const result = await execute(input(f), { plan: tooLongTwice(plans) }, human);
+  const result = await execute(input(f), { plan: planner(plans), planReview: broadOnce() }, human);
   assert.equal(result.state, "delivered", evidence(f).delivery.reason);
-  assert.equal(plans.length, 3); assert.ok(answersIn(plans[2]!).includes(answer), plans[2]);
+  assert.equal(plans.length, 2); assert.ok(answersIn(plans[1]!).includes(answer), plans[1]);
 });
 
 test("an answer to a spent review budget renews the budgets as more rounds does and goes back to the implementer with the findings that stopped the run and the answer", async context => {
@@ -1860,60 +1944,6 @@ for (const assume of [true, false]) {
   });
 }
 
-test("a plan sent back for length still has the reviewer's one revision, and a second revise is asked about as it is without that return", async context => {
-  const f = fixture(context); const human = person("hand off"); const plans: string[] = []; const planReviews: string[] = [];
-  const result = await execute(input(f, {}, { stuck: "park" }), {
-    plan: request => { plans.push(request.prompt); return ok("planned", plans.length === 1 ? "p".repeat(6001) : `Attempt ${plans.length}: add greeting.txt.`); },
-    planReview: request => { planReviews.push(request.prompt); return ok("revise", planReviews.length === 1 ? "Name the test that proves the greeting" : "The plan still names no test"); },
-    tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
-  }, human);
-  const run = questioned(f, result, /The plan still names no test/u, human);
-  assert.deepEqual([plans.length, planReviews.length], [3, 2]); assert.equal(result.states.at(-5), "planReviewResult");
-  assert.deepEqual(result.states.filter(isPlanning), ["falsify", "plan", "plan", "planReview", "plan", "planReview"]);
-  // The reviewer reads the plans that fit; the third planning answers the review, not a length that no longer stands.
-  assert.ok(planIn(planReviews[0]!).startsWith("Attempt 2: add greeting.txt.\n")); assert.ok(planIn(planReviews[1]!).startsWith("Attempt 3: add greeting.txt.\n"));
-  assert.match(plans[1]!, lastPlanWas(6001)); assert.doesNotMatch(plans[2]!, /\blast plan was\b/u);
-  assert.ok(plans[2]!.includes("Name the test that proves the greeting"));
-  assert.ok(run.needs.includes("The plan still names no test")); assert.ok(result.output.summary.includes("The plan still names no test"));
-  assert.doesNotMatch(run.needs, /Name the test that proves the greeting/u); assert.doesNotMatch(run.needs, /6001 characters/u);
-  assert.equal(candidate(f.worktree).status, ""); assert.deepEqual(run.result.checks, []);
-});
-
-test("a plan the reviewer sent back that comes back over 6000 characters is sent back once for length, and the plan that then fits is reviewed and worked from", async context => {
-  const f = fixture(context); const plans: string[] = []; const planReviews: string[] = []; const prompts: string[] = [];
-  const [first, over] = ["Add greeting.txt and nothing else.", "r".repeat(6001)];
-  const result = await execute(input(f, {}, { stuck: "park", maxRepairs: 0, maxReviewRounds: 0 }), {
-    plan: request => { plans.push(request.prompt); return ok("planned", [first, over, plan][plans.length - 1]!); },
-    planReview: request => { planReviews.push(request.prompt); return planReviews.length === 1 ? ok("revise", "Name the test that proves the greeting") : ok("approved", "The plan now names its test"); },
-    tester: request => { prompts.push(request.prompt); return tester(request); },
-    implementer: request => { prompts.push(request.prompt); return implement(request); },
-  });
-  assert.equal(result.state, "delivered", evidence(f).delivery.reason); assert.deepEqual([plans.length, planReviews.length, prompts.length], [3, 2, 2]);
-  assert.deepEqual(result.states.slice(0, result.states.indexOf("test")).filter(isPlanning), ["falsify", "plan", "planReview", "plan", "plan", "planReview"]);
-  // The revision is told what the reviewer wants; the plan after it is told its length as well.
-  assert.doesNotMatch(plans[1]!, /\blast plan was\b/u); assert.ok(plans[1]!.includes("Name the test that proves the greeting"));
-  assert.match(plans[2]!, lastPlanWas(6001)); assert.match(plans[2]!, limitNamed); assert.ok(plans[2]!.includes("Name the test that proves the greeting"));
-  assert.ok(planIn(planReviews[0]!).startsWith(`${first}\n`)); assert.ok(planIn(planReviews[1]!).startsWith(`${plan}\n`));
-  for (const prompt of prompts) { assert.ok(planIn(prompt).startsWith(`${plan}\n`)); assert.equal(planIn(prompt).startsWith(over), false); }
-  const run = held(f, result, /^Delivered/u);
-  assert.deepEqual([run.result.repairs, run.result.reviewRounds], [0, 0]);
-  assert.deepEqual(run.result.agents.filter((agent: any) => agent.stage === "plan").map((agent: any) => agent.summary), [first, over, plan]);
-});
-
-test("a run sends a plan back for length once only: one over 6000 characters after the reviewer's revision is asked about with its length", async context => {
-  const f = fixture(context); const human = person("hand off"); let plans = 0; let planReviews = 0;
-  const result = await execute(input(f, {}, { stuck: "park" }), {
-    plan: () => ok("planned", [() => "p".repeat(6001), () => "Add greeting.txt and nothing else.", () => "p".repeat(6200)][plans++]!()),
-    planReview: () => { planReviews++; return ok("revise", "Name the test that proves the greeting"); },
-    tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
-  }, human);
-  const run = questioned(f, result, overLimit(6200), human);
-  assert.deepEqual([plans, planReviews], [3, 1]); assert.equal(result.states.at(-5), "planResult");
-  assert.deepEqual(result.states.filter(isPlanning), ["falsify", "plan", "plan", "planReview", "plan"]);
-  assert.match(run.needs, /\bsent back once\b/u); assert.doesNotMatch(run.needs, /malformed/iu);
-  assert.equal(candidate(f.worktree).status, ""); assert.deepEqual(run.result.checks, []);
-});
-
 test("a plan over 16000 characters is refused as an empty one is, with no return for length", async context => {
   const f = fixture(context); const human = person("hand off"); const plans: string[] = [];
   const result = await execute(input(f, {}, { stuck: "park" }), {
@@ -1926,23 +1956,6 @@ test("a plan over 16000 characters is refused as an empty one is, with no return
   assert.match(run.delivery.reason, /\bplan\b/u); assert.match(run.delivery.reason, /\b16000 characters\b/u);
   assert.doesNotMatch(run.delivery.reason, /sent back|too broad/u);
   assert.equal(candidate(f.worktree).status, "");
-});
-
-test("a plan of 6000 characters is carried whole, and one of 6001 never reaches the tester or the implementer", async context => {
-  for (const length of [6000, 6001]) {
-    const f = fixture(context); const long = "p".repeat(length); let edits = 0; let plans = 0; let planReviews = 0;
-    const counted = (work: Runner): Runner => request => { edits++; assert.ok(planIn(request.prompt).startsWith(`${long}\n`)); return work(request); };
-    // Whether the run fails outright or the stuck policy takes it is the Machine's choice; either way it says the limit and edits nothing.
-    const [state, said] = await execute(input(f, {}, { stuck: "park" }), {
-      plan: () => { plans++; return ok("planned", long); },
-      planReview: request => { planReviews++; assert.ok(planIn(request.prompt).startsWith(`${long}\n`)); return planning.planReview!.answer(request); },
-      tester: counted(tester), implementer: counted(implement),
-    }, person(...(length === 6000 ? [] : ["hand off"]))).then(done => [done.state, evidence(f).delivery.reason ?? ""], error => ["failed", String(error.message)]);
-    if (length === 6000) { assert.deepEqual([state, edits, plans, planReviews], ["delivered", 2, 1, 1]); continue; }
-    // The planner is asked once more before the run stops, and a second plan as long ends it: no one reviews or works from either.
-    assert.notEqual(state, "delivered"); assert.deepEqual([edits, plans, planReviews], [0, 2, 0]); assert.match(said, /6000/u);
-    assert.equal(candidate(f.worktree).status, ""); assert.equal(git(f.repo, "rev-parse", branch), f.head);
-  }
 });
 
 for (const [label, answer] of [
@@ -1970,26 +1983,8 @@ for (const [label, answer] of [
   });
 }
 
-test("the 6000-character limit is measured on the prose plan, not on the JSON a runner wrapped it in", async context => {
-  for (const length of [6000, 6001]) {
-    const f = fixture(context); const long = "p".repeat(length); let edits = 0; let plans = 0;
-    const counted = (work: Runner): Runner => request => { edits++; assert.ok(planIn(request.prompt).startsWith(`${long}\n`)); return work(request); };
-    const result = await execute(input(f, {}, { stuck: "park" }), {
-      plan: () => { plans++; return { type: "planned", summary: JSON.stringify({ type: "planned", summary: long }) }; }, tester: counted(tester), implementer: counted(implement),
-    }, person(...(length === 6000 ? [] : ["hand off"])));
-    if (length === 6000) { assert.deepEqual([result.state, edits, plans], ["delivered", 2, 1], evidence(f).delivery.reason); continue; }
-    assert.deepEqual([result.state, edits, plans], ["handedOff", 0, 2]); assert.match(evidence(f).delivery.reason, /6000/u);
-    // The length the question gives is the prose plan's, not that of the JSON around it.
-    assert.match(evidence(f).delivery.reason, /\b6001 characters\b/u);
-    // Each plan that was too long is still the stage report of the state that returned it.
-    assert.deepEqual(evidence(f).result.agents.map((agent: any) => agent.stage), ["falsify", "plan", "plan"]);
-    assert.deepEqual(evidence(f).result.agents.slice(1).map((agent: any) => agent.summary), [long, long]);
-    assert.equal(candidate(f.worktree).status, "");
-  }
-});
-
 /** The outcomes each planning state can return, every one of which needs a summary. */
-const reporting: Record<string, string[]> = { falsify: ["sound", "questions"], plan: ["planned"], planReview: ["approved", "revise"] };
+const reporting: Record<string, string[]> = { falsify: ["sound", "questions"], plan: ["planned"], planReview: ["approved", "revise", "tooBroad"] };
 for (const policy of ["park", "ask"] as const) {
   for (const [label, summary] of [["no summary", {}], ["an empty summary", { summary: "" }], ["a blank summary", { summary: " \n" }]] as const) {
     test(`with stuck ${policy}, a report with ${label} from falsify, plan, or planReview stops for the owner with the state and the summary named`, async context => {
@@ -4527,6 +4522,21 @@ for (const path of ["docs/catalog.md", "docs/workflows/ticket-task.md", "README.
       `${path} must say in one sentence or table row that a decision matches ignoring case, surrounding whitespace and trailing punctuation`);
   });
 }
+
+for (const path of ["docs/catalog.md", "docs/workflows/ticket-task.md", "README.md"]) {
+  test(`${path} describes no plan length limit, and says plan review can find a ticket too broad and stop with a suggested split`, () => {
+    const text = readFileSync(resolve(path), "utf8"); const prose = text.replace(/\s+/gu, " ");
+    assert.doesNotMatch(prose, /\b6000\b|\b4000 characters\b|plan-length|plan length|over-long plan|too long\?|`?shorten`?\b/iu, `${path} still describes a plan length limit`);
+    assert.ok(statements(text).some(said => /\btoo broad\b|`tooBroad`/iu.test(said) && /\bsplit\b/iu.test(said)),
+      `${path} must say in one sentence or table row that plan review can find a ticket too broad and suggest a split`);
+  });
+}
+test("the catalog names the tooBroad verdict, and its decide row no longer refers to the removed park note", () => {
+  const catalog = readFileSync(resolve("docs/catalog.md"), "utf8");
+  assert.match(catalog, /`tooBroad`/u);
+  const row = catalog.split("\n").find(line => line.startsWith("| `decide` |")) ?? "";
+  assert.ok(row, "the catalog has a decide row"); assert.doesNotMatch(row, /\bnote's\b|\bnote\b/iu);
+});
 
 /** A rule file, or what it does to a file; `unignored` outputs of a setup command are another matter. */
 const ignores = /\.gitignore|\bignore rules?\b|\bignored\b/iu;

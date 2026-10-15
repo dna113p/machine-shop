@@ -159,19 +159,19 @@ budgets. Required Agent roles are `investigator`, `tester`, `implementer`, and
 `reviewer`. Failed red, scope, and green gates use `maxRepairs` (0–3, default 3
 here); review revisions use
 `maxReviewRounds` (0–5, default 2). Neither consumes the other's budget. With a
-stable base this allows at most 17 Agent calls before the stuck policy applies (up to two falsify calls,
-up to three plans and two plan reviews, one initial tester pass, up to six implementation passes, and three implementation reviews;
+stable base this allows at most 16 Agent calls before the stuck policy applies (up to two falsify calls,
+up to two plans and two plan reviews, one initial tester pass, up to six implementation passes, and three implementation reviews;
 tester retries share the repair budget with implementation retries). Setting
-both budgets to zero allows at most ten calls, or nine with `redGreen: false`.
-The single permitted plan revision and the separate one-time returns for plan
-length and malformed falsify questions consume neither budget. A moved base that
+both budgets to zero allows at most nine calls, or eight with `redGreen: false`.
+The single permitted plan revision and the separate one-time return for
+malformed falsify questions consume neither budget. A moved base that
 changes the approved patch adds a fresh review outside these budgets.
 Each `more rounds` decision renews both budgets and returns to the planning or editing stage that stopped,
 including the tester or implementer when that Agent returned `blocked`;
 after a second plan revision it grants one more plan and review with the reviewer's
-feedback. After a second over-long plan it returns to `plan` with the length reason,
-without renewing the automatic return for length. A free-form answer renews
-that return as well as both budgets. `stuck` no longer changes anything:
+feedback. After a `tooBroad` verdict it returns to `plan` with the suggested split,
+without consuming the reviewer's revision allowance. A free-form answer also
+renews both budgets. `stuck` no longer changes anything:
 `"park"` (the default) and `"ask"` both use the same Human question.
 
 ```json
@@ -316,10 +316,10 @@ is.
 | `start` | Open the helper's run on the worktree, which must be clean |
 | `falsify` | Read-only investigator tries to show the ticket is wrong, already done, impossible here, or underspecified; returns `sound` with a one-paragraph summary or `questions` with 1–10 entries containing text, options, recommended, assumable, and why in the report's `questions` field, not its summary or message; a return for malformed questions includes the validation reason and repeats where the questions go |
 | `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; missing or malformed questions return to `falsify` once per run, then go through the stuck policy with the reason and report's evidence file; a sound ticket goes to `plan`, as does an entirely assumable report with `assume: true`; remaining questions go through the stuck policy with numbered needs, flattened with question text, each option, and why capped separately at 600 characters plus an ellipsis |
-| `plan` | Read-only investigator returns `planned` with the complete plan as a summary of at most 6000 characters, recorded as stage `plan`; a return for length names the previous length and limit and asks for the same plan in fewer words, naming files and tests without restating the ticket |
-| `planResult` | Capture the report before guarding the unchanged worktree and validating the captured prose plan's length before `planReview`; a captured plan over 6000 characters returns to `plan` once, separately from the reviewer's revision; a second goes through the stuck policy with its length, the limit, and a plain explanation |
-| `planReview` | Read-only reviewer returns `approved` or `revise` with a summary; the prompt includes the plan verbatim |
-| `planReviewResult` | Capture the report before guarding the unchanged worktree; first `revise` returns to `plan`, second `revise` goes through the stuck policy with the reviewer's summary as the reason and the usual capped blocker needs; `approved` continues to `test` or, with `redGreen: false`, `change` |
+| `plan` | Read-only investigator returns `planned` with the complete plan as a summary, recorded as stage `plan`; asks for a concise plan naming files and tests without restating the ticket |
+| `planResult` | Capture the report before guarding the unchanged worktree, then pass the plan to `planReview` |
+| `planReview` | Read-only reviewer returns `approved` or `revise` with a summary, preferring concise plans without restated ticket text or detail the implementer does not need; returns `tooBroad` with a suggested split into smaller tickets when the ticket is too broad for one run; the prompt includes the plan verbatim |
+| `planReviewResult` | Capture the report before guarding the unchanged worktree; first `revise` returns to `plan`, second `revise` goes through the stuck policy with the reviewer's summary as the reason and the usual capped blocker needs; `tooBroad` goes through the stuck policy with the suggested split in the question, without consuming a revision; `approved` continues to `test` or, with `redGreen: false`, `change` |
 | `test` | With `redGreen: true`, the tester writes only tests for every acceptance criterion inside Scope, leaving them uncommitted; its summary is recorded as stage `test` |
 | `scopeAfterTest`, `red` | Check changed paths against Scope, then run the named red check; failures consume the repair budget and return to `test` |
 | `change` | The implementer edits the worktree and leaves the changes uncommitted, making the tester's tests pass without weakening or deleting them |
@@ -336,7 +336,7 @@ is.
 | `dropLocal`, `mergeHandOff`, `mergeAbandon`, `mergeFailure` | Confirmed discard deletes only the local branch and ends `abandoned`; hand off keeps it and ends `handedOff`; cleanup failure ends `blocked`; each writes `merge.json` with `hold` output |
 | `repairBudget`, `repairTarget`, `reviewBudget` | Count gate retries and review revisions separately; gate retries route to the responsible editing stage, review retries to `change`; exhaustion goes to `stuck` |
 | `stuck` | Go to `decide` for both accepted input values |
-| `decide` | Human: sleep on one question with the note's needs and evidence; suggest `more rounds`, `hand off`, `archive`, and `discard`, accepting any other reply as an answer |
+| `decide` | Human: sleep on one question with what is needed and evidence; suggest `more rounds`, `hand off`, `archive`, and `discard`, accepting any other reply as an answer |
 | `confirmDiscard` | Human: `confirm discard` or `go back`, asked before a discard removes anything |
 | `archive`, `remove` | Commit the candidate and keep that commit as the branch `archive/<slug>`; `git worktree remove --force` and `git branch -D` for this run's own worktree and ticket branch |
 
@@ -345,19 +345,18 @@ its unchanged-worktree guard or validation. A missing or empty summary in any
 planning state goes through the stuck policy, with the state and missing summary
 named in the reason. A plan sent back once by the reviewer is re-planned with the
 reviewer's feedback and reviewed again; a second revision stops before editing.
-Separately, a captured prose plan over 6000 characters returns to `plan` once
-with its length and the limit; a later Human answer renews this allowance. The planner must say the same plan in fewer
-words, naming files and tests without restating the ticket. This return is also
-available after a reviewer revision if not already used. A second over-long plan
-goes through the stuck policy with its length against 6000, saying it was sent
-back once and that the ticket may be too broad for one run. Neither over-long
-plan is truncated or passed onward under `Plan:`; both remain captured evidence.
-An empty plan or one over the capture limit of 16000 characters is refused without
-a return for length. Missing or malformed falsify questions return to `falsify`
+The planner names files and tests concisely without restating the ticket. The
+reviewer sends back restated ticket text or detail the implementer does not need
+as an ordinary revision. If the ticket is too broad for one run, the reviewer
+returns `tooBroad` with a suggested split into smaller tickets, one per line in
+the summary. This stops before editing and carries the split into the Human
+question and its saved file; it does not consume the reviewer's revision.
+An empty plan or one over the general stage-report capture limit of 16000
+characters is still refused. Missing or malformed falsify questions return to `falsify`
 once per run with the validation reason and instructions to put the questions
 in the report's `questions` field, not its summary or message. The field is the
-only source of questions. This allowance is separate from the plan-length
-return and reviewer's revision and consumes neither budget. A second malformed
+only source of questions. This allowance is separate from the reviewer's
+revision and consumes neither budget. A second malformed
 report goes through the stuck policy, asking a Human question saying
 the questions were missing or malformed twice, giving the validation reason
 and naming the `falsify-<n>.json` evidence file holding that report.
@@ -623,7 +622,7 @@ has a two-minute timeout and also runs for a resumed `pr` run. `branch` and
 
 Stuck work goes to the `stuck` Operation. This covers falsify returning
 questions that the run cannot assume, a second malformed falsify questions report,
-other malformed planning reports (including missing or empty summaries), a second over-long plan, a second plan review revision, any read-only
+other malformed planning reports (including missing or empty summaries), a plan review finding the ticket too broad, a second plan review revision, any read-only
 planning stage having edited files, the tester or implementer returning `blocked`,
 the reviewer returning `blocked` or having edited files, review non-convergence,
 open owner questions, malformed review reports, either budget exhausting,
@@ -641,7 +640,7 @@ Continue the sleeping run by answering its pending request; no new run or
 
 Any nonblank reply that is not one of the four decisions is an answer and
 works like `more rounds`: renew both budgets, clear owner questions, and go
-back to the stage that stopped. An answer also clears the plan-length return;
+back to the stage that stopped;
 a blank reply repeats the question without restarting work. Answers remain under
 `Answers from the ticket owner:` in every later Agent prompt and survive sleep
 and continuation. Each reply is recorded in `human-<n>.json` and the receipt's
