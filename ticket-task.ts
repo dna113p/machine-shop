@@ -108,11 +108,12 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   }
 
   /** A failed Git or gh step blocks with its output saved as evidence rather than copied into the ticket summary. */
-  function attempt(file: string, args: string[], cwd: string, timeout?: number, failure = `${file} ${args[0]} failed`) {
+  /** `again` is for states a continued run may repeat: their log may already exist. */
+  function attempt(file: string, args: string[], cwd: string, timeout?: number, failure = `${file} ${args[0]} failed`, again = false) {
     const done = run(file, args, cwd, timeout);
     if (!done.ok) {
       const log = join(work.open(), `${file}-${args[0]}.log`);
-      writeFileSync(log, `${file} ${args.join(" ")}\n${done.stdout}\n${done.detail}\n`, { flag: "wx", mode: 0o600 });
+      writeFileSync(log, `${file} ${args.join(" ")}\n${done.stdout}\n${done.detail}\n`, { ...(again ? {} : { flag: "wx" }), mode: 0o600 });
       work.block(`${failure}; inspect ${log}`);
     }
     return done;
@@ -425,7 +426,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         || step(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", saved.checked, remoteTip], repository.path, publishTimeoutMs).ok);
       if (!available || !run("git", ["merge-base", "--is-ancestor", tip, remoteTip!], repository.path).ok) {
         undo(original);
-        return stop(`Base ${tip} cannot be shown to be published on ${saved.checkedBase} at ${saved.checked}; the base must be pushed first. Inspect any rebase logs in ${work.open()}.`);
+        return stop(`Base ${tip} cannot be shown to be published on ${saved.checkedBase} at ${repository.remote}; the base must be pushed first. Inspect any rebase logs in ${work.open()}.`);
       }
     }
     const patchId = (commit: string) => {
@@ -761,9 +762,11 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   }
 
   function dropLocal(): Event {
-    // A run continued after a crash may find the branch already deleted.
-    const present = run("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${saved.branch}`], repository.path).ok;
-    if (present && !attempt("git", ["branch", "-D", saved.branch], repository.path).ok) return { type: "blocked" };
+    // A run continued after a crash may find the branch already deleted; only Git's clean "no such ref" skips the delete.
+    const shown = run("git", ["show-ref", "--verify", "--quiet", `refs/heads/${saved.branch}`], repository.path);
+    const missing = !shown.ok && shown.status === 1 && !shown.detail;
+    if (!shown.ok && !missing) return work.block(`git show-ref could not tell whether ${saved.branch} exists: ${shown.detail || `exit ${shown.status}`}`);
+    if (!missing && !attempt("git", ["branch", "-D", saved.branch], repository.path, undefined, undefined, true).ok) return { type: "blocked" };
     saved.localDeleted = true;
     return { type: "removed" };
   }
@@ -772,14 +775,14 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   function cleanUp(): Event {
     const ref = `refs/heads/${saved.branch}`;
     const listArgs = ["ls-remote", "--heads", saved.checked, ref];
-    const listed = attempt("git", listArgs, repository.path, publishTimeoutMs);
+    const listed = attempt("git", listArgs, repository.path, publishTimeoutMs, undefined, true);
     if (!listed.ok) return { type: "blocked" };
     if (listed.stdout) {
       const args = ["push", "--no-follow-tags", saved.checked, "--delete", ref];
       const deleted = run("git", args, repository.path, publishTimeoutMs);
       if (!deleted.ok) {
         // The host can delete the branch between our query and push. Only a successful empty query excuses the failed push.
-        const remaining = attempt("git", listArgs, repository.path, publishTimeoutMs);
+        const remaining = attempt("git", listArgs, repository.path, publishTimeoutMs, undefined, true);
         const log = join(work.open(), "git-push.log");
         writeFileSync(log, `git ${args.join(" ")}\n${deleted.stdout}\n${deleted.detail}\n`, { mode: 0o600 });
         if (!remaining.ok) return { type: "blocked" };
@@ -791,7 +794,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return settle("merged");
   }
 
-  // Delivery and result receipts were already written before waiting; this receipt records the later ending exactly once.
+  // Delivery and result receipts were already written before waiting; this receipt records the later ending, and a continued run may write it again.
   function settle(outcome: "merged" | "handedOff" | "abandoned" | "blocked"): Event {
     const directory = work.open();
     const reason = outcome === "blocked" ? work.status().reason : saved.mergeReason;
@@ -1348,7 +1351,7 @@ function run(file: string, args: string[], cwd: string, timeout = 30_000) {
     cwd, encoding: "utf8", shell: false, timeout, killSignal: "SIGKILL", maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GH_PROMPT_DISABLED: "1", GH_REPO: undefined },
   });
-  return { ok: !done.error && done.status === 0, stdout: (done.stdout ?? "").trim(), detail: done.error?.message ?? (done.stderr ?? "").trim() };
+  return { ok: !done.error && done.status === 0, status: done.error ? null : done.status, stdout: (done.stdout ?? "").trim(), detail: done.error?.message ?? (done.stderr ?? "").trim() };
 }
 function git(cwd: string, ...args: string[]): string {
   const done = run("git", args, cwd);
