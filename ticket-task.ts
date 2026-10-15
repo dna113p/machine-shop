@@ -6,7 +6,7 @@ import { taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject 
 import { brief, firstLine } from "./defaults/_machine-shop/brief.ts";
 import { outsideScope } from "./defaults/_machine-shop/scope.ts";
 
-export const description = "Carry one local ticket for one Git repository from an isolated worktree through falsification, planning, plan review, implementation, checks, and review to a delivered branch, patch, or pull request; a pull request is then watched until it merges, when its branch is deleted and the ticket completes; a stuck run parks by default or asks for a Human decision.";
+export const description = "Carry one local ticket for one Git repository from an isolated worktree through falsification, planning, plan review, implementation, checks, and review to a delivered branch, patch, or pull request; a pull request is then watched until it merges, when its branch is deleted and the ticket completes; a stuck run sleeps on a Human question.";
 export const agentRoles = {
   investigator: "Tries to falsify the ticket, then plans its implementation without editing",
   tester: "Writes failing tests for the ticket's acceptance criteria before implementation",
@@ -75,14 +75,20 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     questionsFault: "",
     ownerQuestions: null as { text: string; where: string; options?: string[]; recommended?: string; why?: string }[] | null,
     wouldAssume: [] as FalsifyQuestion[],
+    answers: [] as string[],
     assumptions: [] as Assumption[],
     assumptionsJson: "",
     task: taskData(),
   });
-  const { ticket, repository, prefix, worktree, evidenceRoot, resume, redGreen, assume, stuck, work, branch: named } = parseTicket(input, saved.task);
+  const { ticket, repository, prefix, worktree, evidenceRoot, resume, redGreen, assume, work, branch: named } = parseTicket(input, saved.task);
   // A continued run keeps its saved branch; resume may adopt the worktree's branch.
   saved.branch ||= named;
   const assumptionsPrompt = () => saved.assumptionsJson ? ["Assumptions:", saved.assumptionsJson] : [];
+  // Answers remain in every later stage's prompt, including after a sleeping run continues.
+  const prompt = (instruction: string) => [
+    work.prompt(instruction),
+    ...(saved.answers.length ? ["Answers from the ticket owner:", ...saved.answers] : []),
+  ].join("\n\n");
 
   function scope(stage: "test" | "change"): Event {
     saved.repairing = stage;
@@ -602,7 +608,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   };
   const locations = () => [`Worktree: ${worktree}`, `Branch: ${saved.branch}`, `Evidence: ${work.open()}`];
   const stuckPrompt = () => brief({
-    decision: `Ticket ${ticket.id} is stuck: choose how to go on`, standing: standing(), evidence: locations(),
+    decision: `Ticket ${ticket.id} is stuck: answer what is needed`, standing: standing(),
+    needs: parkDetails().needs, evidence: locations(),
     options: [
       { name: "more rounds", does: saved.repairing === "falsify" || saved.repairing === "plan" || saved.repairing === "planReview"
         ? `restart the repair budget and return to ${saved.repairing} with the standing feedback.`
@@ -610,6 +617,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       { name: "hand off", does: "stop here and keep the worktree and branch exactly as they are, with nothing committed, for another workflow or a person.", recommended: true },
       { name: "archive", does: `commit the candidate as delivery would have and keep that commit as the branch ${archiveBranch()}, then remove the worktree and delete ${saved.branch}. Ignored files are not kept.` },
       { name: "discard", does: "remove the worktree and delete the branch without saving the candidate; asks for confirmation first." },
+      { name: "any other reply", does: "answer the question and return to the stage that stopped with fresh budgets and this answer as standing feedback." },
     ],
   });
   const discardPrompt = () => brief({
@@ -971,6 +979,19 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   }
   const chose = (value: string) => ({ event }: { event: Event }) => event.value === value;
   const decide = ({ event }: { event: Event }) => { saved.decision = work.choice("decide", event, decisions); };
+  const continueWork = ({ event }: { event: Event }) => {
+    saved.decision = work.choice("decide", event);
+    if (saved.decision !== "more rounds") {
+      saved.answers.push(saved.decision);
+      saved.lengthReturned = false;
+      saved.overLimit = 0;
+    }
+    work.renew();
+    saved.ownerQuestions = null;
+    saved.wouldAssume = [];
+    if (saved.standingReview !== null) work.block(saved.standingReview);
+    saved.standingReview = null;
+  };
   const mergeDecide = ({ event }: { event: Event }) => { saved.mergeDecision = work.choice("mergeDecide", event, mergeDecisions); };
   return machine({
     initial: "shape", output: () => saved.held ?? undefined,
@@ -979,7 +1000,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       // A clean resume starts planning afresh. A resumed candidate is held to Scope; red cannot be proved again once implemented.
       prepare: operation(prepare, { prepared: "start", resumed: "scopeAfterChange", redeliver: "rebase", blocked: "failure" }),
       start: operation(work.start, { started: "falsify" }),
-      falsify: agent(() => work.prompt([
+      falsify: agent(() => prompt([
         "Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 entries shaped as { text, options: string[], recommended: string, assumable: boolean, why }, giving the exact questions a person could answer. text and why must be non-empty strings; options must be a non-empty array of non-empty strings; recommended must copy one of those options exactly. Mark assumable true only for a gap whose conservative answer loses nothing if wrong: it stops, refuses, or keeps more. A product decision, a change of scope, or anything irreversible is never assumable.",
         ...(saved.questionsFault ? [`Your last report's questions were missing or malformed: ${saved.questionsFault}.`] : []),
         "Put the questions in the report's questions field, not in the summary or message.",
@@ -988,7 +1009,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         questions: { target: "falsifyResult", actions: rememberPlanning },
       }, { using: "investigator", cwd: worktree }),
       falsifyResult: operation(stopped("falsifyResult", falsifyResult), { sound: "plan", assumed: "plan", reask: "falsify", blocked: "stuck" }),
-      plan: agent(() => work.prompt([
+      plan: agent(() => prompt([
         `Plan the implementation of this sound ticket. Do not edit any file. Cover the acceptance criteria, tests, permitted paths, and required checks. Address any plan review feedback in the stage reports. Return planned with the complete plan as the summary, at most ${planLimit} characters.`,
         ...(saved.overLimit ? [`Your last plan was ${saved.overLimit} characters; the limit is ${planLimit}. Say the same plan in fewer words: name the files and the tests, and do not restate the ticket.`] : []),
         ...assumptionsPrompt(),
@@ -996,7 +1017,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         planned: { target: "planResult", actions: rememberPlanning },
       }, { using: "investigator", cwd: worktree }),
       planResult: operation(stopped("planResult", planResult), { planned: "planReview", shorten: "plan", blocked: "stuck" }),
-      planReview: agent(() => work.prompt([
+      planReview: agent(() => prompt([
         "Review the plan against the ticket, relevant code, scope, acceptance criteria, and tests. Do not edit any file. Return approved with a summary if it is ready to implement, or revise with a summary of what must change. Only one revision of the plan is allowed.",
         ...assumptionsPrompt(),
         "Plan:", saved.plan,
@@ -1007,7 +1028,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       planReviewResult: operation(stopped("planReviewResult", planReviewResult), { approved: redGreen ? "test" : "change", revise: "plan", blocked: "stuck" }),
       test: agent(() => {
         saved.repairing = "test";
-        return work.prompt([
+        return prompt([
           "Write only tests that encode the acceptance criteria below, one or more per criterion, inside the Scope paths below. Do not implement anything and do not change non-test files. The tests must fail now and pass once the ticket is implemented. Leave changes uncommitted.",
           ...assumptionsPrompt(),
           ...(saved.plan ? ["Plan:", saved.plan] : []),
@@ -1028,7 +1049,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }, { passed: "change", failed: "repairBudget" }),
       change: agent(() => {
         saved.repairing = "change";
-        return work.prompt([
+        return prompt([
           "Implement the ticket and its tests. Keep the change focused. Do not weaken checks or expand scope. Leave your changes uncommitted; the workflow commits and delivers them.",
           ...assumptionsPrompt(),
           ...(saved.plan ? ["Plan:", saved.plan] : []),
@@ -1046,7 +1067,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       scopeAfterChange: operation(() => scope("change"), { passed: "verify", failed: "repairBudget" }),
       verify: operation(() => { saved.repairing = "change"; return work.checks(); }, { passed: "sealReview", failed: "repairBudget" }),
       sealReview: operation(work.seal, { sealed: "review" }),
-      review: agent(() => work.prompt([
+      review: agent(() => prompt([
         "Review the current diff and verification evidence. Do not edit any file. Check acceptance criteria, regressions, scope, and whether tests actually establish the intended behavior.",
         ...assumptionsPrompt(),
         ...(saved.assumptions.length ? ["An assumption you disagree with is a discussion finding for the ticket owner."] : []),
@@ -1067,25 +1088,22 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       repairTarget: operation(() => ({ type: saved.repairing }), { falsify: "falsify", plan: "plan", planReview: "planReview", test: "test", change: "change" }),
       reviewBudget: operation(stopped("reviewBudget", work.reviewRound), { retry: "change", exhausted: "stuck" }),
       // Preparation, commit, and delivery failures still end blocked by themselves.
-      stuck: operation(() => ({ type: stuck }), { ask: "decide", park: "park" }),
+      stuck: operation(() => ({ type: "ask" }), { ask: "decide" }),
       park: operation(() => {
         writeFileSync(join(work.open(), "park.txt"), parkNote() + "\n", { flag: "wx", mode: 0o600 });
         return conclude("parked");
       }, { parked: "parked" }),
       decide: human(stuckPrompt, {
         submitted: [
+          { guard: ({ event }: { event: Event }) => typeof event.value === "string" && !event.value.trim(), target: "stuck" },
           // Back to the planning or editing stage that stopped, including the tester after a failed red.
-          { guard: chose("more rounds"), target: "repairTarget", actions: (args: { event: Event }) => {
-            decide(args); work.renew();
-            saved.ownerQuestions = null;
-            if (saved.standingReview !== null) work.block(saved.standingReview);
-            saved.standingReview = null;
-          } },
+          { guard: chose("more rounds"), target: "repairTarget", actions: continueWork },
           { guard: chose("hand off"), target: "handOff", actions: decide },
           { guard: chose("archive"), target: "archive", actions: decide },
-          { target: "confirmDiscard", actions: decide },
+          { guard: chose("discard"), target: "confirmDiscard", actions: decide },
+          { target: "repairTarget", actions: continueWork },
         ],
-      }, { choices: decisions }),
+      }, { suggestions: decisions }),
       confirmDiscard: human(discardPrompt, {
         submitted: [
           { guard: chose("confirm discard"), target: "remove", actions: ({ event }: { event: Event }) => { work.choice("confirmDiscard", event, confirmations); saved.discardConfirmed = true; } },

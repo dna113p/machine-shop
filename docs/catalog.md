@@ -166,13 +166,13 @@ both budgets to zero allows at most ten calls, or nine with `redGreen: false`.
 The single permitted plan revision and the separate one-time returns for plan
 length and malformed falsify questions consume neither budget. A moved base that
 changes the approved patch adds a fresh review outside these budgets.
-With `stuck: "ask"`, each `more rounds` decision
-renews both budgets and returns to the planning or editing stage that stopped,
+Each `more rounds` decision renews both budgets and returns to the planning or editing stage that stopped,
 including the tester or implementer when that Agent returned `blocked`;
 after a second plan revision it grants one more plan and review with the reviewer's
 feedback. After a second over-long plan it returns to `plan` with the length reason,
-without renewing the automatic return for length. The default
-`stuck: "park"` ends unattended runs immediately with their candidate kept.
+without renewing the automatic return for length. A free-form answer renews
+that return as well as both budgets. `stuck` no longer changes anything:
+`"park"` (the default) and `"ask"` both use the same Human question.
 
 ```json
 {
@@ -317,7 +317,7 @@ is.
 | `falsify` | Read-only investigator tries to show the ticket is wrong, already done, impossible here, or underspecified; returns `sound` with a one-paragraph summary or `questions` with 1–10 entries containing text, options, recommended, assumable, and why in the report's `questions` field, not its summary or message; a return for malformed questions includes the validation reason and repeats where the questions go |
 | `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; missing or malformed questions return to `falsify` once per run, then go through the stuck policy with the reason and report's evidence file; a sound ticket goes to `plan`, as does an entirely assumable report with `assume: true`; remaining questions go through the stuck policy with numbered needs, flattened with question text, each option, and why capped separately at 600 characters plus an ellipsis |
 | `plan` | Read-only investigator returns `planned` with the complete plan as a summary of at most 6000 characters, recorded as stage `plan`; a return for length names the previous length and limit and asks for the same plan in fewer words, naming files and tests without restating the ticket |
-| `planResult` | Capture the report before guarding the unchanged worktree and validating the captured prose plan's length before `planReview`; a captured plan over 6000 characters returns to `plan` once per run, separately from the reviewer's revision; a second goes through the stuck policy with its length, the limit, and a plain explanation |
+| `planResult` | Capture the report before guarding the unchanged worktree and validating the captured prose plan's length before `planReview`; a captured plan over 6000 characters returns to `plan` once, separately from the reviewer's revision; a second goes through the stuck policy with its length, the limit, and a plain explanation |
 | `planReview` | Read-only reviewer returns `approved` or `revise` with a summary; the prompt includes the plan verbatim |
 | `planReviewResult` | Capture the report before guarding the unchanged worktree; first `revise` returns to `plan`, second `revise` goes through the stuck policy with the reviewer's summary as the reason and the usual capped blocker needs; `approved` continues to `test` or, with `redGreen: false`, `change` |
 | `test` | With `redGreen: true`, the tester writes only tests for every acceptance criterion inside Scope, leaving them uncommitted; its summary is recorded as stage `test` |
@@ -335,8 +335,9 @@ is.
 | `mergeDecide`, `confirmMergeDiscard` | Human, regardless of `stuck`: a closed pull request or three consecutive check failures offers only `hand off` and `discard`; discard needs a second confirmation, and `go back` returns to `mergeDecide` |
 | `dropLocal`, `mergeHandOff`, `mergeAbandon`, `mergeFailure` | Confirmed discard deletes only the local branch and ends `abandoned`; hand off keeps it and ends `handedOff`; cleanup failure ends `blocked`; each writes `merge.json` with `hold` output |
 | `repairBudget`, `repairTarget`, `reviewBudget` | Count gate retries and review revisions separately; gate retries route to the responsible editing stage, review retries to `change`; exhaustion goes to `stuck` |
-| `stuck`, `park` | Select the input policy: `ask` goes to `decide`; `park` writes a note and receipt, keeps the candidate, and ends `parked` |
-| `decide` | Human, only with `stuck: "ask"`: stuck work waits for one of `more rounds`, `hand off`, `archive`, or `discard` |
+| `stuck` | Go to `decide` for both accepted input values |
+| `decide` | Human: sleep on one question with the note's needs and evidence; suggest `more rounds`, `hand off`, `archive`, and `discard`, accepting any other reply as an answer |
+| `park` | Retained for compatibility, but unreachable from `stuck`; writes `park.txt` and a receipt and ends `parked` |
 | `confirmDiscard` | Human: `confirm discard` or `go back`, asked before a discard removes anything |
 | `archive`, `remove` | Commit the candidate and keep that commit as the branch `archive/<slug>`; `git worktree remove --force` and `git branch -D` for this run's own worktree and ticket branch |
 
@@ -345,8 +346,8 @@ its unchanged-worktree guard or validation. A missing or empty summary in any
 planning state goes through the stuck policy, with the state and missing summary
 named in the reason. A plan sent back once by the reviewer is re-planned with the
 reviewer's feedback and reviewed again; a second revision stops before editing.
-Separately, a captured prose plan over 6000 characters returns to `plan` once per
-run with its length and the limit. The planner must say the same plan in fewer
+Separately, a captured prose plan over 6000 characters returns to `plan` once
+with its length and the limit; a later Human answer renews this allowance. The planner must say the same plan in fewer
 words, naming files and tests without restating the ticket. This return is also
 available after a reviewer revision if not already used. A second over-long plan
 goes through the stuck policy with its length against 6000, saying it was sent
@@ -358,7 +359,7 @@ once per run with the validation reason and instructions to put the questions
 in the report's `questions` field, not its summary or message. The field is the
 only source of questions. This allowance is separate from the plan-length
 return and reviewer's revision and consumes neither budget. A second malformed
-report goes through the stuck policy, parking by default with a note saying
+report goes through the stuck policy, asking a Human question saying
 the questions were missing or malformed twice, giving the validation reason
 and naming the `falsify-<n>.json` evidence file holding that report.
 Each question has the shape
@@ -375,9 +376,10 @@ gap whose conservative answer loses nothing if wrong: it stops, refuses, or keep
 more. A product decision, a change of scope, or anything irreversible is never
 assumable. With `assume: false`, all questions go to the owner. With `assume: true`,
 an entirely assumable report records the recommended answers and continues to
-`plan`; a report with any question that is not assumable parks by default on only
-those questions, listing the others as answers it would have assumed, without
-recording them as assumptions. `stuck: "ask"` still routes these stops to `decide`.
+`plan`; a report with any question that is not assumable asks only those
+questions and sleeps on the Human request, listing the others as answers it
+would have assumed, without recording them as assumptions. An answer returns
+to `falsify` and remains in the planner's prompt when the ticket is found sound.
 
 When the run continues, its evidence directory gets `assumptions.json`, an array
 of `{ question, answer, options, why }` copied from the questions and recommended
@@ -388,7 +390,7 @@ finding; the report shape and existing escalation rule are unchanged.
 At the same time, `falsify` writes `ticket-task-assumptions.json` inside the
 worktree's own Git directory, resolved by
 `git rev-parse --path-format=absolute --git-dir`. This saved copy survives a
-park or hand off, outside the working tree and never staged or committed.
+sleep or hand off, outside the working tree and never staged or committed.
 
 After plan approval, new runs go through `test` → `scopeAfterTest` → `red` →
 `change` → `scopeAfterChange` → `verify`. With `redGreen: false`, they skip
@@ -630,24 +632,30 @@ and the recoverable rebase stops described above.
 Entering `test` or `change` marks the tester or implementer as the stage to
 repair, so `more rounds` after that Agent returns `blocked` goes back to it;
 the decision prompt names that same Agent.
-With the default `stuck: "park"`, `park` writes `park.txt` and a delivery receipt
-and ends `parked` immediately, without a Human request, commit, archive, or
-removal. The worktree, branch, and uncommitted candidate stay exactly as they are.
-A planning park leaves no candidate unless a read-only Agent edited the worktree.
-The note names the answer needed from the reason and gives this next step:
-"Add the answer to the ticket body, then run the ticket again with resume: true;
-the run continues from the kept worktree with fresh budgets."
+A stuck run sleeps on one Human question in `decide`, keeping its worktree,
+branch, and candidate. The prompt uses the park note's text for what stopped
+it, what is needed, open questions, and evidence. It does not write `park.txt`
+or a final receipt while waiting. Continue the sleeping run by answering its
+pending request; no new run or `resume` input is needed.
 
-With `stuck: "ask"`, the run enters the Human state `decide`. All Human prompts
-and park notes use the same brief helper: decision first (at most ten words,
+Any nonblank reply that is not one of the four decisions is an answer and
+works like `more rounds`: renew both budgets, clear owner questions, and go
+back to the stage that stopped. An answer also clears the plan-length return;
+a blank reply repeats the question without restarting work. Answers remain under
+`Answers from the ticket owner:` in every later Agent prompt and survive sleep
+and continuation. Each reply is recorded in `human-<n>.json` and the receipt's
+`decisions` list. Exact decision replies take the existing paths below.
+
+All Human prompts use the same brief helper: decision first (at most ten words,
 truncated at a word boundary with `…`), a blank line, standing against the ticket,
-optional changes and needs, evidence locations, then options. Standing includes
-the ticket id and title, stopped state, reason, and both budgets. `hand off` is
-recommended and listed first in the decision prompt. The restricted choices are:
+needs, evidence locations, then options. Standing includes the ticket id and
+title, stopped state, reason, and both budgets. `hand off` is recommended and
+listed first in the prompt. The four decisions are suggestions, not restricted
+choices:
 
 | Choice | Effect | Final state |
 | --- | --- | --- |
-| `more rounds` | Both used budget counts return to zero; return to the planning state that stopped, or to `plan` with the reviewer's feedback after a second revision. Otherwise return to the editing stage that stopped, the tester or implementer, with the standing findings. A plan must be approved before testing and implementation. It can be chosen again every time a budget runs out | continues |
+| `more rounds` | Both used budget counts return to zero and owner questions are cleared; return to the planning state that stopped, or to `plan` with the reviewer's feedback after a second revision. Otherwise return to the editing stage that stopped, the tester or implementer, with the standing findings. A plan must be approved before testing and implementation. It can be chosen again every time a budget runs out | continues |
 | `hand off` | Nothing is touched: the worktree and the branch stay, uncommitted, for another workflow or a person to work in | `handedOff` |
 | `archive` | What delivery would have committed, tracked and untracked files without ignored files or `.machine-runs`, is committed and kept as the branch `archive/<slug>`; then the worktree is removed and the ticket branch deleted | `abandoned` |
 | `discard` | After confirmation, the worktree is removed and the branch deleted without saving the candidate | `abandoned` |
@@ -693,7 +701,8 @@ changed, and no other path removes a candidate without an archive. Removal runs
 `git worktree remove --force` and `git branch -D` from `repository.path`, only
 on this run's own worktree and ticket branch; if either fails the run ends
 `blocked` with the saved log. The workflow builds these steps from the public
-Human primitive with restricted choices. How they are presented, and how long a
+Human primitive with suggestions for `decide` and restricted choices for
+`confirmDiscard`. How they are presented, and how long a
 run may wait, belongs to whichever surface runs the Machine.
 
 With `"resume": true` and an existing worktree, `prepare` adopts it instead of
@@ -800,6 +809,8 @@ If a failed delete is followed by a successful query showing the branch gone,
 cleanup continues; any other deletion failure ends `blocked` with `hold` and a log.
 
 Final states are `delivered`, `merged`, `parked`, `handedOff`, `abandoned`, and `blocked`.
+`parked` and its `park.txt` format remain for compatibility with earlier runs,
+but no current stuck path reaches them.
 The `merged` final returns exactly `{ "action": "complete", "summary": "<text>" }`
 after deleting the local and remote ticket branch, so Machines Dispatch closes
 the ticket. All other finals return exactly `{ "action": "hold", "summary": "<text>" }`
@@ -856,7 +867,7 @@ For a delivered-candidate resume, the successful hold retains its usual
 `Delivered <branch> at <commit>` first sentence and adds one sentence saying
 the delivered commit was replayed onto the new base, or delivered again
 unchanged, before the final `Evidence: <directory>`.
-For parking, `delivery.json` also records the `reason` and
+For earlier parked runs, `delivery.json` also records the `reason` and
 `park: { needs, next, budgets: { repairs: { used, max }, reviewRounds: { used, max } } }`.
 The one-line hold starts `Parked on <branch>: ` followed by the first line of
 `park.txt`, then `Needs: ...`, `Worktree kept at ...`, and ends `Evidence: <directory>`.
