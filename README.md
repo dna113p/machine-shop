@@ -137,6 +137,10 @@ the owner questions, and returns to the stage that stopped. An answer also
 clears the plan-length return.
 The answer stays in later Agent prompts. `stuck` no longer changes anything:
 both `"park"` (the default) and `"ask"` are accepted.
+Each question is saved as `question-<n>.txt` in the evidence directory, numbered
+from 1 across re-asks and continuation after sleep. The four decisions match
+ignoring case, surrounding whitespace and trailing punctuation (`. , ; : ! ? …`);
+`confirm discard` and `go back` stay exact.
 
 Branch and patch deliveries end `delivered` with
 `{ "action": "hold", "summary": "…" }`, keeping the Dispatch ticket open.

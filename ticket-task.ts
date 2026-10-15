@@ -3,7 +3,7 @@ import { closeSync, existsSync, lstatSync, openSync, readFileSync, realpathSync,
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Event, MachinePrimitives } from "@dna113p/machines";
 import { taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
-import { brief, firstLine } from "./defaults/_machine-shop/brief.ts";
+import { brief } from "./defaults/_machine-shop/brief.ts";
 import { outsideScope } from "./defaults/_machine-shop/scope.ts";
 
 export const description = "Carry one local ticket for one Git repository from an isolated worktree through falsification, planning, plan review, implementation, checks, and review to a delivered branch, patch, or pull request; a pull request is then watched until it merges, when its branch is deleted and the ticket completes; a stuck run sleeps on a Human question.";
@@ -20,6 +20,11 @@ const planLimit = 6000;
 // A sandboxed harness may be unable to start the project's checks at all. That is not a blocker: the checks are the workflow's to run.
 const cannotRun = "Run the checks you can. If your environment cannot run them, as when a sandbox refuses to start processes, say which and why in your summary and still return completed: the workflow runs every required check itself after you return. Return blocked only for something a person must decide or supply.";
 const decisions = ["more rounds", "hand off", "archive", "discard"] as const;
+const decisionOf = (value: unknown) => {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().replace(/[.,;:!?…]+$/u, "").trim().toLowerCase();
+  return decisions.find(decision => decision === normalized);
+};
 const confirmations = ["confirm discard", "go back"] as const;
 const mergeDecisions = ["hand off", "discard"] as const;
 
@@ -40,6 +45,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     adopted: false,
     removed: false,
     decision: "",
+    questions: 0,
     stoppedIn: "",
     discardConfirmed: false,
     archived: null as { branch: string; commit: string } | null,
@@ -609,7 +615,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const locations = () => [`Worktree: ${worktree}`, `Branch: ${saved.branch}`, `Evidence: ${work.open()}`];
   const stuckPrompt = () => brief({
     decision: `Ticket ${ticket.id} is stuck: answer what is needed`, standing: standing(),
-    needs: parkDetails().needs, evidence: locations(),
+    needs: stuckNeeds(), evidence: locations(),
     options: [
       { name: "more rounds", does: saved.repairing === "falsify" || saved.repairing === "plan" || saved.repairing === "planReview"
         ? `restart the repair budget and return to ${saved.repairing} with the standing feedback.`
@@ -629,7 +635,6 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       { name: "go back", does: "return to the decision with the candidate kept." },
     ],
   });
-  const parkNext = "Add the answer to the ticket body, then run the ticket again with resume: true; the run continues from the kept worktree with fresh budgets.";
   const questionCount = () => `${saved.ownerQuestions!.length} open question${saved.ownerQuestions!.length === 1 ? "" : "s"}`;
   const questionText = (question: { text: string; where: string }, cap = Infinity) => {
     const where = flat(question.where);
@@ -641,23 +646,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   }).join("\n");
   const wouldAssumeLines = (cap?: number) => saved.wouldAssume.length
     ? `\nHad these been the only questions, the run would have assumed:\n${saved.wouldAssume.map(question => `- ${capped(question.text, cap)} → ${capped(question.recommended, cap)}`).join("\n")}` : "";
-  function parkDetails() {
-    const { reason, repairs, maxRepairs, reviewRounds, maxReviewRounds } = work.status();
+  function stuckNeeds(): string {
+    const { reason } = work.status();
     // Ask for one owner response while preserving the actual question or criterion as context.
     const why = flat(reason);
     const needs = /^(Repair|Review) budget exhausted/u.test(why)
       ? `Explain how to resolve the remaining findings: ${why}`
       : `Clarify how to resolve this blocker: ${why}`;
-    return { needs: saved.ownerQuestions
+    return saved.ownerQuestions
       ? `Answer the open question${saved.ownerQuestions.length === 1 ? "" : "s"}:\n${questionLines(600)}${wouldAssumeLines(600)}`
-      : needs.replace(/^(.{600}).+$/u, "$1…"),
-      ...(saved.ownerQuestions ? { questions: saved.ownerQuestions.map(({ text, where }) => ({ text, where })) } : {}), next: parkNext,
-      budgets: { repairs: { used: repairs, max: maxRepairs }, reviewRounds: { used: reviewRounds, max: maxReviewRounds } } };
+      : needs.replace(/^(.{600}).+$/u, "$1…");
   }
-  const parkNote = () => brief({
-    decision: `Ticket ${ticket.id} is parked: answer what is needed`, standing: standing(),
-    needs: parkDetails().needs, evidence: locations(), options: [{ name: "resume", does: parkNext, recommended: true }],
-  });
   const stopped = (state: string, run: () => Event) => () => { saved.stoppedIn = state; return run(); };
 
   /** Saves what delivery would have committed as a commit on a branch of its own, which outlives the worktree and the ticket branch. */
@@ -707,7 +706,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: "removed" };
   }
 
-  function conclude(wanted: "completed" | "blocked" | "handed-off" | "abandoned" | "parked"): Event {
+  function conclude(wanted: "completed" | "blocked" | "handed-off" | "abandoned"): Event {
     const result = `${saved.branch} at ${saved.commitHash}${saved.prUrl ? `, pull request ${saved.prUrl}` : ""}${saved.patches.length ? `, patch ${saved.patches.join(", ")}` : ""}`;
     // The branch outlives the worktree; a blocked run keeps both for inspection, and a worktree that stays behind is not a delivery.
     if (wanted === "completed") {
@@ -723,7 +722,6 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const reason = finished ? "" : String(work.output()?.reason);
     writeFileSync(join(directory, "delivery.json"), JSON.stringify({
       schemaVersion: 1, outcome, ...(finished ? {} : { reason }), ...(saved.decision ? { decision: saved.decision } : {}),
-      ...(outcome === "parked" ? { park: parkDetails() } : {}),
       ticket: ticket.id, repository: { name: repository.name, path: repository.path }, branch: saved.branch,
       baseCommit: saved.baseCommit || null, commit: saved.commitHash || null, output: repository.output,
       ...(saved.rebasedFrom ? { rebasedFrom: saved.rebasedFrom } : {}),
@@ -733,9 +731,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       worktree, ...(saved.adopted ? { resumed: true } : {}), worktreeCreated: saved.created, worktreeRemoved: saved.removed, reviewNotes: saved.reviewNotes,
     }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     const reasonBrief = flat(reason).replace(/^(.{600}).+$/u, "$1…").replace(/[^.!?…]$/u, "$&.");
-    const needsBrief = saved.ownerQuestions ? `${questionCount()}; the first: ${questionText(saved.ownerQuestions[0]!, 600)}` : flat(parkDetails().needs);
     saved.held = { action: "hold", summary: [
-      { delivered: `Delivered ${result}.`, blocked: `Blocked: ${reasonBrief}`, "handed-off": `Handed off on ${saved.branch}: ${reasonBrief}`, abandoned: `Abandoned: ${reasonBrief}`, parked: `Parked on ${saved.branch}: ${firstLine(parkNote())} Needs: ${needsBrief}` }[outcome],
+      { delivered: `Delivered ${result}.`, blocked: `Blocked: ${reasonBrief}`, "handed-off": `Handed off on ${saved.branch}: ${reasonBrief}`, abandoned: `Abandoned: ${reasonBrief}` }[outcome],
       ...(finished && saved.taken ? [saved.redelivered ? "The base has not moved, so the same commit was delivered again unchanged."
         : `The delivered commit ${saved.taken} was replayed onto the new base ${saved.baseCommit}.`] : []),
       ...(saved.decision ? [`Decision: ${saved.decision}.`] : []),
@@ -978,9 +975,11 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: "approved" };
   }
   const chose = (value: string) => ({ event }: { event: Event }) => event.value === value;
-  const decide = ({ event }: { event: Event }) => { saved.decision = work.choice("decide", event, decisions); };
+  const choseDecision = (value: typeof decisions[number]) => ({ event }: { event: Event }) => decisionOf(event.value) === value;
+  const decide = ({ event }: { event: Event }) => { saved.decision = decisionOf(work.choice("decide", event))!; };
   const continueWork = ({ event }: { event: Event }) => {
-    saved.decision = work.choice("decide", event);
+    const reply = work.choice("decide", event);
+    saved.decision = decisionOf(reply) ?? reply;
     if (saved.decision !== "more rounds") {
       saved.answers.push(saved.decision);
       saved.lengthReturned = false;
@@ -1088,19 +1087,18 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       repairTarget: operation(() => ({ type: saved.repairing }), { falsify: "falsify", plan: "plan", planReview: "planReview", test: "test", change: "change" }),
       reviewBudget: operation(stopped("reviewBudget", work.reviewRound), { retry: "change", exhausted: "stuck" }),
       // Preparation, commit, and delivery failures still end blocked by themselves.
-      stuck: operation(() => ({ type: "ask" }), { ask: "decide" }),
-      park: operation(() => {
-        writeFileSync(join(work.open(), "park.txt"), parkNote() + "\n", { flag: "wx", mode: 0o600 });
-        return conclude("parked");
-      }, { parked: "parked" }),
+      stuck: operation(() => {
+        writeFileSync(join(work.open(), `question-${++saved.questions}.txt`), stuckPrompt() + "\n", { flag: "wx", mode: 0o600 });
+        return { type: "ask" };
+      }, { ask: "decide" }),
       decide: human(stuckPrompt, {
         submitted: [
           { guard: ({ event }: { event: Event }) => typeof event.value === "string" && !event.value.trim(), target: "stuck" },
           // Back to the planning or editing stage that stopped, including the tester after a failed red.
-          { guard: chose("more rounds"), target: "repairTarget", actions: continueWork },
-          { guard: chose("hand off"), target: "handOff", actions: decide },
-          { guard: chose("archive"), target: "archive", actions: decide },
-          { guard: chose("discard"), target: "confirmDiscard", actions: decide },
+          { guard: choseDecision("more rounds"), target: "repairTarget", actions: continueWork },
+          { guard: choseDecision("hand off"), target: "handOff", actions: decide },
+          { guard: choseDecision("archive"), target: "archive", actions: decide },
+          { guard: choseDecision("discard"), target: "confirmDiscard", actions: decide },
           { target: "repairTarget", actions: continueWork },
         ],
       }, { suggestions: decisions }),
@@ -1138,7 +1136,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       failure: operation(() => conclude("blocked"), { delivered: "delivered", blocked: "blocked" }),
       handOff: operation(() => conclude("handed-off"), { handedOff: "handedOff" }),
       abandon: operation(() => conclude("abandoned"), { abandoned: "abandoned" }),
-      delivered: final(), merged: final(), blocked: final(), handedOff: final(), abandoned: final(), parked: final(),
+      delivered: final(), merged: final(), blocked: final(), handedOff: final(), abandoned: final(),
     },
   });
 }

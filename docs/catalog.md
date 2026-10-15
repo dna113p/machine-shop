@@ -337,7 +337,6 @@ is.
 | `repairBudget`, `repairTarget`, `reviewBudget` | Count gate retries and review revisions separately; gate retries route to the responsible editing stage, review retries to `change`; exhaustion goes to `stuck` |
 | `stuck` | Go to `decide` for both accepted input values |
 | `decide` | Human: sleep on one question with the note's needs and evidence; suggest `more rounds`, `hand off`, `archive`, and `discard`, accepting any other reply as an answer |
-| `park` | Retained for compatibility, but unreachable from `stuck`; writes `park.txt` and a receipt and ends `parked` |
 | `confirmDiscard` | Human: `confirm discard` or `go back`, asked before a discard removes anything |
 | `archive`, `remove` | Commit the candidate and keep that commit as the branch `archive/<slug>`; `git worktree remove --force` and `git branch -D` for this run's own worktree and ticket branch |
 
@@ -537,7 +536,7 @@ the candidate and stops through `stuck`, saying the base already holds the
 change; resume alone repeats this stop too. A refusing hook, missing patch id,
 unexpected commit count, changed parent or message, moved HEAD, or dirty tree
 after replay conservatively restores the approved candidate on the original
-base and stops through `stuck`. No new Human choices or park instructions are
+base and stops through `stuck`. No new Human choices or resume instructions are
 needed.
 
 Before undoing onto the new tip, the step checks the replayed commit's added
@@ -633,10 +632,12 @@ Entering `test` or `change` marks the tester or implementer as the stage to
 repair, so `more rounds` after that Agent returns `blocked` goes back to it;
 the decision prompt names that same Agent.
 A stuck run sleeps on one Human question in `decide`, keeping its worktree,
-branch, and candidate. The prompt uses the park note's text for what stopped
-it, what is needed, open questions, and evidence. It does not write `park.txt`
-or a final receipt while waiting. Continue the sleeping run by answering its
-pending request; no new run or `resume` input is needed.
+branch, and candidate. The prompt describes what stopped it, what is needed,
+open questions, and evidence. Each question is written as `question-<n>.txt`
+in the evidence directory, numbered from 1 across the run, including re-asks
+and continuation after sleep. No final receipt is written while waiting.
+Continue the sleeping run by answering its pending request; no new run or
+`resume` input is needed.
 
 Any nonblank reply that is not one of the four decisions is an answer and
 works like `more rounds`: renew both budgets, clear owner questions, and go
@@ -644,7 +645,10 @@ back to the stage that stopped. An answer also clears the plan-length return;
 a blank reply repeats the question without restarting work. Answers remain under
 `Answers from the ticket owner:` in every later Agent prompt and survive sleep
 and continuation. Each reply is recorded in `human-<n>.json` and the receipt's
-`decisions` list. Exact decision replies take the existing paths below.
+`decisions` list, preserving the raw reply. The four decisions match ignoring
+case, surrounding whitespace and trailing punctuation (`. , ; : ! ? …`).
+The canonical decision is recorded in `delivery.json`; `confirm discard` and
+`go back` stay exact. Decision replies take the existing paths below.
 
 All Human prompts use the same brief helper: decision first (at most ten words,
 truncated at a word boundary with `…`), a blank line, standing against the ticket,
@@ -706,7 +710,7 @@ Human primitive with suggestions for `decide` and restricted choices for
 run may wait, belongs to whichever surface runs the Machine.
 
 With `"resume": true` and an existing worktree, `prepare` adopts it instead of
-creating one, whether or not a park or `hand off` left a candidate. It requires all of: the
+creating one, whether or not a hand off or block left a candidate. It requires all of: the
 worktree directory exists and is a Git worktree of `repository.path`; its `HEAD`
 is a symbolic ref to a branch that belongs to this ticket by the rule above; and
 that branch points at the resolved base commit or at an ancestor of it, so
@@ -808,9 +812,7 @@ Remote deletion runs only after `MERGED` and uses the URL recorded at delivery.
 If a failed delete is followed by a successful query showing the branch gone,
 cleanup continues; any other deletion failure ends `blocked` with `hold` and a log.
 
-Final states are `delivered`, `merged`, `parked`, `handedOff`, `abandoned`, and `blocked`.
-`parked` and its `park.txt` format remain for compatibility with earlier runs,
-but no current stuck path reaches them.
+Final states are `delivered`, `merged`, `handedOff`, `abandoned`, and `blocked`.
 The `merged` final returns exactly `{ "action": "complete", "summary": "<text>" }`
 after deleting the local and remote ticket branch, so Machines Dispatch closes
 the ticket. All other finals return exactly `{ "action": "hold", "summary": "<text>" }`
@@ -819,11 +821,11 @@ relaunches itself, launches another Machine, or edits or closes a ticket file.
 The one-line delivery summary names the branch, commit, and pull request URL or patch
 path on success, or the reason otherwise; then the decision if one was made, the
 archive branch and its commit after `archive`, the worktree if it was kept
-(always for `parked`, and before delivery for `handedOff` and `blocked` once it exists), and the evidence
+(before delivery for `handedOff` and `blocked` once it exists), and the evidence
 directory. Read
 the final state, not the action, to tell the endings apart. `delivered` means
 the worktree was removed and the branch or patch delivered; before delivery,
-`parked` and `handedOff` keep the worktree and branch for inspection or further work. A pre-delivery `blocked` run also keeps
+`handedOff` keeps the worktree and branch for inspection or further work. A pre-delivery `blocked` run also keeps
 them unless delivered-candidate adoption was refused before recreation or its
 recreated worktree was withdrawn; `abandoned` means both are
 gone, with the candidate on its archive branch after `archive`. A worktree that
@@ -851,7 +853,7 @@ every output mode (an empty list when there are no minors). When falsify assumed
 answers or a candidate resume read them back, `delivery.json` also records
 `assumptions`, the array written to `assumptions.json`, for every outcome in that
 run; both are absent when no assumptions were made or restored. Its `outcome` is `delivered`,
-`parked`, `handed-off`, `abandoned`, or `blocked`. It records `decision` when one was made
+`handed-off`, `abandoned`, or `blocked`. It records `decision` when one was made
 (the last choice at `decide`, so `discard` for a confirmed discard and
 `more rounds` for a run that went on to deliver), `archive` as
 `{ "branch", "commit" }` when the archive branch was created, and `resumed` for
@@ -867,20 +869,11 @@ For a delivered-candidate resume, the successful hold retains its usual
 `Delivered <branch> at <commit>` first sentence and adds one sentence saying
 the delivered commit was replayed onto the new base, or delivered again
 unchanged, before the final `Evidence: <directory>`.
-For earlier parked runs, `delivery.json` also records the `reason` and
-`park: { needs, next, budgets: { repairs: { used, max }, reviewRounds: { used, max } } }`.
-The one-line hold starts `Parked on <branch>: ` followed by the first line of
-`park.txt`, then `Needs: ...`, `Worktree kept at ...`, and ends `Evidence: <directory>`.
-For open review or falsification questions, `park.questions` is the report's
-ordered array of open `{text, where}` entries; falsification questions use an empty `where`.
-The reason and needs list every question on its own numbered
-line with its location. Needs cap each question's flattened text separately at
-600 characters plus an ellipsis, keeping its location; the list itself is not
-capped. The one-line hold instead uses `Needs: N open questions; the first:
-<text> (<where>)`, with the same cap on the first question. Empty locations omit
-the parentheses. Other stops use the same needs text in the receipt, note, and
-summary, with whitespace flattened in the single-line summary and no
-`park.questions` field. Falsification questions follow the same limits as review
+The stuck question's reason and Needs list every open review or falsification
+question on its own numbered line with its location. Needs cap each question's
+flattened text separately at 600 characters plus an ellipsis, keeping its
+location; the list itself is not capped. Empty locations omit the parentheses.
+Falsification questions follow the same limits as review
 questions: each numbered line then lists the options with the recommended
 answer first and marked, followed by why. Under Needs, each option and why is
 flattened and capped separately at 600 characters plus an ellipsis. In a mixed
@@ -889,7 +882,7 @@ have assumed, outside the numbered questions; Needs flatten and cap each such
 question and answer separately at 600 characters plus an ellipsis. A second plan
 review revision uses the usual blocker needs, capped at 600 characters plus an
 ellipsis when truncated. The full stop reason remains in the receipt and the
-note's standing section, and raw planning events preserve even malformed reports.
+question's standing section, and raw planning events preserve even malformed reports.
 For pull requests, `delivery.json` and `result.json` describe delivery before
 the merge wait and are never rewritten. The later `merge.json` records
 `schemaVersion`, `outcome`, `prUrl`, `branch`, `checks`, `ghFailures`,
@@ -899,7 +892,7 @@ Machine output carry the final merge outcome even when `result.json` says
 recorded separately as `human-<n>.json`.
 
 `result.json` keeps the helper's vocabulary: before the merge wait, its `outcome` is `blocked` for
-`parked`, `handedOff`, and `abandoned`; `repairs` counts red, scope, and green
+`handedOff` and `abandoned`; `repairs` counts red, scope, and green
 gate retries and `reviewRounds` counts review revisions, each cumulative across renewals;
 `decisions` lists every Human answer.
 
