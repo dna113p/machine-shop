@@ -43,7 +43,7 @@ the [input](docs/catalog.md#common-input).
 
 ## The workflows
 
-Ten defaults that the installer copies into a project on request:
+Eleven defaults that the installer copies into a project on request:
 
 | Default | Purpose |
 | --- | --- |
@@ -53,6 +53,7 @@ Ten defaults that the installer copies into a project on request:
 | [`refactor`](docs/workflows/refactor.md) | Preserve behavior against a passing baseline |
 | [`add-tests`](docs/workflows/add-tests.md) | Add meaningful tests without changing production behavior |
 | [`review-code`](docs/workflows/review-code.md) | Return evidence-backed review findings without edits |
+| [`retrospective`](docs/workflows/retrospective.md) | Report recurring ticket stops and automation candidates from run evidence; changes only its own evidence folder |
 | [`investigate`](docs/workflows/investigate.md) | Investigate and challenge a diagnosis or technical choice |
 | [`update-docs`](docs/workflows/update-docs.md) | Update docs/examples and validate against the source |
 | [`upgrade-dependency`](docs/workflows/upgrade-dependency.md) | Assess compatibility, get approval, upgrade, and verify |
@@ -138,6 +139,10 @@ See the [diagram](docs/workflows/ticket-task.md#flow).
    that the Machine judges itself.
 6. **Commit, rebase, deliver.** If the base moved, the commit is replayed onto
    it and checked again.
+
+**Resuming after the base moved.** A resumed run saves its uncommitted
+candidate, moves onto the current tip and runs setup before checks. Conflicts
+go to its implementer, then through the normal scope check, checks, and review.
 
 ### When it is stuck
 

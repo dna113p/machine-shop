@@ -11,7 +11,7 @@ import * as task from "../defaults/_machine-shop/task.ts";
 import { taskRun } from "../defaults/_machine-shop/task.ts";
 import { runtime } from "./runtime.ts";
 
-const names = ["verify-checks", "implement-task", "fix-bug", "refactor", "add-tests", "review-code", "investigate", "update-docs", "upgrade-dependency", "prepare-release"];
+const names = ["verify-checks", "implement-task", "fix-bug", "refactor", "add-tests", "review-code", "investigate", "update-docs", "upgrade-dependency", "prepare-release", "retrospective"];
 const modules = Object.fromEntries(await Promise.all(names.map(async name => [name, await import(pathToFileURL(resolve("defaults", `${name}.ts`)).href)])));
 const ok = (type = "completed", summary = "Evidence from the bounded fake runner") => ({ type, summary });
 const command = (code = 'console.log("check passed")', extra = {}) => ({ name: "tests", command: [process.execPath, "-e", code], ...extra });
@@ -48,7 +48,7 @@ test("all defaults export discoverable metadata and construct without effects", 
     assert.match(mod.description, /\S/u); assert.doesNotMatch(mod.description, /\n/u);
     const data = input(cwd, ["review-code", "investigate"].includes(name) ? { checks: [] } : {});
     if (name === "fix-bug") Object.assign(data, { regression: { ...command(), failureExitCode: 1, failureIncludes: "assertion" } });
-    const definition = mod.default(runtime, data);
+    const definition = mod.default(runtime, name === "retrospective" ? { workspaces: [cwd] } : data);
     assert.deepEqual(runtime.requiredAgentNames(definition), Object.keys(mod.agentRoles ?? {}).sort());
   }
   assert.equal(existsSync(join(cwd, ".machine-runs")), false);
