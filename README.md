@@ -1,6 +1,6 @@
 # Machine Shop
 
-Ready-made software workflows for Machines. Each one is a TypeScript state
+Ready-made software workflows for [Machines](https://github.com/dna113p/machines). Each one is a TypeScript state
 machine with real check gates, a small repair budget, and a JSON receipt of
 what happened.
 
@@ -202,3 +202,12 @@ Machine and keeps a receipt.
 Tests drive the real runtime with fake Agents, temporary Git repositories, and
 real commands, so they need no paid model. They do not measure how well a live
 model does the work.
+
+## The Machines family
+
+| Project | What it does |
+| --- | --- |
+| [Machines](https://github.com/dna113p/machines) | The runtime: write a workflow as states, and run it with Agents, checks and people |
+| **Machine Shop** (this repository) | Ready-made software workflows to copy into a project |
+| [Machines Dispatch](https://github.com/dna113p/machines-dispatch) | A local daemon that runs a Machine for each ticket that is ready |
+| [Machine Wars](https://github.com/dna113p/machine-wars) | A concept: ranking Agents so a Machine can pick one |
