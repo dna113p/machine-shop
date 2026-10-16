@@ -130,6 +130,10 @@ A missing section blocks before any Agent runs. A run then goes
 6. **Commit, rebase, deliver.** If the base moved, the commit is replayed onto
    it and checked again.
 
+A resumed run whose base moved saves its uncommitted candidate, moves onto the
+current tip and runs setup before checks; conflicts go to its implementer,
+then through the normal scope check, checks, and review.
+
 A stuck run sleeps on one Human question, keeping its worktree and branch.
 The prompt says what is needed, lists open questions and evidence, and suggests
 `more rounds`, `hand off`, `archive`, and `discard`; discard still asks for confirmation.
