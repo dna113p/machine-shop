@@ -17,6 +17,7 @@ The installer copies these into a project on request.
 | [add-tests](add-tests.md) | Add tests without changing production code |
 | [update-docs](update-docs.md) | Update docs and check them against the source |
 | [review-code](review-code.md) | Return review findings without editing |
+| [retrospective](retrospective.md) | Read ticket-run evidence and report repeated causes without changing the workspaces |
 | [investigate](investigate.md) | Diagnose or research, then have the answer challenged |
 | [upgrade-dependency](upgrade-dependency.md) | Plan an upgrade, get approval, upgrade, and verify |
 | [prepare-release](prepare-release.md) | Check a candidate and get sign-off; never publish |

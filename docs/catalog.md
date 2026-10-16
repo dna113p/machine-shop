@@ -2,7 +2,7 @@
 
 These are selectable starting points, not a mandatory process for every project.
 The project orchestrator chooses and adapts the useful subset, supplies actual
-acceptance criteria and commands, and validates the results. Do not run all ten
+acceptance criteria and commands, and validates the results. Do not run all eleven
 for one task. Small direct changes can remain direct.
 
 ## Defaults
@@ -20,6 +20,7 @@ so these do not replace project-specific names such as `verify`.
 | [refactor](../defaults/refactor.ts) | green baseline -> behavior-preserving change -> checks -> review; bounded repair | implementer, reviewer | 4 |
 | [add-tests](../defaults/add-tests.ts) | green baseline -> focused tests -> checks -> review; bounded repair | tester, reviewer | 4 |
 | [review-code](../defaults/review-code.ts) | read-only review -> unchanged-checkout guard -> findings receipt | reviewer | 1 |
+| [retrospective](../defaults/retrospective.ts) | read evidence -> classify stops -> validate and report; one malformed-report retry | analyst | 2 |
 | [investigate](../defaults/investigate.ts) | investigate -> unchanged guard -> challenge evidence; bounded research revision | investigator, reviewer | 4 |
 | [update-docs](../defaults/update-docs.ts) | docs/examples change -> explicit validation -> source-consistency review; bounded repair | writer, reviewer | 4 |
 | [upgrade-dependency](../defaults/upgrade-dependency.ts) | green baseline -> compatibility proposal -> Human approval -> upgrade -> checks -> review; bounded repair | analyst, implementer, reviewer | 5 |
@@ -39,9 +40,44 @@ security concern; it is not a security certification. For UI, performance, datab
 or domain-specific work, adapt the selected workflow with real project checks.
 Production migrations and publishing are deliberately not generic defaults.
 
+## Retrospective
+
+[retrospective](workflows/retrospective.md) accepts its own input: `workspaces`,
+an array of 1–20 absolute directories, and optional `since`, a `YYYY-MM-DD` UTC
+start date. With no date it covers the last seven days. It needs no Git checkout
+and runs no checks or other Machines.
+
+Operations read only `.machine-runs/machine-shop/<run>/` in the named
+workspaces: `started.json`, `result.json`, `question-<n>.txt`, Human answers and
+JSON stage reports. Only `ticket-task` runs are classified. Questions use their
+file modification time; endings use `finishedAt`. Only `decide` answers are
+matched, in numeric order, to question files. Older runs without question text
+use the ending reason and answers as one stop. A missing result is reported as
+not ended; it does not hide an in-window question. Completed runs with no stops
+are omitted. Unreadable evidence is named without preventing the other reports.
+Symlinked run directories are skipped and evidence-file symlinks are refused.
+
+One analyst, given only extracted stops, supplies causes, automation marks and
+one suggested change with its repository per group. Bind a read-only preset;
+the analyst is instructed to use no tools or files. Operations group by workflow,
+stopped stage and normalized first sentence of the reason, and validate complete
+classification coverage. A malformed reply gets one retry, then a blocked result.
+Only a falsify question's own recommended option counts as a recommendation;
+hand off, archive and discard always need a person. Continue/fix-reviewer and
+mechanical retry answers are also automation candidates.
+
+The Markdown output is also `report.md` in the first workspace's new evidence
+folder. It lists stops needing no person first, repeated causes by descending
+count with suggestions and repositories, then single stops, runs not ended and
+unreadable runs. Each stop includes the ticket, workflow, stage, cause, owner
+answer and supplied blocker locations. These locations are not claimed to be
+the decision to stop. Unknown metadata stays unknown. The Machine changes
+nothing outside its own evidence folder, writes no tickets, changes no Machine,
+and never starts, resumes or answers another run.
+
 ## Common input
 
-The defaults accept a JSON object through MCP/Pi, `--input-file`, or a JSON
+Except for retrospective’s separate input above, the defaults accept a JSON object through MCP/Pi, `--input-file`, or a JSON
 string as CLI positional input. They do not accept an unstructured task string.
 
 ```json
@@ -151,7 +187,7 @@ without a final receipt. These workflows do not resume, undo, or roll back work.
 
 ## Ticket delivery
 
-[ticket-task](../ticket-task.ts) is a separate root workflow, not one of the ten
+[ticket-task](../ticket-task.ts) is a separate root workflow, not one of the eleven
 defaults: it is not in `defaults/`, the installer does not copy it, and it is the
 only workflow here built on the shared helper that commits or publishes. It
 reuses the helper for evidence, checks, fingerprints, review, and separate
@@ -924,7 +960,7 @@ tickets and repository settings only from a trusted source.
 ## ChatGPT thread
 
 [chatgpt-thread](../chatgpt-thread.ts) is a separate root workflow, not one of
-the ten defaults: it is not in `defaults/`, the installer does not copy it, and
+the eleven defaults: it is not in `defaults/`, the installer does not copy it, and
 it does not use the shared helper, so it runs no checks and writes no
 `.machine-runs` receipt. It keeps one ChatGPT web chat going by sending each
 Human reply back to the same conversation.
@@ -978,7 +1014,7 @@ editing. Separate roles do not inherently mean separate providers/models.
 
 `npm run check` type-checks the new definitions and runs real-runtime tests with
 fake Agent runners, real commands, and temporary Git repositories. Tests exercise
-all ten success paths, failure and rejection paths, red/green requirements,
+all eleven success paths, failure and rejection paths, red/green requirements,
 repair budgets, stale verification, source-integrity guards, malformed inputs,
 command errors, and result retrieval. `npm run smoke:install` covers selective
 installation, conflicts, relocation, discovery, and the real CLI. Ticket delivery

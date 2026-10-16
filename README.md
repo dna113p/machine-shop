@@ -14,7 +14,7 @@ workflow policy only, not the Machines runtime, Agent harnesses, scheduling, or
 
 ## The workflows
 
-Ten defaults that the installer copies into a project on request:
+Eleven defaults that the installer copies into a project on request:
 
 | Default | Purpose |
 | --- | --- |
@@ -24,6 +24,7 @@ Ten defaults that the installer copies into a project on request:
 | [`refactor`](docs/workflows/refactor.md) | Preserve behavior against a passing baseline |
 | [`add-tests`](docs/workflows/add-tests.md) | Add meaningful tests without changing production behavior |
 | [`review-code`](docs/workflows/review-code.md) | Return evidence-backed review findings without edits |
+| [`retrospective`](docs/workflows/retrospective.md) | Report recurring ticket stops and automation candidates from run evidence; changes only its own evidence folder |
 | [`investigate`](docs/workflows/investigate.md) | Investigate and challenge a diagnosis or technical choice |
 | [`update-docs`](docs/workflows/update-docs.md) | Update docs/examples and validate against the source |
 | [`upgrade-dependency`](docs/workflows/upgrade-dependency.md) | Assess compatibility, get approval, upgrade, and verify |
