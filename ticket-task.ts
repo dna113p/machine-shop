@@ -39,6 +39,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     firstApproved: null as { baseCommit: string; commit: string } | null,
     rebasedFrom: null as { baseCommit: string; commit: string } | null,
     rebaseSteps: 0,
+    moved: null as { from: string; to: string; ref: string; patch: string; conflicts: string[]; settled: string[] } | null,
     created: false,
     adopted: false,
     removed: false,
@@ -166,7 +167,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   function prepare(): Event {
     const base = run("git", ["rev-parse", "--verify", "--quiet", `${repository.base ?? "HEAD"}^{commit}`], repository.path);
     if (!base.ok) return work.block(`Base ${repository.base ?? "HEAD"} does not resolve to a commit in ${repository.path}.`);
-    saved.baseCommit = base.stdout;
+    const current = base.stdout;
+    saved.baseCommit = current;
     // A resumed run's base is the commit its branch is on, so the branch is read before the remote is asked about the base.
     if (resume) {
       const adoption = adopt();
@@ -179,6 +181,19 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (repository.output === "pr" && !published()) return { type: "blocked" };
     if (resume) {
       saved.adopted = true;
+      const conflicts = unmerged();
+      if (conflicts.length) {
+        // A separate resume may inherit an unresolved index from a handed-off move.
+        const record = join(git(worktree, "rev-parse", "--absolute-git-dir"), "ticket-task-move.json");
+        if (!existsSync(record)) {
+          work.block(`Unmerged files: ${conflicts.join(", ")}. Cannot locate the saved candidate record ${record}; the worktree was left unchanged.`);
+          return { type: "stuck" };
+        }
+        saved.moved = JSON.parse(readFileSync(record, "utf8"));
+        saved.moved!.conflicts = [...new Set([...saved.moved!.conflicts, ...conflicts])];
+        return conflict();
+      }
+      if (saved.baseCommit !== current) return moveOnto(current);
       return { type: pending() === "" ? "prepared" : "resumed" };
     }
     const owners = branchOwners();
@@ -211,7 +226,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
    * The push sends every commit the remote lacks below the ticket commit, so in pr mode the base must already be on the pull request's
    * base branch there. The remote itself is asked, since a remote-tracking ref only says what it held at the last fetch.
    */
-  function published(): boolean {
+  function published(commit = saved.baseCommit): boolean {
     const refuse = (why: string) => { work.block(why); return false; };
     // The remote's configured URL, not its name, keeps a separate pushurl from sending the commit elsewhere.
     saved.checked = run("git", ["config", "--get", `remote.${repository.remote}.url`], repository.path).stdout || repository.remote;
@@ -233,10 +248,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (!run("git", ["cat-file", "-e", `${tip}^{commit}`], repository.path).ok
       && !attempt("git", ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", saved.checked, tip], repository.path, publishTimeoutMs,
         `The tip of ${where} could not be fetched to check that the base is published; nothing was changed`).ok) return false;
-    if (run("git", ["merge-base", "--is-ancestor", saved.baseCommit, tip], repository.path).ok) return true;
-    const ahead = git(repository.path, "rev-list", "--count", `${tip}..${saved.baseCommit}`);
+    if (run("git", ["merge-base", "--is-ancestor", commit, tip], repository.path).ok) return true;
+    const ahead = git(repository.path, "rev-list", "--count", `${tip}..${commit}`);
     return refuse(`Base ${repository.base ?? "HEAD"} has ${ahead} unpublished local commit${ahead === "1" ? " that is" : "s that are"} not in ${where}, `
-      + "and the pull request would carry them. The base must be pushed first; nothing was changed.");
+      + `and the pull request would carry them. The base must be pushed first; nothing was changed. Checked commit: ${commit}.`);
   }
 
   /** A resumed run adopts the worktree an earlier run left behind, with or without a candidate; every condition is read, never repaired. */
@@ -264,7 +279,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (whose !== ticket.slug) return work.block(`Cannot resume: HEAD in ${worktree} is on ${current}, which belongs to ticket ${whose}; nothing was changed.`);
     saved.branch = current;
     const tip = run("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${saved.branch}^{commit}`], repository.path).stdout;
-    // Adopt the candidate on its own base; after approval, rebase compares it with the source checkout's current tip.
+    // Validate the candidate on its own base before prepare moves it onto the current tip.
     if (!tip || !run("git", ["merge-base", "--is-ancestor", tip, saved.baseCommit], repository.path).ok) {
       if (!tip || !run("git", ["merge-base", tip, saved.baseCommit], repository.path).ok) {
         return work.block(`Cannot resume: ${saved.branch} shares no history with the base commit ${saved.baseCommit}; nothing was changed.`);
@@ -294,6 +309,127 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       if (saved.assumptionsJson) writeFileSync(join(work.open(), "assumptions.json"), saved.assumptionsJson, { flag: "wx", mode: 0o600 });
     }
     return { type: "resumed" };
+  }
+
+  const rawGit = (...args: string[]) => execFileSync("git", args, {
+    cwd: worktree, encoding: "utf8", timeout: 30_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
+  });
+  const unmerged = () => rawGit("diff", "--name-only", "--diff-filter=U", "-z").split("\0").filter(Boolean);
+  const moveRecord = () => join(git(worktree, "rev-parse", "--absolute-git-dir"), "ticket-task-move.json");
+  const movedPrompt = () => saved.moved ? [
+    `The resume move from ${saved.moved.from} onto base ${saved.moved.to} ${saved.baseCommit === saved.moved.to ? "was applied" : "was restored on its old base"}. Saved candidate: ${saved.moved.ref} (${saved.moved.patch}).`,
+    ...(saved.moved.settled.length ? [`Settled conflicts: ${saved.moved.settled.map(path => JSON.stringify(path)).join(", ")}. Check that both sides' intent survives.`] : []),
+  ] : [];
+  function conflict(): Event {
+    const moved = saved.moved!;
+    const diff = join(work.open(), "resume-conflicts.diff");
+    const sides = moved.conflicts.map(path => `File: ${JSON.stringify(path)}\nCurrent base changes:\n`
+      + rawGit("diff", "--binary", "--no-ext-diff", "--no-textconv", moved.from, moved.to, "--", path)
+      + `\nSaved candidate changes:\n` + rawGit("diff", "--binary", "--no-ext-diff", "--no-textconv", moved.from, moved.ref, "--", path)).join("\n");
+    writeFileSync(diff, sides, { mode: 0o600 });
+    work.block(`Saved candidate: ${moved.ref} (${moved.patch}). Conflicts: ${moved.conflicts.map(path => JSON.stringify(path)).join(", ")}. `
+      + `Moved from ${moved.from} to ${moved.to}. Both sides: ${diff}\n${sides.slice(0, 12000)}`);
+    return { type: "conflicted" };
+  }
+
+  /** Preserve an unapproved candidate off-branch, then apply it to the current base before any checks or review. */
+  function moveOnto(tip: string): Event {
+    if (repository.output === "pr" && !published(tip)) return { type: "stuck" };
+    const original = saved.baseCommit;
+    let snapshot = "";
+    const stop = (reason: string): Event => { work.block(reason); return { type: "stuck" }; };
+    const restore = () => {
+      git(worktree, "symbolic-ref", "HEAD", `refs/heads/${saved.branch}`);
+      git(worktree, "reset", "--hard", snapshot || original);
+      // Clean under the saved candidate's rules before its additions become untracked again.
+      git(worktree, "clean", "-f", "-d", "-q", "-e", "/.machine-runs");
+      undo(original);
+    };
+    if (pending() !== "") {
+      git(worktree, "add", "--all");
+      git(worktree, "reset", "--quiet", "--", ".machine-runs");
+      const tree = git(worktree, "write-tree");
+      // commit-tree creates only a recovery object: no hooks, branch movement, or approved ticket commit.
+      snapshot = git(worktree, "commit-tree", tree, "-p", original, "-m", ticket.title, "-m", `Ticket: ${ticket.id}`);
+      const ref = `refs/machine-shop/saved/${ticket.slug}/${snapshot}`;
+      git(worktree, "update-ref", ref, snapshot);
+      const patch = join(work.open(), "saved-candidate.patch");
+      writeFileSync(patch, rawGit("diff", "--binary", "--no-ext-diff", "--no-textconv", original, snapshot), { flag: "wx", mode: 0o600 });
+      saved.moved = { from: original, to: tip, ref, patch, conflicts: [], settled: [] };
+    }
+    try {
+      git(worktree, "reset", "--quiet", "--hard", tip);
+      if (snapshot) {
+        const added = rawGit("diff-tree", "-r", "--no-renames", "--diff-filter=A", "--name-only", "-z", original, snapshot);
+        const paths = join(work.open(), "resume-added.paths");
+        writeFileSync(paths, added, { mode: 0o600 });
+        const fd = openSync(paths, "r");
+        try {
+          const ignored = spawnSync("git", ["check-ignore", "--no-index", "-v", "-z", "--stdin"], {
+            cwd: worktree, stdio: [fd, "pipe", "pipe"], encoding: "utf8", timeout: 30_000, killSignal: "SIGKILL", maxBuffer: 8 * 1024 * 1024,
+          });
+          if (ignored.error || (ignored.status !== 0 && ignored.status !== 1)) throw new Error(`Cannot check ignore rules: ${ignored.error?.message ?? ignored.stderr}`);
+          const entries = ignored.stdout.split("\0");
+          const dropped: string[] = [];
+          for (let index = 0; index + 3 < entries.length; index += 4) {
+            if (!entries[index + 2]!.startsWith("!")) dropped.push(`${JSON.stringify(entries[index + 3])} (rule in ${JSON.stringify(entries[index])}:${entries[index + 1]})`);
+          }
+          if (dropped.length) {
+            restore();
+            return stop(`Ignore rules on base ${tip} would drop added files: ${dropped.join(", ")}. The candidate was restored uncommitted on ${original}.`);
+          }
+        } finally { closeSync(fd); }
+      }
+      for (const command of repository.setup) {
+        const passed = work.check(command, "setup");
+        const moved = git(worktree, "rev-parse", "HEAD") !== tip
+          || run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${saved.branch}`;
+        if (!passed || moved || pending() !== "") {
+          restore();
+          work.reopen(true);
+          return stop(`setup: ${command.name} ${moved ? "moved HEAD or the ticket branch" : !passed ? "failed" : "changed tracked or unignored files"} on base ${tip}; the worktree was restored on ${original}.`);
+        }
+      }
+      if (!snapshot) { saved.baseCommit = tip; return { type: "prepared" }; }
+      const applied = run("git", ["cherry-pick", "--no-commit", snapshot], worktree);
+      const conflicts = unmerged();
+      if (conflicts.length) {
+        saved.baseCommit = tip;
+        saved.moved!.conflicts = conflicts;
+        writeFileSync(moveRecord(), JSON.stringify(saved.moved) + "\n", { mode: 0o600 });
+        return conflict();
+      }
+      if (!applied.ok) throw new Error(`Cannot re-apply the saved candidate: ${applied.detail}`);
+      if (run("git", ["diff", "--cached", "--quiet", "HEAD"], worktree).ok) {
+        restore();
+        return stop(`Base ${tip} already holds this change; the candidate was restored uncommitted on ${original}.`);
+      }
+      git(worktree, "reset", "--quiet");
+      saved.baseCommit = tip;
+      return { type: "resumed" };
+    } catch (error) {
+      restore();
+      return stop(`Move onto ${tip} failed: ${String(error)}. The candidate was restored uncommitted on ${original}.`);
+    }
+  }
+
+  /** A claimed resolution must clear both the unmerged index and markers before scope, checks, and review. */
+  function unsettled(): Event | undefined {
+    const moved = saved.moved;
+    if (!moved?.conflicts.length) return undefined;
+    const remaining = [...new Set([...unmerged(), ...moved.conflicts.filter(path => {
+      const file = join(worktree, path);
+      return existsSync(file) && lstatSync(file).isFile() && /^(?:<<<<<<< |\|\|\|\|\|\|\| |>>>>>>> )/mu.test(readFileSync(file, "utf8"));
+    })])];
+    if (remaining.length) {
+      work.block(`Saved candidate: ${moved.ref} (${moved.patch}). Unsettled conflicts: ${remaining.map(path => JSON.stringify(path)).join(", ")}. Remove conflict markers and git add each settled file without committing.`);
+      return { type: "failed" };
+    }
+    git(worktree, "reset", "--quiet");
+    moved.settled = moved.conflicts;
+    moved.conflicts = [];
+    rmSync(moveRecord(), { force: true });
+    return undefined;
   }
 
   /** Only the recorded delivery may bypass review; all eligibility checks precede recreating its worktree. */
@@ -467,7 +603,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       const conflicts = git(worktree, "diff", "--name-only", "--diff-filter=U");
       restore();
       return stop(`Replay onto ${tip} failed${conflicts ? ` with conflicts in ${conflicts.split("\n").join(", ")}` : " (Git or a hook refused it)"}. `
-        + `The approved candidate is uncommitted on ${original}; resume alone will stop again until a person ports the candidate onto the new base. Inspect rebase logs in ${work.open()}.`);
+        + `The approved candidate is uncommitted on ${original}; a resumed run moves it onto the current base and sends conflicts to the implementer to settle. Inspect rebase logs in ${work.open()}.`);
     }
     const count = git(worktree, "rev-list", "--count", `${tip}..HEAD`);
     if (count === "0") {
@@ -487,7 +623,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       // Only added paths become untracked after a mixed reset; modified and deleted paths stay tracked.
       const restoreAndStop = (reason: string) => {
         restore();
-        return stop(`${reason} Undo onto ${tip} was needed because ${why}. The approved candidate is uncommitted on its original base ${original}; resume alone will stop again until the candidate or ignore rules are reconciled.`);
+        return stop(`${reason} Undo onto ${tip} was needed because ${why}. The approved candidate is uncommitted on its original base ${original}; a resumed run checks the current tip's ignore rules before re-applying and stops again until the candidate or ignore rules are reconciled.`);
       };
       const paths = join(work.open(), `rebase-${++saved.rebaseSteps}.paths`);
       // Keep raw output: run() trims whitespace, which can be part of the first filename.
@@ -614,7 +750,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ...(saved.extraRound !== "unused" ? [`The one extra review round was used; review retries: ${saved.extraReviewRounds} of ${maxReviewRounds}. ${latest ? `Reviewer newSinceLastRound: ${capped(latest.newSinceLastRound, 600)}` : "No review has finished in the extra round yet."}`] : []),
     ].join("\n");
   };
-  const locations = () => [`Worktree: ${worktree}`, `Branch: ${saved.branch}`, `Evidence: ${work.open()}`];
+  const locations = () => [`Worktree: ${worktree}`, `Branch: ${saved.branch}`, `Evidence: ${work.open()}`,
+    ...(saved.moved ? [`Saved candidate: ${saved.moved.ref} (${saved.moved.patch})`] : []),
+    ...(saved.moved?.conflicts.length ? [`Unsettled conflicts: ${saved.moved.conflicts.map(path => JSON.stringify(path)).join(", ")}`] : [])];
   const stuckPrompt = () => brief({
     decision: `Ticket ${ticket.id} is stuck: answer what is needed`, standing: standing(),
     needs: stuckNeeds(), evidence: locations(),
@@ -1023,7 +1161,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     states: {
       shape: operation(shape, { prepared: "prepare", blocked: "failure" }),
       // A clean resume starts planning afresh. A resumed candidate is held to Scope; red cannot be proved again once implemented.
-      prepare: operation(prepare, { prepared: "start", resumed: "scopeAfterChange", redeliver: "rebase", blocked: "failure" }),
+      prepare: operation(stopped("prepare", prepare), { prepared: "start", resumed: "scopeAfterChange", conflicted: "change", stuck: "stuck", redeliver: "rebase", blocked: "failure" }),
       start: operation(work.start, { started: "falsify" }),
       falsify: agent(() => prompt([
         "Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 entries shaped as { text, options: string[], recommended: string, assumable: boolean, why }, giving the exact questions a person could answer. text and why must be non-empty strings; options must be a non-empty array of non-empty strings; recommended must copy one of those options exactly. Mark assumable true only for a gap whose conservative answer loses nothing if wrong: it stops, refuses, or keeps more. A product decision, a change of scope, or anything irreversible is never assumable.",
@@ -1077,6 +1215,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         return prompt([
           "Implement the ticket and its tests. Keep the change focused. Do not weaken checks or expand scope. Leave your changes uncommitted; the workflow commits and delivers them.",
           ...(saved.extraRound !== "unused" ? ["Blockers the reviewer found when the review budget was spent; fix each and add the regression test it asked for:", ...saved.extraFeedback] : []),
+          ...movedPrompt(),
+          ...(saved.moved?.conflicts.length ? [
+            `Settle conflicts in ${saved.moved.conflicts.map(path => JSON.stringify(path)).join(", ")}, keeping both sides' intent. Both sides are in ${join(work.open(), "resume-conflicts.diff")}. Remove every conflict marker and mark each settled file with git add; do not commit.`,
+          ] : []),
           ...assumptionsPrompt(),
           ...(saved.plan ? ["Plan:", saved.plan] : []),
           ...(redGreen ? ["The tester's tests in the stage reports are the contract; make them pass without weakening or deleting them. If a test is wrong, say so in the summary rather than changing its intent."] : []),
@@ -1090,11 +1232,12 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         completed: { target: "scopeAfterChange", actions: record("change") },
         blocked: { target: "stuck", actions: record("change") },
       }, { using: "implementer", cwd: worktree }),
-      scopeAfterChange: operation(() => scope("change"), { passed: "verify", failed: "repairBudget" }),
+      scopeAfterChange: operation(() => unsettled() ?? scope("change"), { passed: "verify", failed: "repairBudget" }),
       verify: operation(() => { saved.repairing = "change"; return work.checks(); }, { passed: "sealReview", failed: "repairBudget" }),
       sealReview: operation(work.seal, { sealed: "review" }),
       review: agent(() => prompt([
         "Review the current diff and verification evidence. Do not edit any file. Check acceptance criteria, regressions, scope, and whether tests actually establish the intended behavior.",
+        ...movedPrompt(),
         ...assumptionsPrompt(),
         ...(saved.assumptions.length ? ["An assumption you disagree with is a discussion finding for the ticket owner."] : []),
         ...(saved.provedRed ? ["The tests were written before the implementation and the Machine saw them fail; check that the implementation makes them pass for the right reason and that no test was weakened."] : []),

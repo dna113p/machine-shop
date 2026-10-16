@@ -18,8 +18,8 @@ function fixture(context: TestContext) {
 const checkInput = workspace => ({ task: "Check the installed workflow", workspace,
   checks: [{ name: "local-check", command: [process.execPath, "-e", "console.log('real check')"] }] });
 
-test("installer lists exactly ten opt-in defaults", () => {
-  assert.equal(available.length, 10);
+test("installer lists exactly eleven opt-in defaults", () => {
+  assert.equal(available.length, 11);
   const listed = spawnSync(process.execPath, ["scripts/install.mjs", "--list"], { encoding: "utf8" });
   assert.equal(listed.status, 0, listed.stderr);
   assert.deepEqual(listed.stdout.trim().split("\n"), available);
@@ -111,7 +111,7 @@ test("all installed definitions discover cleanly without fake live bindings or e
   const { project, home } = fixture(context);
   install({ target: project, workflows: available });
   const found = await launcher.listMachines({ cwd: project, home });
-  assert.equal(found.length, 10);
+  assert.equal(found.length, 11);
   assert.ok(found.every(item => item.error === undefined), JSON.stringify(found));
   assert.deepEqual(found.find(item => item.name === "dev-verify-checks").missingAgents, []);
   assert.ok(found.find(item => item.name === "dev-implement-task").missingAgents.includes("implementer"));

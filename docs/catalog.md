@@ -2,7 +2,7 @@
 
 These are selectable starting points, not a mandatory process for every project.
 The project orchestrator chooses and adapts the useful subset, supplies actual
-acceptance criteria and commands, and validates the results. Do not run all ten
+acceptance criteria and commands, and validates the results. Do not run all eleven
 for one task. Small direct changes can remain direct.
 
 ## Defaults
@@ -20,6 +20,7 @@ so these do not replace project-specific names such as `verify`.
 | [refactor](../defaults/refactor.ts) | green baseline -> behavior-preserving change -> checks -> review; bounded repair | implementer, reviewer | 4 |
 | [add-tests](../defaults/add-tests.ts) | green baseline -> focused tests -> checks -> review; bounded repair | tester, reviewer | 4 |
 | [review-code](../defaults/review-code.ts) | read-only review -> unchanged-checkout guard -> findings receipt | reviewer | 1 |
+| [retrospective](../defaults/retrospective.ts) | read evidence -> classify stops -> validate and report; one malformed-report retry | analyst | 2 |
 | [investigate](../defaults/investigate.ts) | investigate -> unchanged guard -> challenge evidence; bounded research revision | investigator, reviewer | 4 |
 | [update-docs](../defaults/update-docs.ts) | docs/examples change -> explicit validation -> source-consistency review; bounded repair | writer, reviewer | 4 |
 | [upgrade-dependency](../defaults/upgrade-dependency.ts) | green baseline -> compatibility proposal -> Human approval -> upgrade -> checks -> review; bounded repair | analyst, implementer, reviewer | 5 |
@@ -39,9 +40,44 @@ security concern; it is not a security certification. For UI, performance, datab
 or domain-specific work, adapt the selected workflow with real project checks.
 Production migrations and publishing are deliberately not generic defaults.
 
+## Retrospective
+
+[retrospective](workflows/retrospective.md) accepts its own input: `workspaces`,
+an array of 1–20 absolute directories, and optional `since`, a `YYYY-MM-DD` UTC
+start date. With no date it covers the last seven days. It needs no Git checkout
+and runs no checks or other Machines.
+
+Operations read only `.machine-runs/machine-shop/<run>/` in the named
+workspaces: `started.json`, `result.json`, `question-<n>.txt`, Human answers and
+JSON stage reports. Only `ticket-task` runs are classified. Questions use their
+file modification time; endings use `finishedAt`. Only `decide` answers are
+matched, in numeric order, to question files. Older runs without question text
+use the ending reason and answers as one stop. A missing result is reported as
+not ended; it does not hide an in-window question. Completed runs with no stops
+are omitted. Unreadable evidence is named without preventing the other reports.
+Symlinked run directories are skipped and evidence-file symlinks are refused.
+
+One analyst, given only extracted stops, supplies causes, automation marks and
+one suggested change with its repository per group. Bind a read-only preset;
+the analyst is instructed to use no tools or files. Operations group by workflow,
+stopped stage and normalized first sentence of the reason, and validate complete
+classification coverage. A malformed reply gets one retry, then a blocked result.
+Only a falsify question's own recommended option counts as a recommendation;
+hand off, archive and discard always need a person. Continue/fix-reviewer and
+mechanical retry answers are also automation candidates.
+
+The Markdown output is also `report.md` in the first workspace's new evidence
+folder. It lists stops needing no person first, repeated causes by descending
+count with suggestions and repositories, then single stops, runs not ended and
+unreadable runs. Each stop includes the ticket, workflow, stage, cause, owner
+answer and supplied blocker locations. These locations are not claimed to be
+the decision to stop. Unknown metadata stays unknown. The Machine changes
+nothing outside its own evidence folder, writes no tickets, changes no Machine,
+and never starts, resumes or answers another run.
+
 ## Common input
 
-The defaults accept a JSON object through MCP/Pi, `--input-file`, or a JSON
+Except for retrospective’s separate input above, the defaults accept a JSON object through MCP/Pi, `--input-file`, or a JSON
 string as CLI positional input. They do not accept an unstructured task string.
 
 ```json
@@ -151,7 +187,7 @@ without a final receipt. These workflows do not resume, undo, or roll back work.
 
 ## Ticket delivery
 
-[ticket-task](../ticket-task.ts) is a separate root workflow, not one of the ten
+[ticket-task](../ticket-task.ts) is a separate root workflow, not one of the eleven
 defaults: it is not in `defaults/`, the installer does not copy it, and it is the
 only workflow here built on the shared helper that commits or publishes. It
 reuses the helper for evidence, checks, fingerprints, review, and separate
@@ -320,7 +356,7 @@ is.
 | State | Work |
 | --- | --- |
 | `shape` | Validate the checkout and root paths; open evidence and block missing ticket sections or empty required lists before any Agent or worktree |
-| `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch instead: no uncommitted change goes through `start` to `falsify`, a candidate to `scopeAfterChange`, then `verify`; with no worktree, a recorded delivered commit is recreated and set up, then continues at `rebase` |
+| `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch, save any candidate and move onto a newer base before setup and checks: conflicts go to `change`, a cleanly applied candidate to `scopeAfterChange`, then `verify`, and no uncommitted change through `start` to `falsify`; with no worktree, a recorded delivered commit is recreated and set up, then continues at `rebase` |
 | `start` | Open the helper's run on the worktree, which must be clean |
 | `falsify` | Read-only investigator tries to show the ticket is wrong, already done, impossible here, or underspecified; returns `sound` with a one-paragraph summary or `questions` with 1–10 entries containing text, options, recommended, assumable, and why in the report's `questions` field, not its summary or message; a return for malformed questions includes the validation reason and repeats where the questions go |
 | `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; missing or malformed questions return to `falsify` once per run, then go through the stuck policy with the reason and report's evidence file; a sound ticket goes to `plan`, as does an entirely assumable report with `assume: true`; remaining questions go through the stuck policy with numbered needs, flattened with question text, each option, and why capped separately at 600 characters plus an ellipsis |
@@ -402,7 +438,10 @@ After plan approval, new runs go through `test` → `scopeAfterTest` → `red` �
 `change` → `scopeAfterChange` → `verify`. With `redGreen: false`, they skip
 `test`, `scopeAfterTest`, and `red`. Resumed runs with a candidate skip them too,
 since red cannot be proved again once the change exists, but are held to the Scope
-at `scopeAfterChange` before `verify`. A resumed worktree with no uncommitted change
+at `scopeAfterChange` before `verify`. If its base moved, preparation saves and
+re-applies the candidate first; conflicts go to `change` for the implementer
+to settle before the scope check, checks, and review. A resumed worktree with no
+uncommitted change
 starts again at `falsify` with the current ticket, then plans and tests afresh.
 The reviewer, tester, and implementer receive the captured prose plan verbatim under a `Plan:`
 heading. The tester receives the acceptance and Scope lists and must write one or more
@@ -537,8 +576,9 @@ commit on the ticket branch. Before a stop, repair, or re-review, the commit is
 undone with a mixed reset, its recorded hash is cleared, and verification is
 reopened. A conflict aborts the rebase and restores the approved candidate
 uncommitted on its original base. The reason names the conflicting paths and
-new tip: resume alone repeats the conflict until a person ports the candidate
-onto the new base in the worktree. A replay leaving no commit similarly restores
+new tip: a resumed run saves the candidate, moves it onto the current base,
+and sends conflicts to the implementer before checks and review. A replay leaving
+no commit similarly restores
 the candidate and stops through `stuck`, saying the base already holds the
 change; resume alone repeats this stop too. A refusing hook, missing patch id,
 unexpected commit count, changed parent or message, moved HEAD, or dirty tree
@@ -551,8 +591,9 @@ paths against ignore rules with `git check-ignore --no-index`; if any would
 be dropped by the next `git add --all`, it restores the approved candidate
 uncommitted on its original base and stops through `stuck`.
 The ignore stop names the affected files and each rule's file, the new tip,
-and why the undo was needed; resume alone repeats the stop until the candidate
-or ignore rules are reconciled. Modified and deleted paths stay tracked after
+and why the undo was needed; resume checks the current tip's rules in `prepare`
+and stops there until the candidate or ignore rules are reconciled. Modified
+and deleted paths stay tracked after
 the undo, and re-included added paths are safe. Failure to inspect added paths
 or ignore rules also restores the candidate and goes through `stuck`, with
 failure logs retained. The added paths are saved as `rebase-<n>.paths`.
@@ -722,11 +763,13 @@ worktree directory exists and is a Git worktree of `repository.path`; its `HEAD`
 is a symbolic ref to a branch that belongs to this ticket by the rule above; and
 that branch points at the resolved base commit or at an ancestor of it, so
 nothing was committed on it. The base branch may therefore have moved forward
-while the ticket was stuck: the commit the ticket branch points at is this
-run's starting base commit for the commit guard and, in `pr` mode, the initial
-check that the base is published. After approval, `rebase` compares it with the
-current source tip and replays onto a forward move before delivery. The final
-base determines the delivered commit's parent, patch range, and `delivery.json`.
+while the ticket was stuck. Adoption validates the commit the ticket branch
+points at and, in `pr` mode, checks that it is published. Once every refusal
+check passes, `prepare` moves the worktree onto the current base before any
+Agent, scope check, or verification runs. In `pr` mode it first checks that the
+current tip is published too; otherwise it asks with nothing changed. Delivery's
+replay still handles a base that moves again during the run. The final base
+determines the delivered commit's parent, patch range, and `delivery.json`.
 A branch that holds commits the base does not, or that shares no
 history with it, is not adopted. The run continues on the branch the worktree
 is on and does not compute a name from the current title, so a candidate
@@ -736,10 +779,41 @@ A worktree on a branch whose ownership is unresolved, or that belongs to another
 ticket, is not adopted; for the first the message gives the `git config` command
 that records it. If any of these fails
 the run ends `blocked` with a message naming the condition, changing nothing.
-Setup commands are not run again for an existing worktree. With a candidate, resume skips `falsify`, `plan`,
-and `planReview` and goes to `scopeAfterChange`, then `verify`, review, commit,
-rebase, and deliver as usual, with fresh budgets and the normal repair loop if
-review asks for changes. A candidate resume reads `ticket-task-assumptions.json`
+When the base has not moved, setup is not run again and resume behaves as
+before. When it has moved, preparation first saves any uncommitted candidate
+as `saved-candidate.patch` in the evidence directory and as a recovery ref at
+`refs/machine-shop/saved/<id-slug>/<hash>`. The recovery commit object does not
+move the ticket branch or run hooks; the candidate remains uncommitted there.
+The worktree is reset onto the tip, added paths are checked against its ignore
+rules, and setup runs on that clean tip before the saved candidate is re-applied.
+A clean worktree moves and runs setup too, then plans afresh.
+
+If the tip's ignore rules match an added file, preparation restores the candidate
+on its old base and asks, naming the file and the rule's file. This check uses
+the tip's rules even if the candidate would un-ignore that file. Failed setup,
+setup moving HEAD or the branch, or tracked or unignored setup output also
+restores the old candidate and asks, naming the command. A re-apply that leaves
+no change asks because the base already holds it, again restoring the candidate.
+Every later question names the saved ref and patch outside the Needs text limit.
+
+With a candidate, resume skips `falsify`, `plan`, and `planReview`. A clean
+re-apply goes to `scopeAfterChange`, then `verify`, review, commit, rebase, and
+deliver. Conflicts go to `change`: its prompt names the files, old and new base,
+saved candidate, and `resume-conflicts.diff`, which holds each side's changes.
+The implementer must keep both sides' intent, remove markers, and `git add` each
+settled file without committing. An unmerged index or remaining opening, base,
+or closing conflict marker counts as a failed repair through the existing
+budget. Bare `=======` lines are allowed as Markdown underlines. Once settled,
+the scope check, checks, and review run normally; review is told which bases
+were involved and which conflicts were settled. Exhaustion asks the owner with
+the files and saved copy named. A later resume with an unmerged index returns
+to `change` without moving again; `ticket-task-move.json` in the worktree's Git
+directory preserves the original saved-copy locations. Archiving unresolved
+conflicts can commit their markers, but the saved ref still holds the candidate
+as it stood before the move. The repair budget and review rules are unchanged.
+
+A resume uses fresh budgets and the normal repair loop if review asks for changes.
+A candidate resume reads `ticket-task-assumptions.json`
 from its worktree's Git directory, if present, validates it, and writes this run's
 evidence `assumptions.json`. It passes those answers under `Assumptions:` to its
 reviewer, lists them under `## Assumptions` in the pull request, and records them
@@ -852,8 +926,11 @@ the repository and the commit: the helper's `started.json`, check and setup
 logs (including red), `scope-<n>.json` path checks, Agent summaries, full
 planning events as `<stage>-<n>.json` (`falsify`, `plan`, `planReview`, numbered per
 stage even on retries), structured reviews as `review-<n>.json`, each Human answer
-as `human-<n>.json`, and `result.json`,
-plus `delivery.json` with the ticket id, repository name and path, branch, base
+as `human-<n>.json`, and `result.json`. A moved candidate also has
+`saved-candidate.patch`, `resume-added.paths` for the ignore check, and
+`resume-conflicts.diff` if it conflicted; its recovery ref is
+`refs/machine-shop/saved/<id-slug>/<hash>`. Evidence includes
+`delivery.json` with the ticket id, repository name and path, branch, base
 commit, commit hash, output mode, pull request URL or patch paths, worktree
 path, whether the worktree was removed, and `reviewNotes: [{text, where}]` in
 every output mode (an empty list when there are no minors). When falsify assumed
@@ -921,8 +998,9 @@ so a ticket branch checked out in another clone has no record there. One that
 holds its ticket commit is still told by that commit; one without it, unless it
 is named exactly `ticket/<id-slug>`, has unresolved ownership, which blocks a new
 run of the ticket and cannot be resumed until it is recorded. The
-published-base check records configuration once, in `prepare`, and asks the
-recorded remote base again before replay onto a newer tip. It is not an atomic
+published-base checks record configuration in `prepare`, including the new tip
+on resume, and ask the recorded remote base again before delivery replay onto
+a newer tip. It is not an atomic
 lock against later remote movement. A `gh` failure
 after a successful push leaves the pushed branch on the remote. A commit that a
 hook altered stays on the local branch, undelivered. Like the defaults, this is not a sandbox: Agents and commands run with the
@@ -932,7 +1010,7 @@ tickets and repository settings only from a trusted source.
 ## ChatGPT thread
 
 [chatgpt-thread](../chatgpt-thread.ts) is a separate root workflow, not one of
-the ten defaults: it is not in `defaults/`, the installer does not copy it, and
+the eleven defaults: it is not in `defaults/`, the installer does not copy it, and
 it does not use the shared helper, so it runs no checks and writes no
 `.machine-runs` receipt. It keeps one ChatGPT web chat going by sending each
 Human reply back to the same conversation.
@@ -986,7 +1064,7 @@ editing. Separate roles do not inherently mean separate providers/models.
 
 `npm run check` type-checks the new definitions and runs real-runtime tests with
 fake Agent runners, real commands, and temporary Git repositories. Tests exercise
-all ten success paths, failure and rejection paths, red/green requirements,
+all eleven success paths, failure and rejection paths, red/green requirements,
 repair budgets, stale verification, source-integrity guards, malformed inputs,
 command errors, and result retrieval. `npm run smoke:install` covers selective
 installation, conflicts, relocation, discovery, and the real CLI. Ticket delivery
