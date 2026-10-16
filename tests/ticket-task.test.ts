@@ -21,6 +21,10 @@ const review = (type = "approved", summary = "Greeting matches the ticket", extr
   findings: type === "revise" ? [{ severity: "blocker", text: summary, where: "greeting.txt:1" }] : [],
   newSinceLastRound: "Updated findings", ...extra,
 });
+// Stop-policy fixtures need owner input at the first budget: this finding requires a Scope decision.
+const ownerReview = (summary: string) => review("revise", summary, {
+  findings: [{ severity: "blocker", text: summary, where: "outside-scope.txt:1" }],
+});
 const command = (code = 'if (require("fs").existsSync("greeting.test.txt")) eval(require("fs").readFileSync("greeting.test.txt", "utf8")); console.log("check passed")', extra = {}) => ({ name: "tests", command: [process.execPath, "-e", code], ...extra });
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
@@ -1897,7 +1901,7 @@ test("an answer to a spent review budget renews the budgets as more rounds does 
   const prompts: string[] = []; let reviews = 0;
   const result = await execute(input(f, {}, { maxReviewRounds: 1 }), {
     implementer: request => { prompts.push(request.prompt); writeFileSync(join(request.cwd, "greeting.txt"), `hello ${prompts.length}\n`); return ok(); },
-    reviewer: () => ++reviews < 4 ? review("revise", `Finding ${reviews}`) : review(),
+    reviewer: () => ++reviews < 4 ? ownerReview(`Finding ${reviews}`) : review(),
   }, human);
   assert.equal(result.state, "delivered", evidence(f).delivery.reason);
   assert.deepEqual([prompts.length, reviews, human.requests.length], [4, 4, 1]);
@@ -2166,13 +2170,13 @@ test("the default gate budget allows three repairs before failing checks wait fo
   assert.ok(human.requests[0]!.prompt.includes("Repair rounds used: 3 of 3."));
 });
 
-test("the default review budget allows two rounds before review feedback waits for a decision", async context => {
+test("the default review budget allows two retries and one fresh budget for fixable blockers before asking", async context => {
   const f = fixture(context); const human = person("hand off"); let edits = 0; let reviews = 0;
   const result = await execute(input(f), {
     implementer: request => { edits++; return implement(request); }, reviewer: () => review("revise", `Finding ${++reviews}`),
   }, human);
-  const run = handedOff(f, result, /budget exhausted \(2\)\. Finding 3/u, human);
-  assert.deepEqual([edits, reviews, run.result.repairs, run.result.reviewRounds, run.result.checksPassed], [3, 3, 0, 2, true]);
+  const run = handedOff(f, result, /budget exhausted \(2\)\. Finding 6/u, human);
+  assert.deepEqual([edits, reviews, run.result.repairs, run.result.reviewRounds, run.result.checksPassed], [6, 6, 0, 2, true]);
   assert.ok(human.requests[0]!.prompt.includes("Review rounds used: 2 of 2."));
 });
 
@@ -2189,7 +2193,7 @@ test("more rounds restarts the budget with the standing findings, and an approva
   const f = fixture(context); const human = person("more rounds"); const prompts: string[] = []; let reviews = 0;
   const result = await execute(input(f, {}, { maxRepairs: 1, maxReviewRounds: 1 }), {
     implementer: request => { prompts.push(request.prompt); writeFileSync(join(request.cwd, "greeting.txt"), `hello ${prompts.length}\n`); return ok(); },
-    reviewer: () => ++reviews < 3 ? review("revise", `Finding ${reviews}`) : review("approved", "Greeting matches the ticket"),
+    reviewer: () => ++reviews < 3 ? ownerReview(`Finding ${reviews}`) : review("approved", "Greeting matches the ticket"),
   }, human);
   assert.equal(result.state, "delivered"); assert.deepEqual([prompts.length, reviews, human.requests.length], [3, 3, 1]);
   assert.deepEqual(result.states.slice(-15), ["reviewBudget", "stuck", "decide", "repairTarget", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "delivered"]);
@@ -2222,15 +2226,152 @@ test("more rounds can be chosen again each time the budget runs out", async cont
 
 test("more rounds after a budget of zero still gives the implementer one pass", async context => {
   const f = fixture(context); const human = person("more rounds"); let reviews = 0;
-  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ++reviews === 1 ? review("revise", "Handle the empty case") : review("approved") }, human);
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ++reviews === 1 ? ownerReview("Handle the empty case") : review("approved") }, human);
   assert.equal(result.state, "delivered"); assert.equal(reviews, 2); assert.ok(human.requests[0]!.prompt.includes("Repair rounds used: 0 of 0."));
+});
+
+/**
+ * A revise whose only finding is a blocker inside Scope. Its text differs from the summary, so it reaches a prompt only as feedback and not
+ * through the stage reports, and each round's text and newSinceLastRound differ, so the review never stops as not converging.
+ */
+const fixableReview = (round: number, where = "greeting.txt:1", extra = {}) => review("revise", `Review ${round}`, {
+  findings: [{ severity: "blocker", text: `Blocker ${round}`, where }], newSinceLastRound: `New in round ${round}`, ...extra,
+});
+/** The line of a stuck question that says the one extra review round was used; undefined when it says nothing of it. */
+const extraRoundLine = (prompt: string) => prompt.split("\n").find(line => /extra (review )?round/iu.test(line) && /\bused\b/u.test(line));
+
+test("a spent review budget whose last revise has only in-Scope blockers goes back to the implementer once with them, and asks the owner only when a second budget is spent", async context => {
+  const f = fixture(context); const prompts: string[] = []; const reviewed: string[] = []; const asked: number[] = [];
+  const human = person(() => { asked.push(prompts.length); return "more rounds"; }, () => { asked.push(prompts.length); return "hand off"; });
+  const result = await execute(input(f, {}, { maxReviewRounds: 1 }), {
+    implementer: request => { prompts.push(request.prompt); writeFileSync(join(request.cwd, "greeting.txt"), `hello ${prompts.length}\n`); return ok(); },
+    reviewer: request => { reviewed.push(request.prompt); return fixableReview(reviewed.length); },
+  }, human);
+  const run = handedOff(f, result, /budget exhausted \(1\)\. Review 6/u, human);
+  // The first budget is spent at the second review; the run goes on to two more passes instead of asking, and asks after the fourth.
+  // More rounds then renews the budget as ever, but the extra round is not given again: the next spent budget asks straight away.
+  assert.deepEqual(asked, [4, 6]); assert.equal(reviewed.length, 6);
+  assert.equal(result.states.filter(state => state === "stuck").length, 2);
+  assert.match(stuckQuestion(f, human.requests[0], "reviewBudget"), /^Explain how to resolve the remaining findings: Review budget exhausted \(1\)\. Review 4/u);
+  // The implementer's first pass in the extra round carries the blocker that spent the budget, and it stands for the round's later pass too.
+  assert.ok(prompts[2]!.includes("Blocker 2"), prompts[2]);
+  assert.ok(prompts[3]!.includes("Blocker 2"), prompts[3]); assert.ok(prompts[3]!.includes("Blocker 3"), prompts[3]);
+  assert.equal(prompts[1]!.includes("Blocker 2"), false);
+  // The reviewer is asked as before: the standing blocker is the implementer's, not the reviewer's.
+  assert.equal(reviewed[3]!.includes("Blocker 2"), false, reviewed[3]);
+  asksWritten(run.directory, human.requests);
+  assert.deepEqual(run.result.decisions.map((made: any) => made.response), ["more rounds", "hand off"]);
+});
+
+for (const [where, output] of [["greeting.txt:1", "branch"], ["./greeting.test.txt:1-4", "pr"], ["greeting.txt", "branch"]] as const) {
+  test(`an extra review round at ${where} that ends approved commits and delivers by ${output} without asking the owner`, async context => {
+    const f = fixture(context); if (output === "pr") { remote(f); fakeGh(context, f); }
+    const human = person(); let edits = 0; let reviews = 0;
+    const result = await execute(input(f, { output }, { maxReviewRounds: 1 }), {
+      implementer: request => { edits++; writeFileSync(join(request.cwd, "greeting.txt"), `hello ${edits}\n`); return ok(); },
+      reviewer: () => ++reviews < 3 ? fixableReview(reviews, where, reviews === 2 ? { findings: [
+        { severity: "blocker", text: `Blocker ${reviews}`, where }, { severity: "minor", text: "Name the greeting", where: "greeting.txt:1" },
+      ] } : {}) : review(),
+    }, human);
+    assert.deepEqual([edits, reviews, human.requests.length], [3, 3, 0]);
+    assert.equal(result.states.includes("stuck"), false); assert.equal(result.states.includes("decide"), false);
+    const run = ended(f, result, output);
+    assert.deepEqual([run.result.outcome, run.delivery.outcome], ["completed", "delivered"]);
+    assert.equal(git(f.repo, "show", `${run.delivery.commit ?? branch}:greeting.txt`), "hello 3");
+  });
+}
+
+for (const [label, findings] of [
+  ["a blocker outside Scope", [{ severity: "blocker", text: "Blocker 1", where: "elsewhere.txt:3" }]],
+  ["a blocker that names no path", [{ severity: "blocker", text: "Blocker 1", where: "" }]],
+  ["a second blocker outside Scope", [{ severity: "blocker", text: "Blocker 1", where: "greeting.txt:1" }, { severity: "blocker", text: "Blocker 1b", where: "src/elsewhere.ts:4-9" }]],
+  ["a minor finding outside Scope", [{ severity: "blocker", text: "Blocker 1", where: "greeting.txt:1" }, { severity: "minor", text: "Tidy the notes", where: "docs/notes.md:2" }]],
+] as const) {
+  test(`a spent review budget whose last revise has ${label} asks the owner at once, as before`, async context => {
+    const f = fixture(context); const human = person("hand off"); let edits = 0; let reviews = 0;
+    const result = await execute(input(f, {}, { maxReviewRounds: 0 }), {
+      implementer: request => { edits++; return implement(request); },
+      reviewer: () => { reviews++; return fixableReview(1, undefined, { findings }); },
+    }, human);
+    handedOff(f, result, /budget exhausted \(0\)\. Review 1/u, human);
+    assert.deepEqual([edits, reviews, human.requests.length], [1, 1, 1]);
+    assert.equal(extraRoundLine(human.requests[0]!.prompt), undefined, human.requests[0]!.prompt);
+  });
+}
+
+const unmet = [{ text: criterion, met: false, evidence: "greeting.txt:1" }];
+for (const [label, extra] of [
+  ["an unmet criterion and no finding", { criteria: unmet, findings: [] }],
+  ["an unmet criterion and only a minor finding", { criteria: unmet, findings: [{ severity: "minor", text: "Name the greeting", where: "greeting.txt:1" }] }],
+  ["only a discussion finding", { findings: [{ severity: "discussion", text: "Should the greeting be localized?", where: "greeting.txt:1" }] }],
+  ["a blocker and a discussion finding", { findings: [
+    { severity: "blocker", text: "Blocker 1", where: "greeting.txt:1" }, { severity: "discussion", text: "Should the greeting be localized?", where: "greeting.txt:1" },
+  ] }],
+] as const) {
+  test(`a spent review budget whose last revise has ${label} asks the owner at once, as before`, async context => {
+    const f = fixture(context); const human = person("hand off"); let edits = 0; let reviews = 0;
+    const result = await execute(input(f, {}, { maxReviewRounds: 0 }), {
+      implementer: request => { edits++; return implement(request); },
+      reviewer: () => { reviews++; return fixableReview(1, undefined, extra); },
+    }, human);
+    handedOff(f, result, /budget exhausted \(0\)\. Review 1/u, human);
+    assert.deepEqual([edits, reviews, human.requests.length], [1, 1, 1]);
+    assert.equal(extraRoundLine(human.requests[0]!.prompt), undefined, human.requests[0]!.prompt);
+  });
+}
+
+test("a run that stops after its extra review round says the round was used and gives the reviewer's newSinceLastRound", async context => {
+  const f = fixture(context); const human = person("hand off"); let reviews = 0;
+  const result = await execute(input(f, {}, { maxReviewRounds: 0 }), {
+    implementer: implement, reviewer: () => fixableReview(++reviews),
+  }, human);
+  const run = handedOff(f, result, /budget exhausted \(0\)\. Review 2/u, human);
+  assert.equal(reviews, 2);
+  const [request] = human.requests;
+  assert.match(stuckQuestion(f, request, "reviewBudget"), /^Explain how to resolve the remaining findings: Review budget exhausted \(0\)\. Review 2/u);
+  // Said above what is needed, with the reviewer's own account of what was new in the round.
+  assert.ok(extraRoundLine(standingOf(request!.prompt)), request!.prompt);
+  assert.ok(standingOf(request!.prompt).includes("New in round 2"), request!.prompt);
+  asksWritten(run.directory, human.requests);
+});
+
+test("a run stopped another way during its extra review round says the round was used and gives the reviewer's newSinceLastRound", async context => {
+  const f = fixture(context); const human = person("hand off"); let edits = 0; let reviews = 0;
+  const result = await execute(input(f, {}, { maxReviewRounds: 1 }), {
+    implementer: request => { if (++edits === 4) return ok("blocked", "The greeting file is locked"); writeFileSync(join(request.cwd, "greeting.txt"), `hello ${edits}\n`); return ok(); },
+    reviewer: () => fixableReview(++reviews),
+  }, human);
+  handedOff(f, result, /The greeting file is locked/u, human);
+  assert.deepEqual([edits, reviews, human.requests.length], [4, 3, 1]);
+  const [request] = human.requests;
+  assert.match(stuckQuestion(f, request, "change"), /^Clarify how to resolve this blocker: The greeting file is locked/u);
+  assert.ok(extraRoundLine(standingOf(request!.prompt)), request!.prompt);
+  assert.ok(standingOf(request!.prompt).includes("New in round 3"), request!.prompt);
+});
+
+test("the extra review budget keeps spent repair rounds and reports when no review has finished in it", async context => {
+  const f = fixture(context); const human = person("hand off"); let edits = 0; let reviews = 0;
+  const result = await execute(input(f, { checks: [command('process.exit(require("fs").readFileSync("greeting.txt", "utf8") === "fail" ? 1 : 0)')] }, {
+    maxRepairs: 1, maxReviewRounds: 0,
+  }), {
+    implementer: request => {
+      writeFileSync(join(request.cwd, "greeting.txt"), ++edits === 2 ? "hello\n" : "fail");
+      return ok();
+    },
+    reviewer: () => fixableReview(++reviews),
+  }, human);
+  const run = handedOff(f, result, /Repair budget exhausted \(1\)/u, human);
+  assert.deepEqual([edits, reviews, run.result.repairs], [3, 1, 1]);
+  assert.deepEqual(run.result.checks.map(check => check.passed), [true, false, true, false]);
+  assert.ok(extraRoundLine(standingOf(human.requests[0]!.prompt)));
+  assert.match(standingOf(human.requests[0]!.prompt), /No review has finished in the extra round yet/u);
 });
 
 test("hand off leaves the worktree, the branch, and the uncommitted candidate as they were", async context => {
   const f = fixture(context); let before: unknown;
   const human = person(() => { before = candidate(f.worktree); return "hand off"; });
   const result = await execute(scoped(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), "code.txt"), {
-    implementer: request => { writeFileSync(join(request.cwd, "code.txt"), "new"); return implement(request); }, reviewer: () => review("revise", "Handle the empty case"),
+    implementer: request => { writeFileSync(join(request.cwd, "code.txt"), "new"); return implement(request); }, reviewer: () => ownerReview("Handle the empty case"),
   }, human);
   const run = handedOff(f, result, /budget exhausted \(0\)\. Handle the empty case/u, human);
   assert.deepEqual(candidate(f.worktree), before); assert.equal(candidate(f.worktree).status, "M code.txt\n?? greeting.test.txt\n?? greeting.txt");
@@ -2251,7 +2392,7 @@ test("archive leaves the tracked and untracked candidate on archive/<slug>, with
       mkdirSync(join(request.cwd, ".machine-runs")); writeFileSync(join(request.cwd, ".machine-runs/nested.json"), "{}");
       return implement(request);
     },
-    reviewer: () => review("revise", "Handle the empty case"),
+    reviewer: () => ownerReview("Handle the empty case"),
   }, human);
   abandoned(f, result, "archive");
   assert.deepEqual(result.states.slice(-5), ["decide", "archive", "remove", "abandon", "abandoned"]);
@@ -2276,7 +2417,7 @@ test("archive leaves ignored files out of the archive commit, as delivery leaves
       mkdirSync(join(request.cwd, "build")); writeFileSync(join(request.cwd, "build/out.bin"), Buffer.from([0, 255, 1, 0]), { mode: 0o755 });
       return implement(request);
     },
-    reviewer: () => review("revise", "Handle the empty case"),
+    reviewer: () => ownerReview("Handle the empty case"),
   }, human);
   abandoned(f, result, "archive");
   assert.equal(before, "?? greeting.test.txt\n?? greeting.txt\n!! build/out.bin\n!! debug.log");
@@ -2301,7 +2442,7 @@ test("an existing archive branch blocks the archive before anything is staged, a
   const f = fixture(context); git(f.repo, "branch", archiveBranch);
   let before: ReturnType<typeof candidate> | undefined; let index = "";
   const human = person(() => { before = candidate(f.worktree); index = git(f.worktree, "ls-files", "--stage"); return "archive"; });
-  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, human);
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, human);
   const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: branch ${archiveBranch} already exists in .+, and nothing was staged`, "u"));
   assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
   assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]);
@@ -2322,10 +2463,10 @@ test("a failing commit hook does not prevent the archive", async context => {
 
 test("delivery.json and the summary name the archive branch and its commit", async context => {
   const f = fixture(context);
-  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("archive"));
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, person("archive"));
   const run = abandoned(f, result, "archive"); const commit = git(f.repo, "rev-parse", archiveBranch);
   assert.deepEqual(run.delivery, {
-    schemaVersion: 1, outcome: "abandoned", reason: "Review budget exhausted (0). Handle the empty case\nBlocker: Handle the empty case (greeting.txt:1)", decision: "archive",
+    schemaVersion: 1, outcome: "abandoned", reason: "Review budget exhausted (0). Handle the empty case\nBlocker: Handle the empty case (outside-scope.txt:1)", decision: "archive",
     ticket: "PROJ-12", repository: { name: "widgets", path: f.repo }, branch, baseCommit: f.head, commit: null, output: "branch",
     archive: { branch: archiveBranch, commit }, worktree: f.worktree, worktreeCreated: true, worktreeRemoved: true, reviewNotes: [],
   });
@@ -2344,7 +2485,7 @@ for (const further of [false, true]) {
         if (further) writeFileSync(join(request.cwd, "code.txt"), "new");
         return ok();
       },
-      reviewer: () => review("revise", "Handle the empty case"),
+      reviewer: () => ownerReview("Handle the empty case"),
     }, person("archive"));
     const run = abandoned(f, result, "archive");
     assert.equal(git(f.repo, "log", "--format=%s", `${f.head}..${archiveBranch}`), further ? "Archive: Add a greeting\nagent commit" : "agent commit");
@@ -2357,7 +2498,7 @@ test("a worktree that is not clean after the archive commit ends blocked with no
   const f = fixture(context);
   // --no-verify skips the hooks that can refuse a commit; this one runs after it.
   mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks/post-commit"), "#!/bin/sh\necho late > late.txt\n", { mode: 0o755 });
-  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("archive"));
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, person("archive"));
   const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: the worktree is not clean after the archive commit, so ${archiveBranch} would not hold all of the candidate`, "u"), 1);
   assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
   assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
@@ -2368,7 +2509,7 @@ test("a worktree that is not clean after the archive commit ends blocked with no
 test("a hook that resets HEAD off the archive commit and leaves a clean worktree ends blocked with nothing removed and no archive branch", async context => {
   const f = fixture(context);
   mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks/post-commit"), "#!/bin/sh\ngit reset --quiet --hard HEAD~1\n", { mode: 0o755 });
-  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("archive"));
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, person("archive"));
   const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: a commit hook or Git configuration moved HEAD off the archive commit or changed what it holds, so ${archiveBranch} would not hold the candidate; HEAD is at ${f.head}`, "u"));
   assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
   assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
@@ -2386,7 +2527,7 @@ for (const [changed, script] of [
     const f = fixture(context);
     // --no-verify skips commit-msg, not the hook that prepares the message.
     mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks/prepare-commit-msg"), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
-    const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("archive"));
+    const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, person("archive"));
     const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: a commit hook or Git configuration changed the archive commit's message, so ${archiveBranch} would not name the ticket; HEAD is at [0-9a-f]{40}, which holds the candidate`, "u"), 1);
     assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
     assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
@@ -2400,7 +2541,7 @@ for (const [changed, script] of [
 test("a hook that adds to the archive commit's message without changing its subject or ticket does not prevent the archive", async context => {
   const f = fixture(context);
   mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks/prepare-commit-msg"), '#!/bin/sh\nprintf "\\nPrepared-by: hook\\n" >> "$1"\n', { mode: 0o755 });
-  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("archive"));
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, person("archive"));
   abandoned(f, result, "archive");
   assert.equal(git(f.repo, "log", "-1", "--format=%B", archiveBranch), "Archive: Add a greeting\n\nTicket: PROJ-12\n\nPrepared-by: hook");
 });
@@ -2420,7 +2561,7 @@ test("a candidate that cannot be staged ends blocked with nothing removed", asyn
 test("discard then go back returns to the decision with the worktree, branch, and candidate as they were", async context => {
   const f = fixture(context); let before: unknown; let between: unknown;
   const human = person(() => { before = candidate(f.worktree); return "discard"; }, "go back", () => { between = candidate(f.worktree); return "hand off"; });
-  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, human);
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, human);
   assert.deepEqual(result.states.slice(-6), ["decide", "confirmDiscard", "stuck", "decide", "handOff", "handedOff"]);
   const run = handedOff(f, result, /budget exhausted \(0\)\. Handle the empty case/u, human);
   assert.deepEqual(between, before); assert.deepEqual(candidate(f.worktree), before);
@@ -2451,7 +2592,7 @@ test("discard removes the worktree and branch only after it is confirmed, and ar
     unconfirmed = existsSync(join(f.worktree, "greeting.txt")) && git(f.repo, "rev-parse", branch) === f.head && git(f.repo, "config", "--local", "--get", `branch.${branch}.ticket`) === "proj-12";
     return "confirm discard";
   });
-  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, human);
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, human);
   assert.ok(unconfirmed); assert.deepEqual(result.states.slice(-5), ["decide", "confirmDiscard", "remove", "abandon", "abandoned"]);
   const run = abandoned(f, result, "discard");
   // The ticket record goes with the branch.
@@ -2464,7 +2605,7 @@ test("discard removes the worktree and branch only after it is confirmed, and ar
 test("a worktree that cannot be removed after a confirmed discard ends blocked with the saved log", async context => {
   const f = fixture(context);
   const human = person("discard", () => { git(f.repo, "worktree", "lock", f.worktree); return "confirm discard"; });
-  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, human);
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, human);
   const run = blocked(f, result, /git worktree failed; inspect .+git-worktree\.log/u);
   assert.match(readFileSync(join(run.directory, "git-worktree.log"), "utf8"), /locked/u); assert.equal(run.delivery.decision, "discard");
   assert.equal(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), "hello\n"); assert.equal(git(f.repo, "rev-parse", branch), f.head);
@@ -2472,7 +2613,7 @@ test("a worktree that cannot be removed after a confirmed discard ends blocked w
 
 /** Ends a first run handed off with its uncommitted candidate, and returns the fixture a second run records its own evidence under. */
 async function handOff(f: Fixture) {
-  const first = await execute(input(f, { setup: [command('console.log("installed")', { name: "install" })] }, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("hand off"));
+  const first = await execute(input(f, { setup: [command('console.log("installed")', { name: "install" })] }, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, person("hand off"));
   assert.equal(first.state, "handedOff");
   return { ...f, evidence: join(f.root, "evidence-resumed") };
 }
@@ -3842,7 +3983,7 @@ test("a commit that names a ticket does not give that ticket a branch its id and
 test("a ticket retitled after its run is blocked by the branch that run made, and resumes on it", async context => {
   const f = fixture(context); const earlier = "ticket/proj-12-an-earlier-title";
   const ticket = { ...input(f).ticket, id: "PROJ-12", title: "An earlier title" };
-  const first = await execute({ ...input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), ticket }, { reviewer: () => review("revise", "Handle the empty case") }, person("hand off"));
+  const first = await execute({ ...input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), ticket }, { reviewer: () => ownerReview("Handle the empty case") }, person("hand off"));
   assert.equal(first.state, "handedOff"); assert.equal(record(f, earlier), "proj-12"); assert.equal(git(f.worktree, "symbolic-ref", "--short", "HEAD"), earlier);
   const second = await execute(input(next(f, 2)), { investigator: () => assert.fail() });
   held(next(f, 2), second, /^Blocked: Branch ticket\/proj-12-an-earlier-title already exists in .+ for this ticket; nothing was changed/u);
@@ -3945,7 +4086,7 @@ test("review findings returned as a JSON object reach the implementer and the Hu
   assert.ok(prompts[1]!.endsWith("Current failure/feedback: Handle the empty case\nBlocker: Handle the empty case (greeting.txt:1)"));
   assert.equal(run.delivery.reason, "Review budget exhausted (1). Handle the empty case\nBlocker: Handle the empty case (greeting.txt:1)");
   assert.ok(result.output.summary.startsWith(`Handed off on ${branch}: Review budget exhausted (1). Handle the empty case Blocker: Handle the empty case (greeting.txt:1). Decision: hand off.`));
-  assert.deepEqual(run.result.agents.filter((agent: any) => agent.stage === "review").map((agent: any) => agent.summary), ["Handle the empty case", "Handle the empty case"]);
+  assert.deepEqual(run.result.agents.filter((agent: any) => agent.stage === "review").map((agent: any) => agent.summary), Array(4).fill("Handle the empty case"));
 });
 
 /** Local commits on the base that the remote has never been sent. */
@@ -4067,7 +4208,7 @@ for (const policy of ["park", undefined]) {
           if (cause === "review drift") { writeFileSync(join(request.cwd, "greeting.txt"), "review edit"); before = candidate(request.cwd); return review(); }
           if (cause === "discussion") return review("approved", "Owner question", { findings: [{ severity: "discussion", text: "Which locale?", where: "greeting.txt:1" }] });
           if (cause === "criterion") return review("approved", "Still unmet", { criteria: [{ text: criterion, met: false, evidence: "greeting.txt:1" }], newSinceLastRound: "none" });
-          return cause === "review budget" ? review("revise", "Specify the greeting language") : ok("blocked", "Specify the greeting language");
+          return cause === "review budget" ? ownerReview("Specify the greeting language") : ok("blocked", "Specify the greeting language");
         },
       }, human);
       const run = questioned(f, result, reason, human); assert.deepEqual(candidate(f.worktree), before);
@@ -4114,7 +4255,7 @@ for (const exhausted of ["review", "gates"]) {
         writeFileSync(join(request.cwd, "greeting.txt"), (exhausted === "review" ? edits <= 2 : edits >= 3) ? "fail" : "hello\n");
         before = candidate(request.cwd); return ok();
       },
-      reviewer: () => review("revise", `Finding ${++reviews}`),
+      reviewer: () => ownerReview(`Finding ${++reviews}`),
     }, human);
     const run = questioned(f, result, exhausted === "review" ? /Review budget exhausted \(2\)/u : /Repair budget exhausted \(2\)/u, human);
     assert.match(run.needs, /^Explain how to resolve the remaining findings: /u);
@@ -4129,7 +4270,7 @@ for (const exhausted of ["review", "gates"]) {
 
 test("a candidate handed off at the question resumes with fresh budgets and an approving reviewer delivers it", async context => {
   const f = fixture(context); const human = person("hand off");
-  const first = await execute(input(f, {}, { stuck: "park", maxReviewRounds: 0 }), { reviewer: () => review("revise", "Which language?") }, human);
+  const first = await execute(input(f, {}, { stuck: "park", maxReviewRounds: 0 }), { reviewer: () => ownerReview("Which language?") }, human);
   questioned(f, first, /Review budget exhausted \(0\)/u, human);
   const again = { ...f, evidence: join(f.root, "evidence-resumed") };
   const data = input(again, { setup: [command("process.exit(1)")] }, { resume: true, stuck: "park" });
@@ -4593,7 +4734,7 @@ const delivers = ["shape", "prepare", "scopeAfterChange", "verify", "sealReview"
 async function assumedThenStopped(f: Fixture, stop: "park" | "ask", questions: Gap[], repository = {}) {
   const human = person("hand off");
   const first = await execute(input(f, repository, { assume: true, maxReviewRounds: 0, stuck: stop }), {
-    falsify: () => gaps(questions, "Gaps with a conservative answer each"), reviewer: () => review("revise", "Handle the empty case"),
+    falsify: () => gaps(questions, "Gaps with a conservative answer each"), reviewer: () => ownerReview("Handle the empty case"),
   }, human);
   const run = questioned(f, first, /Review budget exhausted \(0\)/u, human);
   assert.deepEqual(run.delivery.assumptions, assumed(questions));
@@ -4631,7 +4772,7 @@ for (const assuming of [false, true]) {
   test(`a resumed run with a candidate and no saved assumptions, ${assuming ? "after a person removed the file of a run that assumed" : "after a run that assumed nothing"}, gives its reviewer none, lists none in the pull request, and records none`, async context => {
     const f = fixture(context); remote(f); const gh = fakeGh(context, f);
     if (assuming) { await assumedThenStopped(f, "ask", [beside], { output: "pr" }); rmSync(saved(f, [beside])); }
-    else assert.equal((await execute(input(f, { output: "pr" }, { assume: true, maxReviewRounds: 0 }), { reviewer: () => review("revise", "Handle the empty case") }, person("hand off"))).state, "handedOff");
+    else assert.equal((await execute(input(f, { output: "pr" }, { assume: true, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, person("hand off"))).state, "handedOff");
     assert.deepEqual(savedIn(f), []);
     const again = next(f, 2); let prompt = "";
     const result = await execute(input(again, { output: "pr" }, { resume: true, assume: true }), {

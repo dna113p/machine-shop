@@ -15,7 +15,7 @@ It runs from source; the installer never copies it.
 | | |
 | --- | --- |
 | Agent roles | `investigator`, `tester`, `implementer`, `reviewer` |
-| Agent calls, at most | 16 at the default budgets with a stable base; 9 with both budgets at 0 |
+| Agent calls, at most | 22 at the default budgets with a stable base; 11 with both budgets at 0 |
 | Checkout | its own new worktree; the source checkout is left alone |
 | Source | [ticket-task.ts](../../ticket-task.ts) |
 
@@ -120,6 +120,7 @@ flowchart TD
   verify -->|passed| review --> reviewResult
   reviewResult -->|revise| reviewBudget
   reviewBudget -->|retry| change
+  reviewBudget -->|"exhausted, fixable, once"| change
   reviewResult -->|approved| commit --> rebase
   rebase -->|"current, or rebased"| deliver --> success["⚙️ success<br/>remove worktree, write delivery receipt"]
   success -->|"branch or patch"| delivered
@@ -158,6 +159,17 @@ flowchart TD
 ```
 
 ### When stuck
+
+Once per run, a spent review budget returns to the implementer with a fresh
+review budget if the last verdict is `revise`, every finding names a path inside
+Scope, at least one is a blocker, and none is a discussion. A leading `./` and
+trailing `:line` or `:line-range` are removed before matching Scope. The triggering
+blockers stay in the implementer's prompt; repair rounds already used still count.
+A second spent budget, any pathless or outside-Scope finding, or no blocker asks
+the owner. A `blocked` review still stops immediately. Every stuck question after
+the extra round begins says it was used and gives the latest well-formed review's
+`newSinceLastRound` from that point, or says no review has finished in it yet.
+An owner answer does not grant another automatic extra round.
 
 The plan reviewer prefers concise plans and sends back unnecessary detail as
 an ordinary revision. A `tooBroad` verdict stops the run with a suggested split
