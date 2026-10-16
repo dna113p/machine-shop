@@ -50,6 +50,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     archived: null as { branch: string; commit: string } | null,
     reviewSummary: "",
     standingReview: null as string | null,
+    extraRound: "unused" as "unused" | "running" | "used",
+    extraReviewRounds: 0,
+    extraRoundFrom: 0,
+    extraFeedback: [] as string[],
     reviews: [] as Event[],
     // Keep evidence across rebases, but compare reports only within the current patch's reviews.
     reviewsFrom: 0,
@@ -737,11 +741,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const archiveBranch = () => `archive/${saved.branch.slice("ticket/".length)}`;
   const standing = () => {
     const { reason, repairs, totalRepairs, maxRepairs, reviewRounds, totalReviewRounds, maxReviewRounds } = work.status();
+    const latest = saved.reviews.slice(saved.extraRoundFrom).findLast(event => event.type !== "blocked" && !reviewField(event, ticket.sections.acceptance)) as ReviewReport | undefined;
     return [
       `Ticket ${ticket.id}: ${ticket.title}. Stopped in ${saved.stoppedIn}.`,
       `This run is stuck and needs a decision: ${reason}\n`,
       `Repair rounds used: ${repairs} of ${maxRepairs}${totalRepairs > repairs ? ` in this budget, ${totalRepairs} in all` : ""}.`,
       `Review rounds used: ${reviewRounds} of ${maxReviewRounds}${totalReviewRounds > reviewRounds ? ` in this budget, ${totalReviewRounds} in all` : ""}.`,
+      ...(saved.extraRound !== "unused" ? [`The one extra review round was used; review retries: ${saved.extraReviewRounds} of ${maxReviewRounds}. ${latest ? `Reviewer newSinceLastRound: ${capped(latest.newSinceLastRound, 600)}` : "No review has finished in the extra round yet."}`] : []),
     ].join("\n");
   };
   const locations = () => [`Worktree: ${worktree}`, `Branch: ${saved.branch}`, `Evidence: ${work.open()}`,
@@ -1103,6 +1109,36 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }
     return { type: "approved" };
   }
+  function fixable(event: Event | undefined): event is ReviewReport {
+    if (!event || event.type !== "revise" || reviewField(event, ticket.sections.acceptance)) return false;
+    const { findings } = event as ReviewReport;
+    return findings.some(finding => finding.severity === "blocker")
+      && !findings.some(finding => finding.severity === "discussion")
+      && findings.every(finding => {
+        const path = finding.where.replace(/^\.\//u, "").replace(/:\d+(-\d+)?$/u, "");
+        return !!path.trim() && outsideScope([path], ticket.sections.scope).length === 0;
+      });
+  }
+  function reviewBudget(): Event {
+    const { reviewRounds, maxReviewRounds } = work.status();
+    // The helper's spent counter stays intact; only this extra review budget restarts, never repairs.
+    if (saved.extraRound === "running") {
+      if (saved.extraReviewRounds < maxReviewRounds) {
+        saved.extraReviewRounds++;
+        return { type: "retry" };
+      }
+    } else if (saved.extraRound === "unused" && reviewRounds >= maxReviewRounds) {
+      const last = saved.reviews.at(-1);
+      if (fixable(last)) {
+        saved.extraRound = "running";
+        saved.extraRoundFrom = saved.reviews.length;
+        saved.extraFeedback = last.findings.filter(finding => finding.severity === "blocker")
+          .map(finding => `Blocker: ${finding.text} (${finding.where})`);
+        return { type: "retry" };
+      }
+    }
+    return work.reviewRound();
+  }
   const chose = (value: string) => ({ event }: { event: Event }) => event.value === value;
   const choseDecision = (value: typeof decisions[number]) => ({ event }: { event: Event }) => decisionOf(event.value) === value;
   const decide = ({ event }: { event: Event }) => { saved.decision = decisionOf(work.choice("decide", event))!; };
@@ -1113,6 +1149,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       saved.answers.push(saved.decision);
     }
     work.renew();
+    if (saved.extraRound === "running") saved.extraRound = "used";
     saved.ownerQuestions = null;
     saved.wouldAssume = [];
     if (saved.standingReview !== null) work.block(saved.standingReview);
@@ -1177,6 +1214,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         saved.repairing = "change";
         return prompt([
           "Implement the ticket and its tests. Keep the change focused. Do not weaken checks or expand scope. Leave your changes uncommitted; the workflow commits and delivers them.",
+          ...(saved.extraRound !== "unused" ? ["Blockers the reviewer found when the review budget was spent; fix each and add the regression test it asked for:", ...saved.extraFeedback] : []),
           ...movedPrompt(),
           ...(saved.moved?.conflicts.length ? [
             `Settle conflicts in ${saved.moved.conflicts.map(path => JSON.stringify(path)).join(", ")}, keeping both sides' intent. Both sides are in ${join(work.open(), "resume-conflicts.diff")}. Remove every conflict marker and mark each settled file with git add; do not commit.`,
@@ -1217,7 +1255,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       reviewResult: operation(stopped("reviewResult", reviewResult), { approved: "commit", revise: "reviewBudget", blocked: "stuck" }),
       repairBudget: operation(stopped("repairBudget", work.repair), { retry: "repairTarget", exhausted: "stuck" }),
       repairTarget: operation(() => ({ type: saved.repairing }), { falsify: "falsify", plan: "plan", planReview: "planReview", test: "test", change: "change" }),
-      reviewBudget: operation(stopped("reviewBudget", work.reviewRound), { retry: "change", exhausted: "stuck" }),
+      reviewBudget: operation(stopped("reviewBudget", reviewBudget), { retry: "change", exhausted: "stuck" }),
       // Preparation, commit, and delivery failures still end blocked by themselves.
       stuck: operation(() => {
         writeFileSync(join(work.open(), `question-${++saved.questions}.txt`), stuckPrompt() + "\n", { mode: 0o600 });

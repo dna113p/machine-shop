@@ -195,10 +195,18 @@ budgets. Required Agent roles are `investigator`, `tester`, `implementer`, and
 `reviewer`. Failed red, scope, and green gates use `maxRepairs` (0–3, default 3
 here); review revisions use
 `maxReviewRounds` (0–5, default 2). Neither consumes the other's budget. With a
-stable base this allows at most 16 Agent calls before the stuck policy applies (up to two falsify calls,
-up to two plans and two plan reviews, one initial tester pass, up to six implementation passes, and three implementation reviews;
+stable base this allows at most 22 Agent calls before the stuck policy applies (up to two falsify calls,
+up to two plans and two plan reviews, one initial tester pass, up to nine implementation passes, and six implementation reviews;
 tester retries share the repair budget with implementation retries). Setting
-both budgets to zero allows at most nine calls, or eight with `redGreen: false`.
+both budgets to zero allows at most 11 calls, or 10 with `redGreen: false`.
+The extra review round is available only once per run, even after an owner answer.
+Its triggering blockers stay in the implementer's prompt. Scope is checked for
+every finding with `outsideScope`, after removing a leading `./` and trailing
+`:line` or `:line-range`. A pathless or outside-Scope finding, any discussion,
+or no blocker asks the owner at the first spent budget; a `blocked` review still
+stops immediately. Every stuck question after the extra round begins says it
+was used and gives the latest well-formed review's `newSinceLastRound` from
+that point, or says no review has finished in it yet.
 The single permitted plan revision and the separate one-time return for
 malformed falsify questions consume neither budget. A moved base that
 changes the approved patch adds a fresh review outside these budgets.
@@ -370,7 +378,7 @@ is.
 | `cleanUp` | Only after `MERGED`, delete the remote ticket branch and then the local one; an already absent remote branch counts as deleted, other failures end `blocked` with a log |
 | `mergeDecide`, `confirmMergeDiscard` | Human, regardless of `stuck`: a closed pull request or three consecutive check failures offers only `hand off` and `discard`; discard needs a second confirmation, and `go back` returns to `mergeDecide` |
 | `dropLocal`, `mergeHandOff`, `mergeAbandon`, `mergeFailure` | Confirmed discard deletes only the local branch and ends `abandoned`; hand off keeps it and ends `handedOff`; cleanup failure ends `blocked`; each writes `merge.json` with `hold` output |
-| `repairBudget`, `repairTarget`, `reviewBudget` | Count gate retries and review revisions separately; gate retries route to the responsible editing stage, review retries to `change`; exhaustion goes to `stuck` |
+| `repairBudget`, `repairTarget`, `reviewBudget` | Count gate retries and review revisions separately; gate retries route to the responsible editing stage, review retries to `change`. Once per run, a spent review budget returns to `change` with a fresh review budget if the last verdict is `revise`, every finding names an in-Scope path, at least one is a blocker, and none is a discussion. Repair counts carry over. Other exhaustion goes to `stuck` |
 | `stuck` | Go to `decide` for both accepted input values |
 | `decide` | Human: sleep on one question with what is needed and evidence; suggest `more rounds`, `hand off`, `archive`, and `discard`, accepting any other reply as an answer |
 | `confirmDiscard` | Human: `confirm discard` or `go back`, asked before a discard removes anything |

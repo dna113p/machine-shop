@@ -140,6 +140,27 @@ See the [diagram](docs/workflows/ticket-task.md#flow).
 6. **Commit, rebase, deliver.** If the base moved, the commit is replayed onto
    it and checked again.
 
+A spent review budget returns to the implementer once with a fresh review budget
+when the last verdict is `revise`, every finding names a path inside Scope,
+there is a blocker, and there is no discussion finding. The blocker feedback stays
+in the implementer's prompt, and repair rounds already used still count.
+A second spent budget, an outside-Scope or pathless finding, or no blocker asks
+the owner; a `blocked` review still stops immediately. After the extra round
+begins, every stuck question says it was used and gives the reviewer's latest
+`newSinceLastRound`, or says no review has finished in it yet.
+
+A stuck run sleeps on one Human question, keeping its worktree and branch.
+The prompt says what is needed, lists open questions and evidence, and suggests
+`more rounds`, `hand off`, `archive`, and `discard`; discard still asks for confirmation.
+Any other reply is an answer: like `more rounds`, it renews both budgets, clears
+the owner questions, and returns to the stage that stopped.
+The answer stays in later Agent prompts. `stuck` no longer changes anything:
+both `"park"` (the default) and `"ask"` are accepted.
+Each question is saved as `question-<n>.txt` in the evidence directory, numbered
+from 1 across re-asks and continuation after sleep. The four decisions match
+ignoring case, surrounding whitespace and trailing punctuation (`. , ; : ! ? …`);
+`confirm discard` and `go back` stay exact.
+
 **Resuming after the base moved.** A resumed run saves its uncommitted
 candidate, moves onto the current tip and runs setup before checks. Conflicts
 go to its implementer, then through the normal scope check, checks, and review.
