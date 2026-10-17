@@ -7,9 +7,13 @@ Nothing is installed until a person approves the plan. An analyst confirms the v
 | | |
 | --- | --- |
 | Agent roles | `analyst`, `implementer`, `reviewer` |
-| Agent calls, at most | 5 at the default budget |
+| Agent calls, at most | 10 at the default budget |
 | Checkout | clean |
 | Source | [upgrade-dependency.ts](../../defaults/upgrade-dependency.ts) |
+
+Malformed Agent reports use [report recovery](../catalog.md#recovery): one
+send-back to the same role with the exact fault, retained in stage evidence.
+The call ceiling includes these send-backs; repair and review budgets are unchanged.
 
 ## Input
 

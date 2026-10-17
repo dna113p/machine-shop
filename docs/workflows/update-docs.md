@@ -7,9 +7,13 @@ A writer reads the source of truth and checks every command and API name it docu
 | | |
 | --- | --- |
 | Agent roles | `writer`, `reviewer` |
-| Agent calls, at most | 4 at the default budget |
+| Agent calls, at most | 8 at the default budget |
 | Checkout | clean |
 | Source | [update-docs.ts](../../defaults/update-docs.ts) |
+
+Malformed Agent reports use [report recovery](../catalog.md#recovery): one
+send-back to the same role with the exact fault, retained in stage evidence.
+The call ceiling includes these send-backs; repair and review budgets are unchanged.
 
 ## Input
 

@@ -7,9 +7,13 @@ Same shape as [refactor](refactor.md), with a tester instead of an implementer. 
 | | |
 | --- | --- |
 | Agent roles | `tester`, `reviewer` |
-| Agent calls, at most | 4 at the default budget |
+| Agent calls, at most | 8 at the default budget |
 | Checkout | clean |
 | Source | [add-tests.ts](../../defaults/add-tests.ts) |
+
+Malformed Agent reports use [report recovery](../catalog.md#recovery): one
+send-back to the same role with the exact fault, retained in stage evidence.
+The call ceiling includes these send-backs; repair and review budgets are unchanged.
 
 ## Input
 

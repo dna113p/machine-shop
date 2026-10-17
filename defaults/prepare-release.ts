@@ -13,10 +13,11 @@ export default function prepareRelease(p: MachinePrimitives, input: unknown) {
       start: operation(work.start, { started: "verify" }),
       verify: operation(() => work.checks(), { passed: "sealReview", failed: "failure" }),
       sealReview: operation(work.seal, { sealed: "review" }),
-      review: agent(() => work.prompt("Assess the current release candidate without editing. Check the requested scope, version consistency, change summary, compatibility, known risks, package/build evidence, and rollback notes. Put a concise release-note draft and readiness checklist in the summary. Return approved only when the supplied evidence supports Human consideration, otherwise blocked. Never tag, commit, push, publish, or deploy."), {
-        approved: { target: "reviewResult", actions: ({ event }: { event: Event }) => work.capture("release-review", event) },
-        blocked: { target: "failure", actions: ({ event }: { event: Event }) => work.capture("release-review", event) },
+      review: agent(() => work.prompt("Assess the current release candidate without editing. Check the requested scope, version consistency, change summary, compatibility, known risks, package/build evidence, and rollback notes. Put a concise release-note draft and readiness checklist in the summary. Return approved only when the supplied evidence supports Human consideration, otherwise blocked. Never tag, commit, push, publish, or deploy.", "release-review"), {
+        approved: { target: "reviewReport", actions: ({ event }: { event: Event }) => work.receive(event) },
+        blocked: { target: "reviewReport", actions: ({ event }: { event: Event }) => work.receive(event) },
       }, { using: "reviewer", cwd: work.workspace }),
+      reviewReport: operation(() => work.reported("release-review"), { sendBack: "review", approved: "reviewResult", blocked: "failure" }),
       reviewResult: operation(work.review, { approved: "approval", blocked: "failure" }),
       approval: human(() => work.humanPrompt("Sign off on this verified release candidate? This workflow does not publish it."), {
         submitted: [

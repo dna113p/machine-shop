@@ -7,9 +7,13 @@ The checks must pass before anyone touches the code, and that green baseline is 
 | | |
 | --- | --- |
 | Agent roles | `implementer`, `reviewer` |
-| Agent calls, at most | 4 at the default budget |
+| Agent calls, at most | 8 at the default budget |
 | Checkout | clean |
 | Source | [refactor.ts](../../defaults/refactor.ts) |
+
+Malformed Agent reports use [report recovery](../catalog.md#recovery): one
+send-back to the same role with the exact fault, retained in stage evidence.
+The call ceiling includes these send-backs; repair and review budgets are unchanged.
 
 ## Input
 
