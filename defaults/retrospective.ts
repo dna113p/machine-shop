@@ -242,16 +242,21 @@ export default function retrospective(p: MachinePrimitives, input: unknown) {
       ].join("\n"), { classified: { target: "report", actions: capture }, blocked: { target: "analystBlocked", actions: capture } }, { using: "analyst", cwd: work.workspace }),
       report: operation(() => {
         if (reading.stops.length) {
-          try {
-            classified = validate(response?.summary, reading.stops);
-            work.capture("classify", response!);
-          } catch (error) {
+          const result = work.sendBack("classify", response!, () => {
+            const classification = validate(response?.summary, reading.stops);
+            work.summary("classify", response!);
+            return classification;
+          });
+          if (result.type !== "valid") {
             classified = { stops: [], groups: [] };
-            const reason = `Malformed analyst report: ${message(error)}`;
+            const reason = `Malformed analyst report: ${result.fault}`;
             work.capture("classify", { type: "invalid", summary: reason });
             work.block(reason);
+            // This existing repair route is the one send-back, not an additional retry.
             return { type: "invalid" };
           }
+          classified = result.report;
+          work.capture("classify", response!);
         }
         writeReport();
         return { type: "reported" };

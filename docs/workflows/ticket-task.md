@@ -15,9 +15,13 @@ It runs from source; the installer never copies it.
 | | |
 | --- | --- |
 | Agent roles | `investigator`, `tester`, `implementer`, `reviewer` |
-| Agent calls, at most | 22 at the default budgets with a stable base; 11 with both budgets at 0 |
+| Agent calls, at most | 42 at the default budgets with a stable base; 20 with both budgets at 0 |
 | Checkout | its own new worktree; the source checkout is left alone |
 | Source | [ticket-task.ts](../../ticket-task.ts) |
+
+Malformed Agent reports use [report recovery](../catalog.md#recovery): one
+send-back to the same role with the exact fault, retained in stage evidence.
+The call ceiling includes these send-backs; repair and review budgets are unchanged.
 
 ## Input
 

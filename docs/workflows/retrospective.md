@@ -10,6 +10,10 @@ upstream changes. It writes no ticket and changes no Machine or source file.
 | Workspace | One or more existing directories; Git is not required |
 | Source | [retrospective.ts](../../defaults/retrospective.ts) |
 
+Malformed Agent reports use [report recovery](../catalog.md#recovery): one
+send-back to the same role with the exact fault, retained in stage evidence.
+The call ceiling includes these send-backs; repair and review budgets are unchanged.
+
 ## Input
 
 A JSON object supplied with `--input-file`, as a JSON string, or through MCP or

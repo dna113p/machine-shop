@@ -15,21 +15,21 @@ so these do not replace project-specific names such as `verify`.
 | Machine | State sequence | Required Agent roles | Maximum Agent calls, default repair budget |
 | --- | --- | --- | --- |
 | [verify-checks](../defaults/verify-checks.ts) | local checks -> receipt | none | 0 |
-| [implement-task](../defaults/implement-task.ts) | implement -> checks -> review; bounded repair -> checks -> review | implementer, reviewer | 4 |
-| [fix-bug](../defaults/fix-bug.ts) | regression test -> prove red -> fix -> prove green -> checks -> review; bounded repair | tester, implementer, reviewer | 5 |
-| [refactor](../defaults/refactor.ts) | green baseline -> behavior-preserving change -> checks -> review; bounded repair | implementer, reviewer | 4 |
-| [add-tests](../defaults/add-tests.ts) | green baseline -> focused tests -> checks -> review; bounded repair | tester, reviewer | 4 |
-| [review-code](../defaults/review-code.ts) | read-only review -> unchanged-checkout guard -> findings receipt | reviewer | 1 |
+| [implement-task](../defaults/implement-task.ts) | implement -> checks -> review; bounded repair -> checks -> review | implementer, reviewer | 8 |
+| [fix-bug](../defaults/fix-bug.ts) | regression test -> prove red -> fix -> prove green -> checks -> review; bounded repair | tester, implementer, reviewer | 10 |
+| [refactor](../defaults/refactor.ts) | green baseline -> behavior-preserving change -> checks -> review; bounded repair | implementer, reviewer | 8 |
+| [add-tests](../defaults/add-tests.ts) | green baseline -> focused tests -> checks -> review; bounded repair | tester, reviewer | 8 |
+| [review-code](../defaults/review-code.ts) | read-only review -> unchanged-checkout guard -> findings receipt | reviewer | 2 |
 | [retrospective](../defaults/retrospective.ts) | read evidence -> classify stops -> validate and report; one malformed-report retry | analyst | 2 |
-| [investigate](../defaults/investigate.ts) | investigate -> unchanged guard -> challenge evidence; bounded research revision | investigator, reviewer | 4 |
-| [update-docs](../defaults/update-docs.ts) | docs/examples change -> explicit validation -> source-consistency review; bounded repair | writer, reviewer | 4 |
-| [upgrade-dependency](../defaults/upgrade-dependency.ts) | green baseline -> compatibility proposal -> Human approval -> upgrade -> checks -> review; bounded repair | analyst, implementer, reviewer | 5 |
-| [prepare-release](../defaults/prepare-release.ts) | checks -> readiness assessment/release-note draft -> Human sign-off -> receipt | reviewer | 1 |
+| [investigate](../defaults/investigate.ts) | investigate -> unchanged guard -> challenge evidence; bounded research revision | investigator, reviewer | 8 |
+| [update-docs](../defaults/update-docs.ts) | docs/examples change -> explicit validation -> source-consistency review; bounded repair | writer, reviewer | 8 |
+| [upgrade-dependency](../defaults/upgrade-dependency.ts) | green baseline -> compatibility proposal -> Human approval -> upgrade -> checks -> review; bounded repair | analyst, implementer, reviewer | 10 |
+| [prepare-release](../defaults/prepare-release.ts) | checks -> readiness assessment/release-note draft -> Human sign-off -> receipt | reviewer | 2 |
 
 With no repairs, most editing tasks use two Agent calls, bugfix and dependency
 upgrade use three, and investigation uses two. `maxRepairs` defaults to 1 and can
 be 0–3. Each retry returns through the real checks and review, rather than accepting
-an Agent's claim. These are invocation ceilings, not token/dollar limits. A harness
+an Agent's claim. The table includes one malformed-report send-back per stage entry. These are invocation ceilings, not token/dollar limits. A harness
 can make multiple model/tool calls inside one invocation; its own limits still apply.
 Use `maxRepairs: 0` for the cheapest one-pass behavior. Model selection is never
 hardcoded; resolve the role bindings from the target project's `machine agents`.
@@ -39,6 +39,55 @@ and tradeoff analysis. `review-code` can cover a change, an API, or a focused
 security concern; it is not a security certification. For UI, performance, database,
 or domain-specific work, adapt the selected workflow with real project checks.
 Production migrations and publishing are deliberately not generic defaults.
+
+## Recovery
+
+`sendBack`, exported by [`defaults/_machine-shop/task.ts`](../defaults/_machine-shop/task.ts),
+validates an Agent report and returns either its valid value, `sendBack` on the
+first fault, or `invalid` on a second fault. About eight ticket runs stopped on
+report shape alone: questions that were not an array of 1–10 entries, criteria
+that were not an array, or a missing plan summary. The work did not need repair;
+the Agent needed to return the expected shape. org-25 and org-28 handled two
+cases separately. This helper applies the same recovery to every validated report.
+
+A report goes back once to the same role with the validator's exact fault:
+“Your last report was malformed: criteria must be an array. Return it again in the required shape.”
+`work.sendBack` also keeps the raw report, stage, fault, and feedback in
+`report-fault-<n>.json`. Validators and review rules are unchanged. A second
+malformed report follows the existing stop or failure route.
+
+The caller owns the allowance. Keep it across the send-back; reset it when a
+new stage entry begins. Ticket falsify deliberately keeps its allowance spent
+even after Human `more rounds`. Retrospective keeps its existing single retry
+through the repair budget, with the fault in its existing feedback. All other
+send-backs spend neither repair nor review budget, nor a plan revision.
+
+A custom Machine can validate in an Operation and choose its own transitions:
+
+```ts
+import { taskRun } from "./_machine-shop/task.ts";
+
+const work = taskRun("custom", input, { git: "snapshot" });
+const allowance = p.data({ returned: false, feedback: "" });
+// In the Operation receiving the review Agent's event:
+const result = work.sendBack("review", event, () => {
+  work.summary("review", event); // Preserve the normal summary validator.
+  if (!Array.isArray(event.criteria)) throw new Error("criteria must be an array");
+  return event;
+}, allowance);
+if (result.type === "sendBack") return { type: "reask" };
+if (result.type === "invalid") return work.block(result.fault);
+work.capture("review", result.report);
+return result.report;
+```
+
+Route `reask` straight to that Agent and append `allowance.feedback` to its
+prompt. Reset `allowance.returned` and `allowance.feedback` on a fresh stage
+entry, never on `reask`. For summary-only reports, the defaults use
+`work.receive(event)` then an Operation calling `work.reported(stage)`;
+they route `sendBack` back to the same Agent and call
+`work.prompt(instruction, stage)` to include its exact feedback.
+The helper performs validation and evidence recording; the Machine owns routing.
 
 ## Retrospective
 
@@ -195,10 +244,10 @@ budgets. Required Agent roles are `investigator`, `tester`, `implementer`, and
 `reviewer`. Failed red, scope, and green gates use `maxRepairs` (0–3, default 3
 here); review revisions use
 `maxReviewRounds` (0–5, default 2). Neither consumes the other's budget. With a
-stable base this allows at most 22 Agent calls before the stuck policy applies (up to two falsify calls,
-up to two plans and two plan reviews, one initial tester pass, up to nine implementation passes, and six implementation reviews;
+stable base this allows at most 42 Agent calls before the stuck policy applies, including malformed-report send-backs (up to two falsify calls,
+up to four calls each for planning and plan review, two initial tester calls, up to eighteen implementation calls, and twelve implementation review calls;
 tester retries share the repair budget with implementation retries). Setting
-both budgets to zero allows at most 11 calls, or 10 with `redGreen: false`.
+both budgets to zero allows at most 20 calls, or 18 with `redGreen: false`.
 The extra review round is available only once per run, even after an owner answer.
 Its triggering blockers stay in the implementer's prompt. Scope is checked for
 every finding with `outsideScope`, after removing a leading `./` and trailing
@@ -207,8 +256,7 @@ or no blocker asks the owner at the first spent budget; a `blocked` review still
 stops immediately. Every stuck question after the extra round begins says it
 was used and gives the latest well-formed review's `newSinceLastRound` from
 that point, or says no review has finished in it yet.
-The single permitted plan revision and the separate one-time return for
-malformed falsify questions consume neither budget. A moved base that
+The single permitted plan revision and [malformed-report recovery](#recovery) consume neither budget. A moved base that
 changes the approved patch adds a fresh review outside these budgets.
 Each `more rounds` decision renews both budgets and returns to the planning or editing stage that stopped,
 including the tester or implementer when that Agent returned `blocked`;
@@ -386,7 +434,7 @@ is.
 
 New runs begin with `falsify` → `plan` → `planReview`, capturing each report before
 its unchanged-worktree guard or validation. A missing or empty summary in any
-planning state goes through the stuck policy, with the state and missing summary
+planning state goes back once with the exact fault, then through the stuck policy, with the state and missing summary
 named in the reason. A plan sent back once by the reviewer is re-planned with the
 reviewer's feedback and reviewed again; a second revision stops before editing.
 The planner names files and tests concisely without restating the ticket. The
@@ -396,7 +444,7 @@ returns `tooBroad` with a suggested split into smaller tickets, one per line in
 the summary. This stops before editing and carries the split into the Human
 question and its saved file; it does not consume the reviewer's revision.
 An empty plan or one over the general stage-report capture limit of 16000
-characters is still refused. Missing or malformed falsify questions return to `falsify`
+characters is still refused and gets one send-back. Missing or malformed falsify questions return to `falsify`
 once per run with the validation reason and instructions to put the questions
 in the report's `questions` field, not its summary or message. The field is the
 only source of questions. This allowance is separate from the reviewer's
@@ -482,7 +530,7 @@ evidence directory and describes what is new.
 `reviewResult` judges the report, preserving the read-only guard:
 
 1. For `approved` and `revise`, missing or wrongly typed fields, invalid entries, or a criteria count that
-   differs from the acceptance list block with the field named and go to
+   differs from the acceptance list go back once with the exact fault, then block with the field named and go to
    `stuck`. Entries are matched to criteria by position, so a reworded
    criterion is not malformed. Feedback uses the ticket's criterion text at that
    position, not the reviewer's wording.
