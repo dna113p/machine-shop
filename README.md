@@ -71,6 +71,9 @@ A project orchestrator chooses among them with the runtime's
 `machine-project-setup` skill, records the routes in the project's
 `.machines/README.md`, and hands out work with `machine-delegation`.
 
+Malformed Agent reports get [one send-back with the exact fault](docs/catalog.md#recovery),
+kept in the stage evidence, before the existing stop applies.
+
 ## Installing
 
 - Each workflow lands as `.machines/dev-<name>.ts`, beside the helper

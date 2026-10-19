@@ -49,12 +49,14 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     discardConfirmed: false,
     archived: null as { branch: string; commit: string } | null,
     reviewSummary: "",
+    reviewSummaryFault: "",
     standingReview: null as string | null,
     extraRound: "unused" as "unused" | "running" | "used",
     extraReviewRounds: 0,
     extraRoundFrom: 0,
     extraFeedback: [] as string[],
     reviews: [] as Event[],
+    malformedReviews: [] as number[],
     // Keep evidence across rebases, but compare reports only within the current patch's reviews.
     reviewsFrom: 0,
     reviewNotes: [] as { text: string; where: string }[],
@@ -92,8 +94,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   saved.branch ||= named;
   const assumptionsPrompt = () => saved.assumptionsJson ? ["Assumptions:", saved.assumptionsJson] : [];
   // Answers remain in every later stage's prompt, including after a sleeping run continues.
-  const prompt = (instruction: string) => [
-    work.prompt(instruction),
+  const prompt = (instruction: string, stage?: string) => [
+    work.prompt(instruction, stage),
     ...(saved.answers.length ? ["Answers from the ticket owner:", ...saved.answers] : []),
   ].join("\n\n");
 
@@ -971,7 +973,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     ],
   });
 
-  const record = (stage: string) => ({ event }: { event: Event }) => { saved.stoppedIn = stage; work.capture(stage, event); };
+  const record = (stage: string) => ({ event }: { event: Event }) => { saved.stoppedIn = stage; work.receive(event); };
+  // Valid editing reports retain the existing route; only refused summaries need a recovery Operation.
+  const hasSummary = (stage: string) => ({ event }: { event: Event }) => {
+    try { work.summary(stage, event); return true; }
+    catch { return false; }
+  };
+  const recordValid = (stage: string) => ({ event }: { event: Event }) => {
+    saved.stoppedIn = stage;
+    work.receive(event);
+    work.reported(stage);
+  };
   const rememberPlanning = ({ event }: { event: Event }) => { saved.planningReport = event; };
   /** Keep the raw report even if its summary is refused; guards and validation run only after capture. */
   function keep(stage: PlanningStage): { summary: string } | { refusal: string } {
@@ -995,21 +1007,23 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     saved.assumptions = [];
     saved.assumptionsJson = "";
     if (work.unchanged().type === "changed") return { type: "blocked" };
-    if ("refusal" in kept) return work.block(kept.refusal);
     const event = saved.planningReport;
+    const allowance = { returned: saved.questionsReturned, feedback: saved.questionsFault };
+    const result = work.sendBack("falsify", event, () => {
+      if ("refusal" in kept) throw new Error(kept.refusal);
+      const fault = event.type === "sound" ? undefined : questionField(event.questions);
+      if (fault) throw new Error(fault);
+      return event;
+    }, allowance);
+    saved.questionsReturned = allowance.returned;
+    saved.questionsFault = allowance.feedback;
+    if (result.type === "sendBack") return { type: "reask" };
+    if (result.type === "invalid") return work.block("refusal" in kept ? result.fault
+      : `The falsify report's questions were missing or malformed twice: ${result.fault}. The report is kept in ${join(work.open(), `falsify-${saved.planningReports.falsify}.json`)}.`);
     if (event.type === "sound") {
       saved.questionsFault = "";
       work.block("");
       return { type: "sound" };
-    }
-    const malformed = questionField(event.questions);
-    saved.questionsFault = malformed ?? "";
-    if (malformed) {
-      if (!saved.questionsReturned) {
-        saved.questionsReturned = true;
-        return { type: "reask" };
-      }
-      return work.block(`The falsify report's questions were missing or malformed twice: ${malformed}. The report is kept in ${join(work.open(), `falsify-${saved.planningReports.falsify}.json`)}.`);
     }
     const questions = event.questions as FalsifyQuestion[];
     const open = assume ? questions.filter(question => !question.assumable) : questions;
@@ -1026,17 +1040,27 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     saved.wouldAssume = assume ? questions.filter(question => question.assumable) : [];
     return work.block(`Ticket owner must settle ${questionCount()}:\n${questionLines()}${wouldAssumeLines()}`);
   }
+  function planningShape(stage: PlanningStage, kept: { summary: string } | { refusal: string }) {
+    const result = work.sendBack(stage, saved.planningReport, () => {
+      if ("refusal" in kept) throw new Error(kept.refusal);
+      return kept.summary;
+    });
+    if (result.type === "valid") work.resetReport(stage);
+    return result;
+  }
   function planResult(): Event {
     const kept = keep("plan");
     if (work.unchanged().type === "changed") return { type: "blocked" };
-    if ("refusal" in kept) return work.block(kept.refusal);
-    saved.plan = kept.summary;
+    const result = planningShape("plan", kept);
+    if (result.type !== "valid") return result.type === "sendBack" ? { type: "reask" } : work.block(result.fault);
+    saved.plan = result.report;
     return { type: "planned" };
   }
   function planReviewResult(): Event {
     const kept = keep("planReview");
     if (work.unchanged().type === "changed") return { type: "blocked" };
-    if ("refusal" in kept) return work.block(kept.refusal);
+    const result = planningShape("planReview", kept);
+    if (result.type !== "valid") return result.type === "sendBack" ? { type: "reask" } : work.block(result.fault);
     if (saved.planningReport.type === "approved") {
       saved.repairing = "change";
       work.block("");
@@ -1044,14 +1068,20 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }
     if (saved.planningReport.type === "tooBroad") {
       saved.repairing = "plan";
-      return work.block(`Plan review found the ticket too broad for one run. Suggested split:\n${kept.summary}`);
+      return work.block(`Plan review found the ticket too broad for one run. Suggested split:\n${result.report}`);
     }
     if (saved.planRevisions++ === 0) return { type: "revise" };
     saved.repairing = "plan";
-    return work.block(kept.summary);
+    return work.block(result.report);
   }
   const recordReview = ({ event }: { event: Event }) => {
-    saved.reviewSummary = work.capture("review", event);
+    saved.reviewSummaryFault = "";
+    try { saved.reviewSummary = work.capture("review", event); }
+    catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith("Agent review must return a non-empty summary")) throw error;
+      saved.reviewSummary = "";
+      saved.reviewSummaryFault = error.message;
+    }
     saved.reviews.push(event);
     writeFileSync(join(work.open(), `review-${saved.reviews.length}.json`), JSON.stringify(event, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     // Keep well-formed minor notes even when another part of this round's report blocks delivery.
@@ -1068,6 +1098,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     // Keep the helper's read-only guard, but judge the report here instead of trusting its event type.
     if (work.unchanged().type === "changed") return { type: "blocked" };
     const event = saved.reviews.at(-1)!;
+    const result = work.sendBack("review", event, () => {
+      if (saved.reviewSummaryFault) throw new Error(saved.reviewSummaryFault);
+      const fault = event.type === "blocked" ? undefined : reviewField(event, ticket.sections.acceptance);
+      if (fault) throw new Error(fault);
+      return event as ReviewReport;
+    });
+    if (result.type !== "valid") saved.malformedReviews.push(saved.reviews.length - 1);
+    if (result.type === "sendBack") return { type: "reask" };
+    // Summary refusal used to fail the run; structured review faults stop for the owner below.
+    if (result.type === "invalid" && saved.reviewSummaryFault) throw new Error(result.fault);
+    if (result.type === "valid") work.resetReport("review");
     if (event.type === "blocked") return work.block(saved.reviewSummary);
     // Even a malformed report can contain useful findings. Keep them apart from the Machine's stop reason.
     const feedback = [
@@ -1078,13 +1119,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         ? [`${finding.severity === "blocker" ? "Blocker" : "Discussion"}: ${finding.text}${typeof finding.where === "string" ? ` (${finding.where})` : ""}`] : []) : []),
     ].join("\n");
     const stop = (reason: string) => { saved.standingReview = feedback; return work.block(reason); };
-    const malformed = reviewField(event, ticket.sections.acceptance);
-    if (malformed) return stop(`Malformed review report: ${malformed}.`);
+    if (result.type === "invalid") return stop(`Malformed review report: ${result.fault}.`);
     const report = event as ReviewReport;
     const unmet = report.criteria.flatMap((criterion, index) => criterion.met ? [] : [ticket.sections.acceptance[index]!]);
     const blockers = report.findings.filter(finding => finding.severity === "blocker");
     const discussions = report.findings.filter(finding => finding.severity === "discussion");
-    const previous = saved.reviews.length - 1 > saved.reviewsFrom ? saved.reviews.at(-2) : undefined;
+    const previous = saved.reviews.slice(saved.reviewsFrom, -1).findLast((_report, index) =>
+      !saved.malformedReviews.includes(saved.reviewsFrom + index));
     const prior = previous && previous.type !== "blocked" && !reviewField(previous, ticket.sections.acceptance) ? previous as ReviewReport : undefined;
     // Decide whether repair is needed first, then whether another repair can make progress.
     if (unmet.length || blockers.length) {
@@ -1149,6 +1190,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       saved.answers.push(saved.decision);
     }
     work.renew();
+    // Falsify deliberately retains its allowance even across an owner's continuation.
+    for (const stage of ["plan", "planReview", "test", "change", "review"]) work.resetReport(stage);
     if (saved.extraRound === "running") saved.extraRound = "used";
     saved.ownerQuestions = null;
     saved.wouldAssume = [];
@@ -1165,7 +1208,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       start: operation(work.start, { started: "falsify" }),
       falsify: agent(() => prompt([
         "Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 entries shaped as { text, options: string[], recommended: string, assumable: boolean, why }, giving the exact questions a person could answer. text and why must be non-empty strings; options must be a non-empty array of non-empty strings; recommended must copy one of those options exactly. Mark assumable true only for a gap whose conservative answer loses nothing if wrong: it stops, refuses, or keeps more. A product decision, a change of scope, or anything irreversible is never assumable.",
-        ...(saved.questionsFault ? [`Your last report's questions were missing or malformed: ${saved.questionsFault}.`] : []),
+        ...(saved.questionsFault ? [saved.questionsFault] : []),
         "Put the questions in the report's questions field, not in the summary or message.",
       ].join("\n")), {
         sound: { target: "falsifyResult", actions: rememberPlanning },
@@ -1175,20 +1218,20 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       plan: agent(() => prompt([
         "Plan the implementation of this sound ticket. Do not edit any file. Cover the acceptance criteria, tests, permitted paths, and required checks. Address any plan review feedback in the stage reports. Return planned with the complete plan as the summary. Keep it concise: name the files and the tests, and do not restate the ticket.",
         ...assumptionsPrompt(),
-      ].join("\n")), {
+      ].join("\n"), "plan"), {
         planned: { target: "planResult", actions: rememberPlanning },
       }, { using: "investigator", cwd: worktree }),
-      planResult: operation(stopped("planResult", planResult), { planned: "planReview", blocked: "stuck" }),
+      planResult: operation(stopped("planResult", planResult), { planned: "planReview", reask: "plan", blocked: "stuck" }),
       planReview: agent(() => prompt([
         "Review the plan against the ticket, relevant code, scope, acceptance criteria, and tests. Do not edit any file. Return approved with a summary if it is ready to implement, or revise with a summary of what must change. Prefer concise plans: send back as revise a plan that restates the ticket or carries detail the implementer does not need. Return tooBroad if the ticket is too broad for one run, with a summary suggesting a split into smaller tickets, one per line. Only one revision of the plan is allowed.",
         ...assumptionsPrompt(),
         "Plan:", saved.plan,
-      ].join("\n")), {
+      ].join("\n"), "planReview"), {
         approved: { target: "planReviewResult", actions: rememberPlanning },
         revise: { target: "planReviewResult", actions: rememberPlanning },
         tooBroad: { target: "planReviewResult", actions: rememberPlanning },
       }, { using: "reviewer", cwd: worktree }),
-      planReviewResult: operation(stopped("planReviewResult", planReviewResult), { approved: redGreen ? "test" : "change", revise: "plan", blocked: "stuck" }),
+      planReviewResult: operation(stopped("planReviewResult", planReviewResult), { approved: redGreen ? "test" : "change", reask: "planReview", revise: "plan", blocked: "stuck" }),
       test: agent(() => {
         saved.repairing = "test";
         return prompt([
@@ -1198,11 +1241,18 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
           "Scope:", ...ticket.sections.scope.map(text => `- ${text}`),
           cannotRun,
-        ].join("\n"));
+        ].join("\n"), "test");
       }, {
-        completed: { target: "scopeAfterTest", actions: record("test") },
-        blocked: { target: "stuck", actions: record("test") },
+        completed: [
+          { guard: hasSummary("test"), target: "scopeAfterTest", actions: recordValid("test") },
+          { target: "testReport", actions: record("test") },
+        ],
+        blocked: [
+          { guard: hasSummary("test"), target: "stuck", actions: recordValid("test") },
+          { target: "testReport", actions: record("test") },
+        ],
       }, { using: "tester", cwd: worktree }),
+      testReport: operation(() => work.reported("test"), { sendBack: "test", completed: "scopeAfterTest", blocked: "stuck" }),
       scopeAfterTest: operation(() => scope("test"), { passed: "red", failed: "repairBudget" }),
       red: operation(() => {
         saved.repairing = "test";
@@ -1227,11 +1277,18 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           "Forbidden:", ...ticket.sections.forbidden.map(text => `- ${text}`),
           "Resolve discussion findings or explain why they need the ticket owner in your summary.",
           cannotRun,
-        ].join("\n"));
+        ].join("\n"), "change");
       }, {
-        completed: { target: "scopeAfterChange", actions: record("change") },
-        blocked: { target: "stuck", actions: record("change") },
+        completed: [
+          { guard: hasSummary("change"), target: "scopeAfterChange", actions: recordValid("change") },
+          { target: "changeReport", actions: record("change") },
+        ],
+        blocked: [
+          { guard: hasSummary("change"), target: "stuck", actions: recordValid("change") },
+          { target: "changeReport", actions: record("change") },
+        ],
       }, { using: "implementer", cwd: worktree }),
+      changeReport: operation(() => work.reported("change"), { sendBack: "change", completed: "scopeAfterChange", blocked: "stuck" }),
       scopeAfterChange: operation(() => unsettled() ?? scope("change"), { passed: "verify", failed: "repairBudget" }),
       verify: operation(() => { saved.repairing = "change"; return work.checks(); }, { passed: "sealReview", failed: "repairBudget" }),
       sealReview: operation(work.seal, { sealed: "review" }),
@@ -1247,12 +1304,12 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         "On a second or later review, say what is new versus the previous report in newSinceLastRound, or none if nothing is new. Read previous review-<n>.json reports alongside the stage reports in the evidence directory.",
         "For blocked, only the summary is required. For approved or revise, include the full structured report below.",
         'End with one line: MACHINES_EVENT {"type":"approved"|"revise"|"blocked","summary":"<one paragraph>","criteria":[{"text":"<criterion as given>","met":true|false,"evidence":"<file:line or command>"}],"findings":[{"severity":"blocker"|"discussion"|"minor","text":"<finding>","where":"<file:line>"}],"newSinceLastRound":"none"|"<what changed in this round\'s findings>"}',
-      ].join("\n")), {
+      ].join("\n"), "review"), {
         approved: { target: "reviewResult", actions: recordReview },
         revise: { target: "reviewResult", actions: recordReview },
         blocked: { target: "reviewResult", actions: recordReview },
       }, { using: "reviewer", cwd: worktree }),
-      reviewResult: operation(stopped("reviewResult", reviewResult), { approved: "commit", revise: "reviewBudget", blocked: "stuck" }),
+      reviewResult: operation(stopped("reviewResult", reviewResult), { approved: "commit", reask: "review", revise: "reviewBudget", blocked: "stuck" }),
       repairBudget: operation(stopped("repairBudget", work.repair), { retry: "repairTarget", exhausted: "stuck" }),
       repairTarget: operation(() => ({ type: saved.repairing }), { falsify: "falsify", plan: "plan", planReview: "planReview", test: "test", change: "change" }),
       reviewBudget: operation(stopped("reviewBudget", reviewBudget), { retry: "change", exhausted: "stuck" }),

@@ -262,6 +262,131 @@ test("malformed Agent output fails rather than manufacturing success", async con
   await assert.rejects(execute("review-code", input(cwd, { checks: [] }), { reviewer: () => ({ type: "reviewed" }) }), /non-empty summary/u);
 });
 
+/** What a send-back tells the Agent: the fault exactly as its validator gave it. */
+const sentBack = (fault: string) => `Your last report was malformed: ${fault}. Return it again in the required shape.`;
+const summaryFault = (stage: string) => `Agent ${stage} must return a non-empty summary of at most 16000 characters`;
+/** The evidence files of a run, other than its result receipt, that hold this text. */
+function kept(report: string, text: string) {
+  const directory = join(report, "..");
+  return readdirSync(directory).filter(name => name !== "result.json" && readFileSync(join(directory, name), "utf8").includes(text));
+}
+/** Each default's Agents as they answer in a run that succeeds, with its input and the Human answer it needs. */
+function succeeding(name: string, cwd: string) {
+  const change = (text: string) => () => { writeFileSync(join(cwd, "change.txt"), text); return ok(); };
+  switch (name) {
+    case "review-code": return { data: input(cwd, { checks: [] }), agents: { reviewer: () => ok("reviewed") } };
+    case "investigate": return { data: input(cwd, { checks: [] }), agents: { investigator: () => ok(), reviewer: () => ok("approved") } };
+    case "fix-bug": return { data: input(cwd, { regression: regression() }), agents: {
+      tester: () => ok(), implementer: () => { writeFileSync(join(cwd, "code.txt"), "fixed"); return ok(); }, reviewer: () => ok("approved") } };
+    case "upgrade-dependency": return { data: input(cwd), human: () => "approve", agents: {
+      analyst: () => ok("completed", "Proposed version and migration evidence"), implementer: change("upgraded"), reviewer: () => ok("approved") } };
+    case "prepare-release": return { data: input(cwd), human: () => "approve", agents: { reviewer: () => ok("approved", "Draft release notes") } };
+    case "update-docs": return { data: input(cwd), agents: { writer: change(name), reviewer: () => ok("approved") } };
+    case "add-tests": return { data: input(cwd), agents: { tester: change(name), reviewer: () => ok("approved") } };
+    default: return { data: input(cwd), agents: { implementer: change(name), reviewer: () => ok("approved") } };
+  }
+}
+// Every Agent report a default validates, by the role that gives it, the outcome it claims, and the stage it is captured as.
+for (const [name, role, type, stage] of [
+  ["review-code", "reviewer", "reviewed", "review"],
+  ["implement-task", "implementer", "completed", "change"], ["implement-task", "reviewer", "approved", "review"],
+  ["refactor", "implementer", "completed", "change"], ["refactor", "reviewer", "revise", "review"],
+  ["add-tests", "tester", "completed", "change"], ["add-tests", "reviewer", "approved", "review"],
+  ["update-docs", "writer", "completed", "change"], ["update-docs", "reviewer", "approved", "review"],
+  ["investigate", "investigator", "completed", "investigation"], ["investigate", "reviewer", "approved", "challenge"],
+  ["fix-bug", "tester", "completed", "regression"], ["fix-bug", "implementer", "completed", "fix"], ["fix-bug", "reviewer", "approved", "review"],
+  ["upgrade-dependency", "analyst", "completed", "proposal"], ["upgrade-dependency", "implementer", "completed", "upgrade"], ["upgrade-dependency", "reviewer", "approved", "review"],
+  ["prepare-release", "reviewer", "approved", "release-review"],
+] as const) {
+  test(`${name}: a malformed ${role} report goes back once to the ${role} with its exact fault, which is kept in the evidence, and a valid second report continues`, async context => {
+    const cwd = repo(context); const run = succeeding(name, cwd); const prompts: string[] = [];
+    const agents: Record<string, (request: { prompt: string }) => unknown> = { ...run.agents };
+    const valid = agents[role]!;
+    agents[role] = request => { prompts.push(request.prompt); return prompts.length === 1 ? { type } : valid(request); };
+    const result = await execute(name, run.data, agents, run.human ? { human: run.human } : {});
+    assert.equal(result.state, "done", result.output?.reason); assert.equal(result.output.outcome, "completed");
+    assert.equal(prompts.length, 2);
+    assert.doesNotMatch(prompts[0]!, /Your last report was malformed/u);
+    assert.ok(prompts[1]!.includes(sentBack(summaryFault(stage))), prompts[1]);
+    assert.notDeepEqual(kept(result.output.report, summaryFault(stage)), [], "the fault is kept in the evidence");
+    // The send-back spends no budget.
+    assert.deepEqual([result.output.repairs, result.output.reviewRounds], [0, 0]);
+  });
+}
+
+test("a default's second malformed report from the same entry still fails the run, after one send-back", async context => {
+  const cwd = repo(context); const prompts: string[] = [];
+  await assert.rejects(execute("review-code", input(cwd, { checks: [] }), {
+    reviewer: (request: { prompt: string }) => { prompts.push(request.prompt); return { type: "reviewed" }; },
+  }), /non-empty summary/u);
+  assert.equal(prompts.length, 2); assert.ok(prompts[1]!.includes(sentBack(summaryFault("review"))));
+});
+
+test("a default sends back once per entry into a stage: a later entry gets its own send-back", async context => {
+  const cwd = repo(context); const prompts: string[] = []; let reviews = 0;
+  const result = await execute("implement-task", input(cwd), {
+    implementer: (request: { prompt: string }) => {
+      prompts.push(request.prompt);
+      if (prompts.length % 2 === 1) return { type: "completed", summary: " " };
+      writeFileSync(join(cwd, "change.txt"), String(prompts.length)); return ok();
+    },
+    reviewer: () => ++reviews === 1 ? ok("revise", "Handle the empty case") : ok("approved"),
+  });
+  assert.equal(result.state, "done", result.output?.reason);
+  assert.deepEqual([prompts.length, reviews], [4, 2]);
+  for (const index of [1, 3]) assert.ok(prompts[index]!.includes(sentBack(summaryFault("change"))), `call ${index + 1}`);
+  assert.doesNotMatch(prompts[2]!, /Your last report was malformed/u);
+  assert.deepEqual([result.output.repairs, result.output.reviewRounds], [1, 0]);
+});
+
+test("the shared send-back helper is part of every task run", context => {
+  const work = taskRun("helper-test", input(repo(context)), { checks: true, git: "clean" }) as unknown as Record<string, unknown>;
+  assert.equal(typeof work.sendBack, "function");
+});
+
+test("the exported sendBack helper keeps the caller's allowance across valid reports until explicitly reset", () => {
+  const allowance = { returned: false, feedback: "" };
+  const fault = 'criteria[0]: expected "met".\nKeep the exact diagnostic';
+  const invalid = () => { throw new Error(fault); };
+  assert.deepEqual(task.sendBack(invalid, allowance), { type: "sendBack", fault, feedback: sentBack(fault) });
+  assert.equal(allowance.returned, true);
+  const report = { criteria: [] };
+  assert.deepEqual(task.sendBack(() => report, allowance), { type: "valid", report });
+  assert.equal(allowance.feedback, "");
+  assert.deepEqual(task.sendBack(invalid, allowance), { type: "invalid", fault, feedback: sentBack(fault) });
+  allowance.returned = false;
+  assert.equal(task.sendBack(invalid, allowance).type, "sendBack");
+});
+
+/** The text of a level-two or level-three section, up to the next heading of the same or a higher level. */
+function section(text: string, heading: string) {
+  const start = text.search(new RegExp(`^(#{2,3}) ${heading}\\b`, "mu"));
+  if (start < 0) return undefined;
+  const level = /^#+/u.exec(text.slice(start))![0].length;
+  const rest = text.slice(start).split("\n").slice(1).join("\n");
+  const end = rest.search(new RegExp(`^#{1,${level}} `, "mu"));
+  return end < 0 ? rest : rest.slice(0, end);
+}
+
+test("docs/catalog.md has a Recovery section that names the send-back helper, says why with the counts, and shows a custom Machine using it", () => {
+  const recovery = section(readFileSync(resolve("docs/catalog.md"), "utf8"), "Recovery");
+  assert.ok(recovery !== undefined, "docs/catalog.md has no Recovery section");
+  const prose = recovery.replace(/\s+/gu, " ");
+  assert.match(prose, /`(?:work\.)?sendBack`/u, "the section names the helper");
+  assert.match(prose, /\bonce\b/iu, "the section says a report goes back once");
+  assert.ok(prose.includes("Return it again in the required shape"), "the section gives the wording the Agent receives");
+  assert.match(prose, /\b(?:about )?(?:eight|8)\b[^.]*\bruns?\b|\bruns?\b[^.]*\b(?:eight|8)\b/iu, "the section gives the count of stopped runs as its reason");
+  const example = /```(?:ts|typescript)\n([\s\S]*?)```/u.exec(recovery)?.[1];
+  assert.ok(example, "the section has a TypeScript usage example");
+  assert.match(example, /sendBack|reported/u, "the example uses the helper");
+});
+
+for (const page of ["ticket-task", "add-tests", "fix-bug", "implement-task", "investigate", "prepare-release", "refactor", "review-code", "update-docs", "upgrade-dependency"]) {
+  test(`docs/workflows/${page}.md links to the catalog's Recovery section`, () => {
+    assert.ok(readFileSync(resolve("docs/workflows", `${page}.md`), "utf8").includes("../catalog.md#recovery"));
+  });
+}
+
 for (const [label, fields] of [
   ["empty checks", { checks: [] }], ["relative workspace", { workspace: "." }], ["unbounded retries", { maxRepairs: 4 }],
   ["shell command string", { checks: [{ name: "tests", command: "npm test" }] }],

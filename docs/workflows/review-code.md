@@ -7,9 +7,13 @@ One reviewer call. It works on a dirty checkout, since that is often what is bei
 | | |
 | --- | --- |
 | Agent roles | `reviewer` |
-| Agent calls, at most | 1 |
+| Agent calls, at most | 2 |
 | Checkout | dirty is fine; it must stay unchanged |
 | Source | [review-code.ts](../../defaults/review-code.ts) |
+
+Malformed Agent reports use [report recovery](../catalog.md#recovery): one
+send-back to the same role with the exact fault, retained in stage evidence.
+The call ceiling includes these send-backs; repair and review budgets are unchanged.
 
 ## Input
 

@@ -7,9 +7,13 @@ The bug has to be caught on camera before anyone fixes it. A tester writes a reg
 | | |
 | --- | --- |
 | Agent roles | `tester`, `implementer`, `reviewer` |
-| Agent calls, at most | 5 at the default budget |
+| Agent calls, at most | 10 at the default budget |
 | Checkout | clean |
 | Source | [fix-bug.ts](../../defaults/fix-bug.ts) |
+
+Malformed Agent reports use [report recovery](../catalog.md#recovery): one
+send-back to the same role with the exact fault, retained in stage evidence.
+The call ceiling includes these send-backs; repair and review budgets are unchanged.
 
 ## Input
 

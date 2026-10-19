@@ -11,10 +11,11 @@ export default function reviewCode(p: MachinePrimitives, input: unknown) {
     initial: "start", output: work.output,
     states: {
       start: operation(work.start, { started: "review" }),
-      review: agent(() => work.prompt("Review the requested code/diff without editing. Prioritize concrete correctness, regression, and security findings. Cite paths/lines, impact, and evidence. Separate confirmed problems from questions; state explicitly when no actionable finding is supported. Return reviewed to deliver the report, not to certify the code bug-free; return blocked if the assignment cannot be evaluated."), {
-        reviewed: { target: "integrity", actions: ({ event }: { event: Event }) => work.capture("review", event) },
-        blocked: { target: "failure", actions: ({ event }: { event: Event }) => work.capture("review", event) },
+      review: agent(() => work.prompt("Review the requested code/diff without editing. Prioritize concrete correctness, regression, and security findings. Cite paths/lines, impact, and evidence. Separate confirmed problems from questions; state explicitly when no actionable finding is supported. Return reviewed to deliver the report, not to certify the code bug-free; return blocked if the assignment cannot be evaluated.", "review"), {
+        reviewed: { target: "reviewReport", actions: ({ event }: { event: Event }) => work.receive(event) },
+        blocked: { target: "reviewReport", actions: ({ event }: { event: Event }) => work.receive(event) },
       }, { using: "reviewer", cwd: work.workspace }),
+      reviewReport: operation(() => work.reported("review"), { sendBack: "review", reviewed: "integrity", blocked: "failure" }),
       integrity: operation(work.unchanged, { unchanged: "success", changed: "failure" }),
       ...resultStates(work, p),
     },

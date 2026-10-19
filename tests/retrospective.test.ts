@@ -289,6 +289,25 @@ test("malformed analyst JSON retries once, then blocks with an incomplete report
   assert.match(receipt.reason, /Malformed analyst report/u);
 });
 
+test("analyst recovery keeps the exact fault in existing feedback and evidence without adding a retry", async context => {
+  const ws = workspace(context);
+  run(ws, "malformed-classification", { questions: [budget("alpha")], answers: ["continue"] });
+  const prompts: string[] = [];
+  const valid = analyst([], causeOf);
+  const { state, folder } = await execute([ws], (request: { prompt: string }) => {
+    prompts.push(request.prompt);
+    return prompts.length === 1 ? { type: "classified", summary: "{}" } : valid(request);
+  });
+  assert.equal(state, "done"); assert.equal(prompts.length, 2);
+  const fault = "Expected stops and groups arrays";
+  assert.ok(prompts[1]!.includes(`Current failure/feedback: Malformed analyst report: ${fault}`));
+  const evidence = JSON.parse(readFileSync(join(folder, "report-fault-1.json"), "utf8"));
+  assert.equal(evidence.stage, "classify"); assert.equal(evidence.fault, fault);
+  assert.deepEqual(evidence.event, { type: "classified", summary: "{}" });
+  const receipt = JSON.parse(readFileSync(join(folder, "result.json"), "utf8"));
+  assert.deepEqual([receipt.repairs, receipt.agentInvocations], [1, 2]);
+});
+
 for (const malformed of ["missing stop", "duplicate stop", "unknown stop", "missing group", "duplicate group", "unknown group", "invalid mark"]) {
   test(`classification coverage rejects ${malformed}, then accepts a corrected reply`, async context => {
     const ws = workspace(context);
