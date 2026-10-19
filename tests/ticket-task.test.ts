@@ -1194,7 +1194,8 @@ test("a run stopped in plan review continues from its checkpoint with its branch
   // The first run stops once plan review has started, after its checkpoint was saved, as a process that ends there would.
   const f = fixture(context); const first = answering("planReview"); const firstSaves = checkpointed();
   await assert.rejects(execute(input(f, {}, { stuck: "park" }), first.agents, person(), firstSaves.options), /interrupted in planReview/u);
-  assert.deepEqual(first.prompts.map(([state]) => state), ["falsify", "plan", "planReview"]);
+  // The Agent state asks plan review once more after the first throw, and the run stops on the second.
+  assert.deepEqual(first.prompts.map(([state]) => state), ["falsify", "plan", "planReview", "planReview"]);
   assert.deepEqual(firstSaves.unsaveable, [], "every state's working data is plain JSON");
   const checkpoint = firstSaves.saved.planReview;
   assert.ok(checkpoint, "a checkpoint was saved on entering planReview");
