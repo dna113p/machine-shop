@@ -4503,12 +4503,178 @@ test("a pr run proceeds when its base is on the remote, also behind a tip the re
   const refs = git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)");
   const result = await execute(input(f, { output: "pr" }));
   const commit = merged(f, result).delivery.commit; untouched(f);
-  assert.equal(git(f.repo, "rev-parse", `${commit}^`), f.head);
+  assert.equal(git(f.repo, "rev-parse", `${commit}^`), tip);
   assert.deepEqual(pushed.atCheck().split("\n"), [`refs/heads/main ${tip}`, `refs/heads/${branch} ${commit}`]); assert.equal(pushed(), `refs/heads/main ${tip}`);
   // Reading the remote's tip moved no local ref and left no FETCH_HEAD behind; the ticket branch it made is gone with the merge.
   assert.equal(git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"), refs);
   assert.equal(existsSync(join(f.repo, ".git/FETCH_HEAD")), false);
 });
+
+/** Someone else publishes a commit that adds `<name>.txt` on the remote's main from a clone of their own, which the source checkout never fetches; returns the remote's new tip. */
+function publishElsewhere(f: Fixture, name = "remote") {
+  const other = join(f.root, "other");
+  if (!existsSync(other)) git(f.root, "clone", "-q", join(f.root, "remote.git"), other);
+  writeFileSync(join(other, `${name}.txt`), `${name}\n`); git(other, "add", ".");
+  git(other, "-c", "user.email=fixture@example.invalid", "-c", "user.name=Fixture", "commit", "-q", "-m", `published by someone else: ${name}.txt`);
+  git(other, "push", "-q", "origin", "main");
+  return git(other, "rev-parse", "HEAD");
+}
+/** What prepare recorded when a pr run took the remote's tip in place of a local base that was behind it. */
+const baseRecord = (run: { directory: string }) => JSON.parse(readFileSync(join(run.directory, "base.json"), "utf8"));
+const fetchHead = (f: Fixture) => existsSync(join(f.repo, ".git/FETCH_HEAD"));
+const allRefs = (f: Fixture) => git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)");
+const runStates = (output: string) => ["shape", "prepare", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success",
+  ...(output === "pr" ? ["checkMerge", "cleanUp", "merged"] : ["delivered"])];
+
+for (const base of [undefined, "main"] as const) {
+  test(`a fresh pr run whose ${base ? "named" : "omitted"} base is one commit behind the remote makes its worktree from the remote tip and names both commits in base.json`, async context => {
+    const f = fixture(context); const pushed = remote(f); fakeGh(context, f); const tip = publishElsewhere(f); const refs = allRefs(f); const seen: string[] = [];
+    const result = await execute(input(f, { output: "pr", ...(base ? { base } : {}) }), {
+      tester: request => { seen.push(git(request.cwd, "rev-parse", "HEAD")); return tester(request); },
+      implementer: request => { seen.push(git(request.cwd, "rev-parse", "HEAD")); assert.equal(readFileSync(join(request.cwd, "remote.txt"), "utf8"), "remote\n"); return implement(request); },
+    });
+    const tail = runStates("pr").slice(runStates("pr").indexOf("reviewResult"));
+    assert.deepEqual(result.states.slice(-tail.length), tail);
+    const run = merged(f, result); untouched(f);
+    // The worktree was made from the remote's tip, so the Agents worked on it and delivery did not need to replay.
+    assert.deepEqual(seen, [tip, tip]);
+    const commit = onTip(f, tip, run.delivery.commit);
+    assert.deepEqual([run.delivery.baseCommit, run.delivery.rebasedFrom, phases(run)], [tip, undefined, ["red", "verify"]]);
+    assert.equal(git(f.repo, "show", "--name-only", "--format=", commit), "greeting.test.txt\ngreeting.txt");
+    // The prepare evidence names the local base that was behind and the tip used in its place.
+    assert.deepEqual(baseRecord(run), { ref: base ?? "HEAD", local: f.head, remote: "origin", branch: "main", tip });
+    // The local base branch did not move, no other ref did, and no FETCH_HEAD was left behind.
+    assert.equal(git(f.repo, "rev-parse", "main"), f.head); assert.equal(allRefs(f), refs); assert.equal(fetchHead(f), false);
+    assert.equal(pushed(), `refs/heads/main ${tip}`);
+  });
+}
+
+test("a resumed pr run whose saved base is behind the remote tip moves onto the tip, not onto the local base, and names both commits in base.json", async context => {
+  const f = fixture(context); const pushed = remote(f); fakeGh(context, f); const again = await handOff(f);
+  // The run was handed off on the local base, which is also the remote's; then someone else publishes a commit the source checkout never fetches.
+  const tip = publishElsewhere(f); const refs = others(f);
+  const result = await execute(input(again, { output: "pr" }, { resume: true }), {
+    investigator: () => assert.fail(), implementer: () => assert.fail(),
+    reviewer: request => {
+      assert.equal(git(request.cwd, "rev-parse", "HEAD"), tip); assert.equal(readFileSync(join(request.cwd, "remote.txt"), "utf8"), "remote\n");
+      assert.equal(readFileSync(join(request.cwd, "greeting.txt"), "utf8"), "hello\n"); return review();
+    },
+  });
+  assert.deepEqual(result.states, runStates("pr"));
+  const run = merged(again, result); untouched(f);
+  const commit = onTip(f, tip, run.delivery.commit);
+  assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", commit), "code.txt\ngreeting.test.txt\ngreeting.txt\nremote.txt");
+  // The move happened in prepare, before checks and approval, so delivery did not replay.
+  assert.deepEqual([run.delivery.baseCommit, run.delivery.resumed, run.delivery.rebasedFrom, phases(run)], [tip, true, undefined, ["verify"]]);
+  assert.deepEqual(baseRecord(run), { ref: "HEAD", local: f.head, remote: "origin", branch: "main", tip });
+  assert.equal(git(f.repo, "rev-parse", "main"), f.head); assert.equal(others(f), refs); assert.equal(fetchHead(f), false);
+  assert.equal(pushed(), `refs/heads/main ${tip}`);
+});
+
+test("a resumed pr run whose branch was started from the remote tip is adopted while the local base stays behind, and is not moved", async context => {
+  const f = fixture(context); const pushed = remote(f); fakeGh(context, f); const tip = publishElsewhere(f);
+  const first = await execute(input(f, { output: "pr" }, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, person("hand off"));
+  assert.equal(first.state, "handedOff"); assert.equal(git(f.repo, "rev-parse", branch), tip); assert.equal(git(f.repo, "rev-parse", "main"), f.head);
+  const again = next(f, 2); const refs = others(f); const calls = recordGit(context, f);
+  const result = await execute(input(again, { output: "pr" }, { resume: true }), {
+    investigator: () => assert.fail(), implementer: () => assert.fail(),
+    reviewer: request => { assert.equal(git(request.cwd, "rev-parse", "HEAD"), tip); return review(); },
+  });
+  assert.deepEqual(result.states, runStates("pr"));
+  const run = merged(again, result); untouched(f);
+  onTip(f, tip, run.delivery.commit);
+  assert.deepEqual([run.delivery.baseCommit, run.delivery.resumed, run.delivery.rebasedFrom, phases(run)], [tip, true, undefined, ["verify"]]);
+  // Nothing was moved: no candidate was set aside for a move, and nothing was replayed.
+  assert.deepEqual(savedRefs(f), []); assert.equal(calls().some(call => /(?:^|\s)rebase\s/u.test(call)), false);
+  assert.equal(git(f.repo, "rev-parse", "main"), f.head); assert.equal(others(f), refs); assert.equal(fetchHead(f), false);
+  assert.equal(pushed(), `refs/heads/main ${tip}`);
+});
+
+test("a pr run started from the remote tip replays onto a later remote tip at delivery while the local base stays behind", async context => {
+  const f = fixture(context); const pushed = remote(f); fakeGh(context, f); const started = publishElsewhere(f); let tip = "";
+  const result = await execute(input(f, { output: "pr" }), {
+    reviewer: request => { assert.equal(git(request.cwd, "rev-parse", "HEAD"), started); tip = publishElsewhere(f, "later"); return review(); },
+  });
+  const tail = runStates("pr").slice(runStates("pr").indexOf("reviewResult"));
+  assert.deepEqual(result.states.slice(-tail.length), tail);
+  const run = merged(f, result); untouched(f);
+  const commit = onTip(f, tip, run.delivery.commit); rebasedFrom(f, run, started);
+  assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", commit), "code.txt\ngreeting.test.txt\ngreeting.txt\nlater.txt\nremote.txt");
+  assert.deepEqual([run.delivery.baseCommit, phases(run)], [tip, ["red", "verify", "reverify"]]);
+  assert.equal(git(f.repo, "rev-parse", "main"), f.head); assert.equal(fetchHead(f), false);
+  assert.equal(pushed(), `refs/heads/main ${tip}`);
+});
+
+test("a pr run started from the remote tip is not delivered when the remote moves back below it: the commit is undone and the run ends blocked", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const started = publishElsewhere(f); let before: Candidate | undefined;
+  const result = await execute(input(f, { output: "pr" }), {
+    reviewer: request => { before = candidate(request.cwd); git(join(f.root, "other"), "push", "-q", "-f", "origin", `${f.head}:main`); return review(); },
+  });
+  assert.equal(result.state, "blocked"); assert.deepEqual(result.states.slice(-5), ["reviewResult", "commit", "rebase", "failure", "blocked"]);
+  const run = held(f, result, /^Blocked: Base \S+ was rewritten or moved back to \S+; the ticket must be delivered by hand\./u); untouched(f);
+  assert.ok(names(run.delivery.reason, started), "the reason names the remote tip the run started from");
+  assert.ok(names(run.delivery.reason, f.head), "the reason names the remote's tip now");
+  uncommitted(f, run, started, before!);
+  assert.equal(git(f.repo, "rev-parse", "main"), f.head); assert.equal(pushed(), ""); assert.equal(gh(), undefined);
+});
+
+test("a pr run started from the remote tip keeps its candidate uncommitted when the remote cannot be read again at delivery", async context => {
+  const f = fixture(context); remote(f); const gh = fakeGh(context, f); const started = publishElsewhere(f);
+  const calls = recordGit(context, f); const human = person("hand off"); let before: Candidate | undefined;
+  const unavailable = join(f.root, "unavailable.git");
+  const result = await execute(input(f, { output: "pr" }), {
+    reviewer: request => { before = candidate(request.cwd); renameSync(join(f.root, "remote.git"), unavailable); return review(); },
+  }, human);
+  const run = questionedIn("rebase", f, result, /cannot be shown to be published on main at origin; the base must be pushed first/u, human);
+  assert.ok(run.delivery.reason.includes(started)); uncommitted(f, run, started, before!); untouched(f);
+  assert.match(readFileSync(join(run.directory, "rebase-1-ls-remote.log"), "utf8"), /does not appear to be a git repository/u);
+  assert.equal(calls().filter(call => call.startsWith("ls-remote ")).length, 2);
+  assert.equal(git(f.repo, "rev-parse", "main"), f.head); assert.equal(fetchHead(f), false); assert.equal(gh(), undefined);
+  assert.equal(git(unavailable, "for-each-ref", "--format=%(refname) %(objectname)"), `refs/heads/main ${started}`);
+});
+
+test("a resumed pr run whose branch holds a commit in neither the local base nor the remote tip is refused with today's message", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const tip = publishElsewhere(f);
+  linked(f); implement({ cwd: f.worktree }); git(f.worktree, "add", "."); git(f.worktree, "commit", "-qm", "earlier commit");
+  const own = git(f.repo, "rev-parse", branch); const refs = allRefs(f);
+  const result = await execute(input(f, { output: "pr" }, { resume: true }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
+  assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
+  held(f, result, /^Blocked: Cannot resume: ticket\/proj-12-add-a-greeting holds 1 commit that is not in the base commit .+ or the base moved back; only an uncommitted candidate is resumed, and nothing was changed\. Evidence: /u);
+  assert.equal(git(f.repo, "rev-parse", branch), own); assert.equal(allRefs(f), refs); assert.equal(pushed(), `refs/heads/main ${tip}`); assert.equal(gh(), undefined);
+});
+
+test("a pr run whose local base has a commit the remote lacks is refused with today's message, also when the remote has moved on", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const tip = publishElsewhere(f); ahead(f, 1); const refs = allRefs(f);
+  const result = await execute(input(f, { output: "pr" }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
+  assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
+  const run = held(f, result, /^Blocked: Base HEAD has 1 unpublished local commit that is not in the default branch main on origin, /u);
+  assert.ok(result.output.summary.includes(`and the pull request would carry them. The base must be pushed first; nothing was changed. Checked commit: ${f.head}. Evidence: `));
+  assert.equal(existsSync(f.worktree), false); assert.equal(existsSync(join(run.directory, "base.json")), false);
+  assert.equal(allRefs(f), refs); assert.equal(pushed(), `refs/heads/main ${tip}`); assert.equal(gh(), undefined);
+});
+
+test("a pr run whose local base is the remote tip starts from it and writes no base.json", async context => {
+  const f = fixture(context); const pushed = remote(f); fakeGh(context, f); const seen: string[] = [];
+  const result = await execute(input(f, { output: "pr" }), { implementer: request => { seen.push(git(request.cwd, "rev-parse", "HEAD")); return implement(request); } });
+  const run = merged(f, result); untouched(f);
+  assert.deepEqual(seen, [f.head]); onTip(f, f.head, run.delivery.commit);
+  assert.deepEqual([run.delivery.baseCommit, run.delivery.rebasedFrom], [f.head, undefined]);
+  assert.equal(existsSync(join(run.directory, "base.json")), false); assert.equal(pushed(), "");
+});
+
+for (const output of ["branch", "patch"] as const) {
+  test(`a ${output} run whose local base is behind the remote starts from the local base, never asks the remote, and writes no base.json`, async context => {
+    const f = fixture(context); const pushed = remote(f); const tip = publishElsewhere(f); const calls = recordGit(context, f); const seen: string[] = [];
+    const result = await execute(input(f, { output }), { implementer: request => { seen.push(git(request.cwd, "rev-parse", "HEAD")); return implement(request); } });
+    assert.equal(result.state, "delivered"); assert.deepEqual(result.states.slice(-5), runStates(output).slice(-5));
+    const run = held(f, result, /^Delivered/u); untouched(f);
+    assert.deepEqual(seen, [f.head]); onTip(f, f.head);
+    assert.deepEqual([run.delivery.baseCommit, run.delivery.rebasedFrom], [f.head, undefined]);
+    assert.deepEqual(calls().filter(call => /^(?:ls-remote|fetch|push|pull|clone|remote)\b/u.test(call)), []);
+    assert.equal(existsSync(join(run.directory, "base.json")), false);
+    assert.throws(() => git(f.repo, "cat-file", "-e", tip)); assert.equal(pushed(), `refs/heads/main ${tip}`);
+  });
+}
 
 for (const output of ["branch", "patch", "pr"]) {
   test(`${output} delivery ${output === "pr" ? "asks the remote about the base before anything else" : "never queries the remote, whatever the base holds"}`, async context => {

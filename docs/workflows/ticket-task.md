@@ -48,7 +48,7 @@ The call ceiling includes these send-backs; repair and review budgets are unchan
 | `ticket.body` | yes | — | Markdown with `## Goal`, `## Scope` (paths or globs the change may touch), `## Acceptance` (testable criteria), and `## Forbidden`. A missing section blocks before any Agent runs. |
 | `repository.name` | yes | — | One path segment, used in the worktree name. |
 | `repository.path` | yes | — | Absolute path to the source checkout root. |
-| `repository.base` | no | its HEAD | Branch or ref to start from and rebase onto. |
+| `repository.base` | no | its HEAD | Branch or ref to start from and rebase onto. In `pr` mode, if this local base is behind the remote base branch, use that branch's published tip instead. No local base or remote-tracking ref moves; `base.json` in the prepare evidence records the local ref and commit, remote, remote branch, and tip used. |
 | `repository.setup` | no | none | Commands run in the new worktree before any Agent, such as `npm ci`. Same shape as `checks`. |
 | `repository.checks` | yes, 1–20 | — | The gates, as `{ name, command, timeoutMs }` with `command` an argv array. |
 | `repository.rerunFailedChecks` | no | `true` | Run each failed gate once more, alone, after all gates have run. A passing rerun is marked `flaky`, with both logs kept and no repair round used. Set `false` to require first-time passes. |
@@ -64,6 +64,13 @@ The call ceiling includes these send-backs; repair and review budgets are unchan
 | `assume` | no | `false` | Let `falsify` answer questions whose cautious answer loses nothing, and record them, instead of stopping. |
 | `stuck` | no | `"park"` | `stuck` no longer changes anything: both `"park"` and `"ask"` sleep on the same Human question. |
 | `resume` | no | `false` | Pick up the worktree a hand-off or block left, or a delivered commit whose worktree is gone. |
+
+In `pr` mode, resume also moves an uncommitted candidate onto the published tip
+when the local base is behind. Before delivery, a run whose local base remains
+behind its starting commit reads the recorded remote base again: it keeps the
+same base if the tip is unchanged, replays onto a newer tip, and refuses a tip
+that was rewritten or moved back. A local base with unpublished commits is
+still refused.
 
 ## Flow
 

@@ -180,7 +180,14 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         return adoption;
       }
     }
-    if (repository.output === "pr" && !published()) return { type: "blocked" };
+    const remote = repository.output === "pr" ? published() : undefined;
+    if (repository.output === "pr" && !remote) return { type: "blocked" };
+    const start = remote && run("git", ["merge-base", "--is-ancestor", current, remote], repository.path).ok ? remote : current;
+    if (start !== current) {
+      writeFileSync(join(work.open(), "base.json"), JSON.stringify({
+        ref: repository.base ?? "HEAD", local: current, remote: repository.remote, branch: saved.checkedBase, tip: start,
+      }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    }
     if (resume) {
       saved.adopted = true;
       const conflicts = unmerged();
@@ -195,7 +202,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         saved.moved!.conflicts = [...new Set([...saved.moved!.conflicts, ...conflicts])];
         return conflict();
       }
-      if (saved.baseCommit !== current) return moveOnto(current);
+      if (saved.baseCommit !== start) return moveOnto(start);
       return { type: pending() === "" ? "prepared" : "resumed" };
     }
     const owners = branchOwners();
@@ -213,6 +220,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       return work.block(`Branch ${saved.branch} already exists in ${repository.path} for ticket ${owners.get(saved.branch)}, whose id and title spell the name this ticket would take; nothing was changed.`);
     }
     if (existsSync(worktree)) return work.block(`Worktree directory ${worktree} already exists; nothing was changed.`);
+    saved.baseCommit = start;
     if (!attempt("git", ["worktree", "add", "-b", saved.branch, worktree, saved.baseCommit], repository.path).ok) return { type: "blocked" };
     saved.created = true;
     // Git keeps the record with the branch: it follows a rename and goes when the branch is deleted.
@@ -224,12 +232,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: "prepared" };
   }
 
-  /**
-   * The push sends every commit the remote lacks below the ticket commit, so in pr mode the base must already be on the pull request's
-   * base branch there. The remote itself is asked, since a remote-tracking ref only says what it held at the last fetch.
-   */
-  function published(commit = saved.baseCommit): boolean {
-    const refuse = (why: string) => { work.block(why); return false; };
+  /** Read the pull request base from the remote itself and make its commit available without moving local refs. */
+  function remoteTip(): { tip: string; where: string } | undefined {
+    const refuse = (why: string) => { work.block(why); return undefined; };
     // The remote's configured URL, not its name, keeps a separate pushurl from sending the commit elsewhere.
     saved.checked = run("git", ["config", "--get", `remote.${repository.remote}.url`], repository.path).stdout || repository.remote;
     const name = pullRequestBase();
@@ -237,7 +242,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const ref = name ? `refs/heads/${name}` : "HEAD";
     const listed = attempt("git", ["ls-remote", "--symref", saved.checked, ref], repository.path, publishTimeoutMs,
       `Remote ${repository.remote} could not be reached to check that the base is published; nothing was changed`);
-    if (!listed.ok) return false;
+    if (!listed.ok) return undefined;
     const lines = listed.stdout.split("\n").map(line => line.split("\t"));
     const tip = lines.find(([id, at]) => at === ref && /^[0-9a-f]{40,64}$/u.test(id ?? ""))?.[0];
     const head = lines.find(([id, at]) => at === "HEAD" && id?.startsWith("ref: refs/heads/"))?.[0]?.slice("ref: refs/heads/".length);
@@ -249,11 +254,20 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     // A remote that is ahead of every local ref has a tip this repository lacks. Fetching it by URL stores the commits and moves no ref.
     if (!run("git", ["cat-file", "-e", `${tip}^{commit}`], repository.path).ok
       && !attempt("git", ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", saved.checked, tip], repository.path, publishTimeoutMs,
-        `The tip of ${where} could not be fetched to check that the base is published; nothing was changed`).ok) return false;
-    if (run("git", ["merge-base", "--is-ancestor", commit, tip], repository.path).ok) return true;
+        `The tip of ${where} could not be fetched to check that the base is published; nothing was changed`).ok) return undefined;
+    return { tip, where };
+  }
+
+  /** The push must carry no unpublished base commits. Return the remote tip that proved the base was published. */
+  function published(commit = saved.baseCommit): string | undefined {
+    const remote = remoteTip();
+    if (!remote) return undefined;
+    const { tip, where } = remote;
+    if (run("git", ["merge-base", "--is-ancestor", commit, tip], repository.path).ok) return tip;
     const ahead = git(repository.path, "rev-list", "--count", `${tip}..${commit}`);
-    return refuse(`Base ${repository.base ?? "HEAD"} has ${ahead} unpublished local commit${ahead === "1" ? " that is" : "s that are"} not in ${where}, `
+    work.block(`Base ${repository.base ?? "HEAD"} has ${ahead} unpublished local commit${ahead === "1" ? " that is" : "s that are"} not in ${where}, `
       + `and the pull request would carry them. The base must be pushed first; nothing was changed. Checked commit: ${commit}.`);
+    return undefined;
   }
 
   /** A resumed run adopts the worktree an earlier run left behind, with or without a candidate; every condition is read, never repaired. */
@@ -286,9 +300,18 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       if (!tip || !run("git", ["merge-base", tip, saved.baseCommit], repository.path).ok) {
         return work.block(`Cannot resume: ${saved.branch} shares no history with the base commit ${saved.baseCommit}; nothing was changed.`);
       }
-      const own = git(repository.path, "rev-list", "--count", `${saved.baseCommit}..${tip}`);
-      return work.block(`Cannot resume: ${saved.branch} holds ${own} commit${own === "1" ? " that is" : "s that are"} not in the base commit ${saved.baseCommit}, `
-        + "so something was committed on it or the base moved back; only an uncommitted candidate is resumed, and nothing was changed.");
+      let onRemote = false;
+      if (repository.output === "pr") {
+        const remote = remoteTip();
+        if (!remote) return { type: "blocked" };
+        onRemote = run("git", ["merge-base", "--is-ancestor", saved.baseCommit, remote.tip], repository.path).ok
+          && run("git", ["merge-base", "--is-ancestor", tip, remote.tip], repository.path).ok;
+      }
+      if (!onRemote) {
+        const own = git(repository.path, "rev-list", "--count", `${saved.baseCommit}..${tip}`);
+        return work.block(`Cannot resume: ${saved.branch} holds ${own} commit${own === "1" ? " that is" : "s that are"} not in the base commit ${saved.baseCommit}, `
+          + "so something was committed on it or the base moved back; only an uncommitted candidate is resumed, and nothing was changed.");
+      }
     }
     saved.baseCommit = tip;
     // A clean resume plans afresh; only a candidate carries the answers its plan used.
@@ -522,16 +545,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
 
   function rebase(): Event {
     const resolved = run("git", ["rev-parse", "--verify", "--quiet", `${repository.base ?? "HEAD"}^{commit}`], repository.path);
-    if (!resolved.ok || resolved.stdout === saved.baseCommit) {
-      if (saved.untested) {
-        if (!resolved.ok) return withdraw("the current base no longer resolves");
-        if (work.checks().type !== "passed" || !work.accept()) return withdraw("verification gates failed on the delivered commit");
-        saved.untested = false;
-        saved.redelivered = true;
-      }
-      return { type: "current" };
-    }
-    const tip = resolved.stdout;
+    let tip = resolved.stdout;
     const original = saved.baseCommit;
     const approved = saved.commitHash;
     let cleanupFailure = "";
@@ -549,6 +563,36 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }
       return { ...done, log };
     };
+    const readRemoteTip = () => {
+      const ref = `refs/heads/${saved.checkedBase}`;
+      const listed = step(["ls-remote", saved.checked, ref], repository.path, publishTimeoutMs);
+      const remote = listed.stdout.split("\n").map(line => line.split("\t"))
+        .find(([id, at]) => at === ref && /^[0-9a-f]{40,64}$/u.test(id ?? ""))?.[0];
+      const available = listed.ok && remote && (run("git", ["cat-file", "-e", `${remote}^{commit}`], repository.path).ok
+        || step(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", saved.checked, remote], repository.path, publishTimeoutMs).ok);
+      return available ? remote : undefined;
+    };
+    const unpublished = (commit: string) => {
+      undo(original);
+      return stop(`Base ${commit} cannot be shown to be published on ${saved.checkedBase} at ${repository.remote}; the base must be pushed first. Inspect any rebase logs in ${work.open()}.`);
+    };
+    let remote: string | undefined;
+    // A run started from a published tip may still have a local base behind it. Compare with the recorded remote in that case.
+    if (repository.output === "pr" && resolved.ok && tip !== original
+      && run("git", ["merge-base", "--is-ancestor", tip, original], repository.path).ok) {
+      remote = readRemoteTip();
+      if (!remote) return unpublished(original);
+      tip = remote;
+    }
+    if (!resolved.ok || tip === original) {
+      if (saved.untested) {
+        if (!resolved.ok) return withdraw("the current base no longer resolves");
+        if (work.checks().type !== "passed" || !work.accept()) return withdraw("verification gates failed on the delivered commit");
+        saved.untested = false;
+        saved.redelivered = true;
+      }
+      return { type: "current" };
+    }
     const restore = () => {
       if (["rebase-merge", "rebase-apply"].some(state => existsSync(git(worktree, "rev-parse", "--git-path", state)))) {
         git(worktree, "rebase", "--abort");
@@ -568,16 +612,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       return work.block(`Base ${original} was rewritten or moved back to ${tip}; the ticket must be delivered by hand.`);
     }
     if (repository.output === "pr") {
-      const ref = `refs/heads/${saved.checkedBase}`;
-      const listed = step(["ls-remote", saved.checked, ref], repository.path, publishTimeoutMs);
-      const remoteTip = listed.stdout.split("\n").map(line => line.split("\t"))
-        .find(([id, at]) => at === ref && /^[0-9a-f]{40,64}$/u.test(id ?? ""))?.[0];
-      const available = listed.ok && remoteTip && (run("git", ["cat-file", "-e", `${remoteTip}^{commit}`], repository.path).ok
-        || step(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", saved.checked, remoteTip], repository.path, publishTimeoutMs).ok);
-      if (!available || !run("git", ["merge-base", "--is-ancestor", tip, remoteTip!], repository.path).ok) {
-        undo(original);
-        return stop(`Base ${tip} cannot be shown to be published on ${saved.checkedBase} at ${repository.remote}; the base must be pushed first. Inspect any rebase logs in ${work.open()}.`);
-      }
+      remote ??= readRemoteTip();
+      if (!remote || !run("git", ["merge-base", "--is-ancestor", tip, remote], repository.path).ok) return unpublished(tip);
     }
     const patchId = (commit: string) => {
       const diff = step(["diff-tree", "-p", "--no-ext-diff", "--no-textconv", `${commit}^`, commit]);
