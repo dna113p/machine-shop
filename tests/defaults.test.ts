@@ -105,8 +105,12 @@ test("every gate runs even after one fails, and the repair prompt names each fai
     implementer: request => { prompt = request.prompt; return ok(); }, reviewer: () => ok("approved"),
   });
   assert.equal(result.state, "blocked");
-  assert.deepEqual(result.output.checks.map(c => [c.name, c.passed]), [["lint", false], ["types", true], ["tests", false], ["lint", false], ["types", true], ["tests", false]]);
-  assert.match(prompt, /2 checks did not meet their expected results: lint \(inspect .*1\.log\), tests \(inspect .*3\.log\)/u);
+  // Each round runs every gate, then each failed gate once more by itself.
+  assert.deepEqual(result.output.checks.map(c => [c.name, c.passed]), [
+    ["lint", false], ["types", true], ["tests", false], ["lint", false], ["tests", false],
+    ["lint", false], ["types", true], ["tests", false], ["lint", false], ["tests", false],
+  ]);
+  assert.match(prompt, /2 checks did not meet their expected results: lint \(inspect [^)]*\/1\.log[^)]*\/4\.log\), tests \(inspect [^)]*\/3\.log[^)]*\/5\.log\)/u);
   assert.match(result.output.reason, /2 checks did not meet/u);
 });
 
@@ -117,7 +121,128 @@ test("a failed check can be repaired only by rerunning it on the changed candida
     reviewer: () => ok("approved"),
   });
   assert.equal(result.state, "done"); assert.equal(calls, 2);
-  assert.deepEqual(result.output.checks.map(c => c.passed), [false, true]);
+  assert.deepEqual(result.output.checks.map(c => c.passed), [false, false, true]);
+});
+
+/** A gate that fails its first `fails` runs and passes after them, printing and counting each run in a file outside the checkout. */
+function counted(context: TestContext, name: string, fails: number) {
+  const directory = mkdtempSync(join(tmpdir(), "dev-default-runs-"));
+  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  const file = join(directory, "runs");
+  const code = `const fs = require("fs"); const runs = (fs.existsSync(process.argv[1]) ? Number(fs.readFileSync(process.argv[1], "utf8")) : 0) + 1;
+fs.writeFileSync(process.argv[1], String(runs)); console.log(${JSON.stringify(name)} + " run " + runs); process.exit(runs <= ${fails} ? 1 : 0);`;
+  return { gate: { name, command: [process.execPath, "-e", code, file] }, runs: () => existsSync(file) ? Number(readFileSync(file, "utf8")) : 0 };
+}
+type Entry = { name: string; passed: boolean; log: string; flaky?: boolean; rerun?: boolean };
+
+test("a gate that fails and then passes when run once more by itself counts as passed, is marked flaky in the receipt with both outputs, and costs no repair round or Agent call", async context => {
+  const cwd = repo(context); const tests = counted(context, "tests", 1); let edits = 0; let reviewed = "";
+  const result = await execute("implement-task", input(cwd, { checks: [tests.gate] }), {
+    implementer: () => { edits++; writeFileSync(join(cwd, "change.txt"), "change"); return ok(); },
+    reviewer: request => { reviewed = request.prompt; return ok("approved"); },
+  });
+  assert.equal(result.state, "done", result.output?.reason); assert.equal(result.output.outcome, "completed");
+  assert.equal(result.output.checksPassed, true);
+  assert.deepEqual([edits, tests.runs(), result.output.repairs, result.output.agentInvocations], [1, 2, 0, 2]);
+  const receipt = JSON.parse(readFileSync(result.output.report, "utf8")); assert.deepEqual(receipt, result.output);
+  assert.deepEqual(receipt.checks.map((c: Entry) => [c.name, c.passed, c.flaky]), [["tests", false, true], ["tests", true, true]]);
+  const [first, second] = receipt.checks as Entry[];
+  assert.notEqual(first!.log, second!.log);
+  assert.match(readFileSync(first!.log, "utf8"), /tests run 1/u); assert.match(readFileSync(second!.log, "utf8"), /tests run 2/u);
+  // The first run's failure does not stand as current feedback once the gate has passed.
+  assert.doesNotMatch(reviewed, /did not meet its expected result/u);
+});
+
+test("a gate that fails again when run by itself is a failure with both outputs, and the repair round sees it as today", async context => {
+  const cwd = repo(context); const prompts: string[] = [];
+  const result = await execute("implement-task", input(cwd, { maxRepairs: 1, checks: [command('process.exit(require("fs").readFileSync("code.txt", "utf8") === "fixed" ? 0 : 1)')] }), {
+    implementer: request => { if (prompts.push(request.prompt) === 2) writeFileSync(join(cwd, "code.txt"), "fixed"); return ok(); },
+    reviewer: () => ok("approved"),
+  });
+  assert.equal(result.state, "done", result.output?.reason);
+  assert.deepEqual([prompts.length, result.output.repairs], [2, 1]);
+  const checks = result.output.checks as Entry[];
+  assert.deepEqual(checks.map(c => [c.passed, c.flaky === true, c.rerun === true]), [[false, false, false], [false, false, true], [true, false, false]]);
+  assert.ok(checks.every(c => existsSync(c.log)));
+  const feedback = prompts[1]!.split("Current failure/feedback: ")[1] ?? "";
+  assert.ok(feedback.startsWith("verify: tests did not meet its expected result; inspect "), feedback);
+  for (const entry of checks.slice(0, 2)) assert.ok(feedback.includes(entry.log), entry.log);
+});
+
+test("flaky status describes only the latest check round while earlier evidence remains intact", context => {
+  const cwd = repo(context); const tests = counted(context, "tests", 1);
+  const saved = task.taskData();
+  const work = taskRun("flaky-rounds", input(cwd, { checks: [tests.gate] }), { checks: true, git: "clean" }, saved);
+  work.start();
+  assert.equal(work.checks("baseline").type, "passed");
+  assert.deepEqual(saved.flaky, ["tests"]);
+  assert.equal(saved.reason, "");
+  assert.equal(work.checks().type, "passed");
+  assert.deepEqual(saved.flaky, []);
+  assert.deepEqual(saved.evidence.map(entry => [entry.phase, entry.passed, entry.flaky === true]), [
+    ["baseline", false, true], ["baseline", true, true], ["verify", true, false],
+  ]);
+  // Runs saved before this field existed can still verify and initialize it.
+  const legacy = JSON.parse(JSON.stringify(saved)); delete legacy.flaky;
+  const resumed = taskRun("flaky-rounds", input(cwd, { checks: [tests.gate] }), { checks: true, git: "clean" }, legacy);
+  assert.equal(resumed.checks().type, "passed");
+  assert.deepEqual(legacy.flaky, []);
+  assert.equal(tests.runs(), 4);
+});
+
+test("only failed gates are run again, each once, after every gate has run", async context => {
+  const cwd = repo(context);
+  const [lint, tests, types] = [counted(context, "lint", 0), counted(context, "tests", 1), counted(context, "types", 99)];
+  await assert.rejects(execute("verify-checks", input(cwd, { checks: [lint.gate, tests.gate, types.gate] })), /Required checks failed/u);
+  const [receipt] = receipts(cwd);
+  assert.deepEqual(receipt.checks.map((c: Entry) => [c.name, c.passed, c.flaky === true, c.rerun === true]), [
+    ["lint", true, false, false], ["tests", false, true, false], ["types", false, false, false], ["tests", true, true, false], ["types", false, false, true],
+  ]);
+  assert.deepEqual([lint.runs(), tests.runs(), types.runs()], [1, 2, 2]);
+  assert.equal(receipt.checksPassed, false);
+  // The flaky gate passed, so only the gate that failed twice is named, with both of its outputs.
+  assert.ok(receipt.reason.includes(receipt.checks[2].log) && receipt.reason.includes(receipt.checks[4].log), receipt.reason);
+  assert.equal(receipt.reason.includes(receipt.checks[1].log), false, receipt.reason);
+});
+
+test("rerunFailedChecks: false runs each gate once, as today", async context => {
+  const cwd = repo(context); let prompt = "";
+  const checks = [
+    { name: "lint", command: [process.execPath, "-e", "process.exit(1)"] },
+    { name: "types", command: [process.execPath, "-e", "console.log('ok')"] },
+    { name: "tests", command: [process.execPath, "-e", "process.exit(2)"] },
+  ];
+  const result = await execute("implement-task", input(cwd, { maxRepairs: 1, checks, rerunFailedChecks: false }), {
+    implementer: request => { prompt = request.prompt; return ok(); }, reviewer: () => ok("approved"),
+  });
+  assert.equal(result.state, "blocked");
+  assert.deepEqual(result.output.checks.map(c => [c.name, c.passed]), [["lint", false], ["types", true], ["tests", false], ["lint", false], ["types", true], ["tests", false]]);
+  assert.match(prompt, /2 checks did not meet their expected results: lint \(inspect .*1\.log\), tests \(inspect .*3\.log\)/u);
+  // A gate that would pass the second time is not given one.
+  const other = repo(context); const flaky = counted(context, "tests", 1);
+  await assert.rejects(execute("verify-checks", input(other, { checks: [flaky.gate], rerunFailedChecks: false })), /Required checks failed/u);
+  const [receipt] = receipts(other);
+  assert.deepEqual([flaky.runs(), receipt.checks.map((c: Entry) => [c.passed, c.flaky === true])], [1, [[false, false]]]);
+  // On, as by default, the same gate passes as flaky.
+  const third = repo(context); const again = counted(context, "tests", 1);
+  assert.equal((await execute("verify-checks", input(third, { checks: [again.gate], rerunFailedChecks: true }))).state, "done");
+  assert.equal(again.runs(), 2);
+});
+
+test("a non-boolean rerunFailedChecks is refused before execution", context => {
+  const cwd = repo(context);
+  for (const value of ["no", 0, null]) {
+    assert.throws(() => modules["implement-task"].default(runtime, input(cwd, { rerunFailedChecks: value })), /rerunFailedChecks must be a boolean/u);
+  }
+  assert.equal(existsSync(join(cwd, ".machine-runs")), false);
+});
+
+test("read-only workflows refuse rerunFailedChecks, since they run no checks", context => {
+  const cwd = repo(context);
+  for (const name of ["review-code", "investigate"]) {
+    assert.throws(() => modules[name].default(runtime, input(cwd, { checks: [], rerunFailedChecks: false })), name);
+  }
+  assert.equal(existsSync(join(cwd, ".machine-runs")), false);
 });
 
 test("review feedback causes fresh checks and another review", async context => {
@@ -384,6 +509,30 @@ test("docs/catalog.md has a Recovery section that names the send-back helper, sa
 for (const page of ["ticket-task", "add-tests", "fix-bug", "implement-task", "investigate", "prepare-release", "refactor", "review-code", "update-docs", "upgrade-dependency"]) {
   test(`docs/workflows/${page}.md links to the catalog's Recovery section`, () => {
     assert.ok(readFileSync(resolve("docs/workflows", `${page}.md`), "utf8").includes("../catalog.md#recovery"));
+  });
+}
+
+test("docs/catalog.md's Recovery section describes running a failed check once more by itself, why, and the switch that turns it off", () => {
+  const recovery = section(readFileSync(resolve("docs/catalog.md"), "utf8"), "Recovery");
+  assert.ok(recovery !== undefined, "docs/catalog.md has no Recovery section");
+  const prose = recovery.replace(/\s+/gu, " ");
+  assert.ok(prose.includes("`rerunFailedChecks: false`"), "the section names the switch as it is written in the input");
+  assert.ok(prose.includes("`repository.rerunFailedChecks`"), "the section names ticket-task's place for the switch");
+  assert.match(prose, /`flaky`/u, "the section names the receipt's mark");
+  assert.match(prose, /\bonce more\b|\bonce again\b|\bran once\b|\brun once\b/iu, "the section says a failed gate runs once more");
+  assert.match(prose, /\bload\b/iu, "the section gives as its reason the checks that failed under load");
+  assert.match(prose, /\brepair round\b/iu, "the section says the rerun costs no repair round");
+});
+
+// Each gate-running default documents the switch in its input table, and ticket-task under repository.
+for (const [page, field] of [
+  ...["verify-checks", "implement-task", "fix-bug", "refactor", "add-tests", "update-docs", "upgrade-dependency", "prepare-release"].map(page => [page, "rerunFailedChecks"]),
+  ["ticket-task", "repository.rerunFailedChecks"],
+]) {
+  test(`docs/workflows/${page}.md documents ${field}`, () => {
+    const row = readFileSync(resolve("docs/workflows", `${page}.md`), "utf8").split("\n").find(line => line.startsWith(`| \`${field}\` |`));
+    assert.ok(row, `no input table row for ${field}`);
+    assert.match(row, /`true`/u, "the row gives the default");
   });
 }
 

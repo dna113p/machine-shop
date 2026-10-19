@@ -51,6 +51,7 @@ The call ceiling includes these send-backs; repair and review budgets are unchan
 | `repository.base` | no | its HEAD | Branch or ref to start from and rebase onto. |
 | `repository.setup` | no | none | Commands run in the new worktree before any Agent, such as `npm ci`. Same shape as `checks`. |
 | `repository.checks` | yes, 1–20 | — | The gates, as `{ name, command, timeoutMs }` with `command` an argv array. |
+| `repository.rerunFailedChecks` | no | `true` | Run each failed gate once more, alone, after all gates have run. A passing rerun is marked `flaky`, with both logs kept and no repair round used. Set `false` to require first-time passes. |
 | `repository.redCheck` | no | `"tests"` | The check that must fail after the tester and pass after the implementer. |
 | `repository.output` | yes | — | `branch`, `patch`, or `pr`. |
 | `repository.remote` | no | `"origin"` | Where `pr` mode pushes. |

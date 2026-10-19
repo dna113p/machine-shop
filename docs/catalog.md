@@ -42,6 +42,29 @@ Production migrations and publishing are deliberately not generic defaults.
 
 ## Recovery
 
+### Failed checks
+
+After every gate has run, the shared check Operation runs each failed gate
+once more by itself. A gate that passes then counts as passed: both attempts
+are marked `flaky` in the stage evidence and receipt, with both output logs
+kept. A gate that fails again follows the normal failure route; the repair
+prompt names both logs. The rerun costs no repair round or extra Agent call.
+Passed gates are never rerun in that round.
+
+This handles failures observed under load outside a ticket's changes: a status
+line test comparing clock readings, Drip's remote UI test that passed only
+after rerunning, and Drip checks failing in steps the ticket did not touch.
+The flaky mark preserves evidence of the intermittent failure.
+
+Reruns default to enabled. Set `rerunFailedChecks: false` beside `checks` in
+a default's input when a repository requires checks to pass first time.
+For ticket-task, set `repository.rerunFailedChecks` to `false` instead.
+Ticket pull requests list a recovered gate as
+"passed (flaky: failed once, passed when run again alone)".
+Setup commands, red checks, and regression checks are unchanged.
+
+### Malformed Agent reports
+
 `sendBack`, exported by [`defaults/_machine-shop/task.ts`](../defaults/_machine-shop/task.ts),
 validates an Agent report and returns either its valid value, `sendBack` on the
 first fault, or `invalid` on a second fault. About eight ticket runs stopped on
