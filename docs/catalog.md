@@ -871,8 +871,11 @@ With a candidate, resume skips `falsify`, `plan`, and `planReview`. A clean
 re-apply goes to `scopeAfterChange`, then `verify`, review, commit, rebase, and
 deliver. Conflicts go to `change`: its prompt names the files, old and new base,
 saved candidate, and `resume-conflicts.diff`, which holds each side's changes.
-The implementer must keep both sides' intent, remove markers, and `git add` each
-settled file without committing. An unmerged index or remaining opening, base,
+The implementer must keep both sides' intent and remove markers without staging
+or committing. The run stages each conflicted file with no markers left, including
+a deleted file as a removal. For conflicts without markers, the prompt names each
+file and the version left in the worktree; leaving it alone keeps that version.
+An unmerged index or remaining opening, base,
 or closing conflict marker counts as a failed repair through the existing
 budget. Bare `=======` lines are allowed as Markdown underlines. Once settled,
 the scope check, checks, and review run normally; review is told which bases
