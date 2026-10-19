@@ -116,7 +116,7 @@ function readEvidence(workspaces: string[], own: string, since: number, until: n
         const delivery = records.get("delivery.json")?.value;
         const recordedTicket = object(delivery) ? (text(delivery.ticket) ? delivery.ticket
           : object(delivery.ticket) && text(delivery.ticket.id) ? delivery.ticket.id : undefined) : undefined;
-        const ticket = questions.map(question => question.body.match(/\bTicket\s+([^\s:]+)(?=:| is stuck)/u)?.[1]).find(Boolean)
+        const ticket = questions.map(question => question.body.match(/^Ticket (\S+)\. Stopped in /mu)?.[1] ?? question.body.match(/\bTicket\s+([^\s:]+)(?=:| is stuck)/u)?.[1]).find(Boolean)
           ?? recordedTicket ?? "unknown (not recorded)";
         const runStops: Stop[] = [];
         const add = (suffix: string, body: string | null, reason: string, at: number, ownerAnswers: string[], stage: string) => {
@@ -126,7 +126,10 @@ function readEvidence(workspaces: string[], own: string, since: number, until: n
             object(value) && text(value.text) && text(value.recommended) ? [{ text: value.text, recommended: value.recommended }] : []) : [];
           const evidence = [body ?? "", reason, ...[...records.values()].filter(file => file.time <= at).map(file => JSON.stringify(file.value))].join("\n");
           const normalized = line(reason.split(/\.(?:\s|$)|\n/u)[0]!).replace(/\s*\(\d+\)/gu, "").replace(/\d+/gu, "#").toLowerCase()
-            .replace(/\bopen questions?\b/gu, "open question");
+            .replace(/\bopen questions?\b/gu, "open question")
+            .replace(/^answer # open question (?:before any code is written|the reviewer raised)$/u, "ticket owner must settle # open question:")
+            .replace(/^(repair|review) budget used up.*$/u, "$1 budget exhausted")
+            .replace(/^the falsify report's questions were missing or malformed twice:/u, "the falsify report was malformed twice:");
           runStops.push({
             id: `${workspace}/${run}/${suffix}`, key: JSON.stringify(["ticket-task", stage, normalized]), run, workspace,
             ticket,
@@ -137,8 +140,12 @@ function readEvidence(workspaces: string[], own: string, since: number, until: n
           });
         };
         for (const [index, question] of questions.entries()) {
+          const first = question.body.split(/\r?\n/u)[0]!.trim();
+          const needs = question.body.match(/\nNeeds: ([\s\S]*?)(?=\nWorktree: |$)/u)?.[1]?.trim() ?? "";
+          const fullReason = first.startsWith("Discard the candidate") || (first.endsWith("…") && needs.startsWith(first.slice(0, -1)))
+            ? needs : [first, needs].filter(Boolean).join("\n");
           const reason = question.body.match(/This run is stuck and needs a decision:\s*([\s\S]*?)(?:\n\s*Needs:|$)/u)?.[1]?.trim()
-            ?? question.body.trim();
+            ?? fullReason;
           const stage = question.body.match(/Stopped in ([\w-]+)\./u)?.[1] ?? "unknown (not recorded)";
           add(question.name, question.body, reason, question.time, answers[index] === undefined ? [] : [answers[index]!], stage);
         }

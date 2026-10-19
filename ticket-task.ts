@@ -3,7 +3,7 @@ import { closeSync, existsSync, lstatSync, openSync, readFileSync, realpathSync,
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Event, MachinePrimitives } from "@dna113p/machines";
 import { taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
-import { brief } from "./defaults/_machine-shop/brief.ts";
+import { brief, opening } from "./defaults/_machine-shop/brief.ts";
 import { outsideScope } from "./defaults/_machine-shop/scope.ts";
 
 export const description = "Carry one local ticket for one Git repository from an isolated worktree through falsification, planning, plan review, implementation, checks, and review to a delivered branch, patch, or pull request; a pull request is then watched until it merges, when its branch is deleted and the ticket completes; a stuck run sleeps on a Human question.";
@@ -794,11 +794,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   /** Where an archive keeps the candidate: this run's branch name with archive/ in place of ticket/. */
   const archiveBranch = () => `archive/${saved.branch.slice("ticket/".length)}`;
   const standing = () => {
-    const { reason, repairs, totalRepairs, maxRepairs, reviewRounds, totalReviewRounds, maxReviewRounds } = work.status();
+    const { repairs, totalRepairs, maxRepairs, reviewRounds, totalReviewRounds, maxReviewRounds } = work.status();
     const latest = saved.reviews.slice(saved.extraRoundFrom).findLast(event => event.type !== "blocked" && !reviewField(event, ticket.sections.acceptance)) as ReviewReport | undefined;
     return [
-      `Ticket ${ticket.id}: ${ticket.title}. Stopped in ${saved.stoppedIn}.`,
-      `This run is stuck and needs a decision: ${reason}\n`,
+      `Ticket ${ticket.id}. Stopped in ${saved.stoppedIn}.`,
       `Repair rounds used: ${repairs} of ${maxRepairs}${totalRepairs > repairs ? ` in this budget, ${totalRepairs} in all` : ""}.`,
       `Review rounds used: ${reviewRounds} of ${maxReviewRounds}${totalReviewRounds > reviewRounds ? ` in this budget, ${totalReviewRounds} in all` : ""}.`,
       ...(saved.extraRound !== "unused" ? [`The one extra review round was used; review retries: ${saved.extraReviewRounds} of ${maxReviewRounds}. ${latest ? `Reviewer newSinceLastRound: ${capped(latest.newSinceLastRound, 600)}` : "No review has finished in the extra round yet."}`] : []),
@@ -808,8 +807,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     ...(saved.moved ? [`Saved candidate: ${saved.moved.ref} (${saved.moved.patch})`] : []),
     ...(saved.moved?.conflicts.length ? [`Unsettled conflicts: ${saved.moved.conflicts.map(path => JSON.stringify(path)).join(", ")}`] : [])];
   const stuckPrompt = () => brief({
-    decision: `Ticket ${ticket.id} is stuck: answer what is needed`, standing: standing(),
-    needs: stuckNeeds(), evidence: locations(),
+    decision: asking().first, standing: standing(),
+    needs: asking().rest || undefined, evidence: locations(),
     options: [
       { name: "more rounds", does: saved.repairing === "falsify" || saved.repairing === "plan" || saved.repairing === "planReview"
         ? `restart the repair budget and return to ${saved.repairing} with the standing feedback.`
@@ -823,7 +822,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const discardPrompt = () => brief({
     decision: `Discard the candidate for ticket ${ticket.id}?`,
     standing: `${standing()}\nThe candidate will not be saved: no archive branch is made, and its uncommitted and committed work on that branch is lost.`,
-    evidence: locations(),
+    needs: fullAsking(), evidence: locations(),
     options: [
       { name: "confirm discard", does: `remove the worktree ${worktree} and delete the branch ${saved.branch} in ${repository.path}.` },
       { name: "go back", does: "return to the decision with the candidate kept." },
@@ -840,16 +839,33 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   }).join("\n");
   const wouldAssumeLines = (cap?: number) => saved.wouldAssume.length
     ? `\nHad these been the only questions, the run would have assumed:\n${saved.wouldAssume.map(question => `- ${capped(question.text, cap)} → ${capped(question.recommended, cap)}`).join("\n")}` : "";
-  function stuckNeeds(): string {
-    const { reason } = work.status();
-    // Ask for one owner response while preserving the actual question or criterion as context.
+  function asking(reason = work.status().reason): { first: string; rest: string } {
+    if (saved.ownerQuestions) return {
+      first: `Answer ${questionCount()} ${saved.stoppedIn === "falsifyResult" ? "before any code is written" : "the reviewer raised"}.`,
+      rest: `${questionLines(600)}${wouldAssumeLines(600)}`,
+    };
     const why = flat(reason);
-    const needs = /^(Repair|Review) budget exhausted/u.test(why)
-      ? `Explain how to resolve the remaining findings: ${why}`
-      : `Clarify how to resolve this blocker: ${why}`;
-    return saved.ownerQuestions
-      ? `Answer the open question${saved.ownerQuestions.length === 1 ? "" : "s"}:\n${questionLines(600)}${wouldAssumeLines(600)}`
-      : needs.replace(/^(.{600}).+$/u, "$1…");
+    const budget = /^(Repair|Review) budget exhausted \(\d+\)\. /u.exec(why);
+    if (budget) {
+      const { repairs, maxRepairs, reviewRounds, maxReviewRounds } = work.status();
+      let first = `${budget[1]} budget used up (${budget[1] === "Repair" ? `${repairs} of ${maxRepairs}` : `${reviewRounds} of ${maxReviewRounds}`})`;
+      const conflicts = saved.moved?.conflicts ?? [];
+      if (conflicts.length) {
+        first += ` with ${conflicts.length} unsettled conflict${conflicts.length === 1 ? "" : "s"}`;
+        const paths = ` in ${conflicts.join(", ")}`;
+        if (first.length + paths.length + 1 < 100) first += paths;
+      }
+      return { first: `${first}.`, rest: capped(why.slice(budget[0].length), 600) };
+    }
+    const split = opening(why);
+    return { first: split.first, rest: capped(split.rest, 600) };
+  }
+  function fullAsking(): string {
+    const { first, rest } = asking();
+    return first.endsWith("…") && rest.startsWith(first.slice(0, -1)) ? rest : [first, rest].filter(Boolean).join("\n");
+  }
+  function summaryReason(reason: string, split = opening(flat(reason))): string {
+    return [split.first, capped(split.rest, 600)].filter(Boolean).map(part => part.replace(/[^.!?…]$/u, "$&.")).join(" ");
   }
   const stopped = (state: string, run: () => Event) => () => { saved.stoppedIn = state; return run(); };
 
@@ -926,12 +942,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     const reasonBrief = flat(reason).replace(/^(.{600}).+$/u, "$1…").replace(/[^.!?…]$/u, "$&.");
     saved.held = { action: "hold", summary: [
-      { delivered: `Delivered ${result}.`, blocked: `Blocked: ${reasonBrief}`, "handed-off": `Handed off on ${saved.branch}: ${reasonBrief}`, abandoned: `Abandoned: ${reasonBrief}` }[outcome],
+      { delivered: `Delivered ${result}.`, blocked: `Blocked: ${reasonBrief}`, "handed-off": `Handed off: ${summaryReason(reason, asking(reason))}`, abandoned: `Abandoned: ${reasonBrief}` }[outcome],
       ...(finished && saved.taken ? [saved.redelivered ? "The base has not moved, so the same commit was delivered again unchanged."
         : `The delivered commit ${saved.taken} was replayed onto the new base ${saved.baseCommit}.`] : []),
       ...(saved.decision ? [`Decision: ${saved.decision}.`] : []),
       ...(saved.archived ? [`Candidate archived on ${saved.archived.branch} at ${saved.archived.commit}.`] : []),
       ...(outcome === "abandoned" ? [`Worktree and ${saved.branch} removed${saved.archived ? "" : " without saving the candidate"}.`] : []),
+      ...(outcome === "handed-off" ? [`Branch: ${saved.branch}.`] : []),
       ...((saved.created || saved.adopted) && !saved.removed ? [`Worktree kept at ${worktree}.`] : []),
       `Evidence: ${directory}`,
     ].join(" ") };
@@ -1004,9 +1021,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }, null, 2) + "\n", { mode: 0o600 });
     const ending = {
       merged: `Merged ${saved.prUrl}; deleted ${saved.branch} locally and on ${repository.remote}.`,
-      handedOff: `Handed off ${saved.prUrl} on ${saved.branch}: ${flat(reason)} Branch kept locally and on ${repository.remote}.`,
-      abandoned: `Abandoned ${saved.prUrl}: ${flat(reason)} Deleted ${saved.branch} locally; the pushed branch is kept on ${repository.remote}.`,
-      blocked: `Blocked after delivering ${saved.prUrl} on ${saved.branch}: ${flat(reason)} Local branch ${saved.localDeleted ? "deleted" : "kept"}; remote branch ${saved.remoteDeleted ? "deleted" : "not confirmed deleted"}.`,
+      handedOff: `${reason ? `Handed off: ${summaryReason(reason)}` : "Handed off."} Pull request: ${saved.prUrl}. Branch: ${saved.branch}, kept locally and on ${repository.remote}.`,
+      abandoned: `${reason ? `Abandoned: ${summaryReason(reason)}` : "Abandoned."} Pull request: ${saved.prUrl}. Branch: ${saved.branch}, deleted locally; the pushed branch is kept on ${repository.remote}.`,
+      blocked: `${reason ? `Blocked after delivery: ${summaryReason(reason)}` : "Blocked after delivery."} Pull request: ${saved.prUrl}. Branch: ${saved.branch}; local branch ${saved.localDeleted ? "deleted" : "kept"}; remote branch ${saved.remoteDeleted ? "deleted" : "not confirmed deleted"}.`,
     }[outcome];
     saved.held = { action: outcome === "merged" ? "complete" : "hold", summary: `${ending} Evidence: ${directory}` };
     return { type: outcome };
@@ -1071,7 +1088,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     saved.questionsFault = allowance.feedback;
     if (result.type === "sendBack") return { type: "reask" };
     if (result.type === "invalid") return work.block("refusal" in kept ? result.fault
-      : `The falsify report's questions were missing or malformed twice: ${result.fault}. The report is kept in ${join(work.open(), `falsify-${saved.planningReports.falsify}.json`)}.`);
+      : `The falsify report was malformed twice: ${result.fault}. The report is kept in ${join(work.open(), `falsify-${saved.planningReports.falsify}.json`)}.`);
     if (event.type === "sound") {
       saved.questionsFault = "";
       work.block("");

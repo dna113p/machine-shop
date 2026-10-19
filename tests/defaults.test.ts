@@ -7,6 +7,8 @@ import { test, type TestContext } from "node:test";
 import { pathToFileURL } from "node:url";
 import { brief, firstLine } from "../defaults/_machine-shop/brief.ts";
 // Read through the namespace so an export a test needs and the module lacks fails that test alone.
+import * as brief_ from "../defaults/_machine-shop/brief.ts";
+// Read through the namespace so an export a test needs and the module lacks fails that test alone.
 import * as task from "../defaults/_machine-shop/task.ts";
 import { taskRun } from "../defaults/_machine-shop/task.ts";
 import { runtime } from "./runtime.ts";
@@ -659,15 +661,40 @@ test("a report captured as a JSON object yields its summary, and any other text 
   }
 });
 
-test("brief keeps the decision to ten whole words on its first line", () => {
-  for (const count of [1, 10, 11, 20]) {
+test("brief keeps the decision to 100 characters on its first line, cut after a whole word with an ellipsis", () => {
+  // A first sentence of more than ten words, such as a spent budget with its conflict, is kept whole.
+  for (const decision of ["Decide", "Repair budget used up (3 of 3) with 1 unsettled conflict in README.md.", "x".repeat(100)]) {
+    assert.equal(firstLine(brief({ decision, standing: "Standing", evidence: [] })), decision);
+  }
+  for (const count of [1, 10, 11, 20, 40]) {
     const words = Array.from({ length: count }, (_, index) => `word${index}`);
+    const whole = words.join(" ");
     const note = brief({ decision: words.join(" \n "), standing: "Standing", evidence: [] });
-    assert.equal(firstLine(note), words.slice(0, 10).join(" ") + (count > 10 ? "…" : ""));
+    const first = firstLine(note);
     assert.equal(note.split("\n")[1], "");
-    assert.ok(firstLine(note).split(/\s+/u).length <= 10);
+    assert.ok(first.length <= 100, first);
+    if (whole.length <= 100) { assert.equal(first, whole); continue; }
+    // As many whole words as fit with the ellipsis, and no more.
+    assert.ok(first.endsWith("…"), first);
+    const kept = first.slice(0, -1);
+    assert.ok(whole.startsWith(`${kept} `), first);
+    assert.ok(`${kept} ${words[kept.split(" ").length]}…`.length > 100, first);
   }
   assert.equal(firstLine("First\r\nSecond"), "First");
+});
+
+test("opening splits a text after its first sentence or line, and gives the whole text as the rest when that sentence is cut", () => {
+  const opening = (brief_ as Record<string, unknown>).opening as (text: string) => { first: string; rest: string };
+  assert.equal(typeof opening, "function", "brief.ts exports opening");
+  // A period ends the sentence only before whitespace or the end, so a field name or a path stays in it.
+  assert.deepEqual(opening("The falsify report was malformed twice: questions[0].why must be a non-empty string. The report is kept in /x/falsify-2.json."),
+    { first: "The falsify report was malformed twice: questions[0].why must be a non-empty string.", rest: "The report is kept in /x/falsify-2.json." });
+  assert.deepEqual(opening("Malformed review report: criteria must be an array."), { first: "Malformed review report: criteria must be an array.", rest: "" });
+  assert.deepEqual(opening("Acceptance criteria are missing\nSay which file holds them."), { first: "Acceptance criteria are missing", rest: "Say which file holds them." });
+  const long = `Paths outside the ticket Scope after change: ${Array.from({ length: 8 }, (_, index) => `"docs/page-${index}.md"`).join(", ")}. Scope: greeting.txt.`;
+  const cut = opening(long);
+  assert.ok(cut.first.length <= 100 && cut.first.endsWith("…"), cut.first);
+  assert.equal(cut.rest, long); assert.ok(long.startsWith(cut.first.slice(0, -1)), cut.first);
 });
 
 test("brief includes each part once and puts recommended options first without mutating them", () => {

@@ -430,7 +430,7 @@ is.
 | `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch, save any candidate and move onto a newer base before setup and checks: conflicts go to `change`, a cleanly applied candidate to `scopeAfterChange`, then `verify`, and no uncommitted change through `start` to `falsify`; with no worktree, a recorded delivered commit is recreated and set up, then continues at `rebase` |
 | `start` | Open the helper's run on the worktree, which must be clean |
 | `falsify` | Read-only investigator tries to show the ticket is wrong, already done, impossible here, or underspecified; returns `sound` with a one-paragraph summary or `questions` with 1–10 entries containing text, options, recommended, assumable, and why in the report's `questions` field, not its summary or message; a return for malformed questions includes the validation reason and repeats where the questions go |
-| `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; missing or malformed questions return to `falsify` once per run, then go through the stuck policy with the reason and report's evidence file; a sound ticket goes to `plan`, as does an entirely assumable report with `assume: true`; remaining questions go through the stuck policy with numbered needs, flattened with question text, each option, and why capped separately at 600 characters plus an ellipsis |
+| `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; missing or malformed questions return to `falsify` once per run, then go through the stuck policy with the reason and report's evidence file; a sound ticket goes to `plan`, as does an entirely assumable report with `assume: true`; remaining questions go through the stuck policy with their count in the first sentence and each question once in numbered needs, flattened with question text, each option, and why capped separately at 600 characters plus an ellipsis |
 | `plan` | Read-only investigator returns `planned` with the complete plan as a summary, recorded as stage `plan`; asks for a concise plan naming files and tests without restating the ticket |
 | `planResult` | Capture the report before guarding the unchanged worktree, then pass the plan to `planReview` |
 | `planReview` | Read-only reviewer returns `approved` or `revise` with a summary, preferring concise plans without restated ticket text or detail the implementer does not need; returns `tooBroad` with a suggested split into smaller tickets when the ticket is too broad for one run; the prompt includes the plan verbatim |
@@ -451,7 +451,7 @@ is.
 | `dropLocal`, `mergeHandOff`, `mergeAbandon`, `mergeFailure` | Confirmed discard deletes only the local branch and ends `abandoned`; hand off keeps it and ends `handedOff`; cleanup failure ends `blocked`; each writes `merge.json` with `hold` output |
 | `repairBudget`, `repairTarget`, `reviewBudget` | Count gate retries and review revisions separately; gate retries route to the responsible editing stage, review retries to `change`. Once per run, a spent review budget returns to `change` with a fresh review budget if the last verdict is `revise`, every finding names an in-Scope path, at least one is a blocker, and none is a discussion. Repair counts carry over. Other exhaustion goes to `stuck` |
 | `stuck` | Go to `decide` for both accepted input values |
-| `decide` | Human: sleep on one question with what is needed and evidence; suggest `more rounds`, `hand off`, `archive`, and `discard`, accepting any other reply as an answer |
+| `decide` | Human: sleep on one question with what is needed first, then the stopped stage and budgets, the remaining reason or questions once, and evidence; suggest `more rounds`, `hand off`, `archive`, and `discard`, accepting any other reply as an answer |
 | `confirmDiscard` | Human: `confirm discard` or `go back`, asked before a discard removes anything |
 | `archive`, `remove` | Commit the candidate and keep that commit as the branch `archive/<slug>`; `git worktree remove --force` and `git branch -D` for this run's own worktree and ticket branch |
 
@@ -769,10 +769,14 @@ case, surrounding whitespace and trailing punctuation (`. , ; : ! ? …`).
 The canonical decision is recorded in `delivery.json`; `confirm discard` and
 `go back` stay exact. Decision replies take the existing paths below.
 
-All Human prompts use the same brief helper: decision first (at most ten words,
-truncated at a word boundary with `…`), a blank line, standing against the ticket,
-needs, evidence locations, then options. Standing includes the ticket id and
-title, stopped state, reason, and both budgets. `hand off` is recommended and
+All Human prompts use the same brief helper: decision first (at most 100 characters
+including `…` when cut at a word boundary), a blank line, standing, needs when
+non-empty, evidence locations, then options. A stuck question starts with what
+is needed: a question count, report fault or spent budget. Standing includes
+the ticket id without its title, stopped state, both budgets and any extra review
+round. Needs give the remaining reason or numbered questions once. When the
+opening is cut, Needs retain the full reason up to their usual limit. Discard
+confirmation gives the stop reason once under Needs. `hand off` is recommended and
 listed first in the prompt. The four decisions are suggestions, not restricted
 choices:
 
@@ -974,7 +978,9 @@ the ticket. All other finals return exactly `{ "action": "hold", "summary": "<te
 with no other field, keeping the ticket open. The workflow never
 relaunches itself, launches another Machine, or edits or closes a ticket file.
 The one-line delivery summary names the branch, commit, and pull request URL or patch
-path on success, or the reason otherwise; then the decision if one was made, the
+path on success. A hand-off starts with a short sentence saying what is needed,
+then the remaining reason; the branch follows the decision. Other stops begin
+with their reason. Summaries also include the decision if one was made, the
 archive branch and its commit after `archive`, the worktree if it was kept
 (before delivery for `handedOff` and `blocked` once it exists), and the evidence
 directory. Read
@@ -1027,20 +1033,21 @@ For a delivered-candidate resume, the successful hold retains its usual
 `Delivered <branch> at <commit>` first sentence and adds one sentence saying
 the delivered commit was replayed onto the new base, or delivered again
 unchanged, before the final `Evidence: <directory>`.
-The stuck question's reason and Needs list every open review or falsification
-question on its own numbered line with its location. Needs cap each question's
-flattened text separately at 600 characters plus an ellipsis, keeping its
+The stuck question opens with the count of open review or falsification
+questions. Needs list each question once on its own numbered line with its
+location. Needs cap each question's flattened text separately at 600 characters
+plus an ellipsis, keeping its
 location; the list itself is not capped. Empty locations omit the parentheses.
 Falsification questions follow the same limits as review
 questions: each numbered line then lists the options with the recommended
 answer first and marked, followed by why. Under Needs, each option and why is
 flattened and capped separately at 600 characters plus an ellipsis. In a mixed
-report with `assume: true`, reason and needs also list the answers the run would
+report with `assume: true`, Needs also list the answers the run would
 have assumed, outside the numbered questions; Needs flatten and cap each such
-question and answer separately at 600 characters plus an ellipsis. A second plan
-review revision uses the usual blocker needs, capped at 600 characters plus an
-ellipsis when truncated. The full stop reason remains in the receipt and the
-question's standing section, and raw planning events preserve even malformed reports.
+question and answer separately at 600 characters plus an ellipsis. Other stops
+put their first sentence above standing and their remaining reason under Needs,
+flattened and capped at 600 characters plus an ellipsis when truncated. The full
+stop reason remains in the receipt, and raw planning events preserve even malformed reports.
 For pull requests, `delivery.json` and `result.json` describe delivery before
 the merge wait and are never rewritten. The later `merge.json` records
 `schemaVersion`, `outcome`, `prUrl`, `branch`, `checks`, `ghFailures`,

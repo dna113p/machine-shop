@@ -198,9 +198,13 @@ an ordinary revision. A `tooBroad` verdict stops the run with a suggested split
 into smaller tickets in the question; answering or choosing `more rounds`
 returns to the planner.
 
-The question describes what stopped the run, what is needed, open questions,
-budgets, and evidence locations. Each question is written as `question-<n>.txt`
-in the evidence directory, numbered from 1 across re-asks and continuation
+The question starts with what is needed: the number of open questions, the
+malformed report's fault, or the spent budget. Its opening is at most 100
+characters, cut at a word boundary with an ellipsis when needed. Then it gives
+the ticket id without its title, the stopped stage, budgets and any extra review
+round, followed by the questions or remaining reason once, and evidence locations.
+Discard confirmation keeps the same order, with the stop reason under Needs.
+Each question is written as `question-<n>.txt` in the evidence directory, numbered from 1 across re-asks and continuation
 after sleep. The four decisions
 are suggestions. Any other reply is an answer and works like `more rounds`:
 it renews both budgets, clears the owner questions, and returns to the stage

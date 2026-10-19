@@ -75,8 +75,12 @@ flowchart LR
 ```
 
 Operations group by workflow, stopped stage and the first sentence of the reason,
-normalizing numeric budgets and counts. The analyst receives only those extracted
-stops and returns a one-line cause and automation mark for each stop, plus one
+normalizing numeric budgets and counts. Both the older standing-text questions
+and the request-first layout are read, including discard confirmations and cut
+openings. Aliases for question counts, spent budgets and malformed falsify reports
+keep the same grouping key across layouts. The ticket id and stopped stage remain
+available even before a delivery receipt exists. The analyst receives only those
+extracted stops and returns a one-line cause and automation mark for each stop, plus one
 suggested change and repository per group. Operations require every stop and
 group exactly once. The analyst must not use tools or read or edit files; its
 configured harness supplies the read-only permissions, not this workflow.
