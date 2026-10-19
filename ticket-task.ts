@@ -317,6 +317,21 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     cwd: worktree, encoding: "utf8", timeout: 30_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
   });
   const unmerged = () => rawGit("diff", "--name-only", "--diff-filter=U", "-z").split("\0").filter(Boolean);
+  const marked = (path: string) => {
+    const file = join(worktree, path);
+    return existsSync(file) && lstatSync(file).isFile() && /^(?:<<<<<<< |\|\|\|\|\|\|\| |>>>>>>> )/mu.test(readFileSync(file, "utf8"));
+  };
+  const markerlessPrompt = () => saved.moved!.conflicts.filter(path => !marked(path)).map(path => {
+    if (!existsSync(join(worktree, path))) return `${JSON.stringify(path)}: Git left it deleted; leaving it so removes the file.`;
+    const hash = git(worktree, "hash-object", "--", path);
+    const matches = (ref: string) => {
+      const blob = run("git", ["rev-parse", "--verify", `${ref}:${path}`], worktree);
+      return blob.ok && blob.stdout === hash;
+    };
+    const version = matches("HEAD") ? "the current base's version"
+      : matches(saved.moved!.ref) ? "the saved candidate's version" : "a version from neither side";
+    return `${JSON.stringify(path)}: No conflict markers; the worktree holds ${version}. Leaving it alone keeps that version.`;
+  });
   const moveRecord = () => join(git(worktree, "rev-parse", "--absolute-git-dir"), "ticket-task-move.json");
   const movedPrompt = () => saved.moved ? [
     `The resume move from ${saved.moved.from} onto base ${saved.moved.to} ${saved.baseCommit === saved.moved.to ? "was applied" : "was restored on its old base"}. Saved candidate: ${saved.moved.ref} (${saved.moved.patch}).`,
@@ -419,12 +434,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   function unsettled(): Event | undefined {
     const moved = saved.moved;
     if (!moved?.conflicts.length) return undefined;
-    const remaining = [...new Set([...unmerged(), ...moved.conflicts.filter(path => {
-      const file = join(worktree, path);
-      return existsSync(file) && lstatSync(file).isFile() && /^(?:<<<<<<< |\|\|\|\|\|\|\| |>>>>>>> )/mu.test(readFileSync(file, "utf8"));
-    })])];
+    const unmergedPaths = new Set(unmerged());
+    for (const path of moved.conflicts) {
+      if (unmergedPaths.has(path) && !marked(path)) git(worktree, "add", "--all", "--", `:(literal)${path}`);
+    }
+    const remaining = [...new Set([...unmerged(), ...moved.conflicts.filter(marked)])];
     if (remaining.length) {
-      work.block(`Saved candidate: ${moved.ref} (${moved.patch}). Unsettled conflicts: ${remaining.map(path => JSON.stringify(path)).join(", ")}. Remove conflict markers and git add each settled file without committing.`);
+      work.block(`Saved candidate: ${moved.ref} (${moved.patch}). Unsettled conflicts: ${remaining.map(path => JSON.stringify(path)).join(", ")}. Remove every conflict marker in each, keeping both sides' intent, without committing.`);
       return { type: "failed" };
     }
     git(worktree, "reset", "--quiet");
@@ -1267,7 +1283,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           ...(saved.extraRound !== "unused" ? ["Blockers the reviewer found when the review budget was spent; fix each and add the regression test it asked for:", ...saved.extraFeedback] : []),
           ...movedPrompt(),
           ...(saved.moved?.conflicts.length ? [
-            `Settle conflicts in ${saved.moved.conflicts.map(path => JSON.stringify(path)).join(", ")}, keeping both sides' intent. Both sides are in ${join(work.open(), "resume-conflicts.diff")}. Remove every conflict marker and mark each settled file with git add; do not commit.`,
+            `Settle conflicts in ${saved.moved.conflicts.map(path => JSON.stringify(path)).join(", ")}, keeping both sides' intent. Both sides are in ${join(work.open(), "resume-conflicts.diff")}. Remove every conflict marker; do not commit; the workflow stages settled files.`,
+            ...markerlessPrompt(),
           ] : []),
           ...assumptionsPrompt(),
           ...(saved.plan ? ["Plan:", saved.plan] : []),

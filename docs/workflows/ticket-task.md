@@ -163,6 +163,16 @@ flowchart TD
   class stuck no
 ```
 
+### Resumed conflicts
+
+If moving a resumed candidate onto the current base conflicts, the implementer
+removes every conflict marker while keeping both sides' intent, without staging
+or committing. The run stages each settled conflict itself, including deletions
+as removals. For a conflict without markers, the prompt names the file and what
+Git left in the worktree; leaving it alone keeps that version. Files with markers
+remain unsettled, count against the repair budget, and are named when the run asks
+for help. Once settled, scope checks, required checks, and review run normally.
+
 ### When stuck
 
 Once per run, a spent review budget returns to the implementer with a fresh

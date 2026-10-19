@@ -3678,6 +3678,8 @@ test("a resumed candidate that conflicts with the new tip goes to the implemente
   // The implementer was asked once, with the conflicted file, the new base, and the saved candidate named.
   assert.equal(prompts.length, 1); const ref = savedAsItStood(f, evidence(again).directory, started, files);
   for (const part of ["greeting.txt", ref]) assert.ok(prompts[0]!.includes(part), part);
+  // The run stages what is settled, so the prompt asks only for what the Agent can do.
+  assert.doesNotMatch(prompts[0]!, /git add/u);
   assert.ok(names(prompts[0]!, tip), "the implementer's prompt names the new base");
   assert.ok(names(reviewed, tip), "the review prompt says the candidate was moved onto the new base");
   const commit = onTip(f, tip); const run = held(again, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(again);
@@ -3685,6 +3687,111 @@ test("a resumed candidate that conflicts with the new tip goes to the implemente
   assert.deepEqual([run.delivery.baseCommit, run.delivery.commit, run.delivery.rebasedFrom, phases(run)], [tip, commit, undefined, ["verify"]]);
   assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-1.json"), "utf8")), { stage: "change", changed: ["greeting.test.txt", "greeting.txt"], outside: [] });
 });
+
+test("a resumed conflict the implementer settles without staging, as a sandbox that cannot write the Git index must, is staged by the run and passes in one round", async context => {
+  const f = fixture(context); const again = await handOff(f);
+  const tip = advance(again, "greeting.txt", "hi\n"); const prompts: string[] = []; const settled = "hello\nhi\n";
+  const result = await execute(input(again, {}, { resume: true }), {
+    investigator: () => assert.fail(),
+    implementer: request => {
+      prompts.push(request.prompt);
+      // The settled file is written, but never staged: the sandbox cannot write the index.
+      writeFileSync(join(request.cwd, "greeting.txt"), settled);
+      return ok("completed", "Kept both greetings; git add failed because the Git index is read-only");
+    },
+    reviewer: request => {
+      assert.equal(readFileSync(join(request.cwd, "greeting.txt"), "utf8"), settled); assert.equal(git(request.cwd, "ls-files", "-u"), "");
+      return review();
+    },
+  }, person());
+  assert.equal(result.state, "delivered");
+  assert.deepEqual(result.states, ["shape", "prepare", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "delivered"]);
+  assert.equal(result.states.includes("repairBudget"), false);
+  assert.equal(prompts.length, 1); assert.match(prompts[0]!, /greeting\.txt/u); assert.doesNotMatch(prompts[0]!, /git add/u);
+  onTip(f, tip); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), settled.trim());
+  assert.equal(evidence(again).result.repairs, 0);
+});
+
+test("a resumed conflict that still has a marker stays unsettled and is the only file the question names, while the settled one beside it is staged by the run", async context => {
+  const f = fixture(context); const again = await handOff(f);
+  // The candidate also edits code.txt, and the base edits both files while the ticket waits.
+  writeFileSync(join(f.worktree, "code.txt"), "candidate\n");
+  advance(again, "greeting.txt", "hi\n"); const tip = advance(again, "code.txt", "base\n"); const human = person("hand off"); const prompts: string[] = [];
+  const result = await execute(scoped(input(again, {}, { resume: true, maxRepairs: 0 }), "code.txt"), {
+    investigator: () => assert.fail(), reviewer: () => assert.fail(),
+    implementer: request => {
+      assert.match(git(request.cwd, "ls-files", "-u"), /\tcode\.txt$/mu); assert.match(git(request.cwd, "ls-files", "-u"), /\tgreeting\.txt$/mu);
+      prompts.push(request.prompt);
+      // code.txt is settled; greeting.txt keeps its markers. Neither is staged.
+      writeFileSync(join(request.cwd, "code.txt"), "candidate\nbase\n");
+      return ok("completed", "Settled code.txt only");
+    },
+  }, human);
+  assert.equal(prompts.length, 1); assert.doesNotMatch(prompts[0]!, /git add/u);
+  const run = questionedIn("repairBudget", again, result, /Unsettled conflicts: "greeting\.txt"\./u, human);
+  assert.doesNotMatch(run.delivery.reason, /Unsettled conflicts:[^.]*code\.txt/u);
+  assert.doesNotMatch(run.delivery.reason, /git add/u);
+  // Only the settled conflict was staged, and nothing was committed.
+  const left = git(f.worktree, "ls-files", "-u");
+  assert.doesNotMatch(left, /\tcode\.txt$/mu); assert.match(left, /\tgreeting\.txt$/mu);
+  assert.equal(git(f.worktree, "show", ":code.txt"), "candidate\nbase");
+  assert.match(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), /^<<<<<<< /mu);
+  assert.equal(git(f.repo, "rev-parse", branch), tip);
+});
+
+test("staging a settled conflict with a glob-like filename does not stage a matching non-conflict file", async context => {
+  const f = fixture(context); advance(f, "notes-other.txt", "original\n"); const again = await handOff(f);
+  writeFileSync(join(f.worktree, "notes*.txt"), "candidate\n");
+  advance(again, "notes*.txt", "base\n"); const tip = advance(again, "greeting.txt", "hi\n"); const human = person("hand off");
+  const result = await execute(scoped(input(again, {}, { resume: true, maxRepairs: 0 }), "notes*.txt"), {
+    investigator: () => assert.fail(), reviewer: () => assert.fail(),
+    implementer: request => {
+      writeFileSync(join(request.cwd, "notes*.txt"), "candidate\nbase\n");
+      writeFileSync(join(request.cwd, "notes-other.txt"), "unrelated edit\n");
+      return ok();
+    },
+  }, human);
+  questionedIn("repairBudget", again, result, /Unsettled conflicts: "greeting\.txt"\./u, human);
+  assert.equal(git(f.worktree, "show", ":notes*.txt"), "candidate\nbase");
+  assert.equal(git(f.worktree, "show", ":notes-other.txt"), "original");
+  assert.equal(readFileSync(join(f.worktree, "notes-other.txt"), "utf8"), "unrelated edit\n");
+  assert.match(git(f.worktree, "ls-files", "-u"), /\tgreeting\.txt$/mu);
+  assert.equal(git(f.repo, "rev-parse", branch), tip);
+});
+
+for (const action of ["leaves", "deletes"] as const) {
+  test(`a resumed modify/delete conflict on a file the candidate deleted and the base changed is settled in one round when the implementer ${action} it`, async context => {
+    const f = fixture(context); const again = await handOff(f);
+    // The candidate deletes code.txt; the base changes it. Git leaves the base's version, with no markers.
+    rmSync(join(f.worktree, "code.txt")); const tip = advance(again, "code.txt", "newer\n"); const prompts: string[] = [];
+    const result = await execute(scoped(input(again, {}, { resume: true }), "code.txt"), {
+      investigator: () => assert.fail(),
+      implementer: request => {
+        // A second round would itself be the failure; the count is checked below.
+        if (prompts.push(request.prompt) > 1) return ok();
+        assert.match(git(request.cwd, "ls-files", "-u"), /\tcode\.txt$/mu);
+        assert.equal(readFileSync(join(request.cwd, "code.txt"), "utf8"), "newer\n");
+        if (action === "deletes") rmSync(join(request.cwd, "code.txt"));
+        return ok();
+      },
+      reviewer: request => { assert.equal(git(request.cwd, "ls-files", "-u"), ""); return review(); },
+    }, person());
+    assert.equal(result.state, "delivered");
+    assert.deepEqual(result.states.slice(0, 5), ["shape", "prepare", "change", "scopeAfterChange", "verify"]);
+    assert.equal(result.states.includes("repairBudget"), false);
+    // The prompt says what Git left for a conflict with no markers, so leaving it alone is a choice.
+    assert.equal(prompts.length, 1); assert.doesNotMatch(prompts[0]!, /git add/u);
+    assert.match(prompts[0]!, /"code\.txt"[^\n]*the current base's version/u);
+    onTip(f, tip);
+    if (action === "leaves") {
+      assert.equal(git(f.repo, "show", `${branch}:code.txt`), "newer");
+      assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+    } else {
+      assert.match(git(f.repo, "show", "--name-status", "--format=", branch), /^D\tcode\.txt$/mu);
+      assert.equal(git(f.repo, "ls-tree", "-r", "--name-only", branch).split("\n").includes("code.txt"), false);
+    }
+  });
+}
 
 test("a resumed candidate whose conflicts the implementer cannot settle within the repair budget asks the owner, naming the files and the saved candidate, which holds the work as it stood", async context => {
   const f = fixture(context); const again = await handOff(f); const started = f.head; const files = stood(f);
