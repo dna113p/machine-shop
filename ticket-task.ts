@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { closeSync, existsSync, lstatSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { Event, MachinePrimitives } from "@dna113p/machines";
+import { defineEndings, type Event, type MachinePrimitives } from "@dna113p/machines";
 import { taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
 import { brief, opening } from "./defaults/_machine-shop/brief.ts";
 import { outsideScope } from "./defaults/_machine-shop/scope.ts";
@@ -14,6 +14,11 @@ export const agentRoles = {
   reviewer: "Reviews evidence and the resulting change without editing",
 };
 
+export const endings = defineEndings({
+  delivered: { kind: "succeeded" }, merged: { kind: "succeeded" },
+  handedOff: { kind: "cancelled" }, abandoned: { kind: "cancelled" }, refused: { kind: "failed" },
+});
+
 const publishTimeoutMs = 120_000;
 // A sandboxed harness may be unable to start the project's checks at all. That is not a blocker: the checks are the workflow's to run.
 const cannotRun = "Run the checks you can. If your environment cannot run them, as when a sandbox refuses to start processes, say which and why in your summary and still return completed: the workflow runs every required check itself after you return. Return blocked only for something a person must decide or supply.";
@@ -24,6 +29,8 @@ const decisionOf = (value: unknown) => {
   return decisions.find(decision => decision === normalized);
 };
 const confirmations = ["confirm discard", "go back"] as const;
+const stepDecisions = ["retry", "hand off", "discard"] as const;
+const deliveryDecisions = ["retry", "hand off"] as const;
 const mergeDecisions = ["hand off", "discard"] as const;
 
 export default function ticketTask(p: MachinePrimitives, input: unknown) {
@@ -65,6 +72,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     ghFailures: 0,
     mergeReason: "",
     mergeDecision: "",
+    failedStep: "setup" as "setup" | "commit" | "rebase" | "deliver",
+    retryable: false,
+    mergeFailedIn: "" as "" | "cleanUp" | "dropLocal",
     localDeleted: false,
     remoteDeleted: false,
     // Where prepare found the base published: the remote's URL and the pull request base branch there, its default branch by name when the base names none.
@@ -182,6 +192,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }
     const remote = repository.output === "pr" ? published() : undefined;
     if (repository.output === "pr" && !remote) return { type: "blocked" };
+    if (repository.output === "pr" && !hostedRepository(saved.checked)) {
+      return work.block(`Remote ${repository.remote} does not name a hosted owner/repository, so a pull request cannot be opened there; ${saved.branch} was not pushed.`);
+    }
     const start = remote && run("git", ["merge-base", "--is-ancestor", current, remote], repository.path).ok ? remote : current;
     if (start !== current) {
       writeFileSync(join(work.open(), "base.json"), JSON.stringify({
@@ -223,11 +236,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     saved.baseCommit = start;
     if (!attempt("git", ["worktree", "add", "-b", saved.branch, worktree, saved.baseCommit], repository.path).ok) return { type: "blocked" };
     saved.created = true;
+    return { type: "created" };
+  }
+
+  function setup(): Event {
     // Git keeps the record with the branch: it follows a rename and goes when the branch is deleted.
-    if (!attempt("git", ["config", "--local", `branch.${saved.branch}.ticket`, ticket.slug], repository.path).ok) return { type: "blocked" };
-    if (!repository.setup.every(command => work.check(command, "setup"))) return { type: "blocked" };
+    if (!attempt("git", ["config", "--local", `branch.${saved.branch}.ticket`, ticket.slug], repository.path, undefined, undefined, true).ok) return stepFailure("setup", true);
+    if (!repository.setup.every(command => work.check(command, "setup"))) return stepFailure("setup", true);
     if (pending() !== "") {
-      return work.block("A setup command changed tracked or unignored files in the worktree; they would be committed with the ticket. Ignore its outputs in the repository.");
+      return stepFailure("setup", true, "A setup command changed tracked or unignored files in the worktree; they would be committed with the ticket. Ignore its outputs in the repository.");
     }
     return { type: "prepared" };
   }
@@ -523,24 +540,29 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
 
   function commit(): Event {
     if (git(worktree, "rev-parse", "HEAD") !== saved.baseCommit || run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${saved.branch}`) {
-      return work.block(`An Agent committed or moved HEAD or ${saved.branch} itself; only this workflow commits. Nothing was delivered.`);
+      return stepFailure("commit", false, `An Agent committed or moved HEAD or ${saved.branch} itself; only this workflow commits. Nothing was delivered.`);
     }
-    if (!work.accept()) return { type: "blocked" };
+    if (!work.accept()) return stepFailure("commit", false);
+    const index = git(worktree, "write-tree");
     // Unstaging afterwards also drops run evidence an Agent staged by force; an exclude pathspec fails outright on an ignored .machine-runs.
     git(worktree, "add", "--all");
     git(worktree, "reset", "--quiet", "--", ".machine-runs");
-    if (run("git", ["diff", "--cached", "--quiet"], worktree).ok) return work.block("Nothing to commit: the approved candidate does not differ from its base commit.");
+    if (run("git", ["diff", "--cached", "--quiet"], worktree).ok) return stepFailure("commit", false, "Nothing to commit: the approved candidate does not differ from its base commit.");
     const tree = git(worktree, "write-tree");
-    if (!attempt("git", ["commit", "--quiet", "-m", ticket.title, "-m", `Ticket: ${ticket.id}`], worktree).ok) return { type: "blocked" };
+    if (!attempt("git", ["commit", "--quiet", "-m", ticket.title, "-m", `Ticket: ${ticket.id}`], worktree, undefined, undefined, true).ok) {
+      // Restore the pre-commit index so accept() can compare the same verified candidate on retry.
+      git(worktree, "read-tree", index);
+      return stepFailure("commit", true);
+    }
     // Commit hooks run, but only the approved tree under the ticket's own message may be delivered.
     const [origin, subject, ...body] = git(worktree, "log", "-1", "--no-show-signature", "--format=%T %P%n%s%n%b").split("\n");
     if (origin !== `${tree} ${saved.baseCommit}` || pending() !== "" || subject !== ticket.title || !body.some(line => flat(line) === flat(`Ticket: ${ticket.id}`))) {
-      return work.block(`A commit hook or Git configuration changed the approved candidate or its commit message; ${saved.branch} holds that unapproved commit and nothing was delivered.`);
+      return stepFailure("commit", false, `A commit hook or Git configuration changed the approved candidate or its commit message; ${saved.branch} holds that unapproved commit and nothing was delivered.`);
     }
     const head = git(worktree, "rev-parse", "HEAD");
     // A hook can also detach HEAD or reset the branch; the ticket branch itself must hold the approved commit.
     if (run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${saved.branch}` || git(repository.path, "rev-parse", `refs/heads/${saved.branch}`) !== head) {
-      return work.block(`A commit hook or Git configuration moved HEAD or ${saved.branch} away from the approved commit; nothing was delivered.`);
+      return stepFailure("commit", false, `A commit hook or Git configuration moved HEAD or ${saved.branch} away from the approved commit; nothing was delivered.`);
     }
     saved.commitHash = head;
     saved.firstApproved ??= { baseCommit: saved.baseCommit, commit: head };
@@ -603,7 +625,11 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (!resolved.ok || tip === original) {
       if (saved.untested) {
         if (!resolved.ok) return withdraw("the current base no longer resolves");
-        if (work.checks().type !== "passed" || !work.accept()) return withdraw("verification gates failed on the delivered commit");
+        if (work.checks().type !== "passed" || !work.accept()) {
+          undo(original); work.reopen(true); saved.repairing = "change";
+          saved.reviewsFrom = saved.reviews.length; saved.taken = "";
+          return { type: "failed" };
+        }
         saved.untested = false;
         saved.redelivered = true;
       }
@@ -625,7 +651,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     };
     if (!run("git", ["merge-base", "--is-ancestor", original, tip], repository.path).ok) {
       undo(original);
-      return work.block(`Base ${original} was rewritten or moved back to ${tip}; the ticket must be delivered by hand.`);
+      return stepFailure("rebase", false, `Base ${original} was rewritten or moved back to ${tip}; the ticket must be delivered by hand.`);
     }
     if (repository.output === "pr") {
       remote ??= readRemoteTip();
@@ -758,36 +784,38 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   function deliver(): Event {
     const directory = work.open();
     if (repository.output === "patch") {
-      const made = attempt("git", ["format-patch", "--output-directory", directory, `${saved.baseCommit}..HEAD`], worktree);
-      if (!made.ok) return { type: "blocked" };
+      const made = attempt("git", ["format-patch", "--output-directory", directory, `${saved.baseCommit}..HEAD`], worktree, undefined, undefined, true);
+      if (!made.ok) return stepFailure("deliver", true);
       saved.patches = made.stdout.split("\n").filter(Boolean);
     }
     if (repository.output === "pr") {
       // gh must open the pull request in the repository the push went to, whatever GH_REPO or other remotes say.
       const hosted = hostedRepository(saved.checked);
-      if (!hosted) return work.block(`Remote ${repository.remote} does not name a hosted owner/repository, so a pull request cannot be opened there; ${saved.branch} was not pushed.`);
+      if (!hosted) throw new Error("Prepared pull request remote no longer names a hosted repository");
       // The only ref ever pushed is this run's own branch at the approved commit, without force and whatever push.followTags says.
       // It goes to the URL prepare checked, read once: a remote reconfigured since then, as an Agent can do, is not asked again.
-      if (!attempt("git", ["push", "--no-follow-tags", saved.checked, `${saved.commitHash}:refs/heads/${saved.branch}`], worktree, publishTimeoutMs).ok) return { type: "blocked" };
-      const body = join(directory, "pull-request.md");
-      writeFileSync(body, [
-        ticket.title,
-        ...(ticket.summary ? ["## Summary", ticket.summary] : []),
-        ...(saved.assumptions.length ? ["## Assumptions", saved.assumptions.map(({ question, answer, why }) => `- ${flat(question)} Assumed: ${flat(answer)} (${flat(why)})`).join("\n")] : []),
-        "## Checks", repository.checks.map(name => `- ${name}: passed${(saved.task.flaky ?? []).includes(name) ? " (flaky: failed once, passed when run again alone)" : ""}`).join("\n"),
-        // The helper has already taken the summary out of a JSON report; one that is still an object is evidence, not text for a reader.
-        "## Review", jsonObject(saved.reviewSummary) ? "The reviewer approved this change without a written summary; its report is kept with the run evidence." : saved.reviewSummary,
-        ...(saved.reviewNotes.length ? ["## Review notes", saved.reviewNotes.map(note => `- ${flat(note.text)}${flat(note.where) ? ` (${flat(note.where)})` : ""}`).join("\n")] : []),
-        `Ticket: ${ticket.id}`,
-      ].join("\n\n") + "\n", { flag: "wx", mode: 0o600 });
-      // The base is always named, and is the one prepare compared with the remote, not one read again from refs or configuration that may have changed since.
-      const opened = attempt("gh", ["pr", "create", "--repo", hosted, ...(repository.draft ? ["--draft"] : []), "--base", saved.checkedBase,
-        "--head", saved.branch, "--title", ticket.title, "--body-file", body], worktree, publishTimeoutMs);
-      if (!opened.ok) return { type: "blocked" };
-      saved.prUrl = opened.stdout.split(/\s+/u).findLast(word => /^https?:\/\/\S+$/u.test(word)) ?? "";
-      if (!saved.prUrl) return work.block(`gh pr create printed no pull request URL; inspect ${saved.branch} on ${repository.remote}.`);
+      if (!attempt("git", ["push", "--no-follow-tags", saved.checked, `${saved.commitHash}:refs/heads/${saved.branch}`], worktree, publishTimeoutMs, undefined, true).ok) return stepFailure("deliver", true, undefined, "unreachable");
+      if (!saved.prUrl) {
+        const body = join(directory, "pull-request.md");
+        writeFileSync(body, [
+          ticket.title,
+          ...(ticket.summary ? ["## Summary", ticket.summary] : []),
+          ...(saved.assumptions.length ? ["## Assumptions", saved.assumptions.map(({ question, answer, why }) => `- ${flat(question)} Assumed: ${flat(answer)} (${flat(why)})`).join("\n")] : []),
+          "## Checks", repository.checks.map(name => `- ${name}: passed${(saved.task.flaky ?? []).includes(name) ? " (flaky: failed once, passed when run again alone)" : ""}`).join("\n"),
+          // The helper has already taken the summary out of a JSON report; one that is still an object is evidence, not text for a reader.
+          "## Review", jsonObject(saved.reviewSummary) ? "The reviewer approved this change without a written summary; its report is kept with the run evidence." : saved.reviewSummary,
+          ...(saved.reviewNotes.length ? ["## Review notes", saved.reviewNotes.map(note => `- ${flat(note.text)}${flat(note.where) ? ` (${flat(note.where)})` : ""}`).join("\n")] : []),
+          `Ticket: ${ticket.id}`,
+        ].join("\n\n") + "\n", { mode: 0o600 });
+        // The base is always named, and is the one prepare compared with the remote, not one read again from refs or configuration that may have changed since.
+        const opened = attempt("gh", ["pr", "create", "--repo", hosted, ...(repository.draft ? ["--draft"] : []), "--base", saved.checkedBase,
+          "--head", saved.branch, "--title", ticket.title, "--body-file", body], worktree, publishTimeoutMs, undefined, true);
+        if (!opened.ok) return stepFailure("deliver", true, undefined, "unreachable");
+        saved.prUrl = opened.stdout.split(/\s+/u).findLast(word => /^https?:\/\/\S+$/u.test(word)) ?? "";
+        if (!saved.prUrl) return stepFailure("deliver", true, `gh pr create printed no pull request URL; inspect ${saved.branch} on ${repository.remote}.`);
+      }
     }
-    if (!attempt("git", ["config", "--local", `branch.${saved.branch}.ticketDelivered`, saved.commitHash], repository.path).ok) return { type: "blocked" };
+    if (!attempt("git", ["config", "--local", `branch.${saved.branch}.ticketDelivered`, saved.commitHash], repository.path, undefined, undefined, true).ok) return stepFailure("deliver", true);
     return { type: "delivered" };
   }
 
@@ -874,34 +902,34 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const name = archiveBranch();
     const failure = "The candidate could not be archived, so nothing was removed";
     if (run("git", ["show-ref", "--verify", "--quiet", `refs/heads/${name}`], repository.path).ok) {
-      return work.block(`${failure}: branch ${name} already exists in ${repository.path}, and nothing was staged.`);
+      throw new Error(`${failure}: branch ${name} already exists in ${repository.path}, and nothing was staged.`);
     }
     // Whether the candidate still matches its checks is settled here; the archive commit is this workflow's own and is not drift.
     work.retire();
     // Staged as commit stages it, so ignored files stay out here as they would have there.
-    if (!attempt("git", ["add", "--all"], worktree, undefined, failure).ok || !attempt("git", ["reset", "--quiet", "--", ".machine-runs"], worktree, undefined, failure).ok) return { type: "blocked" };
+    if (!attempt("git", ["add", "--all"], worktree, undefined, failure).ok || !attempt("git", ["reset", "--quiet", "--", ".machine-runs"], worktree, undefined, failure).ok) throw new Error(work.status().reason);
     const head = () => git(worktree, "rev-parse", "HEAD");
     const parent = head();
     if (run("git", ["diff", "--cached", "--quiet"], worktree).ok) {
       // Removal without anything saved belongs to a confirmed discard alone. Commits an Agent made on the branch are a candidate, archived as they are.
-      if (parent === saved.baseCommit) return work.block(`${failure}: the candidate does not differ from its base commit ${saved.baseCommit}, so there is nothing to archive; discard removes it.`);
+      if (parent === saved.baseCommit) throw new Error(`${failure}: the candidate does not differ from its base commit ${saved.baseCommit}, so there is nothing to archive; discard removes it.`);
     } else {
       const tree = git(worktree, "write-tree"); const title = `Archive: ${ticket.title}`;
-      if (!attempt("git", ["commit", "--quiet", "--no-verify", "-m", title, "-m", `Ticket: ${ticket.id}`], worktree, undefined, failure).ok) return { type: "blocked" };
+      if (!attempt("git", ["commit", "--quiet", "--no-verify", "-m", title, "-m", `Ticket: ${ticket.id}`], worktree, undefined, failure).ok) throw new Error(work.status().reason);
       // --no-verify skips only the hooks that can refuse a commit. One that runs after it can reset HEAD and leave a clean worktree without the candidate.
       const [origin, subject, ...body] = git(worktree, "log", "-1", "--no-show-signature", "--format=%T %P%n%s%n%b").split("\n");
       if (origin !== `${tree} ${parent}`) {
-        return work.block(`${failure}: a commit hook or Git configuration moved HEAD off the archive commit or changed what it holds, so ${name} would not hold the candidate; HEAD is at ${head()}.`);
+        throw new Error(`${failure}: a commit hook or Git configuration moved HEAD off the archive commit or changed what it holds, so ${name} would not hold the candidate; HEAD is at ${head()}.`);
       }
       // One that prepares the message still runs too, and the archive is found again by its subject and its ticket.
       if (subject !== title || !body.some(line => flat(line) === flat(`Ticket: ${ticket.id}`))) {
-        return work.block(`${failure}: a commit hook or Git configuration changed the archive commit's message, so ${name} would not name the ticket; HEAD is at ${head()}, which holds the candidate.`);
+        throw new Error(`${failure}: a commit hook or Git configuration changed the archive commit's message, so ${name} would not name the ticket; HEAD is at ${head()}, which holds the candidate.`);
       }
     }
     // Whatever the commit left behind would be deleted with the worktree.
-    if (pending() !== "") return work.block(`${failure}: the worktree is not clean after the archive commit, so ${name} would not hold all of the candidate.`);
+    if (pending() !== "") throw new Error(`${failure}: the worktree is not clean after the archive commit, so ${name} would not hold all of the candidate.`);
     const commit = head();
-    if (!attempt("git", ["branch", name, commit], worktree, undefined, failure).ok) return { type: "blocked" };
+    if (!attempt("git", ["branch", name, commit], worktree, undefined, failure).ok) throw new Error(work.status().reason);
     saved.archived = { branch: name, commit };
     return { type: "archived" };
   }
@@ -910,15 +938,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   function remove(): Event {
     if (!saved.archived && !saved.discardConfirmed) throw new Error("The worktree and branch are removed only after an archive or a confirmed discard");
     work.retire();
-    if (!attempt("git", ["worktree", "remove", "--force", worktree], repository.path).ok) return { type: "blocked" };
+    if (!attempt("git", ["worktree", "remove", "--force", worktree], repository.path).ok) throw new Error(work.status().reason);
     saved.removed = true;
-    if (!attempt("git", ["branch", "-D", saved.branch], repository.path).ok) return { type: "blocked" };
+    if (!attempt("git", ["branch", "-D", saved.branch], repository.path).ok) throw new Error(work.status().reason);
     return { type: "removed" };
   }
 
-  function conclude(wanted: "completed" | "blocked" | "handed-off" | "abandoned"): Event {
+  function conclude(wanted: "completed" | "refused" | "handed-off" | "abandoned"): Event {
     const result = `${saved.branch} at ${saved.commitHash}${saved.prUrl ? `, pull request ${saved.prUrl}` : ""}${saved.patches.length ? `, patch ${saved.patches.join(", ")}` : ""}`;
-    // The branch outlives the worktree; a blocked run keeps both for inspection, and a worktree that stays behind is not a delivery.
+    // Delivery succeeds even when its worktree must be kept for manual cleanup.
     if (wanted === "completed") {
       saved.removed = attempt("git", ["worktree", "remove", worktree], repository.path, undefined,
         `The worktree could not be removed after delivering ${result}`).ok;
@@ -926,8 +954,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     // A kept worktree the helper cannot fingerprint any more, as with a nested repository, still gets its ending recorded.
     work.retire();
     // The helper's receipt knows completed and blocked; delivery.json carries what a Human decided.
-    const finished = work.finish(wanted === "completed" && saved.removed ? "completed" : "blocked").type === "completed";
-    const outcome = finished ? "delivered" : wanted === "completed" ? "blocked" : wanted;
+    const finished = work.finish(wanted === "completed" ? "completed" : "blocked").type === "completed";
+    const outcome = finished ? "delivered" : wanted === "completed" ? "refused" : wanted;
     const directory = work.open();
     const reason = finished ? "" : String(work.output()?.reason);
     writeFileSync(join(directory, "delivery.json"), JSON.stringify({
@@ -942,17 +970,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     const reasonBrief = flat(reason).replace(/^(.{600}).+$/u, "$1…").replace(/[^.!?…]$/u, "$&.");
     saved.held = { action: "hold", summary: [
-      { delivered: `Delivered ${result}.`, blocked: `Blocked: ${reasonBrief}`, "handed-off": `Handed off: ${summaryReason(reason, asking(reason))}`, abandoned: `Abandoned: ${reasonBrief}` }[outcome],
+      { delivered: `Delivered ${result}.`, refused: `Refused: ${reasonBrief}`, "handed-off": `Handed off: ${summaryReason(reason, asking(reason))}`, abandoned: `Abandoned: ${reasonBrief}` }[outcome],
       ...(finished && saved.taken ? [saved.redelivered ? "The base has not moved, so the same commit was delivered again unchanged."
         : `The delivered commit ${saved.taken} was replayed onto the new base ${saved.baseCommit}.`] : []),
       ...(saved.decision ? [`Decision: ${saved.decision}.`] : []),
       ...(saved.archived ? [`Candidate archived on ${saved.archived.branch} at ${saved.archived.commit}.`] : []),
       ...(outcome === "abandoned" ? [`Worktree and ${saved.branch} removed${saved.archived ? "" : " without saving the candidate"}.`] : []),
       ...(outcome === "handed-off" ? [`Branch: ${saved.branch}.`] : []),
-      ...((saved.created || saved.adopted) && !saved.removed ? [`Worktree kept at ${worktree}.`] : []),
+      ...((saved.created || saved.adopted) && !saved.removed ? [`Worktree kept at ${worktree}${finished ? `; it could not be removed: inspect ${directory}/git-worktree.log.` : "."}`] : []),
       `Evidence: ${directory}`,
     ].join(" ") };
-    return { type: outcome === "handed-off" ? "handedOff" : outcome };
+    return { type: outcome === "handed-off" ? "handedOff" : outcome === "delivered" && !saved.removed ? "kept" : outcome };
   }
 
   function checkMerge(): Event {
@@ -981,8 +1009,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     // A run continued after a crash may find the branch already deleted; only Git's clean "no such ref" skips the delete.
     const shown = run("git", ["show-ref", "--verify", "--quiet", `refs/heads/${saved.branch}`], repository.path);
     const missing = !shown.ok && shown.status === 1 && !shown.detail;
-    if (!shown.ok && !missing) return work.block(`git show-ref could not tell whether ${saved.branch} exists: ${shown.detail || `exit ${shown.status}`}`);
-    if (!missing && !attempt("git", ["branch", "-D", saved.branch], repository.path, undefined, undefined, true).ok) return { type: "blocked" };
+    if (!shown.ok && !missing) return mergeFailure(`git show-ref could not tell whether ${saved.branch} exists: ${shown.detail || `exit ${shown.status}`}`);
+    if (!missing && !attempt("git", ["branch", "-D", saved.branch], repository.path, undefined, undefined, true).ok) return { type: "failed" };
     saved.localDeleted = true;
     return { type: "removed" };
   }
@@ -992,7 +1020,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const ref = `refs/heads/${saved.branch}`;
     const listArgs = ["ls-remote", "--heads", saved.checked, ref];
     const listed = attempt("git", listArgs, repository.path, publishTimeoutMs, undefined, true);
-    if (!listed.ok) return { type: "blocked" };
+    if (!listed.ok) return { type: "failed" };
     if (listed.stdout) {
       const args = ["push", "--no-follow-tags", saved.checked, "--delete", ref];
       const deleted = run("git", args, repository.path, publishTimeoutMs);
@@ -1001,19 +1029,20 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         const remaining = attempt("git", listArgs, repository.path, publishTimeoutMs, undefined, true);
         const log = join(work.open(), "git-push.log");
         writeFileSync(log, `git ${args.join(" ")}\n${deleted.stdout}\n${deleted.detail}\n`, { mode: 0o600 });
-        if (!remaining.ok) return { type: "blocked" };
-        if (remaining.stdout) return work.block(`git push failed deleting ${saved.branch}; inspect ${log}`);
+        if (!remaining.ok) return { type: "failed" };
+        if (remaining.stdout) return mergeFailure(`git push failed deleting ${saved.branch}; inspect ${log}`);
       }
     }
     saved.remoteDeleted = true;
-    if (dropLocal().type === "blocked") return { type: "blocked" };
+    if (dropLocal().type === "failed") return { type: "failed" };
     return settle("merged");
   }
 
   // Delivery and result receipts were already written before waiting; this receipt records the later ending, and a continued run may write it again.
-  function settle(outcome: "merged" | "handedOff" | "abandoned" | "blocked"): Event {
+  function settle(outcome: "merged" | "handedOff" | "abandoned"): Event {
     const directory = work.open();
-    const reason = outcome === "blocked" ? work.status().reason : saved.mergeReason;
+    const reason = saved.mergeReason;
+    const remoteKept = saved.remoteDeleted ? `The pushed branch was already deleted on ${repository.remote}.` : `The pushed branch is kept on ${repository.remote}.`;
     writeFileSync(join(directory, "merge.json"), JSON.stringify({
       schemaVersion: 1, outcome, prUrl: saved.prUrl, branch: saved.branch, checks: saved.mergeChecks,
       ghFailures: saved.ghFailures, localDeleted: saved.localDeleted, remoteDeleted: saved.remoteDeleted,
@@ -1021,9 +1050,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }, null, 2) + "\n", { mode: 0o600 });
     const ending = {
       merged: `Merged ${saved.prUrl}; deleted ${saved.branch} locally and on ${repository.remote}.`,
-      handedOff: `${reason ? `Handed off: ${summaryReason(reason)}` : "Handed off."} Pull request: ${saved.prUrl}. Branch: ${saved.branch}, kept locally and on ${repository.remote}.`,
-      abandoned: `${reason ? `Abandoned: ${summaryReason(reason)}` : "Abandoned."} Pull request: ${saved.prUrl}. Branch: ${saved.branch}, deleted locally; the pushed branch is kept on ${repository.remote}.`,
-      blocked: `${reason ? `Blocked after delivery: ${summaryReason(reason)}` : "Blocked after delivery."} Pull request: ${saved.prUrl}. Branch: ${saved.branch}; local branch ${saved.localDeleted ? "deleted" : "kept"}; remote branch ${saved.remoteDeleted ? "deleted" : "not confirmed deleted"}.`,
+      handedOff: `${reason ? `Handed off: ${summaryReason(reason)}` : "Handed off."} Pull request: ${saved.prUrl}. Branch: ${saved.branch}, ${saved.remoteDeleted ? `kept locally. ${remoteKept}` : `kept locally and on ${repository.remote}.`}`,
+      abandoned: `${reason ? `Abandoned: ${summaryReason(reason)}` : "Abandoned."} Pull request: ${saved.prUrl}. Branch: ${saved.branch}, deleted locally${saved.remoteDeleted ? `. ${remoteKept}` : `; the pushed branch is kept on ${repository.remote}.`}`,
     }[outcome];
     saved.held = { action: outcome === "merged" ? "complete" : "hold", summary: `${ending} Evidence: ${directory}` };
     return { type: outcome };
@@ -1031,12 +1059,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
 
   const mergePrompt = (confirm = false) => brief({
     decision: confirm ? `Discard the local branch for ticket ${ticket.id}?` : `Decide what happens to ticket ${ticket.id}`,
-    standing: `${saved.mergeReason}\nPull request: ${saved.prUrl}\nBranch: ${saved.branch}\nThe worktree has already been removed. The pushed branch will be kept.`,
+    standing: `${saved.mergeReason}\nPull request: ${saved.prUrl}\nBranch: ${saved.branch}\nThe worktree has already been removed. ${saved.remoteDeleted ? "The pushed branch has already been deleted." : "The pushed branch will be kept."}`,
     evidence: [`Evidence: ${work.open()}`],
     options: confirm ? [
       { name: "confirm discard", does: `delete only the local branch ${saved.branch} in ${repository.path}.` },
       { name: "go back", does: "return to the decision with the branch kept." },
     ] : [
+      ...(saved.mergeFailedIn ? [{ name: "retry", does: `rerun ${saved.mergeFailedIn} only.` }] : []),
       { name: "hand off", does: "keep the branch and leave the ticket open for someone else.", recommended: true },
       { name: "discard", does: "delete only the local branch after confirmation and leave the ticket open." },
     ],
@@ -1267,13 +1296,52 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (saved.standingReview !== null) work.block(saved.standingReview);
     saved.standingReview = null;
   };
+  /** Expected failures retain the error and select only recovery choices that can act. */
+  function stepFailure(step: typeof saved.failedStep, retryable: boolean, reason?: string, type = "failed"): Event {
+    saved.failedStep = step; saved.retryable = retryable;
+    if (reason !== undefined) work.block(reason);
+    return { type: step === "rebase" ? "handBack" : type };
+  }
+  const stepChoices = () => saved.failedStep === "deliver" ? deliveryDecisions : saved.retryable ? stepDecisions : mergeDecisions;
+  const stepPrompt = (confirm = false) => brief({
+    decision: confirm ? `Discard the candidate for ticket ${ticket.id}?` : `Ticket ${ticket.id}: ${saved.failedStep} failed`,
+    standing: `${saved.failedStep}: ${work.status().reason}${confirm ? "\nThe candidate will not be saved: its uncommitted and committed work will be lost." : ""}`,
+    evidence: locations(),
+    options: confirm ? [
+      { name: "confirm discard", does: `remove the worktree ${worktree} and delete the branch ${saved.branch}.` },
+      { name: "go back", does: "return to the decision with the candidate kept." },
+    ] : stepChoices().map(name => ({ name, does: {
+      retry: `rerun ${saved.failedStep} only after its error is resolved.`,
+      "hand off": "keep the worktree and branch for another workflow or a person.",
+      discard: "remove the worktree and branch without saving the candidate, after confirmation.",
+    }[name] })),
+  });
+  function stepFailed(): Event {
+    writeFileSync(join(work.open(), `question-${++saved.questions}.txt`), stepPrompt() + "\n", { mode: 0o600 });
+    return { type: saved.failedStep === "deliver" ? "delivery" : saved.retryable ? "retryable" : "keep" };
+  }
+  const stepDecision = (stage: string, choices: readonly string[]) => ({ event }: { event: Event }) => {
+    const choice = work.choice(stage, event, choices);
+    if (choice === "hand off" || choice === "discard") saved.decision = choice;
+  };
+  function mergeFailure(reason: string): Event { work.block(reason); return { type: "failed" }; }
+  const mergeStep = (step: "cleanUp" | "dropLocal", run: () => Event) => () => {
+    const result = run();
+    if (result.type === "failed") saved.mergeFailedIn = step;
+    return result;
+  };
+  const mergeRetryDecision = ({ event }: { event: Event }) => {
+    const choice = work.choice("mergeRetryDecide", event, stepDecisions);
+    if (choice !== "retry") saved.mergeDecision = choice;
+  };
   const mergeDecide = ({ event }: { event: Event }) => { saved.mergeDecision = work.choice("mergeDecide", event, mergeDecisions); };
   return machine({
     initial: "shape", output: () => saved.held ?? undefined,
     states: {
-      shape: operation(shape, { prepared: "prepare", blocked: "failure" }),
+      shape: operation(shape, { prepared: "prepare", blocked: "refuse" }),
       // A clean resume starts planning afresh. A resumed candidate is held to Scope; red cannot be proved again once implemented.
-      prepare: operation(stopped("prepare", prepare), { prepared: "start", resumed: "scopeAfterChange", conflicted: "change", stuck: "stuck", redeliver: "rebase", blocked: "failure" }),
+      prepare: operation(stopped("prepare", prepare), { prepared: "start", resumed: "scopeAfterChange", conflicted: "change", stuck: "stuck", redeliver: "rebase", blocked: "refuse", created: "setup" }),
+      setup: operation(setup, { prepared: "start", failed: "stepFailed" }),
       start: operation(work.start, { started: "falsify" }),
       falsify: agent(() => prompt([
         "Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 entries shaped as { text, options: string[], recommended: string, assumable: boolean, why }, giving the exact questions a person could answer. text and why must be non-empty strings; options must be a non-empty array of non-empty strings; recommended must copy one of those options exactly. Mark assumable true only for a gap whose conservative answer loses nothing if wrong: it stops, refuses, or keeps more. A product decision, a change of scope, or anything irreversible is never assumable.",
@@ -1383,7 +1451,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       repairBudget: operation(stopped("repairBudget", work.repair), { retry: "repairTarget", exhausted: "stuck" }),
       repairTarget: operation(() => ({ type: saved.repairing }), { falsify: "falsify", plan: "plan", planReview: "planReview", test: "test", change: "change" }),
       reviewBudget: operation(stopped("reviewBudget", reviewBudget), { retry: "change", exhausted: "stuck" }),
-      // Preparation, commit, and delivery failures still end blocked by themselves.
+      // Budget and review stops keep their existing question and continuation rules.
       stuck: operation(() => {
         writeFileSync(join(work.open(), `question-${++saved.questions}.txt`), stuckPrompt() + "\n", { mode: 0o600 });
         return { type: "ask" };
@@ -1405,15 +1473,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           { target: "stuck", actions: ({ event }: { event: Event }) => { work.choice("confirmDiscard", event, confirmations); } },
         ],
       }, { choices: confirmations }),
-      archive: operation(archive, { archived: "remove", blocked: "failure" }),
-      remove: operation(remove, { removed: "abandon", blocked: "failure" }),
-      commit: operation(commit, { committed: "rebase", blocked: "failure" }),
-      rebase: operation(stopped("rebase", rebase), { current: "deliver", rebased: "deliver", review: "verify", failed: "repairBudget", stuck: "stuck", blocked: "failure" }),
-      deliver: operation(deliver, { delivered: "success", blocked: "failure" }),
-      success: operation(() => conclude("completed"), { delivered: repository.output === "pr" ? "checkMerge" : "delivered", blocked: "blocked" }),
+      archive: operation(archive, { archived: "remove" }),
+      remove: operation(remove, { removed: "abandon" }),
+      commit: operation(commit, { committed: "rebase", failed: "stepFailed" }),
+      rebase: operation(stopped("rebase", rebase), { current: "deliver", rebased: "deliver", review: "verify", failed: "repairBudget", stuck: "stuck", blocked: "refuse", handBack: "stepFailed" }),
+      deliver: operation(deliver, { delivered: "success", unreachable: "stepFailed", failed: "stepFailed" }, { retry: { on: "unreachable", times: 3, wait: "1m" } }),
+      success: operation(() => conclude("completed"), { delivered: repository.output === "pr" ? "checkMerge" : "delivered", kept: "delivered", refused: "refused" }),
       checkMerge: operation(checkMerge, { merged: "cleanUp", waiting: "awaitMerge", decide: "mergeDecide" }),
       awaitMerge: wait({ every: "10m" }, { due: "checkMerge" }),
-      cleanUp: operation(cleanUp, { merged: "merged", blocked: "mergeFailure" }),
+      cleanUp: operation(mergeStep("cleanUp", cleanUp), { merged: "merged", failed: "mergeFailed" }, { retry: { on: "failed", times: 3, wait: "1m" } }),
       mergeDecide: human(() => mergePrompt(), {
         submitted: [
           { guard: chose("hand off"), target: "mergeHandOff", actions: mergeDecide },
@@ -1423,17 +1491,57 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       confirmMergeDiscard: human(() => mergePrompt(true), {
         submitted: [
           { guard: chose("confirm discard"), target: "dropLocal", actions: ({ event }: { event: Event }) => { work.choice("confirmMergeDiscard", event, confirmations); } },
+          { guard: () => !!saved.mergeFailedIn, target: "mergeRetryDecide", actions: ({ event }: { event: Event }) => { work.choice("confirmMergeDiscard", event, confirmations); } },
           { target: "mergeDecide", actions: ({ event }: { event: Event }) => { work.choice("confirmMergeDiscard", event, confirmations); } },
         ],
       }, { choices: confirmations }),
-      dropLocal: operation(dropLocal, { removed: "mergeAbandon", blocked: "mergeFailure" }),
+      dropLocal: operation(mergeStep("dropLocal", dropLocal), { removed: "mergeAbandon", failed: "mergeFailed" }, { retry: { on: "failed", times: 3, wait: "1m" } }),
       mergeHandOff: operation(() => settle("handedOff"), { handedOff: "handedOff" }),
       mergeAbandon: operation(() => settle("abandoned"), { abandoned: "abandoned" }),
-      mergeFailure: operation(() => settle("blocked"), { blocked: "blocked" }),
-      failure: operation(() => conclude("blocked"), { delivered: "delivered", blocked: "blocked" }),
+      mergeFailed: operation(() => {
+        saved.mergeReason = work.status().reason;
+        writeFileSync(join(work.open(), `question-${++saved.questions}.txt`), mergePrompt() + "\n", { mode: 0o600 });
+        return { type: "ask" };
+      }, { ask: "mergeRetryDecide" }),
+      mergeRetryDecide: human(() => mergePrompt(), {
+        submitted: [
+          { guard: chose("retry"), target: "retryMergeStep", actions: mergeRetryDecision },
+          { guard: chose("hand off"), target: "mergeHandOff", actions: mergeRetryDecision },
+          { target: "confirmMergeDiscard", actions: mergeRetryDecision },
+        ],
+      }, { choices: stepDecisions }),
+      retryMergeStep: operation(() => ({ type: saved.mergeFailedIn }), { cleanUp: "cleanUp", dropLocal: "dropLocal" }),
+      stepFailed: operation(stepFailed, { delivery: "deliverDecide", retryable: "stepDecide", keep: "keepDecide" }),
+      stepDecide: human(() => stepPrompt(), {
+        submitted: [
+          { guard: chose("retry"), target: "retryStep", actions: stepDecision("stepDecide", stepDecisions) },
+          { guard: chose("hand off"), target: "handOff", actions: stepDecision("stepDecide", stepDecisions) },
+          { target: "confirmStepDiscard", actions: stepDecision("stepDecide", stepDecisions) },
+        ],
+      }, { choices: stepDecisions }),
+      keepDecide: human(() => stepPrompt(), {
+        submitted: [
+          { guard: chose("hand off"), target: "handOff", actions: stepDecision("keepDecide", mergeDecisions) },
+          { target: "confirmStepDiscard", actions: stepDecision("keepDecide", mergeDecisions) },
+        ],
+      }, { choices: mergeDecisions }),
+      deliverDecide: human(() => stepPrompt(), {
+        submitted: [
+          { guard: chose("retry"), target: "retryStep", actions: stepDecision("deliverDecide", deliveryDecisions) },
+          { target: "handOff", actions: stepDecision("deliverDecide", deliveryDecisions) },
+        ],
+      }, { choices: deliveryDecisions }),
+      retryStep: operation(() => ({ type: saved.failedStep }), { setup: "setup", commit: "commit", deliver: "deliver" }),
+      confirmStepDiscard: human(() => stepPrompt(true), {
+        submitted: [
+          { guard: chose("confirm discard"), target: "remove", actions: ({ event }: { event: Event }) => { work.choice("confirmStepDiscard", event, confirmations); saved.discardConfirmed = true; } },
+          { target: "stepFailed", actions: ({ event }: { event: Event }) => { work.choice("confirmStepDiscard", event, confirmations); } },
+        ],
+      }, { choices: confirmations }),
+      refuse: operation(() => conclude("refused"), { refused: "refused" }),
       handOff: operation(() => conclude("handed-off"), { handedOff: "handedOff" }),
       abandon: operation(() => conclude("abandoned"), { abandoned: "abandoned" }),
-      delivered: final(), merged: final(), blocked: final(), handedOff: final(), abandoned: final(),
+      delivered: final(endings.delivered), merged: final(endings.merged), refused: final(endings.refused), handedOff: final(endings.handedOff), abandoned: final(endings.abandoned),
     },
   });
 }

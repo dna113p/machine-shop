@@ -102,7 +102,8 @@ checkout, so commit setup changes first.
 - **One project.** The launch `cwd` and the input's `workspace` must be the
   same project. MCP and Pi take the same JSON input.
 - **Read the result.** Check the final state and the JSON output, not just the
-  exit code. A run that ends `blocked` did not do the task.
+  exit code. A default ending `blocked` or a ticket ending `refused` did not
+  do the task.
 - **From source.** A definition also runs straight from this checkout:
   `machine run /absolute/machine-shop/defaults/verify-checks.ts --input-file …`.
 
@@ -123,7 +124,7 @@ machine run /absolute/machine-shop/ticket-task.ts \
 ```
 
 The ticket body needs `## Goal`, `## Scope`, `## Acceptance`, and `## Forbidden`.
-A missing section blocks before any Agent runs.
+A missing section ends `refused`, a declared failed ending, before any Agent runs.
 
 ### How a run goes
 
@@ -189,6 +190,12 @@ go to its implementer, then through the normal scope check, checks, and review.
 
 ### How it ends
 
+Expected failures use [recovery by step](docs/workflows/ticket-task.md#recovery-by-step):
+push and merge cleanup retry three times at one-minute intervals, then ask.
+Setup and commit failures ask the choices that can act on that candidate.
+
+- **Refused:** malformed tickets and preparation refusals end `refused` with the reason.
+- **Worktree kept after delivery:** ends `delivered` at once, naming the leftover path and cleanup log.
 - **Branch or patch:** ends `delivered` with `{ "action": "hold", "summary": "…" }`,
   keeping the Dispatch ticket open.
 - **Pull request:** after opening it and removing the worktree, the run checks
