@@ -14,7 +14,7 @@
     "smoke:install": "node --test tests/install.test.ts"
   },
   "devDependencies": {
-    "@dna113p/machines": "^0.4.0",
+    "@dna113p/machines": "^0.6.0",
     "@types/node": "^24.0.0",
     "typescript": "^7.0.2"
   }

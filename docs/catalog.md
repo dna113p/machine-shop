@@ -42,6 +42,9 @@ Production migrations and publishing are deliberately not generic defaults.
 
 ## Recovery
 
+Ticket operations use [recovery by step](workflows/ticket-task.md#recovery-by-step),
+including bounded Operation retries and questions specific to each failed step.
+
 ### Failed checks
 
 After every gate has run, the shared check Operation runs each failed gate
@@ -426,8 +429,9 @@ is.
 
 | State | Work |
 | --- | --- |
-| `shape` | Validate the checkout and root paths; open evidence and block missing ticket sections or empty required lists before any Agent or worktree |
-| `prepare` | Resolve the base commit; for `pr`, check with the remote that the base is already published; `git worktree add -b` the branch, record the id slug with it, and run `setup` in the worktree; with `resume`, adopt the existing worktree and its branch, save any candidate and move onto a newer base before setup and checks: conflicts go to `change`, a cleanly applied candidate to `scopeAfterChange`, then `verify`, and no uncommitted change through `start` to `falsify`; with no worktree, a recorded delivered commit is recreated and set up, then continues at `rebase` |
+| `shape` | Validate the checkout and root paths; open evidence and refuse missing ticket sections or empty required lists before any Agent or worktree |
+| `prepare` | Resolve the base commit; for `pr`, check that the base is published and the remote names a hosted repository; `git worktree add -b` the branch, then go to `setup` to record the id slug and run setup commands; with `resume`, adopt the existing worktree and its branch, save any candidate and move onto a newer base before setup and checks: conflicts go to `change`, a cleanly applied candidate to `scopeAfterChange`, then `verify`, and no uncommitted change through `start` to `falsify`; with no worktree, a recorded delivered commit is recreated and set up, then continues at `rebase` |
+| `setup` | Record branch ownership and run new-worktree setup; failures ask `retry`, `hand off`, or confirmed `discard` |
 | `start` | Open the helper's run on the worktree, which must be clean |
 | `falsify` | Read-only investigator tries to show the ticket is wrong, already done, impossible here, or underspecified; returns `sound` with a one-paragraph summary or `questions` with 1–10 entries containing text, options, recommended, assumable, and why in the report's `questions` field, not its summary or message; a return for malformed questions includes the validation reason and repeats where the questions go |
 | `falsifyResult` | Capture the falsify report before guarding the unchanged worktree and validating `questions`; missing or malformed questions return to `falsify` once per run, then go through the stuck policy with the reason and report's evidence file; a sound ticket goes to `plan`, as does an entirely assumable report with `assume: true`; remaining questions go through the stuck policy with their count in the first sentence and each question once in numbered needs, flattened with question text, each option, and why capped separately at 600 characters plus an ellipsis |
@@ -444,11 +448,14 @@ is.
 | `commit` | One commit of everything except `.machine-runs`, even if an Agent staged it: subject is the ticket title, body is `Ticket: <id>` |
 | `rebase` | Resolve the current base; replay exactly the approved ticket commit onto a forward tip. Rerun setup, then `reverify` for an equal patch (`verify` on a resumed delivered commit) or `verify` and fresh review for a changed patch. An unchanged-base delivered resume runs `verify` without replay. Undo the replayed commit before any new stop, repair, or re-review; if ignore rules on the tip would drop added files, restore the candidate on its original base through `stuck` |
 | `deliver` | `branch`: keep the branch. `patch`: `git format-patch` for base..HEAD into the evidence directory. `pr`: `git push --no-follow-tags <remote URL>` of the approved commit to the ticket branch alone, then `gh pr create --repo <host/owner/repository>`. After these succeed, every mode records `branch.<name>.ticketDelivered` in local Git configuration |
-| `success` | Remove the worktree and write the delivery receipts once; branch and patch end `delivered`, pull requests go to `checkMerge` |
+| `success` | Remove the worktree and write the delivery receipts once; branch and patch end `delivered`, pull requests go to `checkMerge`; a kept worktree ends `delivered` immediately with its path and cleanup log |
 | `checkMerge`, `awaitMerge` | Ask `gh pr view <url>` for the pull request state every 10 minutes; an open request or fewer than three consecutive failures waits again |
-| `cleanUp` | Only after `MERGED`, delete the remote ticket branch and then the local one; an already absent remote branch counts as deleted, other failures end `blocked` with a log |
+| `cleanUp` | Only after `MERGED`, delete the remote ticket branch and then the local one; an already absent remote branch counts as deleted, other failures retry three times at one-minute intervals, then ask `mergeRetryDecide` |
 | `mergeDecide`, `confirmMergeDiscard` | Human, regardless of `stuck`: a closed pull request or three consecutive check failures offers only `hand off` and `discard`; discard needs a second confirmation, and `go back` returns to `mergeDecide` |
-| `dropLocal`, `mergeHandOff`, `mergeAbandon`, `mergeFailure` | Confirmed discard deletes only the local branch and ends `abandoned`; hand off keeps it and ends `handedOff`; cleanup failure ends `blocked`; each writes `merge.json` with `hold` output |
+| `dropLocal`, `mergeHandOff`, `mergeAbandon` | Confirmed discard deletes only the local branch and ends `abandoned`; hand off keeps it and ends `handedOff`; cleanup failure retries then asks `mergeRetryDecide`; each ending writes `merge.json` with `hold` output |
+| `stepFailed`, `stepDecide`, `keepDecide`, `deliverDecide`, `confirmStepDiscard` | Save a question naming the failed step and error; offer only available choices; discard needs confirmation and retry reruns only the failed step |
+| `mergeFailed`, `mergeRetryDecide` | After cleanup retries are exhausted, save a question offering `retry`, `hand off`, or confirmed local `discard` |
+| `refuse` | Write a reason and end in the declared failed ending `refused` |
 | `repairBudget`, `repairTarget`, `reviewBudget` | Count gate retries and review revisions separately; gate retries route to the responsible editing stage, review retries to `change`. Once per run, a spent review budget returns to `change` with a fresh review budget if the last verdict is `revise`, every finding names an in-Scope path, at least one is a blocker, and none is a discussion. Repair counts carry over. Other exhaustion goes to `stuck` |
 | `stuck` | Go to `decide` for both accepted input values |
 | `decide` | Human: sleep on one question with what is needed first, then the stopped stage and budgets, the remaining reason or questions once, and evidence; suggest `more rounds`, `hand off`, `archive`, and `discard`, accepting any other reply as an answer |
@@ -625,8 +632,8 @@ phase. A resumed delivered commit instead requires its own `verify` gates on
 an unchanged base and refuses if the base no longer resolves. Otherwise the tip must descend
 from the current `baseCommit`. A base that was rewritten or moved back is not
 replayed onto: `git reset --mixed <baseCommit>` undoes the ticket commit, and
-`failure` ends `blocked` with both commits named and instructions to deliver
-by hand. Resume is not promised here: `adopt` continues to refuse a branch
+`keepDecide` asks `hand off` or confirmed `discard`, with both commits named
+and instructions to deliver by hand. Resume is not promised here: `adopt` continues to refuse a branch
 whose base is not in the new tip.
 
 For a forward move, the approved commit and its `git patch-id --stable` are
@@ -731,7 +738,7 @@ left out. Local remote-tracking refs are not trusted, since they
 only record the last fetch. The resolved base commit must be that remote commit
 or an ancestor of it. When the remote's tip is not in the local repository, it
 is fetched by URL with `--no-tags --no-write-fetch-head`, which stores the
-commits and moves no local ref. The run ends `blocked` before any worktree,
+commits and moves no local ref. The run ends `refused` before any worktree,
 branch, or Agent when the base has commits the remote branch lacks (the message
 gives their number and says the base must be pushed first), when the base
 branch does not exist on the remote, when the base names no branch and the
@@ -790,8 +797,8 @@ choices:
 `archive` saves exactly what delivery would have committed, as a commit Git
 already knows how to store. `<slug>` is whatever follows `ticket/` in this run's
 branch name, so `ticket/proj-12-add-a-greeting` is archived as
-`archive/proj-12-add-a-greeting`. If that branch already exists the run ends
-`blocked` before anything is staged. Otherwise the candidate is staged as
+`archive/proj-12-add-a-greeting`. If that branch already exists the Operation throws
+before anything is staged. Otherwise the candidate is staged as
 `commit` stages it, `git add --all` and then `.machine-runs` unstaged, and
 committed in the worktree with `--no-verify`, subject `Archive: <ticket title>`
 and body `Ticket: <id>`, so a commit hook that refuses the commit does not
@@ -807,7 +814,7 @@ worktree deletes them, so copy out an ignored file you want before choosing
 it is on disk: a file the index marks assume-unchanged or skip-worktree keeps
 its committed content, a nested Git repository is recorded by its commit id
 without its files, and line-ending conversion and clean filters apply as in any
-commit. Nothing is removed, and the run ends `blocked`, when the candidate does
+commit. Nothing is removed, and the Operation throws, when the candidate does
 not differ from its base commit, so that there is nothing to archive and
 `discard` is the choice that removes it; when the candidate cannot be staged or
 committed or the branch cannot be created; when `HEAD` is not a commit of the
@@ -826,8 +833,8 @@ deleted and says that the candidate will not be saved. Its restricted choices
 are `confirm discard` and `go back`; `go back` returns to `decide` with nothing
 changed, and no other path removes a candidate without an archive. Removal runs
 `git worktree remove --force` and `git branch -D` from `repository.path`, only
-on this run's own worktree and ticket branch; if either fails the run ends
-`blocked` with the saved log. The workflow builds these steps from the public
+on this run's own worktree and ticket branch; if either fails the Operation
+throws with the saved log. The workflow builds these steps from the public
 Human primitive with suggestions for `decide` and restricted choices for
 `confirmDiscard`. How they are presented, and how long a
 run may wait, belongs to whichever surface runs the Machine.
@@ -853,7 +860,7 @@ as `ticket/<id-slug>` before branches carried one, is delivered on that branch.
 A worktree on a branch whose ownership is unresolved, or that belongs to another
 ticket, is not adopted; for the first the message gives the `git config` command
 that records it. If any of these fails
-the run ends `blocked` with a message naming the condition, changing nothing.
+the run ends `refused` with a message naming the condition, changing nothing.
 When the base has not moved, setup is not run again and resume behaves as
 before. When it has moved, preparation first saves any uncommitted candidate
 as `saved-candidate.patch` in the evidence directory and as a recovery ref at
@@ -926,7 +933,7 @@ nothing, including for deliveries made before this record existed.
 Merge commits, already merged tips, branches at their base, multiple commits,
 unrelated or moved-back history, a retitled ticket, and wrong or missing ticket
 lines are refused. No branch, multiple owned branches, or an unresolved sibling
-also refuses without changing anything. In `pr` mode a delivered resume blocks
+also refuses without changing anything. In `pr` mode a delivered resume is refused
 because the pull request is brought up to date at its host; it makes no remote
 request and changes nothing.
 
@@ -941,23 +948,18 @@ An unresolved base after recreation also refuses and removes that worktree.
 If the base moved forward, the existing replay, conflict, setup-failure, repair,
 and changed-patch review rules apply, with equal-patch gates run as `verify`.
 If the base has not moved, setup and `verify` test the same commit before it is
-delivered again, without replay or an Agent. Failed unchanged-base gates refuse
-with `Cannot resume` and remove the recreated worktree without entering repair;
-the delivery record and branch remain unchanged unless a command itself moved
-them. No prior run's checks are accepted as evidence for this run.
+delivered again, without replay or an Agent. Failed unchanged-base gates undo the commit and enter `repairBudget`, then
+return to `change` as any red check does; they never offer `retry`. No prior run's checks are accepted as evidence for this run.
 
-A run ends `blocked` without asking, changing nothing further, when: required
-ticket sections or list entries are missing; the base
-does not resolve; in `pr` mode the base is not published or the remote cannot be
-asked; a branch of the ticket or the worktree directory already exists; a resume
-precondition fails, including the delivered-candidate checks above; unchanged-base
-redelivery gates fail; recording the delivered commit fails; a setup command during `prepare` fails or leaves tracked or unignored files
-behind; there is nothing to commit; an Agent committed or moved HEAD or the
-branch itself; a commit hook rejects the commit or changes its content or
-message; the base was rewritten or moved back before replay; the commit, patch, push, or `gh` step fails; the worktree cannot be
-removed after delivery; or, after a decision, the candidate cannot be archived
-or the worktree or branch cannot be removed. A failed Git or `gh` step
-saves its output as a log in the evidence directory.
+Shape and preparation refusals end `refused` with the reason. Setup, commit,
+rebase, delivery, and merge cleanup use the [recovery table](workflows/ticket-task.md#recovery-by-step).
+Push and `gh` creation failures retry three times with a fixed one-minute wait,
+then ask `retry` or `hand off`; other delivery failures ask immediately.
+A retry reuses any known pull request URL, avoiding duplicate creation.
+Commit retries restore the index and recheck the verified candidate; failures
+that cannot be retried offer only `hand off` or confirmed `discard`.
+Archive and removal errors throw after the owner's choice. Failed Git or `gh`
+commands save their output as a log in the evidence directory.
 
 After pull request delivery removes the worktree, the run sleeps while waiting
 for the merge when started with the sleep option, as Dispatch does. It saves its
@@ -969,9 +971,14 @@ pull request was closed without merging, regardless of `stuck`. Both decisions
 keep the pushed remote branch. There is no worktree to archive or repair.
 Remote deletion runs only after `MERGED` and uses the URL recorded at delivery.
 If a failed delete is followed by a successful query showing the branch gone,
-cleanup continues; any other deletion failure ends `blocked` with `hold` and a log.
+cleanup continues; other deletion failures retry three times, then ask `retry`,
+`hand off`, or confirmed local `discard` in `mergeRetryDecide`. The same applies
+to `dropLocal`. Retry reruns only the failed Operation, and `go back` from its
+discard confirmation returns to that recovery question.
 
-Final states are `delivered`, `merged`, `handedOff`, `abandoned`, and `blocked`.
+Final states are `delivered`, `merged`, `handedOff`, `abandoned`, and `refused`.
+Their declared ending kinds are succeeded for delivery and merge, cancelled for
+hand off and abandonment, and failed for refusal.
 The `merged` final returns exactly `{ "action": "complete", "summary": "<text>" }`
 after deleting the local and remote ticket branch, so Machines Dispatch closes
 the ticket. All other finals return exactly `{ "action": "hold", "summary": "<text>" }`
@@ -982,24 +989,27 @@ path on success. A hand-off starts with a short sentence saying what is needed,
 then the remaining reason; the branch follows the decision. Other stops begin
 with their reason. Summaries also include the decision if one was made, the
 archive branch and its commit after `archive`, the worktree if it was kept
-(before delivery for `handedOff` and `blocked` once it exists), and the evidence
+(before delivery for `handedOff` and `refused` once it exists), and the evidence
 directory. Read
 the final state, not the action, to tell the endings apart. `delivered` means
-the worktree was removed and the branch or patch delivered; before delivery,
-`handedOff` keeps the worktree and branch for inspection or further work. A pre-delivery `blocked` run also keeps
-them unless delivered-candidate adoption was refused before recreation or its
-recreated worktree was withdrawn; `abandoned` means both are
-gone, with the candidate on its archive branch after `archive`. A worktree that
-cannot be removed, for example because it holds unignored nested `.machine-runs`
-evidence, ends `blocked` with a reason naming the branch, commit, and pull
-request or patch already produced. Invalid input, a `repository.path` that is
-not a checkout root, a worktree or evidence root that resolves into the
-repository through a symlink, and unexpected exceptions are runtime failures.
+the branch, patch, or pull request was delivered. Before delivery, `handedOff`
+keeps the worktree and branch. A `refused` run keeps anything that already
+existed, except that delivered-candidate withdrawal removes its recreated
+worktree; `abandoned` means the worktree and ticket branch are gone, with the
+candidate on its archive branch after `archive`.
+A worktree that cannot be removed after delivery ends `delivered` immediately,
+without the merge wait. Its summary names the kept path and `git-worktree.log`.
+The delivery receipt has outcome `delivered`, `worktreeRemoved: false`, and no
+`reason`; the result receipt has outcome `completed` and an empty reason.
+If the helper cannot confirm passing verification at completion, it instead
+records its reason and the Machine ends `refused`.
+Invalid input, a `repository.path` that is not a checkout root, a worktree or
+evidence root that resolves into the repository through a symlink, and
+unexpected exceptions are runtime failures.
 
-After pull request delivery, the worktree is already gone for every ending:
-`handedOff` keeps both branches, confirmed discard ends `abandoned` keeping
-only the remote branch, and `blocked` records which deletions succeeded.
-`merged` removes both branches and the local branch's ticket configuration.
+During the merge wait the worktree is already gone. `handedOff` keeps the
+remaining branches; confirmed discard ends `abandoned` keeping the remote
+branch. `merged` removes both branches and the local branch's ticket configuration.
 
 Evidence is written to `<evidenceRoot>/.machine-runs/machine-shop/<id>/`, outside
 the repository and the commit: the helper's `started.json`, check and setup
@@ -1017,8 +1027,8 @@ every output mode (an empty list when there are no minors). When falsify assumed
 answers or a candidate resume read them back, `delivery.json` also records
 `assumptions`, the array written to `assumptions.json`, for every outcome in that
 run; both are absent when no assumptions were made or restored. Its `outcome` is `delivered`,
-`handed-off`, `abandoned`, or `blocked`. It records `decision` when one was made
-(the last choice at `decide`, so `discard` for a confirmed discard and
+`handed-off`, `abandoned`, or `refused`. It records `decision` when one was made
+(the last ending choice, so `discard` for a confirmed discard and
 `more rounds` for a run that went on to deliver), `archive` as
 `{ "branch", "commit" }` when the archive branch was created, and `resumed` for
 a resumed run. Its `worktreeCreated` is false for an existing worktree and true
@@ -1053,13 +1063,14 @@ the merge wait and are never rewritten. The later `merge.json` records
 `schemaVersion`, `outcome`, `prUrl`, `branch`, `checks`, `ghFailures`,
 `localDeleted`, `remoteDeleted`, and any `reason` or `decision`. It and the
 Machine output carry the final merge outcome even when `result.json` says
-`completed` but cleanup later blocks. Human answers after delivery are still
+`completed` but cleanup later needs a decision. Human answers after delivery are still
 recorded separately as `human-<n>.json`.
 
 `result.json` keeps the helper's vocabulary: before the merge wait, its `outcome` is `blocked` for
-`handedOff` and `abandoned`; `repairs` counts red, scope, and green
+`handedOff`, `abandoned`, and `refused`; `repairs` counts red, scope, and green
 gate retries and `reviewRounds` counts review revisions, each cumulative across renewals;
-`decisions` lists every Human answer.
+`decisions` lists every Human answer before delivery. Later answers are in
+`human-<n>.json`.
 
 Limits: a run waiting in a Human state before delivery keeps its worktree and
 branch until it is answered. `resume` adopts only the ticket's own worktree and branch, either clean
@@ -1070,7 +1081,7 @@ base rewritten away from its history. Delivery records are local configuration
 and do not travel with a push or clone; without one, even a correctly shaped
 commit cannot be resumed as delivered. Earlier assumptions and review notes
 are not restored from the removed worktree on this path.
-Without `resume`, a second run of the same ticket is blocked while any branch
+Without `resume`, a second run of the same ticket is refused while any branch
 of that ticket exists; resume it, or delete
 the branch and any kept worktree to retry from scratch.
 Two ids that differ only in case or punctuation share an id slug. The ticket

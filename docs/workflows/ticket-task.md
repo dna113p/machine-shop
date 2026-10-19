@@ -78,13 +78,13 @@ still refused.
 
 To keep the picture small, two kinds of edge are left out. An Agent that
 blocks, and a planning or review result that cannot go on, both go to ⏸ stuck.
-A setup, commit, or delivery failure ends ⛔ blocked.
+Expected operational failures follow the recovery paths below.
 
 ```mermaid
 %%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
 flowchart TD
   shape["⚙️ <b>shape</b><br/>all four sections?"]
-  prepare["⚙️ <b>prepare</b><br/>worktree, branch, setup"]
+  prepare["⚙️ <b>prepare</b><br/>worktree and branch"]
   falsify(["🤖 <b>falsify</b> · investigator<br/>is the ticket wrong or vague?"])
   falsifyResult["⚙️ <b>falsifyResult</b><br/>questions stop, or are assumed"]
   plan(["🤖 <b>plan</b> · investigator<br/>concise files and tests"])
@@ -106,12 +106,14 @@ flowchart TD
   rebase["⚙️ <b>rebase</b><br/>replays onto a moved base"]
   deliver["⚙️ <b>deliver</b><br/>branch, patch, or pull request"]
   delivered(("✅ delivered"))
-  blocked(("⛔ blocked"))
+  refused(("⛔ refused"))
   stuck(("⏸ stuck"))
 
   shape -->|prepared| prepare
-  shape -->|"missing sections"| blocked
+  shape -->|"missing sections"| refused
+  prepare -->|created| setup["⚙️ setup"] -->|prepared| falsify
   prepare -->|prepared| falsify
+  prepare -->|refused| refused
   prepare -->|"resumed with edits"| scopeAfterChange
   prepare -->|redeliver| rebase
   falsify --> falsifyResult
@@ -135,20 +137,37 @@ flowchart TD
   reviewBudget -->|"exhausted, fixable, once"| change
   reviewResult -->|approved| commit --> rebase
   rebase -->|"current, or rebased"| deliver --> success["⚙️ success<br/>remove worktree, write delivery receipt"]
-  success -->|"branch or patch"| delivered
+  success -->|"branch, patch, or worktree kept"| delivered
   success -->|"pull request"| checkMerge["⚙️ checkMerge<br/>gh pr view"]
   checkMerge -->|"open, or fewer than 3 failures"| awaitMerge["awaitMerge<br/>sleep 10 minutes"]
   awaitMerge --> checkMerge
   checkMerge -->|merged| cleanUp["⚙️ cleanUp<br/>delete remote and local branch"]
   cleanUp --> merged(("✅ merged"))
-  cleanUp -->|failed| blocked
+  cleanUp -->|"3 retries, then failed"| mergeRetryDecide[/"🙋 mergeRetryDecide<br/>retry, hand off, discard"/]
   checkMerge -->|"closed, or 3 consecutive failures"| mergeDecide[/"🙋 mergeDecide<br/>hand off or discard"/]
   mergeDecide -->|"hand off"| handedOff(("🤝 handedOff"))
   mergeDecide -->|discard| confirmMergeDiscard[/"🙋 confirmMergeDiscard"/]
   confirmMergeDiscard -->|"go back"| mergeDecide
   confirmMergeDiscard -->|"confirm discard"| dropLocal["⚙️ dropLocal<br/>keep pushed branch"]
   dropLocal --> abandoned(("🗑️ abandoned"))
-  dropLocal -->|failed| blocked
+  dropLocal -->|"3 retries, then failed"| mergeRetryDecide
+  mergeRetryDecide -->|"retry failed step"| retryMergeStep["cleanUp or dropLocal"]
+  retryMergeStep --> cleanUp & dropLocal
+  mergeRetryDecide -->|"hand off"| handedOff
+  mergeRetryDecide -->|discard| confirmMergeDiscard
+  confirmMergeDiscard -->|"go back after failure"| mergeRetryDecide
+  setup & commit -->|"retryable failure"| stepDecide[/"🙋 stepDecide<br/>retry, hand off, discard"/]
+  commit & rebase -->|"cannot retry"| keepDecide[/"🙋 keepDecide<br/>hand off, discard"/]
+  stepDecide -->|"retry failed step"| retryStep["setup or commit"]
+  retryStep --> setup & commit
+  stepDecide & keepDecide -->|"hand off"| handedOff
+  stepDecide & keepDecide -->|discard| confirmStepDiscard[/"🙋 confirmStepDiscard"/]
+  confirmStepDiscard -->|"go back"| stepFailed["ask the failed step's question again"]
+  stepFailed --> stepDecide & keepDecide
+  confirmStepDiscard -->|"confirm discard"| remove["⚙️ remove"] --> abandoned
+  deliver -->|"3 network retries, then failed; other failures immediately"| deliverDecide[/"🙋 deliverDecide<br/>retry, hand off"/]
+  deliverDecide -->|retry| deliver
+  deliverDecide -->|"hand off"| handedOff
   rebase -->|"patch changed"| verify
   scopeAfterTest & red & scopeAfterChange & verify -->|failed| repairBudget
   rebase -->|"gates failed"| repairBudget
@@ -163,10 +182,10 @@ flowchart TD
   classDef bad fill:#fee2e2,stroke:#dc2626,color:#0f172a
   classDef no fill:#fde68a,stroke:#b45309,color:#0f172a
   class falsify,plan,planReview,test,change,review agent
-  class shape,prepare,falsifyResult,planResult,planReviewResult,reviewResult,reviewBudget,repairBudget,repairTarget,commit,rebase,deliver op
+  class shape,prepare,setup,falsifyResult,planResult,planReviewResult,reviewResult,reviewBudget,repairBudget,repairTarget,commit,rebase,deliver op
   class scopeAfterTest,red,scopeAfterChange,verify gate
   class delivered good
-  class blocked bad
+  class refused bad
   class stuck no
 ```
 
@@ -248,13 +267,45 @@ flowchart LR
   class again back
 ```
 
+## Recovery by step
+
+Every retry reruns only the failed Operation, without a new commit or review.
+Automatic retries use Operation `retry`: 3 further attempts, each after `1m`
+(one minute). Only `deliver`, `cleanUp`, and `dropLocal` retry automatically.
+Questions are saved as `question-<n>.txt` and answered through the usual Human
+interface. Choices are restricted to the actions available at that step.
+
+| Step | Recovery |
+| --- | --- |
+| `shape` | Missing ticket sections end `refused`, a declared failed ending, with the reason. |
+| `prepare` | Refusals before creating a worktree end `refused` without a question or cleanup. New-worktree setup runs separately in `setup`. Delivered-resume adoption refusals retain the delivery record and remove only the recreated worktree; failed removal names the kept worktree. |
+| `setup` | A failed configuration or setup command, or leftover files, asks `retry`, `hand off`, or `discard`. |
+| `commit` | A failed `git commit` asks `retry`, `hand off`, or `discard`. An empty candidate, stale checks, or changed HEAD, branch, commit content, or message asks only `hand off` or `discard`. |
+| `rebase` | Red checks on a redelivered commit enter the repair loop. A rewritten or backward base asks only `hand off` or `discard`; an unresolved base during delivered-resume verification ends `refused`. Existing replay conflicts and repair rules still apply. |
+| `deliver` | Push and `gh` failures retry automatically, then ask `retry` or `hand off`. Other delivery failures ask immediately. A known pull request URL is reused on retry. |
+| `success` | Failure to remove the worktree still ends `delivered` immediately, naming the worktree and `git-worktree.log`; no merge wait starts. |
+| `cleanUp` | Retry automatically, then ask the merge decision with `retry` added: `retry`, `hand off`, or `discard`. |
+| `dropLocal` | Retry automatically, then ask `retry`, `hand off`, or `discard`. Retry returns only to this failed step. |
+| `archive` | A failure throws and fails the run visibly with the error and any log; the owner already chose archive. |
+| `remove` | A failure throws and fails the run visibly with the error and any log; the owner already authorized removal. |
+
+`discard` always asks for confirmation. Before delivery it removes the worktree
+and ticket branch; during the merge wait it removes only the local branch.
+`hand off` keeps the remaining work. Neither choice grants extra repair or
+review rounds.
+
 ## Results
+
+`delivered` and `merged` are declared successful endings. `handedOff` and
+`abandoned` are declared cancelled endings because they follow a person's
+choice to stop this run; they do not claim the ticket was completed.
+`refused` is a declared failed ending, with the reason recorded.
 
 After delivery removes the worktree, a pull request run checks `gh pr view`
 every 10 minutes until it merges. With the sleep option, as used by Dispatch,
 the run sleeps while waiting for the merge, saving its state between checks.
 Only a reported merge permits remote branch deletion; an already absent remote
-branch counts as deleted. Any other cleanup failure ends `blocked` with a log.
+branch counts as deleted. Other cleanup failures retry and then ask the merge decision with `retry` added.
 
 A pull request closed without merging, or three consecutive `gh` failures
 (including unexpected states), goes to `mergeDecide` regardless of `stuck`.
@@ -267,13 +318,17 @@ so Machines Dispatch closes the ticket. Every other final returns exactly
 `{ "action": "hold", "summary": "…" }`. `delivery.json` and `result.json`
 record delivery once, before waiting; `merge.json` records the later outcome,
 pull request URL, branch, check and failure counts, deletion flags, and any
-reason or decision. Read that later receipt if cleanup fails after delivery.
+reason or decision. Read that later receipt after a merge decision.
+A delivered ticket with a kept worktree records `delivery.json` outcome
+`delivered`, `worktreeRemoved: false`, and no reason; `result.json` records
+`completed` with an empty reason. Refusals record `refused` in `delivery.json`
+and retain the helper's `blocked` outcome in `result.json`.
 
-- ✅ **`delivered`**: committed and delivered as a branch or patch.
+- ✅ **`delivered`**: committed and delivered as a branch or patch, or as a pull request whose worktree could not be removed.
 - ✅ **`merged`**: the pull request merged and the ticket branch was deleted locally and remotely.
 - 🤝 **`handedOff`**: a person chose to hand the work to someone else; after pull request delivery, the worktree is already gone and the branch is kept.
 - 🗑️ **`abandoned`**: archived to `archive/<slug>` and removed, or discarded after a second confirmation.
-- ⛔ **`blocked`**: the ticket's shape, setup, commit, delivery, or branch cleanup failed.
+- ⛔ **`refused`**: the ticket shape or preparation was refused, or final verification could not be confirmed, with the reason. This is a declared failed ending; `delivered` and `merged` are succeeded endings, and `handedOff` and `abandoned` are cancelled endings.
 
 The catalog's [ticket delivery](../catalog.md#ticket-delivery) section has the
 resume rules, evidence files, and every stop.

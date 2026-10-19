@@ -219,14 +219,63 @@ function ended(f: Fixture, result: { state: unknown; output: any; states: string
   assert.equal(result.state, "delivered");
   return held(f, result, summary);
 }
-function blocked(f: Fixture, result: { state: unknown; output: any }, reason: RegExp, commits = 0) {
-  assert.equal(result.state, "blocked");
-  const run = held(f, result, reason); untouched(f);
-  assert.equal(run.result.outcome, "blocked"); assert.equal(run.delivery.outcome, "blocked"); assert.match(run.delivery.reason, reason);
-  assert.equal(git(f.repo, "rev-list", "--count", `main..${branch}`), String(commits));
-  assert.ok(existsSync(join(f.worktree, "code.txt"))); assert.ok(result.output.summary.includes(`Worktree kept at ${f.worktree}.`));
-  assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved], [true, false]);
+/**
+ * A refusal ends by itself in the declared failed ending, `refused`, without a question: nothing was there to clean up or try again.
+ * The helper's receipt still says blocked, which is what the retrospective reads; delivery.json says refused.
+ */
+function refused(f: Fixture, result: { state: unknown; output: any; states: string[] }, reason: RegExp) {
+  assert.equal(result.state, "refused"); assert.deepEqual(result.states.slice(-2), ["refuse", "refused"]);
+  for (const state of ["failure", "blocked", "stuck", "decide", "stepFailed"]) assert.equal(result.states.includes(state), false, state);
+  const run = held(f, result, /^Refused: /u); assert.match(run.delivery.reason, reason);
+  assert.deepEqual([run.result.outcome, run.delivery.outcome, run.delivery.decision], ["blocked", "refused", undefined]);
+  assert.deepEqual(readdirSync(run.directory).filter(name => /^question-\d+\.txt$/u.test(name)), [], "a refusal asks nothing");
   return run;
+}
+/** The choices each step question offers: only those that can act on what failed there. */
+const stepChoices = ["retry", "hand off", "discard"];
+const keepChoices = ["hand off", "discard"];
+const deliverChoices = ["retry", "hand off"];
+const mergeRetryChoices = ["retry", "hand off", "discard"];
+const choicesOf: Record<string, readonly string[]> = { stepDecide: stepChoices, keepDecide: keepChoices, deliverDecide: deliverChoices };
+/**
+ * The question a step asks when it failed once this run's worktree exists. It names the step and its error, says where the worktree,
+ * the branch, and the evidence are, and offers exactly the choices that can act there, as choices rather than suggestions.
+ */
+function stepAsked(f: Fixture, request: Ask | undefined, step: string, reason: RegExp, choices: readonly string[]) {
+  assert.ok(request, `${step} asked its question`);
+  assert.deepEqual(request.choices, choices); assert.equal(request.suggestions, undefined);
+  assert.match(request.prompt, new RegExp(`\\b${step}\\b`, "u"), `the question names ${step}`); assert.match(request.prompt, reason);
+  for (const part of [`Worktree: ${f.worktree}`, `Branch: ${branch}`, "Evidence: "]) assert.ok(request.prompt.includes(part), part);
+  const lines = request.prompt.split("\n");
+  for (const choice of choices) assert.ok(lines.some(line => line.startsWith(`${choice}: `)), `the question says what ${choice} does`);
+  for (const other of ["more rounds", "archive", "retry", "discard", "any other reply"].filter(name => !choices.includes(name))) {
+    assert.equal(lines.some(line => line.startsWith(`${other}: `)), false, `the question does not offer ${other}`);
+  }
+  assert.doesNotMatch(lines[0]!, /\bstuck\b/iu);
+}
+/**
+ * A step that failed after the worktree existed asked its question once, and hand off ended the run there: the worktree and branch are
+ * kept as they were, with `commits` commits on the branch, and the question is in the evidence as question-1.txt.
+ */
+function steppedOff(f: Fixture, result: { state: unknown; output: any; states: string[] }, step: string, decision: string, reason: RegExp, human: { requests: Ask[] }, commits?: number) {
+  assert.equal(result.state, "handedOff"); assert.deepEqual(result.states.slice(-5), [step, "stepFailed", decision, "handOff", "handedOff"]);
+  for (const state of ["failure", "blocked", "stuck", "decide", "refuse"]) assert.equal(result.states.includes(state), false, state);
+  assert.equal(human.requests.length, 1); stepAsked(f, human.requests[0], step, reason, choicesOf[decision]!);
+  const run = held(f, result, /^Handed off: /u);
+  assert.deepEqual([run.result.outcome, run.delivery.outcome, run.delivery.decision], ["blocked", "handed-off", "hand off"]); assert.match(run.delivery.reason, reason);
+  assert.ok(human.requests[0]!.prompt.includes(`Evidence: ${run.directory}`)); asksWritten(run.directory, human.requests);
+  assert.deepEqual(run.result.decisions, [{ stage: decision, response: "hand off" }]);
+  if (commits !== undefined) assert.equal(git(f.repo, "rev-list", "--count", `main..${branch}`), String(commits));
+  assert.ok(existsSync(join(f.worktree, "code.txt"))); assert.ok(result.output.summary.includes(`Decision: hand off. Branch: ${branch}. Worktree kept at ${f.worktree}. Evidence: `));
+  assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved], [true, false]);
+  assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
+  return run;
+}
+/** The evidence directory of a run that failed plainly, before it wrote any receipt. */
+function runDirectory(f: Fixture) {
+  const runs = join(f.evidence, ".machine-runs/machine-shop");
+  const [id, ...others] = readdirSync(runs); assert.deepEqual(others, []);
+  return join(runs, id!);
 }
 /** What a checkout holds beyond its HEAD: its status and every tracked or unignored file with its mode, leaving out run evidence. Ignored files count on request. */
 function candidate(cwd: string, ignored = false) {
@@ -420,6 +469,32 @@ test("construction has no effects and declares exactly the four roles", context 
   assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), "main"); untouched(f);
 });
 
+test("Machine Shop depends on the Machines release that declares endings and retries Operations", () => {
+  const manifest = JSON.parse(readFileSync(resolve("package.json"), "utf8"));
+  assert.equal(manifest.devDependencies["@dna113p/machines"], "^0.6.0");
+  assert.equal(typeof runtime.defineEndings, "function");
+});
+
+test("every final state takes a declared ending, and nothing is left that ends blocked", context => {
+  const f = fixture(context);
+  assert.ok(mod.endings, "ticket-task exports its endings");
+  assert.deepEqual(Object.fromEntries(Object.entries(mod.endings as Record<string, { name: string; kind: string }>).map(([name, ending]) => [name, [ending.name, ending.kind]])), {
+    delivered: ["delivered", "succeeded"], merged: ["merged", "succeeded"], handedOff: ["handedOff", "cancelled"], abandoned: ["abandoned", "cancelled"], refused: ["refused", "failed"],
+  });
+  for (const data of [input(f), input(f, { output: "pr" })]) {
+    const states = (mod.default(runtime, data) as { config: { states: Record<string, { type?: string }> } }).config.states;
+    const finals = Object.entries(states).filter(([, state]) => state.type === "final");
+    assert.deepEqual(finals.map(([name]) => name).sort(), ["abandoned", "delivered", "handedOff", "merged", "refused"]);
+    for (const [name, state] of finals) assert.deepEqual(state, runtime.final(mod.endings[name]), `${name} takes its own ending`);
+    // The failure path is gone: no state is left that a failed step could still end through.
+    for (const gone of ["blocked", "failure", "mergeFailure"]) assert.equal(Object.hasOwn(states, gone), false, gone);
+    for (const state of ["refuse", "setup", "stepFailed", "stepDecide", "keepDecide", "deliverDecide", "confirmStepDiscard", "mergeFailed", "mergeRetryDecide"]) {
+      assert.ok(Object.hasOwn(states, state), state);
+    }
+  }
+  assert.deepEqual(readdirSync(f.root), ["widgets"]); untouched(f);
+});
+
 test("ticketSections parses headings case-insensitively and in any order", () => {
   assert.deepEqual(mod.ticketSections("# Title\r\n## fOrBiDdEn\r\n- No dependencies\r\n## ACCEPTANCE\r\n* First criterion\r\n+ Second criterion\r\n## scope\r\n- src/**\r\n## GOAL\r\nA goal.\r\nMore detail."), {
     goal: "A goal.\nMore detail.", scope: ["src/**"], acceptance: ["First criterion", "Second criterion"], forbidden: ["No dependencies"], missing: [],
@@ -457,11 +532,12 @@ test("ticketSections keeps subheadings as section text without creating sections
 
 for (const [section, remove] of [["Acceptance", /## Acceptance\n- [^\n]+/u], ["Scope", /- greeting\.txt\n- greeting\.test\.txt\n/u]] as const) {
   for (const resume of [false, true]) {
-    test(`a ${resume ? "resumed" : "new"} ticket with missing or empty ${section} blocks before any Agent or worktree`, async context => {
+    test(`a ${resume ? "resumed" : "new"} ticket with missing or empty ${section} is refused before any Agent or worktree`, async context => {
       const f = fixture(context); const data = input(f, {}, { resume }); data.ticket.body = data.ticket.body.replace(remove, "");
       const result = await execute(data, { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
-      assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "failure", "blocked"]);
-      const run = held(f, result, new RegExp(`^Blocked: Ticket body is missing required sections or non-empty lists: ${section}\\. Expected shape:`, "u")); untouched(f);
+      assert.equal(result.state, "refused"); assert.deepEqual(result.states, ["shape", "refuse", "refused"]);
+      const run = held(f, result, new RegExp(`^Refused: Ticket body is missing required sections or non-empty lists: ${section}\\. Expected shape:`, "u")); untouched(f);
+      assert.deepEqual([run.delivery.outcome, run.result.outcome], ["refused", "blocked"]);
       assert.equal(run.delivery.reason.split(" Expected shape:")[0], `Ticket body is missing required sections or non-empty lists: ${section}.`);
       assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.result.agentInvocations], [false, false, 0]);
       assert.equal(existsSync(f.worktree), false); assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), "main");
@@ -967,7 +1043,7 @@ for (const output of ["branch", "patch", "pr"]) {
       implementer: request => { assert.equal(request.cwd, f.worktree); assert.ok(planIn(request.prompt).startsWith(`${plan}\n`)); assert.match(request.prompt, /without weakening or deleting them/u); assert.match(request.prompt, /If a test is wrong, say so in the summary/u); assert.match(request.prompt, /uncommitted/u); return implement(request); },
       reviewer: request => { assert.equal(request.cwd, f.worktree); assert.match(request.prompt, /Do not edit/u); assert.match(request.prompt, /Machine saw them fail/u); return review("approved", "Greeting matches the ticket"); },
     });
-    assert.deepEqual(result.states.slice(0, 4), ["shape", "prepare", "start", "falsify"]);
+    assert.deepEqual(result.states.slice(0, 5), ["shape", "prepare", "setup", "start", "falsify"]);
     // The Operations that follow the three read-only states are the Machine's own; the ticket names only the Agent states and their order.
     assert.deepEqual(result.states.slice(0, result.states.indexOf("test")).filter(isPlanning), ["falsify", "plan", "planReview"]);
     assert.deepEqual(result.states.slice(result.states.indexOf("test")), ["test", "scopeAfterTest", "red", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success",
@@ -1040,7 +1116,7 @@ test("gh is given the checked base by name, so a configured gh-merge-base cannot
   assert.deepEqual(gh()!.slice(0, 9), ["pr", "create", "--repo", slug, "--draft", "--base", "main", "--head", branch]);
 });
 
-test("the default branch gh is given is the one the remote names, and a remote that names none blocks before any Agent", async context => {
+test("the default branch gh is given is the one the remote names, and a remote that names none is refused before any Agent", async context => {
   const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const bare = join(f.root, "remote.git");
   git(f.repo, "push", "-q", "origin", "main:trunk"); git(bare, "symbolic-ref", "HEAD", "refs/heads/trunk");
   const result = await execute(input(f, { output: "pr" }));
@@ -1049,8 +1125,8 @@ test("the default branch gh is given is the one the remote names, and a remote t
   // A detached HEAD on the remote still has a commit to compare with, but no branch for gh to be given.
   git(bare, "update-ref", "--no-deref", "HEAD", f.head); const second = { ...f, evidence: join(f.root, "evidence-2") };
   const unnamed = await execute({ ...input(second, { output: "pr" }), ticket: { ...input(f).ticket, id: "PROJ-13", title: "Add a farewell" } }, { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
-  assert.equal(unnamed.state, "blocked"); assert.deepEqual(unnamed.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
-  held(second, unnamed, /^Blocked: Remote origin does not say which branch is its default, so the pull request base cannot be named\. Set repository\.base to a branch; nothing was changed\. Evidence: /u);
+  assert.equal(unnamed.state, "refused"); assert.deepEqual(unnamed.states, ["shape", "prepare", "refuse", "refused"]); untouched(f);
+  held(second, unnamed, /^Refused: Remote origin does not say which branch is its default, so the pull request base cannot be named\. Set repository\.base to a branch; nothing was changed\. Evidence: /u);
   assert.equal(pushed(), before); assert.equal(gh(), undefined); assert.deepEqual(gh.views(), views); assert.equal(git(f.repo, "branch", "--list", "ticket/proj-13*"), "");
 });
 
@@ -1072,14 +1148,58 @@ for (const [label, code, reason] of [
   ["a failing setup command", "process.exit(3)", /setup: tests did not meet/u],
   ["a setup command that leaves unignored files", 'require("fs").writeFileSync("generated.txt", "x")', /setup command changed/u],
 ] as const) {
-  test(`${label} blocks before any Agent and keeps the worktree`, async context => {
-    const f = fixture(context);
-    const result = await execute(input(f, { setup: [command(code)] }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
-    const run = blocked(f, result, reason);
-    assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]);
+  test(`${label} asks before any Agent, naming setup and its error, and hand off keeps the worktree`, async context => {
+    const f = fixture(context); const human = person("hand off");
+    const result = await execute(input(f, { setup: [command(code)] }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() }, human);
+    const run = steppedOff(f, result, "setup", "stepDecide", reason, human, 0); untouched(f);
+    assert.deepEqual(result.states, ["shape", "prepare", "setup", "stepFailed", "stepDecide", "handOff", "handedOff"]);
     assert.deepEqual([run.result.checks[0].phase, run.result.checks[0].passed, existsSync(run.result.checks[0].log)], ["setup", label.startsWith("a setup"), true]);
+    assert.equal(git(f.worktree, "symbolic-ref", "HEAD"), `refs/heads/${branch}`); assert.equal(run.delivery.commit, null);
   });
 }
+
+test("a failing setup command asked about is discarded only after confirmation, and go back asks the same question again", async context => {
+  const f = fixture(context); let unconfirmed = false;
+  const human = person("discard", "go back", "discard", () => { unconfirmed = existsSync(join(f.worktree, "code.txt")) && git(f.repo, "rev-parse", branch) === f.head; return "confirm discard"; });
+  const result = await execute(input(f, { setup: [command("process.exit(3)")] }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() }, human);
+  assert.ok(unconfirmed, "nothing was removed before the discard was confirmed");
+  assert.deepEqual(result.states, ["shape", "prepare", "setup", "stepFailed", "stepDecide", "confirmStepDiscard", "stepFailed", "stepDecide", "confirmStepDiscard", "remove", "abandon", "abandoned"]);
+  const run = abandoned(f, result, "discard");
+  const [first, confirm, second, again] = human.requests;
+  stepAsked(f, first, "setup", /setup: tests did not meet/u, stepChoices); assert.deepEqual([second!.prompt, second!.choices], [first!.prompt, first!.choices]);
+  for (const request of [confirm!, again!]) {
+    assert.deepEqual(request.choices, ["confirm discard", "go back"]); assert.equal(request.suggestions, undefined);
+    for (const part of [f.worktree, branch, "will not be saved"]) assert.ok(request.prompt.includes(part), part);
+    assert.doesNotMatch(request.prompt, /\bstuck\b/iu);
+  }
+  // Each time the step asks, its question is written; the confirmation is not a question of its own.
+  asksWritten(run.directory, [first!, second!]);
+  assert.deepEqual(run.result.decisions.map((made: any) => `${made.stage}: ${made.response}`),
+    ["stepDecide: discard", "confirmStepDiscard: go back", "stepDecide: discard", "confirmStepDiscard: confirm discard"]);
+  assert.ok(result.output.summary.includes(`Decision: discard. Worktree and ${branch} removed without saving the candidate. Evidence: `));
+});
+
+test("retry reruns only a setup that failed, as often as it is asked, and a setup that then passes goes on to deliver", async context => {
+  const f = fixture(context); const counter = join(f.root, "setup-runs");
+  // Fails on its first two runs and passes on the third. The count is kept outside the worktree, so it leaves nothing there.
+  const flaky = `const fs = require("fs"); const n = fs.existsSync(${JSON.stringify(counter)}) ? Number(fs.readFileSync(${JSON.stringify(counter)}, "utf8")) : 0; `
+    + `fs.writeFileSync(${JSON.stringify(counter)}, String(n + 1)); if (n < 2) { console.log("install failed " + (n + 1)); process.exit(3); }`;
+  const human = person("retry", "retry");
+  const result = await execute(input(f, { setup: [command(flaky, { name: "install" })] }), {}, human);
+  assert.equal(result.state, "delivered"); untouched(f);
+  // Whatever passes the answer on, only setup runs again: the worktree is made once, and planning starts after the setup that passed.
+  assert.deepEqual(result.states.filter(state => ["shape", "prepare", "setup", "stepFailed", "stepDecide", "start", "falsify"].includes(state)).slice(0, 11),
+    ["shape", "prepare", "setup", "stepFailed", "stepDecide", "setup", "stepFailed", "stepDecide", "setup", "start", "falsify"]);
+  assert.equal(result.states.filter(state => state === "prepare").length, 1, "the worktree is made once");
+  const run = held(f, result, /^Delivered/u);
+  assert.equal(human.requests.length, 2);
+  for (const request of human.requests) stepAsked(f, request, "setup", /setup: install did not meet its expected result/u, stepChoices);
+  asksWritten(run.directory, human.requests);
+  assert.deepEqual(run.result.checks.filter((check: any) => check.phase === "setup").map((check: any) => check.passed), [false, false, true]);
+  assert.deepEqual(run.result.decisions, [{ stage: "stepDecide", response: "retry" }, { stage: "stepDecide", response: "retry" }]);
+  assert.equal(readFileSync(counter, "utf8"), "3"); assert.equal(run.delivery.worktreeRemoved, true);
+  assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
+});
 
 /** A branch as a run of the ticket with this id slug leaves it: named for the ticket and carrying its record. */
 const recordedBranch = (f: Fixture, name: string, ticket = "proj-12") => { git(f.repo, "branch", name); git(f.repo, "config", `branch.${name}.ticket`, ticket); };
@@ -1096,12 +1216,14 @@ for (const [label, occupy, found] of [
     `Branch ticket/proj-12-an-earlier-title already exists in ${"<repo>"} with ${unsettled("ticket/proj-12-an-earlier-title")}`],
   ["worktree directory", (f: Fixture) => mkdirSync(f.worktree, { recursive: true }), "Worktree directory"],
 ] as const) {
-  test(`an existing ${label} blocks without changing anything`, async context => {
-    const f = fixture(context); occupy(f);
+  test(`an existing ${label} is refused with the reason, without asking and without changing anything`, async context => {
+    const f = fixture(context); occupy(f); const human = person();
     const branches = git(f.repo, "branch", "--format=%(refname:short) %(objectname)");
-    const result = await execute(input(f, { setup: [command("process.exit(1)")] }), { investigator: () => assert.fail() });
-    assert.equal(result.state, "blocked"); untouched(f);
-    const run = held(f, result, /already exists/u); assert.ok(result.output.summary.startsWith(`Blocked: ${found.replace("<repo>", f.repo)} `));
+    const result = await execute(input(f, { setup: [command("process.exit(1)")] }), { investigator: () => assert.fail() }, human);
+    assert.equal(result.state, "refused"); assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]); untouched(f);
+    assert.deepEqual(human.requests, []);
+    const run = refused(f, result, /already exists/u); assert.ok(result.output.summary.startsWith(`Refused: ${found.replace("<repo>", f.repo)} `));
+    assert.ok(run.delivery.reason.startsWith(found.replace("<repo>", f.repo)), run.delivery.reason);
     assert.doesNotMatch(result.output.summary, /Worktree kept/u);
     assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.result.checks.length], [false, false, null, 0]);
     assert.equal(git(f.repo, "branch", "--format=%(refname:short) %(objectname)"), branches);
@@ -1172,21 +1294,29 @@ function checkpointed(from?: Checkpoint) {
  * every state the runs went through, each sleep with the time its wait began, and any state whose working data was not plain JSON.
  */
 async function untilEnd(assignment: unknown, agents: Record<string, Runner> = {}, human: (request: Ask) => string = person(), onEnter?: RunHooks["onEnter"]) {
-  const states: string[] = []; const sleeps: { enteredAt: string; due: string }[] = []; const unsaveable: string[] = [];
+  const states: string[] = []; const sleeps: { enteredAt: string; due: string; retry?: { attempt: number; of: number } }[] = []; const unsaveable: string[] = [];
   let saves = checkpointed(); let continueAt: RunHooks["continueAt"]; let waiting = "";
+  // An Operation that retries sleeps between its attempts as a timed wait does; the checkpoint then carries which attempt comes next.
+  let retrying: { attempt: number; of: number } | undefined; const retries: Record<string, { attempt: number; of: number }> = {};
   for (let runs = 1; ; runs++) {
-    assert.ok(runs <= 10, "the run kept sleeping");
+    assert.ok(runs <= 20, "the run kept sleeping");
     const result = await execute(assignment, agents, human, {
       ...saves.options, ...(continueAt ? { continueAt } : {}),
-      onEnter: entry => { saves.options.onEnter!(entry); if (entry.kind === "wait") waiting = entry.enteredAt; onEnter?.(entry); },
-      onSleep: due => { sleeps.push({ enteredAt: waiting, due }); },
+      onEnter: entry => {
+        saves.options.onEnter!(entry);
+        if (entry.retry) retries[String(entry.value)] = entry.retry; else delete retries[String(entry.value)];
+        if (entry.kind === "wait" || entry.retry) { waiting = entry.enteredAt; retrying = entry.retry; }
+        onEnter?.(entry);
+      },
+      onSleep: due => { sleeps.push({ enteredAt: waiting, due, ...(retrying ? { retry: retrying } : {}) }); },
     });
     // A continued run first reports the state it starts in, which the run before it reported last.
     states.push(...(continueAt ? result.states.slice(1) : result.states)); unsaveable.push(...saves.unsaveable);
     if (sleeps.length < runs) return { ...result, states, sleeps, unsaveable };
     const checkpoint = saves.saved[String(result.state)];
     assert.ok(checkpoint, `a checkpoint was saved on entering ${String(result.state)}, where the run slept`);
-    continueAt = { value: checkpoint.value, context: checkpoint.context, due: new Date(0).toISOString() };
+    const retry = retries[String(result.state)];
+    continueAt = { value: checkpoint.value, context: checkpoint.context, due: new Date(0).toISOString(), ...(retry ? { retry } : {}) };
     saves = checkpointed(checkpoint);
   }
 }
@@ -1296,7 +1426,7 @@ for (const [policy, assume] of [["park", undefined], [undefined, undefined], ["p
     showsNeed(run.prompt, run.needs, f.worktree);
     for (const question of questions) assert.ok(run.delivery.reason.includes(question.text), question.text);
     assert.deepEqual(run.result.agents, [{ stage: "falsify", outcome: "questions", summary: "The ticket leaves two things open" }]);
-    assert.equal(result.states[3], "falsify"); assert.equal(result.states.some(state => state === "plan" || state === "planReview" || state === "test" || state === "change"), false);
+    assert.equal(result.states[4], "falsify"); assert.equal(result.states.some(state => state === "plan" || state === "planReview" || state === "test" || state === "change"), false);
     assert.deepEqual(candidate(f.worktree), { status: "", files: [["code.txt", 0, Buffer.from("old").toString("base64")]] });
     assert.deepEqual(run.result.checks, []);
     assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
@@ -2083,11 +2213,11 @@ test("DISCARD! then confirm discard abandons the run with the decision recorded 
 
 test("Archive. is the archive decision, and is recorded as archive", async context => {
   const f = fixture(context); const human = person("Archive.");
-  const result = await execute(input(f), { ...editsNothing, planReview: broadOnce() }, human);
+  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, human);
   assert.deepEqual(result.states.slice(result.states.indexOf("decide"), result.states.indexOf("decide") + 2), ["decide", "archive"]);
-  // Nothing was edited, so there is nothing to archive and the run ends blocked with the decision it was given.
-  assert.equal(result.state, "blocked"); const run = evidence(f);
-  assert.equal(run.delivery.decision, "archive"); assert.match(run.delivery.reason, /nothing to archive/u);
+  const run = abandoned(f, result, "archive");
+  assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "Archive." }]);
+  assert.deepEqual(run.delivery.archive, { branch: archiveBranch, commit: git(f.repo, "rev-parse", archiveBranch) });
 });
 
 test("More rounds? is the more rounds decision: it goes back to plan without becoming an answer", async context => {
@@ -2426,12 +2556,12 @@ test("the default review budget allows two retries and one fresh budget for fixa
   assert.ok(human.requests[0]!.prompt.includes("Review rounds used: 2 of 2."));
 });
 
-test("a base that does not resolve still ends blocked in prepare without a Human step", async context => {
+test("a base that does not resolve is refused in prepare without a Human step", async context => {
   const f = fixture(context);
   const result = await execute(input(f, { base: "no-such-branch" }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
-  assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]);
-  const run = held(f, result, /^Blocked: Base no-such-branch does not resolve/u); untouched(f);
-  assert.deepEqual([run.delivery.outcome, run.delivery.decision, run.delivery.worktreeCreated, run.result.decisions], ["blocked", undefined, false, []]);
+  assert.equal(result.state, "refused"); assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]);
+  const run = held(f, result, /^Refused: Base no-such-branch does not resolve/u); untouched(f);
+  assert.deepEqual([run.delivery.outcome, run.delivery.decision, run.delivery.worktreeCreated, run.result.decisions], ["refused", undefined, false, []]);
   assert.equal(existsSync(f.worktree), false); assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), "main");
 });
 
@@ -2671,27 +2801,38 @@ test("archive leaves ignored files out of the archive commit, as delivery leaves
   assert.ok(human.requests[0]!.prompt.includes(`archive: commit the candidate as delivery would have and keep that commit as the branch ${archiveBranch}, then remove the worktree and delete ${branch}. Ignored files are not kept.`));
 });
 
-test("a candidate that does not differ from its base is not archived, and nothing is removed", async context => {
+/**
+ * An archive or a removal that fails after the owner chose it fails the run plainly: the state's own message, with any log it names,
+ * is the run's error, and nothing is turned into an ending. The worktree and the ticket branch stay, and the choice is in the evidence.
+ */
+async function failsPlainly(f: Fixture, running: Promise<unknown>, state: "archive" | "remove", message: RegExp, decisions: string[]) {
+  let error: Error | undefined;
+  await assert.rejects(running, (thrown: Error) => { error = thrown; return true; });
+  assert.ok(error!.message.startsWith(`Operation failed in state "${state}": `), error!.message); assert.match(error!.message, message);
+  const directory = runDirectory(f); untouched(f);
+  assert.deepEqual(readdirSync(directory).filter(name => /^human-\d+\.json$/u.test(name)).sort().map(name => JSON.parse(readFileSync(join(directory, name), "utf8")).response), decisions);
+  assert.ok(existsSync(join(f.worktree, "code.txt"))); assert.equal(git(f.worktree, "symbolic-ref", "HEAD"), `refs/heads/${branch}`);
+  assert.equal(git(f.repo, "worktree", "list").split("\n").length, 2);
+  return { directory, message: error!.message };
+}
+
+test("a candidate that does not differ from its base is not archived: the run fails with the reason, and nothing is removed", async context => {
   const f = fixture(context);
   writeFileSync(join(f.repo, ".gitignore"), "*.log\n"); git(f.repo, "add", "."); git(f.repo, "commit", "-qm", "ignore"); f.head = git(f.repo, "rev-parse", "HEAD");
   // An ignored file is no difference: delivery would not have committed it either.
   const human = person(() => { writeFileSync(join(f.worktree, "debug.log"), "what the tester learned\n"); return "archive"; });
-  const result = await execute(input(f), { tester: () => ok("blocked", "The ticket names no file"), implementer: () => assert.fail(), reviewer: () => assert.fail() }, human);
-  const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: the candidate does not differ from its base commit ${f.head}, so there is nothing to archive; discard removes it`, "u"));
-  assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
-  assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.doesNotMatch(result.output.summary, /archived on/u);
+  await failsPlainly(f, execute(input(f), { tester: () => ok("blocked", "The ticket names no file"), implementer: () => assert.fail(), reviewer: () => assert.fail() }, human), "archive",
+    new RegExp(`candidate could not be archived, so nothing was removed: the candidate does not differ from its base commit ${f.head}, so there is nothing to archive; discard removes it`, "u"), ["archive"]);
   assert.equal(candidate(f.worktree, true).status, "!! debug.log"); assert.equal(git(f.worktree, "diff", "--cached", "--name-only"), "");
   assert.equal(git(f.repo, "rev-parse", branch), f.head); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
 });
 
-test("an existing archive branch blocks the archive before anything is staged, and nothing is removed", async context => {
+test("an existing archive branch fails the archive before anything is staged, and nothing is removed", async context => {
   const f = fixture(context); git(f.repo, "branch", archiveBranch);
   let before: ReturnType<typeof candidate> | undefined; let index = "";
   const human = person(() => { before = candidate(f.worktree); index = git(f.worktree, "ls-files", "--stage"); return "archive"; });
-  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, human);
-  const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: branch ${archiveBranch} already exists in .+, and nothing was staged`, "u"));
-  assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
-  assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]);
+  await failsPlainly(f, execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, human), "archive",
+    new RegExp(`candidate could not be archived, so nothing was removed: branch ${archiveBranch} already exists in .+, and nothing was staged`, "u"), ["archive"]);
   assert.deepEqual(candidate(f.worktree), before); assert.equal(before!.status, "?? greeting.test.txt\n?? greeting.txt"); assert.equal(git(f.worktree, "ls-files", "--stage"), index);
   assert.equal(git(f.repo, "rev-parse", archiveBranch), f.head); assert.equal(git(f.repo, "rev-parse", branch), f.head);
 });
@@ -2740,25 +2881,23 @@ for (const further of [false, true]) {
   });
 }
 
-test("a worktree that is not clean after the archive commit ends blocked with nothing removed and no archive branch", async context => {
+test("a worktree that is not clean after the archive commit fails the run with nothing removed and no archive branch", async context => {
   const f = fixture(context);
   // --no-verify skips the hooks that can refuse a commit; this one runs after it.
   mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks/post-commit"), "#!/bin/sh\necho late > late.txt\n", { mode: 0o755 });
-  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, person("archive"));
-  const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: the worktree is not clean after the archive commit, so ${archiveBranch} would not hold all of the candidate`, "u"), 1);
-  assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
-  assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
+  await failsPlainly(f, execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, person("archive")), "archive",
+    new RegExp(`candidate could not be archived, so nothing was removed: the worktree is not clean after the archive commit, so ${archiveBranch} would not hold all of the candidate`, "u"), ["archive"]);
+  assert.equal(git(f.repo, "rev-list", "--count", `main..${branch}`), "1"); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
   assert.equal(git(f.repo, "log", "-1", "--format=%s", branch), "Archive: Add a greeting");
   assert.equal(readFileSync(join(f.worktree, "late.txt"), "utf8"), "late\n"); assert.equal(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), "hello\n");
 });
 
-test("a hook that resets HEAD off the archive commit and leaves a clean worktree ends blocked with nothing removed and no archive branch", async context => {
+test("a hook that resets HEAD off the archive commit and leaves a clean worktree fails the run with nothing removed and no archive branch", async context => {
   const f = fixture(context);
   mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks/post-commit"), "#!/bin/sh\ngit reset --quiet --hard HEAD~1\n", { mode: 0o755 });
-  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, person("archive"));
-  const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: a commit hook or Git configuration moved HEAD off the archive commit or changed what it holds, so ${archiveBranch} would not hold the candidate; HEAD is at ${f.head}`, "u"));
-  assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
-  assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
+  await failsPlainly(f, execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, person("archive")), "archive",
+    new RegExp(`candidate could not be archived, so nothing was removed: a commit hook or Git configuration moved HEAD off the archive commit or changed what it holds, so ${archiveBranch} would not hold the candidate; HEAD is at ${f.head}`, "u"), ["archive"]);
+  assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
   // The reset left nothing for the clean check to see: the worktree is on the base without the candidate.
   assert.equal(git(f.worktree, "status", "--porcelain"), ""); assert.equal(git(f.repo, "rev-parse", branch), f.head); assert.ok(!existsSync(join(f.worktree, "greeting.txt")));
   // The archive commit is still where the hook left it, since the worktree and its reflog were kept.
@@ -2769,14 +2908,13 @@ for (const [changed, script] of [
   ["subject", 'sed -i "1s/.*/Rewritten/" "$1"'],
   ["ticket", 'sed -i "s/^Ticket: PROJ-12$/Ticket: PROJ-123/" "$1"'],
 ] as const) {
-  test(`a hook that rewrites the archive commit's ${changed} ends blocked with nothing removed and no archive branch`, async context => {
+  test(`a hook that rewrites the archive commit's ${changed} fails the run with nothing removed and no archive branch`, async context => {
     const f = fixture(context);
     // --no-verify skips commit-msg, not the hook that prepares the message.
     mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks/prepare-commit-msg"), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
-    const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, person("archive"));
-    const run = blocked(f, result, new RegExp(`candidate could not be archived, so nothing was removed: a commit hook or Git configuration changed the archive commit's message, so ${archiveBranch} would not name the ticket; HEAD is at [0-9a-f]{40}, which holds the candidate`, "u"), 1);
-    assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
-    assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
+    await failsPlainly(f, execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, person("archive")), "archive",
+      new RegExp(`candidate could not be archived, so nothing was removed: a commit hook or Git configuration changed the archive commit's message, so ${archiveBranch} would not name the ticket; HEAD is at [0-9a-f]{40}, which holds the candidate`, "u"), ["archive"]);
+    assert.equal(git(f.repo, "rev-list", "--count", `main..${branch}`), "1"); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
     // The candidate is whole in the commit the hook reworded, on the ticket branch that was kept.
     assert.equal(git(f.worktree, "status", "--porcelain"), ""); assert.equal(git(f.repo, "rev-parse", `${branch}^`), f.head);
     assert.equal(git(f.repo, "log", "-1", "--format=%B", branch), changed === "subject" ? "Rewritten\n\nTicket: PROJ-12" : "Archive: Add a greeting\n\nTicket: PROJ-123");
@@ -2792,14 +2930,13 @@ test("a hook that adds to the archive commit's message without changing its subj
   assert.equal(git(f.repo, "log", "-1", "--format=%B", archiveBranch), "Archive: Add a greeting\n\nTicket: PROJ-12\n\nPrepared-by: hook");
 });
 
-test("a candidate that cannot be staged ends blocked with nothing removed", async context => {
+test("a candidate that cannot be staged fails the run with the saved log, and nothing is removed", async context => {
   const f = fixture(context);
   // Git refuses to add an embedded repository that has no commit.
   const human = person(() => { git(f.worktree, "init", "-q", "embedded"); return "archive"; });
-  const result = await execute(input(f, { checks: [command("process.exit(1)")] }, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => assert.fail() }, human);
-  const run = blocked(f, result, /candidate could not be archived, so nothing was removed; inspect .+git-add\.log/u);
-  assert.deepEqual(result.states.slice(-4), ["decide", "archive", "failure", "blocked"]);
-  assert.deepEqual([run.delivery.decision, run.delivery.archive], ["archive", undefined]); assert.ok(existsSync(join(run.directory, "git-add.log")));
+  const run = await failsPlainly(f, execute(input(f, { checks: [command("process.exit(1)")] }, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => assert.fail() }, human), "archive",
+    /candidate could not be archived, so nothing was removed; inspect .+git-add\.log/u, ["archive"]);
+  assert.ok(run.message.includes(join(run.directory, "git-add.log"))); assert.ok(existsSync(join(run.directory, "git-add.log")));
   assert.equal(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), "hello\n"); assert.equal(git(f.repo, "rev-parse", branch), f.head);
   assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
 });
@@ -2852,12 +2989,12 @@ test("discard removes the worktree and branch only after it is confirmed, and ar
   assert.deepEqual(run.result.decisions.map((made: any) => made.response), ["discard", "confirm discard"]);
 });
 
-test("a worktree that cannot be removed after a confirmed discard ends blocked with the saved log", async context => {
+test("a worktree that cannot be removed after a confirmed discard fails the run with the saved log", async context => {
   const f = fixture(context);
   const human = person("discard", () => { git(f.repo, "worktree", "lock", f.worktree); return "confirm discard"; });
-  const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, human);
-  const run = blocked(f, result, /git worktree failed; inspect .+git-worktree\.log/u);
-  assert.match(readFileSync(join(run.directory, "git-worktree.log"), "utf8"), /locked/u); assert.equal(run.delivery.decision, "discard");
+  const run = await failsPlainly(f, execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), { reviewer: () => ownerReview("Handle the empty case") }, human), "remove",
+    /git worktree failed; inspect .+git-worktree\.log/u, ["discard", "confirm discard"]);
+  assert.match(readFileSync(join(run.directory, "git-worktree.log"), "utf8"), /locked/u); assert.equal(git(f.repo, "branch", "--list", "archive/*"), "");
   assert.equal(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), "hello\n"); assert.equal(git(f.repo, "rev-parse", branch), f.head);
 });
 
@@ -3049,26 +3186,25 @@ for (const [label, move] of [
   ["rewritten", (f: Fixture) => { git(f.repo, "commit", "-q", "--amend", "-m", "base: second.txt, reworded"); }],
   ["left by a source checkout now on a branch that does not hold it", (f: Fixture) => { git(f.repo, "checkout", "-q", "-b", "sideways", "HEAD^"); git(f.repo, "commit", "-q", "--allow-empty", "-m", "sideways"); }],
 ] as const) {
-  test(`a base ${label} under review is not rebased onto: the commit is undone, the run ends blocked for delivery by hand, and a resume is refused`, async context => {
-    const f = fixture(context); const started = advance(f, "second.txt", "second\n"); const calls = recordGit(context, f);
+  test(`a base ${label} under review is not rebased onto: the commit is undone, the run asks only hand off or discard for delivery by hand, and a resume is refused`, async context => {
+    const f = fixture(context); const started = advance(f, "second.txt", "second\n"); const calls = recordGit(context, f); const human = person("hand off");
     let before: Candidate | undefined; let tip = ""; let refs = "";
     const result = await execute(input(f), {
       reviewer: request => { before = candidate(request.cwd); move(f); tip = f.head = git(f.repo, "rev-parse", "HEAD"); refs = others(f); return review(); },
-    });
-    // Like other delivery failures it ends by itself, without stuck or a Human.
-    assert.equal(result.state, "blocked"); assert.deepEqual(result.states.slice(-5), ["reviewResult", "commit", "rebase", "failure", "blocked"]);
-    const run = held(f, result, /^Blocked: /u);
-    assert.deepEqual([run.result.outcome, run.delivery.outcome, run.delivery.decision, phases(run)], ["blocked", "blocked", undefined, ["red", "verify"]]);
+    }, human);
+    // A retry cannot succeed on a base that went back, so the question naming rebase offers only hand off and discard.
+    const run = steppedOff(f, result, "rebase", "keepDecide", /by hand/iu, human); assert.deepEqual(result.states.slice(-7, -5), ["reviewResult", "commit"]);
+    assert.deepEqual(phases(run), ["red", "verify"]);
     assert.ok(names(run.delivery.reason, started), "the reason names the base the run started from"); assert.ok(names(run.delivery.reason, tip), "the reason names the new tip");
-    assert.match(run.delivery.reason, /by hand/iu); assert.ok(result.output.summary.includes(`Worktree kept at ${f.worktree}.`));
+    assert.ok(names(human.requests[0]!.prompt, started) && names(human.requests[0]!.prompt, tip), "the question names both commits");
     uncommitted(f, run, started, before!); assert.equal(others(f), refs); assert.equal(git(f.repo, "status", "--porcelain", "--untracked-files=all"), "");
     assert.ok(undone(calls(), started), "git reset --mixed <baseCommit>");
     assert.equal(calls().some(call => /(?:^|\s)rebase\s(?:.*\s)?--onto(?:\s|$)/u.test(call)), false);
     // Resume is not promised here: the branch's base is not in the new tip, and adopt refuses it as before, changing nothing.
     const again = next(f, 2);
-    const refused = await execute(input(again, {}, { resume: true }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
-    assert.equal(refused.state, "blocked"); assert.deepEqual(refused.states, ["shape", "prepare", "failure", "blocked"]);
-    held(again, refused, /^Blocked: Cannot resume: ticket\/proj-12-add-a-greeting holds 1 commit that is not in the base commit .+ or the base moved back; only an uncommitted candidate is resumed, and nothing was changed\. Evidence: /u);
+    const refusal = await execute(input(again, {}, { resume: true }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
+    assert.equal(refusal.state, "refused"); assert.deepEqual(refusal.states, ["shape", "prepare", "refuse", "refused"]);
+    held(again, refusal, /^Refused: Cannot resume: ticket\/proj-12-add-a-greeting holds 1 commit that is not in the base commit .+ or the base moved back; only an uncommitted candidate is resumed, and nothing was changed\. Evidence: /u);
     uncommitted(f, undefined, started, before!); assert.equal(others(f), refs);
   });
 }
@@ -4023,7 +4159,7 @@ test("resume keeps a handed-off unmerged index and its original saved candidate 
   assert.deepEqual(result.states.slice(0, 5), ["shape", "prepare", "change", "scopeAfterChange", "verify"]);
 });
 
-const noRecord = (name: string, ticket = "proj-12") => new RegExp(`^Blocked: Cannot resume: HEAD in .+ is on ${name}, which has ${literal(unsettled(name, ticket))} Evidence: `, "u");
+const noRecord = (name: string, ticket = "proj-12") => new RegExp(`^Refused: Cannot resume: HEAD in .+ is on ${name}, which has ${literal(unsettled(name, ticket))} Evidence: `, "u");
 for (const [label, arrange, reason] of [
   ["a missing worktree", () => {}, /worktree directory .+ does not exist; nothing was changed/u],
   ["a directory that is not a Git worktree", (f: Fixture) => { mkdirSync(f.worktree, { recursive: true }); writeFileSync(join(f.worktree, "greeting.txt"), "hello\n"); }, /is not a Git worktree of .+; nothing was changed/u],
@@ -4045,44 +4181,65 @@ for (const [label, arrange, reason] of [
     linked(f); git(f.worktree, "reset", "-q", "--hard", git(f.repo, "commit-tree", "-m", "unrelated", git(f.repo, "rev-parse", "HEAD^{tree}")));
   }, /ticket\/proj-12-add-a-greeting shares no history with the base commit .+; nothing was changed/u],
 ] as const) {
-  test(`resume with ${label} blocks without changing anything`, async context => {
+  test(`resume with ${label} is refused without changing anything`, async context => {
     const f = fixture(context); arrange(f);
     const snapshot = () => [git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"), git(f.repo, "worktree", "list", "--porcelain"),
       existsSync(f.worktree) ? readdirSync(f.worktree) : null, existsSync(join(f.worktree, "greeting.txt")) ? readFileSync(join(f.worktree, "greeting.txt"), "utf8") : null];
     const before = snapshot();
     const result = await execute(input(f, { setup: [command("process.exit(1)")] }, { resume: true }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
-    assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
-    const run = held(f, result, reason);
-    assert.match(result.output.summary, /^Blocked: Cannot resume: /u); assert.doesNotMatch(result.output.summary, /Worktree kept/u);
-    assert.deepEqual([run.delivery.outcome, run.delivery.resumed, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.result.checks.length], ["blocked", undefined, false, false, null, 0]);
+    assert.equal(result.state, "refused"); assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]); untouched(f);
+    const run = held(f, result, reason); refused(f, result, /^Cannot resume: /u);
+    assert.match(result.output.summary, /^Refused: Cannot resume: /u); assert.doesNotMatch(result.output.summary, /Worktree kept/u);
+    assert.deepEqual([run.delivery.outcome, run.delivery.resumed, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.result.checks.length], ["refused", undefined, false, false, null, 0]);
     assert.deepEqual(snapshot(), before);
   });
 }
 
-test("an Agent that commits by itself is not delivered", async context => {
-  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
+test("an Agent that commits by itself is not delivered: commit asks only hand off or discard, since a retry would meet the same commit", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const human = person("hand off");
   const result = await execute(input(f, { output: "pr" }), {
     implementer: request => { implement(request); git(request.cwd, "add", "."); git(request.cwd, "commit", "-qm", "agent commit"); return ok(); },
-  });
-  const run = blocked(f, result, /only this workflow commits/u, 1);
+  }, human);
+  const run = steppedOff(f, result, "commit", "keepDecide", /only this workflow commits/u, human, 1); untouched(f);
   assert.equal(git(f.repo, "log", "-1", "--format=%s", branch), "agent commit");
   assert.equal(pushed(), ""); assert.equal(gh(), undefined); assert.equal(run.delivery.commit, null);
 });
 
-test("an approved candidate with no change is not committed", async context => {
-  const f = fixture(context);
-  blocked(f, await execute(input(f, {}, { redGreen: false }), { implementer: () => ok() }), /Nothing to commit/u);
+test("an approved candidate with no change is not committed: commit asks only hand off or discard", async context => {
+  const f = fixture(context); const human = person("hand off");
+  steppedOff(f, await execute(input(f, {}, { redGreen: false }), { implementer: () => ok() }, human), "commit", "keepDecide", /Nothing to commit/u, human, 0); untouched(f);
 });
 
-test("nested run evidence is never committed, and a worktree that cannot be removed is not reported as delivered", async context => {
+/** A delivered ticket is not a failure: a worktree that cannot be removed afterwards is named in the summary, with the log that says why. */
+function keptAfterDelivery(f: Fixture, result: { state: unknown; output: any; states: string[] }) {
+  assert.equal(result.state, "delivered"); assert.deepEqual(result.states.slice(-3), ["deliver", "success", "delivered"]);
+  const run = held(f, result, new RegExp(`^Delivered ${branch} at ${git(f.repo, "rev-parse", branch)}`, "u")); untouched(f);
+  assert.deepEqual([run.result.outcome, run.result.reason], ["completed", ""]);
+  assert.deepEqual([run.delivery.outcome, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, Object.hasOwn(run.delivery, "reason")], ["delivered", true, false, false]);
+  assert.equal(run.delivery.commit, git(f.repo, "rev-parse", branch)); assert.equal(deliveredAs(f), run.delivery.commit);
+  assert.match(result.output.summary, new RegExp(`Worktree kept at ${literal(f.worktree)}.+${literal(join(run.directory, "git-worktree.log"))}`, "u"));
+  assert.match(readFileSync(join(run.directory, "git-worktree.log"), "utf8"), /untracked|modified/u);
+  assert.ok(existsSync(join(f.worktree, ".machine-runs/nested.json")));
+  return run;
+}
+const nested = (request: { cwd: string }) => { mkdirSync(join(request.cwd, ".machine-runs")); writeFileSync(join(request.cwd, ".machine-runs/nested.json"), "{}"); return implement(request); };
+
+test("nested run evidence is never committed, and a worktree that cannot be removed after delivery still ends delivered, naming it", async context => {
   const f = fixture(context);
-  const result = await execute(input(f, { output: "patch" }), {
-    implementer: request => { mkdirSync(join(request.cwd, ".machine-runs")); writeFileSync(join(request.cwd, ".machine-runs/nested.json"), "{}"); return implement(request); },
-  });
-  const run = blocked(f, result, /worktree could not be removed after delivering .+; inspect .+git-worktree\.log/u, 1);
+  const result = await execute(input(f, { output: "patch" }), { implementer: nested });
+  const run = keptAfterDelivery(f, result);
   assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.test.txt\ngreeting.txt");
-  assert.equal(run.delivery.commit, git(f.repo, "rev-parse", branch)); assert.ok(result.output.summary.includes(run.delivery.patches[0]));
-  assert.ok(existsSync(join(f.worktree, ".machine-runs/nested.json"))); assert.ok(existsSync(join(run.directory, "git-worktree.log")));
+  assert.ok(result.output.summary.includes(run.delivery.patches[0]));
+});
+
+test("a pull request whose worktree cannot be removed after delivery ends delivered at once, naming the worktree, without waiting for the merge", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
+  const result = await execute(input(f, { output: "pr" }), { implementer: nested });
+  const run = keptAfterDelivery(f, result);
+  // With the branch still checked out in the kept worktree, the merge wait could not delete it; it is not entered.
+  assert.deepEqual(gh.views(), []); for (const state of ["checkMerge", "awaitMerge", "cleanUp"]) assert.equal(result.states.includes(state), false, state);
+  assert.equal(run.delivery.prUrl, url); assert.ok(result.output.summary.includes(url)); assert.equal(existsSync(join(run.directory, "merge.json")), false);
+  assert.equal(pushed(), `refs/heads/${branch} ${run.delivery.commit}`); assert.equal(git(f.worktree, "symbolic-ref", "HEAD"), `refs/heads/${branch}`);
 });
 
 test("run evidence an Agent staged by force is left out of the commit", async context => {
@@ -4104,10 +4261,10 @@ for (const [hook, script] of [
   ["post-commit", "echo hooked >> greeting.txt"],
   ["commit-msg", 'sed -i "s/^Ticket: PROJ-12$/Ticket: PROJ-123/" "$1"'],
 ] as const) {
-  test(`a ${hook} hook that alters the approved candidate blocks before delivery`, async context => {
-    const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
+  test(`a ${hook} hook that alters the approved candidate stops before delivery and asks only hand off or discard`, async context => {
+    const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const human = person("hand off");
     mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(join(f.repo, ".git/hooks", hook), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
-    const run = blocked(f, await execute(input(f, { output: "pr" })), /commit hook or Git configuration changed the approved candidate/u, 1);
+    const run = steppedOff(f, await execute(input(f, { output: "pr" }), {}, human), "commit", "keepDecide", /commit hook or Git configuration changed the approved candidate/u, human, 1); untouched(f);
     assert.equal(pushed(), ""); assert.equal(gh(), undefined); assert.equal(run.delivery.commit, null);
   });
 }
@@ -4119,12 +4276,34 @@ test("a commit hook that leaves the candidate and its message intact does not pr
   assert.equal(result.state, "delivered"); assert.match(git(f.repo, "log", "-1", "--format=%B", branch), /^Add a greeting\n\nTicket: PROJ-12\n\nReviewed-by: hook$/u);
 });
 
-test("a hook that moves the ticket branch off the approved commit blocks before anything is pushed", async context => {
-  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
+test("a hook that moves the ticket branch off the approved commit stops before anything is pushed and asks only hand off or discard", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const human = person("hand off");
   mkdirSync(join(f.repo, ".git/hooks"), { recursive: true });
   writeFileSync(join(f.repo, ".git/hooks/post-commit"), `#!/bin/sh\ngit checkout -q --detach && git branch -f ${branch} ${f.head}\n`, { mode: 0o755 });
-  const run = blocked(f, await execute(input(f, { output: "pr" })), /moved HEAD or ticket\/proj-12-add-a-greeting away from the approved commit/u);
+  const run = steppedOff(f, await execute(input(f, { output: "pr" }), {}, human), "commit", "keepDecide", /moved HEAD or ticket\/proj-12-add-a-greeting away from the approved commit/u, human, 0); untouched(f);
   assert.equal(pushed(), ""); assert.equal(gh(), undefined); assert.equal(run.delivery.commit, null);
+});
+
+test("a commit hook that refuses the commit asks, asks again when retry meets it again, and retry delivers once the hook lets it through", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
+  const hook = join(f.repo, ".git/hooks/pre-commit");
+  mkdirSync(join(f.repo, ".git/hooks"), { recursive: true }); writeFileSync(hook, "#!/bin/sh\necho 'pre-commit: refused' >&2\nexit 1\n", { mode: 0o755 });
+  let logged = "";
+  const human = person("retry", () => { logged = readFileSync(join(runDirectory(f), "git-commit.log"), "utf8"); rmSync(hook); return "retry"; });
+  const result = await execute(input(f, { output: "pr" }), {}, human);
+  const run = merged(f, result); untouched(f);
+  assert.equal(human.requests.length, 2);
+  for (const request of human.requests) stepAsked(f, request, "commit", /git commit failed; inspect .+git-commit\.log/u, stepChoices);
+  asksWritten(run.directory, human.requests);
+  // A second refusal is a second question, with the log of that attempt, not a run that fails on the log of the first.
+  assert.match(logged, /pre-commit: refused/u);
+  assert.deepEqual(result.states.filter(state => ["commit", "stepFailed", "stepDecide", "rebase"].includes(state)),
+    ["commit", "stepFailed", "stepDecide", "commit", "stepFailed", "stepDecide", "commit", "rebase"]);
+  assert.equal(result.states.filter(state => state === "review").length, 1, "retry commits the approved candidate without another review");
+  assert.deepEqual(run.result.decisions, [{ stage: "stepDecide", response: "retry" }, { stage: "stepDecide", response: "retry" }]);
+  assert.equal(git(f.repo, "rev-parse", `${run.delivery.commit}^`), f.head); assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", run.delivery.commit), "Add a greeting\nTicket: PROJ-12");
+  assert.equal(git(f.repo, "show", "--name-only", "--format=", run.delivery.commit), "greeting.test.txt\ngreeting.txt");
+  assert.equal(pushed(), ""); assert.deepEqual(gh()!.slice(0, 2), ["pr", "create"]);
 });
 
 test("the pull request is opened in the pushed repository whatever GH_REPO says, with a message-only review in its body", async context => {
@@ -4140,11 +4319,15 @@ test("the pull request is opened in the pushed repository whatever GH_REPO says,
   assert.match(body, /Prose-only approval/u); assert.doesNotMatch(body, /undefined/u);
 });
 
-test("a remote that names no hosted repository blocks pr delivery before pushing", async context => {
+test("a remote that names no hosted repository is refused in prepare, before any worktree, Agent, or commit", async context => {
   const f = fixture(context); const gh = fakeGh(context, f);
   const bare = join(f.root, "remote.git"); git(f.root, "init", "-q", "--bare", "-b", "main", bare); git(f.repo, "remote", "add", "origin", bare);
   git(f.repo, "push", "-q", "origin", "main");
-  blocked(f, await execute(input(f, { output: "pr" })), /does not name a hosted owner\/repository/u, 1);
+  const result = await execute(input(f, { output: "pr" }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
+  assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]); untouched(f);
+  const run = refused(f, result, /does not name a hosted owner\/repository/u);
+  assert.deepEqual([run.delivery.worktreeCreated, run.delivery.commit, run.result.agentInvocations], [false, null, 0]);
+  assert.equal(existsSync(f.worktree), false); assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), "main");
   assert.equal(git(bare, "for-each-ref", "--format=%(refname)"), "refs/heads/main"); assert.equal(gh(), undefined);
 });
 
@@ -4207,22 +4390,90 @@ test("pr delivery pushes no tag even when Git is configured to follow tags", asy
   assert.equal(pushed.atCheck(), `refs/heads/${branch} ${merged(f, result).delivery.commit}`); assert.equal(pushed(), "");
 });
 
-test("a failing push blocks, keeps the committed local branch, and never starts gh", async context => {
-  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
+/**
+ * A remote that refuses the first `times` pushes of the ticket branch, saying which attempt it refused, and takes every later one.
+ * A deletion is not counted, so the merged branch is still deleted afterwards.
+ */
+function failingPushes(f: Fixture, times: number) {
+  const count = join(f.root, "pushes");
+  mkdirSync(join(f.root, "remote.git/hooks"), { recursive: true });
+  writeFileSync(join(f.root, "remote.git/hooks/pre-receive"), [
+    "#!/bin/sh",
+    "while read old new ref; do",
+    '  case "$new" in *[!0]*) ;; *) continue ;; esac',
+    `  n=$(cat "${count}" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "${count}"`,
+    `  if [ "$n" -le ${times} ]; then echo "push $n of the ticket branch refused" >&2; exit 1; fi`,
+    "done",
+  ].join("\n") + "\n", { mode: 0o755 });
+  return () => existsSync(count) ? Number(readFileSync(count, "utf8")) : 0;
+}
+/** The sleeps a run took between the attempts of an Operation that retries: each is a minute, and they count the attempts in order. */
+function retried(result: { sleeps: { enteredAt: string; due: string; retry?: { attempt: number; of: number } }[] }, times: number) {
+  const between = result.sleeps.filter(sleep => sleep.retry);
+  assert.equal(between.length, times, JSON.stringify(result.sleeps));
+  between.forEach((sleep, index) => {
+    assert.equal(Date.parse(sleep.due) - Date.parse(sleep.enteredAt), 60_000, "a minute between attempts");
+    assert.deepEqual(sleep.retry, { attempt: index + 2, of: 4 });
+  });
+}
+
+test("a push that fails twice and then succeeds delivers without a question, a new commit, or a new review", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const pushes = failingPushes(f, 2); const calls = recordGit(context, f);
+  let reviews = 0; let edits = 0;
+  const result = await untilEnd(input(f, { output: "pr" }), { implementer: request => { edits++; return implement(request); }, reviewer: () => { reviews++; return review(); } }, person());
+  const run = merged(f, result); untouched(f);
+  // The retries ran inside deliver: two sleeps of a minute, three pushes, and nothing before deliver ran again.
+  retried(result, 2); assert.equal(result.sleeps.length, 2); assert.equal(pushes(), 3);
+  assert.deepEqual([edits, reviews], [1, 1]);
+  for (const state of ["commit", "rebase", "review", "change"]) assert.equal(result.states.filter(one => one === state).length, 1, state);
+  for (const state of ["stepFailed", "deliverDecide", "stuck", "decide", "failure"]) assert.equal(result.states.includes(state), false, state);
+  assert.equal(readdirSync(run.directory).some(name => /^question-\d+\.txt$/u.test(name)), false);
+  const commit = run.delivery.commit; assert.equal(git(f.repo, "rev-parse", `${commit}^`), f.head);
+  assert.equal(pushed.atCheck(), `refs/heads/${branch} ${commit}`); assert.equal(pushed(), "");
+  assert.equal(calls().filter(call => /^commit\s/u.test(call)).length, 1, "the ticket was committed once");
+  assert.deepEqual(gh()!.slice(0, 2), ["pr", "create"]); assert.deepEqual(result.unsaveable, [], "every state's working data is plain JSON");
+});
+
+test("a push that fails four times asks with only retry and hand off, and retry with the push now succeeding delivers", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const pushes = failingPushes(f, 4);
+  let asked = 0; const human = person(() => { asked = pushes(); return "retry"; });
+  const result = await untilEnd(input(f, { output: "pr" }), {}, human);
+  untouched(f);
+  // One push and three more a minute apart; then the question; then the one push retry made.
+  retried(result, 3); assert.equal(asked, 4); assert.equal(pushes(), 5);
+  assert.equal(result.state, "merged"); assert.deepEqual(result.states.slice(-3), ["checkMerge", "cleanUp", "merged"]);
+  const asking = result.states.indexOf("deliverDecide");
+  assert.deepEqual(result.states.slice(asking - 2, asking + 1), ["deliver", "stepFailed", "deliverDecide"]);
+  assert.deepEqual(result.states.slice(asking + 1).filter(state => ["deliver", "success"].includes(state)), ["deliver", "success"]);
+  for (const state of ["commit", "rebase", "review"]) assert.equal(result.states.filter(one => one === state).length, 1, state);
+  const run = complete(f, result, /^Merged /u);
+  assert.equal(human.requests.length, 1); stepAsked(f, human.requests[0], "deliver", /git push failed; inspect .+git-push\.log/u, deliverChoices);
+  assert.ok(human.requests[0]!.prompt.includes(`Evidence: ${run.directory}`)); asksWritten(run.directory, human.requests);
+  assert.deepEqual(run.result.decisions, [{ stage: "deliverDecide", response: "retry" }]);
+  assert.deepEqual([run.delivery.outcome, run.delivery.prUrl, run.result.outcome], ["delivered", url, "completed"]);
+  assert.match(readFileSync(join(run.directory, "git-push.log"), "utf8"), /push 4 of the ticket branch refused/u);
+  assert.equal(pushed.atCheck(), `refs/heads/${branch} ${run.delivery.commit}`); assert.equal(pushed(), ""); assert.equal(gh.views().length, 1);
+  assert.equal(git(f.repo, "branch", "--list", branch), ""); assert.equal(existsSync(f.worktree), false);
+});
+
+test("a push that keeps failing is retried three times a minute apart, then asks; hand off keeps the committed local branch, and gh never starts", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const human = person("hand off");
   // The remote answers the question prepare asks about the base and then refuses the push.
   mkdirSync(join(f.root, "remote.git/hooks"), { recursive: true }); writeFileSync(join(f.root, "remote.git/hooks/pre-receive"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
-  const result = await execute(input(f, { output: "pr" }));
-  const run = blocked(f, result, /git push failed; inspect .+git-push\.log/u, 1);
-  assert.equal(run.delivery.commit, git(f.repo, "rev-parse", branch)); assert.equal(run.delivery.prUrl, undefined);
+  const result = await untilEnd(input(f, { output: "pr" }), {}, human);
+  retried(result, 3); assert.equal(result.sleeps.length, 3);
+  const run = steppedOff(f, result, "deliver", "deliverDecide", /git push failed; inspect .+git-push\.log/u, human, 1); untouched(f);
+  assert.equal(run.delivery.commit, git(f.repo, "rev-parse", branch)); assert.equal(run.delivery.prUrl, undefined); assert.equal(deliveredAs(f), "");
   assert.match(readFileSync(join(run.directory, "git-push.log"), "utf8"), /pre-receive hook declined/u); assert.equal(pushed(), ""); assert.equal(gh(), undefined);
 });
 
-test("a failing gh blocks after the push and keeps the local branch", async context => {
-  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f, 1);
-  const result = await execute(input(f, { output: "pr" }));
-  const run = blocked(f, result, /gh pr failed; inspect .+gh-pr\.log/u, 1);
+test("a gh that keeps failing is retried three times a minute apart, then asks; hand off keeps the pushed branch and the local one", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f, 1); const human = person("hand off");
+  const result = await untilEnd(input(f, { output: "pr" }), {}, human);
+  retried(result, 3);
+  const run = steppedOff(f, result, "deliver", "deliverDecide", /gh pr failed; inspect .+gh-pr\.log/u, human, 1); untouched(f);
   assert.equal(pushed(), `refs/heads/${branch} ${run.delivery.commit}`); assert.equal(run.delivery.prUrl, undefined);
-  assert.ok(gh()!.includes("--draft")); assert.doesNotMatch(result.output.summary, /example\.invalid/u);
+  assert.ok(gh()!.includes("--draft")); assert.doesNotMatch(result.output.summary, /example\.invalid/u); assert.deepEqual(gh.views(), []);
 });
 
 /** Each `gh pr view` a run made asked about the pull request it opened. */
@@ -4256,17 +4507,106 @@ test("a merged pull request whose remote branch is already gone, as when the hos
   assert.equal(pushed.atCheck(), ""); assert.equal(pushed(), "");
 });
 
-test("a remote that refuses to delete the merged ticket branch ends the run blocked with a hold and a log, and keeps the branch there", async context => {
-  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
-  // The remote takes the delivery's push and refuses only a deletion.
+/** A remote that takes the delivery's push and refuses the first `times` deletions of a branch, every one when `times` is omitted. */
+function refusingDeletes(f: Fixture, times = Infinity) {
+  const count = join(f.root, "deletes");
   mkdirSync(join(f.root, "remote.git/hooks"), { recursive: true });
-  writeFileSync(join(f.root, "remote.git/hooks/pre-receive"), '#!/bin/sh\nwhile read old new ref; do case "$new" in *[!0]*) ;; *) echo "deletion of $ref refused" >&2; exit 1 ;; esac; done\n', { mode: 0o755 });
-  const result = await execute(input(f, { output: "pr" }));
-  assert.equal(result.state, "blocked"); assert.ok(result.states.includes("cleanUp")); assert.equal(result.states.includes("merged"), false); viewed(gh, 1);
-  const run = held(f, result, /^Blocked/u); untouched(f);
+  writeFileSync(join(f.root, "remote.git/hooks/pre-receive"), [
+    "#!/bin/sh",
+    "while read old new ref; do",
+    '  case "$new" in *[!0]*) continue ;; esac',
+    `  n=$(cat "${count}" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "${count}"`,
+    `  if ${Number.isFinite(times) ? `[ "$n" -le ${times} ]` : "true"}; then echo "deletion $n of $ref refused" >&2; exit 1; fi`,
+    "done",
+  ].join("\n") + "\n", { mode: 0o755 });
+  return () => existsSync(count) ? Number(readFileSync(count, "utf8")) : 0;
+}
+/** The question cleanUp asks once its retries are spent: the merge decision with retry added, naming the pull request, the branch, and the error. */
+function mergeRetryAsked(request: Ask | undefined, reason: RegExp) {
+  assert.ok(request, "cleanUp asked its question");
+  assert.deepEqual(request.choices, mergeRetryChoices); assert.equal(request.suggestions, undefined);
+  assert.match(request.prompt, reason); for (const part of [url, branch, "Evidence: "]) assert.ok(request.prompt.includes(part), part);
+  for (const choice of mergeRetryChoices) assert.ok(request.prompt.split("\n").some(line => line.startsWith(`${choice}: `)), `the question says what ${choice} does`);
+}
+
+test("a remote that keeps refusing to delete the merged ticket branch is retried three times a minute apart, then asks; hand off keeps the branch there", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const deletes = refusingDeletes(f); const human = person("hand off");
+  const result = await untilEnd(input(f, { output: "pr" }), {}, human);
+  retried(result, 3); assert.equal(result.sleeps.length, 3); assert.equal(deletes(), 4); viewed(gh, 1); untouched(f);
+  assert.equal(result.state, "handedOff"); assert.deepEqual(result.states.slice(-5), ["cleanUp", "mergeFailed", "mergeRetryDecide", "mergeHandOff", "handedOff"]);
+  for (const state of ["blocked", "mergeFailure", "merged"]) assert.equal(result.states.includes(state), false, state);
+  assert.equal(human.requests.length, 1); mergeRetryAsked(human.requests[0], /git push failed deleting ticket\/proj-12-add-a-greeting/u);
+  const run = held(f, result, /^Handed off: /u); asksWritten(run.directory, human.requests);
   assert.ok(holding(run.directory, ["refused"]).some(name => name.endsWith(".log")), "the refusal is kept in a log");
-  assert.equal(pushed(), `refs/heads/${branch} ${run.delivery.commit}`);
+  assert.deepEqual(run.result.decisions, [], "the delivery receipt predates merge-wait decisions");
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "human-1.json"), "utf8")), { stage: "mergeRetryDecide", response: "hand off" });
+  const receipt = JSON.parse(readFileSync(join(run.directory, "merge.json"), "utf8"));
+  assert.deepEqual([receipt.outcome, receipt.decision, receipt.remoteDeleted, receipt.localDeleted], ["handedOff", "hand off", false, false]);
+  assert.match(receipt.reason, /git push failed deleting/u);
+  assert.equal(pushed(), `refs/heads/${branch} ${run.delivery.commit}`); assert.equal(git(f.repo, "rev-parse", branch), run.delivery.commit);
 });
+
+test("a cleanUp that fails four times asks with retry added to the merge decision, and retry completes the merge wait", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const deletes = refusingDeletes(f, 4);
+  let asked = 0; const human = person(() => { asked = deletes(); return "retry"; });
+  const result = await untilEnd(input(f, { output: "pr" }), {}, human);
+  retried(result, 3); assert.deepEqual([asked, deletes()], [4, 5]); viewed(gh, 1); untouched(f);
+  assert.equal(result.state, "merged"); assert.deepEqual(result.states.slice(-2), ["cleanUp", "merged"]);
+  const asking = result.states.indexOf("mergeRetryDecide");
+  assert.deepEqual(result.states.slice(asking - 2, asking + 1), ["cleanUp", "mergeFailed", "mergeRetryDecide"]);
+  // retry runs cleanUp again and nothing before it: the pull request is not asked about again.
+  assert.equal(checks(result.states), 1); assert.equal(result.states.filter(state => state === "cleanUp").length, 2);
+  mergeRetryAsked(human.requests[0], /git push failed deleting/u); assert.equal(human.requests.length, 1);
+  const run = complete(f, result, /^Merged /u); asksWritten(run.directory, human.requests);
+  for (const part of [url, branch]) assert.ok(result.output.summary.includes(part), part);
+  assert.deepEqual(run.result.decisions, [], "the delivery receipt predates merge-wait decisions");
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "human-1.json"), "utf8")), { stage: "mergeRetryDecide", response: "retry" });
+  const receipt = JSON.parse(readFileSync(join(run.directory, "merge.json"), "utf8"));
+  assert.deepEqual([receipt.outcome, receipt.localDeleted, receipt.remoteDeleted], ["merged", true, true]);
+  assert.equal(pushed(), ""); assert.equal(git(f.repo, "branch", "--list", branch), ""); assert.equal(existsSync(f.worktree), false);
+});
+
+test("a local branch that cannot be deleted after a merge is retried, then asks; retry once it can be deleted completes the merge wait", async context => {
+  const f = fixture(context); const pushed = remote(f); fakeGh(context, f);
+  // Checked out in a worktree of its own, the local branch cannot be deleted; the person frees it before answering.
+  const holder = join(f.root, "holder"); let placed = false;
+  const human = person(() => { git(f.repo, "worktree", "remove", "--force", holder); return "retry"; });
+  const result = await untilEnd(input(f, { output: "pr" }), {}, human, entry => {
+    if (String(entry.value) === "cleanUp" && !placed) { placed = true; git(f.repo, "worktree", "add", "-q", holder, branch); }
+  });
+  retried(result, 3); untouched(f);
+  assert.equal(result.state, "merged"); assert.deepEqual(result.states.slice(-2), ["cleanUp", "merged"]);
+  mergeRetryAsked(human.requests[0], /git branch failed; inspect .+git-branch\.log/u); assert.equal(human.requests.length, 1);
+  const run = complete(f, result, /^Merged /u);
+  const receipt = JSON.parse(readFileSync(join(run.directory, "merge.json"), "utf8"));
+  assert.deepEqual([receipt.outcome, receipt.localDeleted, receipt.remoteDeleted], ["merged", true, true]);
+  assert.equal(pushed(), ""); assert.equal(git(f.repo, "branch", "--list", branch), "");
+});
+
+for (const choice of ["hand off", "discard"] as const) {
+  test(`after remote cleanup succeeds but local deletion fails, ${choice} names the deleted remote branch in its summary`, async context => {
+    const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f);
+    const holder = join(f.root, "holder"); let placed = false;
+    const human = choice === "hand off" ? person("hand off") : person("discard", () => {
+      git(f.repo, "worktree", "remove", "--force", holder); return "confirm discard";
+    });
+    const result = await untilEnd(input(f, { output: "pr" }), {}, human, entry => {
+      if (String(entry.value) === "cleanUp" && !placed) { placed = true; git(f.repo, "worktree", "add", "-q", holder, branch); }
+    });
+    retried(result, 3); viewed(gh, 1); untouched(f);
+    const ending = choice === "hand off" ? "handedOff" : "abandoned";
+    assert.equal(result.state, ending);
+    mergeRetryAsked(human.requests[0], /git branch failed; inspect .+git-branch\.log/u);
+    assert.ok(human.requests[0]!.prompt.includes("The pushed branch has already been deleted."));
+    const run = held(f, result, choice === "hand off" ? /^Handed off: /u : /^Abandoned: /u);
+    assert.ok(result.output.summary.includes(`Pull request: ${url}. Branch: ${branch}, ${choice === "hand off" ? "kept" : "deleted"} locally. The pushed branch was already deleted on origin. Evidence: `), result.output.summary);
+    assert.doesNotMatch(result.output.summary, /kept locally and on|pushed branch is kept/u);
+    const receipt = JSON.parse(readFileSync(join(run.directory, "merge.json"), "utf8"));
+    assert.deepEqual([receipt.outcome, receipt.localDeleted, receipt.remoteDeleted], [ending, choice === "discard", true]);
+    assert.equal(pushed(), "");
+    assert.equal(git(f.repo, "branch", "--list", branch).includes(branch), choice === "hand off");
+  });
+}
 
 /** A delivered pull request's later ending says what happened first, without the branch, then the pull request and where the branch is. */
 function settled(summary: string, after: string) {
@@ -4468,52 +4808,52 @@ test("tickets whose ids differ by a '-' extension keep separate branches, told a
   assert.equal(second.state, "delivered"); assert.equal(evidence(next(f, 2)).delivery.branch, branch); assert.equal(record(f, branch), "proj-12");
   for (const [run, ticket, found] of [[3, { id: "PROJ", title: "Add a greeting" }, "ticket/proj-12-tidy"], [4, { id: "PROJ-12", title: "Tidy" }, branch]] as const) {
     const again = await execute({ ...input(next(f, run)), ticket: { ...input(f).ticket, ...ticket } }, { investigator: () => assert.fail() });
-    assert.equal(again.state, "blocked");
-    held(next(f, run), again, new RegExp(`^Blocked: Branch ${found} already exists in .+ for this ticket; nothing was changed`, "u"));
+    assert.equal(again.state, "refused");
+    held(next(f, run), again, new RegExp(`^Refused: Branch ${found} already exists in .+ for this ticket; nothing was changed`, "u"));
   }
   assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), `main\n${branch}\nticket/proj-12-tidy`); untouched(f);
 });
 
-test("a ticket whose id and title spell the name of another ticket's branch is blocked, and that branch is left alone", async context => {
+test("a ticket whose id and title spell the name of another ticket's branch is refused, and that branch is left alone", async context => {
   const f = fixture(context);
   assert.equal((await execute(input(f))).state, "delivered"); const commit = git(f.repo, "rev-parse", branch);
   const result = await execute({ ...input(next(f, 2)), ticket: { ...input(f).ticket, id: "PROJ", title: "12: add a greeting" } }, { investigator: () => assert.fail() });
-  assert.equal(result.state, "blocked"); untouched(f);
-  held(next(f, 2), result, /^Blocked: Branch ticket\/proj-12-add-a-greeting already exists in .+ for ticket proj-12, whose id and title spell the name this ticket would take; nothing was changed/u);
+  assert.equal(result.state, "refused"); untouched(f);
+  held(next(f, 2), result, /^Refused: Branch ticket\/proj-12-add-a-greeting already exists in .+ for ticket proj-12, whose id and title spell the name this ticket would take; nothing was changed/u);
   assert.equal(git(f.repo, "branch", "--format=%(refname:short) %(objectname)"), `main ${f.head}\n${branch} ${commit}`);
   assert.equal(existsSync(join(f.root, "worktrees", "widgets--proj")), false);
 });
 
-test("a branch without a record that may be this ticket's under an earlier title blocks it, and a ticket with a shorter id, until its record says whose it is", async context => {
+test("a branch without a record that may be this ticket's under an earlier title refuses it, and a ticket with a shorter id, until its record says whose it is", async context => {
   const f = fixture(context); const agents = { investigator: () => assert.fail() };
   // Made by hand: PROJ-12 under an earlier title, or PROJ titled "12 an earlier title".
   const earlier = "ticket/proj-12-an-earlier-title"; git(f.repo, "branch", earlier);
   const refs = () => git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"); const before = refs();
   for (const [run, id, ticket] of [[1, "PROJ-12", "proj-12"], [2, "PROJ", "proj"]] as const) {
     const result = await execute({ ...input(next(f, run)), ticket: { ...input(f).ticket, id, title: "Add a greeting" } }, agents);
-    assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
-    assert.ok(result.output.summary.startsWith(`Blocked: Branch ${earlier} already exists in ${f.repo} with ${unsettled(earlier, ticket)} Evidence: `), result.output.summary);
+    assert.equal(result.state, "refused"); assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]); untouched(f);
+    assert.ok(result.output.summary.startsWith(`Refused: Branch ${earlier} already exists in ${f.repo} with ${unsettled(earlier, ticket)} Evidence: `), result.output.summary);
     assert.equal(refs(), before); assert.equal(existsSync(join(f.root, "worktrees")), false); assert.throws(() => record(f, earlier));
   }
   // Recorded for PROJ-12, it blocks that ticket as its own branch and no longer concerns PROJ.
   git(f.repo, "config", `branch.${earlier}.ticket`, "proj-12");
   const own = await execute(input(next(f, 3)), agents);
-  held(next(f, 3), own, /^Blocked: Branch ticket\/proj-12-an-earlier-title already exists in .+ for this ticket; nothing was changed\. Deliver or delete it/u);
+  held(next(f, 3), own, /^Refused: Branch ticket\/proj-12-an-earlier-title already exists in .+ for this ticket; nothing was changed\. Deliver or delete it/u);
   const shorter = await execute({ ...input(next(f, 4)), ticket: { ...input(f).ticket, id: "PROJ", title: "Add a greeting" } });
   assert.equal(shorter.state, "delivered"); untouched(f);
   assert.equal(evidence(next(f, 4)).delivery.branch, "ticket/proj-add-a-greeting"); assert.equal(record(f, "ticket/proj-add-a-greeting"), "proj");
   assert.equal(git(f.repo, "rev-parse", earlier), f.head);
 });
 
-test("branches without a record that may be those of tickets with longer ids block a ticket one by one, until each record says whose it is", async context => {
+test("branches without a record that may be those of tickets with longer ids refuse a ticket one by one, until each record says whose it is", async context => {
   const f = fixture(context); const ticket = { ...input(f).ticket, id: "PROJ", title: "Add a greeting" };
   // None holds a ticket commit. For PROJ each may be its own: titled "12", "12 1", or "12 add a greeting".
   const others = [["ticket/proj-12", "proj-12"], ["ticket/proj-12-1", "proj-12-1"], ["ticket/proj-12-add-a-greeting", "proj-12"]] as const;
   for (const [name] of others) git(f.repo, "branch", name);
   for (const [index, [name, whose]] of others.entries()) {
     const result = await execute({ ...input(next(f, index)), ticket: { ...input(f).ticket, ...ticket } }, { investigator: () => assert.fail() });
-    assert.equal(result.state, "blocked"); untouched(f);
-    assert.ok(result.output.summary.startsWith(`Blocked: Branch ${name} already exists in ${f.repo} with ${unsettled(name, "proj")} Evidence: `), result.output.summary);
+    assert.equal(result.state, "refused"); untouched(f);
+    assert.ok(result.output.summary.startsWith(`Refused: Branch ${name} already exists in ${f.repo} with ${unsettled(name, "proj")} Evidence: `), result.output.summary);
     assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), ["main", ...others.map(([other]) => other)].join("\n"));
     git(f.repo, "config", `branch.${name}.ticket`, whose);
   }
@@ -4524,17 +4864,17 @@ test("branches without a record that may be those of tickets with longer ids blo
 });
 
 for (const [name, made] of [["ticket/proj-12", "before branches carried a title or a record"], [branch, "by a run whose record did not come along"]] as const) {
-  test(`a delivered ${name} without a record, made ${made}, is told by the ticket commit it holds and blocks that ticket alone`, async context => {
+  test(`a delivered ${name} without a record, made ${made}, is told by the ticket commit it holds and refuses that ticket alone`, async context => {
     const f = fixture(context);
     assert.equal((await execute(input(f))).state, "delivered");
     if (name !== branch) git(f.repo, "branch", "-m", branch, name);
     git(f.repo, "config", "--unset", `branch.${name}.ticket`); assert.throws(() => record(f, name));
     const commit = git(f.repo, "rev-parse", name); assert.equal(git(f.repo, "log", "-1", "--format=%s%n%b", name), "Add a greeting\nTicket: PROJ-12");
     const own = await execute({ ...input(next(f, 2)), ticket: { ...input(f).ticket, id: "PROJ-12", title: "A later title" } }, { investigator: () => assert.fail() });
-    held(next(f, 2), own, new RegExp(`^Blocked: Branch ${name} already exists in .+ for this ticket; nothing was changed`, "u"));
+    held(next(f, 2), own, new RegExp(`^Refused: Branch ${name} already exists in .+ for this ticket; nothing was changed`, "u"));
     // By its name the branch could be PROJ's under a title starting with 12; the commit says it is PROJ-12's, so only the name itself is taken.
     const same = await execute({ ...input(next(f, 3)), ticket: { ...input(f).ticket, id: "PROJ", title: name === branch ? "12: add a greeting" : "12" } }, { investigator: () => assert.fail() });
-    held(next(f, 3), same, new RegExp(`^Blocked: Branch ${name} already exists in .+ for ticket proj-12, whose id and title spell the name this ticket would take; nothing was changed`, "u"));
+    held(next(f, 3), same, new RegExp(`^Refused: Branch ${name} already exists in .+ for ticket proj-12, whose id and title spell the name this ticket would take; nothing was changed`, "u"));
     const shorter = await execute({ ...input(next(f, 4)), ticket: { ...input(f).ticket, id: "PROJ", title: "Tidy" } });
     assert.equal(shorter.state, "delivered"); untouched(f);
     assert.equal(evidence(next(f, 4)).delivery.branch, "ticket/proj-tidy"); assert.equal(git(f.repo, "rev-parse", name), commit);
@@ -4547,17 +4887,17 @@ test("a commit that names a ticket does not give that ticket a branch its id and
   git(f.repo, "commit", "-q", "--allow-empty", "-m", "Add a greeting", "-m", "Ticket: PROJ-12"); f.head = git(f.repo, "rev-parse", "HEAD");
   const cut = "ticket/proj-12-tidy"; git(f.repo, "branch", cut);
   const result = await execute({ ...input(f), ticket: { ...input(f).ticket, id: "PROJ-12", title: "A later title" } }, { investigator: () => assert.fail() });
-  assert.equal(result.state, "blocked"); untouched(f);
-  assert.ok(result.output.summary.startsWith(`Blocked: Branch ${cut} already exists in ${f.repo} with ${unsettled(cut)} Evidence: `), result.output.summary);
+  assert.equal(result.state, "refused"); untouched(f);
+  assert.ok(result.output.summary.startsWith(`Refused: Branch ${cut} already exists in ${f.repo} with ${unsettled(cut)} Evidence: `), result.output.summary);
 });
 
-test("a ticket retitled after its run is blocked by the branch that run made, and resumes on it", async context => {
+test("a ticket retitled after its run is refused by the branch that run made, and resumes on it", async context => {
   const f = fixture(context); const earlier = "ticket/proj-12-an-earlier-title";
   const ticket = { ...input(f).ticket, id: "PROJ-12", title: "An earlier title" };
   const first = await execute({ ...input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), ticket }, { reviewer: () => ownerReview("Handle the empty case") }, person("hand off"));
   assert.equal(first.state, "handedOff"); assert.equal(record(f, earlier), "proj-12"); assert.equal(git(f.worktree, "symbolic-ref", "--short", "HEAD"), earlier);
   const second = await execute(input(next(f, 2)), { investigator: () => assert.fail() });
-  held(next(f, 2), second, /^Blocked: Branch ticket\/proj-12-an-earlier-title already exists in .+ for this ticket; nothing was changed/u);
+  held(next(f, 2), second, /^Refused: Branch ticket\/proj-12-an-earlier-title already exists in .+ for this ticket; nothing was changed/u);
   const resumed = await execute(input(next(f, 3), {}, { resume: true }), { investigator: () => assert.fail(), implementer: () => assert.fail() });
   assert.equal(resumed.state, "delivered"); untouched(f);
   assert.equal(evidence(next(f, 3)).delivery.branch, earlier); assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), `main\n${earlier}`);
@@ -4574,7 +4914,7 @@ test("a resumed run does not adopt an unrecorded branch that could be that of a 
     git(worktree, "checkout", "-q", name);
     const refs = git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)");
     const result = await execute({ ...input(next(f, run), {}, { resume: true }), ticket }, agents);
-    assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
+    assert.equal(result.state, "refused"); assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]); untouched(f);
     assert.match(result.output.summary, noRecord(name, "proj")); assert.ok(result.output.summary.includes(`HEAD in ${worktree} is on ${name}, `));
     assert.equal(git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"), refs); assert.equal(readFileSync(join(worktree, "greeting.txt"), "utf8"), "hello\n");
   }
@@ -4607,12 +4947,12 @@ for (const [label, body, summary] of [
   ["a heading and several paragraphs", "\n# Add a greeting\n\n## Why\n\nWrite hello to greeting.txt,\nand nothing else.\n\nA second paragraph.\n\n## Acceptance criteria\n\n- A file.\n", "Write hello to greeting.txt,\nand nothing else."],
   ["a heading straight after its first paragraph", "# Add a greeting\nWrite hello to greeting.txt,\nand nothing else.\n## Acceptance criteria\n- A file.\n\n### Notes\nNone.\n", "Write hello to greeting.txt,\nand nothing else."],
 ] as const) {
-  test(`a ticket with ${label} ${summary ? "summarizes its first paragraph in the pull request" : "blocks before delivery"}`, async context => {
+  test(`a ticket with ${label} ${summary ? "summarizes its first paragraph in the pull request" : "is refused before delivery"}`, async context => {
     const f = fixture(context); remote(f); fakeGh(context, f);
     const result = await execute({ ...input(f, { output: "pr" }), ticket: { ...input(f).ticket, id: "PROJ-12", title: "Add a greeting", body: body === undefined || summary === undefined ? body : `${body}\n${input(f).ticket.body}` } });
     if (summary === undefined) {
-      assert.equal(result.state, "blocked");
-      const run = held(f, result, /^Blocked: Ticket body is missing required sections or non-empty lists: Goal, Scope, Acceptance, Forbidden\. Expected shape:/u);
+      assert.equal(result.state, "refused");
+      const run = held(f, result, /^Refused: Ticket body is missing required sections or non-empty lists: Goal, Scope, Acceptance, Forbidden\. Expected shape:/u);
       assert.equal(run.delivery.reason.split(" Expected shape:")[0], "Ticket body is missing required sections or non-empty lists: Goal, Scope, Acceptance, Forbidden.");
       for (const heading of ["Goal", "Scope", "Acceptance", "Forbidden"]) assert.ok(run.delivery.reason.includes(`## ${heading}`));
       assert.equal(existsSync(f.worktree), false); assert.equal(evidence(f).result.agentInvocations, 0);
@@ -4667,7 +5007,7 @@ function ahead(f: Fixture, commits: number) {
 }
 
 for (const [commits, count] of [[1, /Base HEAD has 1 unpublished local commit that is not in the default branch main on origin, /u], [2, /Base HEAD has 2 unpublished local commits that are not in the default branch main on origin, /u]] as const) {
-  test(`a pr run whose base is ${commits} ahead of the remote blocks before any Agent and publishes nothing`, async context => {
+  test(`a pr run whose base is ${commits} ahead of the remote is refused before any Agent and publishes nothing`, async context => {
     const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); ahead(f, commits);
     // The remote-tracking ref claims the base is published; only the remote itself knows.
     git(f.repo, "update-ref", "refs/remotes/origin/main", f.head);
@@ -4675,10 +5015,10 @@ for (const [commits, count] of [[1, /Base HEAD has 1 unpublished local commit th
     if (commits === 2) linked(f);
     const refs = git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)");
     const result = await execute(input(f, { output: "pr" }, { resume: commits === 2 }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
-    assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
+    assert.equal(result.state, "refused"); assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]); untouched(f);
     const run = held(f, result, count);
     assert.ok(result.output.summary.includes(`and the pull request would carry them. The base must be pushed first; nothing was changed. Checked commit: ${f.head}. Evidence: `));
-    assert.deepEqual([run.delivery.outcome, run.delivery.worktreeCreated, run.delivery.commit, run.result.agentInvocations], ["blocked", false, null, 0]);
+    assert.deepEqual([run.delivery.outcome, run.delivery.worktreeCreated, run.delivery.commit, run.result.agentInvocations], ["refused", false, null, 0]);
     assert.equal(git(f.repo, "for-each-ref", "--format=%(refname) %(objectname)"), refs); assert.equal(existsSync(f.worktree), commits === 2);
     assert.doesNotMatch(result.output.summary, /Worktree kept/u); assert.equal(run.delivery.resumed, undefined);
     assert.equal(pushed(), ""); assert.equal(gh(), undefined);
@@ -4692,20 +5032,20 @@ test("a named pull request base is compared with that branch on the remote, and 
   const published = pushed();
   const agents = { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() };
   const behind = await execute(input(f, { output: "pr", base: "release" }), agents);
-  held(f, behind, /^Blocked: Base release has 3 unpublished local commits that are not in release on origin, .+ must be pushed first/u);
+  held(f, behind, /^Refused: Base release has 3 unpublished local commits that are not in release on origin, .+ must be pushed first/u);
   git(f.repo, "branch", "local-only");
   const missing = await execute(input({ ...f, evidence: join(f.root, "evidence-missing") }, { output: "pr", base: "local-only" }), agents);
-  assert.match(missing.output.summary, /^Blocked: The pull request base local-only on origin does not exist, so the base cannot be shown to be published\. Push it first/u);
-  assert.deepEqual([behind.states, missing.states], [["shape", "prepare", "failure", "blocked"], ["shape", "prepare", "failure", "blocked"]]);
+  assert.match(missing.output.summary, /^Refused: The pull request base local-only on origin does not exist, so the base cannot be shown to be published\. Push it first/u);
+  assert.deepEqual([behind.states, missing.states], [["shape", "prepare", "refuse", "refused"], ["shape", "prepare", "refuse", "refused"]]);
   assert.equal(pushed(), published); assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), "local-only\nmain\nrelease"); untouched(f);
 });
 
-test("a pr run whose remote cannot be reached blocks before any Agent with the saved log", async context => {
+test("a pr run whose remote cannot be reached is refused before any Agent with the saved log", async context => {
   const f = fixture(context); const gh = fakeGh(context, f);
   git(f.repo, "remote", "add", "origin", join(f.root, "no-such-remote.git"));
   const result = await execute(input(f, { output: "pr" }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
-  assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
-  const run = held(f, result, /^Blocked: Remote origin could not be reached to check that the base is published; nothing was changed; inspect .+git-ls-remote\.log/u);
+  assert.equal(result.state, "refused"); assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]); untouched(f);
+  const run = held(f, result, /^Refused: Remote origin could not be reached to check that the base is published; nothing was changed; inspect .+git-ls-remote\.log/u);
   assert.match(readFileSync(join(run.directory, "git-ls-remote.log"), "utf8"), /no-such-remote\.git/u);
   assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), "main"); assert.equal(existsSync(f.worktree), false); assert.equal(gh(), undefined);
 });
@@ -4822,13 +5162,13 @@ test("a pr run started from the remote tip replays onto a later remote tip at de
   assert.equal(pushed(), `refs/heads/main ${tip}`);
 });
 
-test("a pr run started from the remote tip is not delivered when the remote moves back below it: the commit is undone and the run ends blocked", async context => {
-  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const started = publishElsewhere(f); let before: Candidate | undefined;
+test("a pr run started from the remote tip is not delivered when the remote moves back below it: the commit is undone and the run asks only hand off or discard", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const started = publishElsewhere(f); let before: Candidate | undefined; const human = person("hand off");
   const result = await execute(input(f, { output: "pr" }), {
     reviewer: request => { before = candidate(request.cwd); git(join(f.root, "other"), "push", "-q", "-f", "origin", `${f.head}:main`); return review(); },
-  });
-  assert.equal(result.state, "blocked"); assert.deepEqual(result.states.slice(-5), ["reviewResult", "commit", "rebase", "failure", "blocked"]);
-  const run = held(f, result, /^Blocked: Base \S+ was rewritten or moved back to \S+; the ticket must be delivered by hand\./u); untouched(f);
+  }, human);
+  const run = steppedOff(f, result, "rebase", "keepDecide", /Base \S+ was rewritten or moved back to \S+; the ticket must be delivered by hand\./u, human); untouched(f);
+  assert.deepEqual(result.states.slice(-7, -5), ["reviewResult", "commit"]); assert.match(run.delivery.reason, /^Base /u);
   assert.ok(names(run.delivery.reason, started), "the reason names the remote tip the run started from");
   assert.ok(names(run.delivery.reason, f.head), "the reason names the remote's tip now");
   uncommitted(f, run, started, before!);
@@ -4855,16 +5195,16 @@ test("a resumed pr run whose branch holds a commit in neither the local base nor
   linked(f); implement({ cwd: f.worktree }); git(f.worktree, "add", "."); git(f.worktree, "commit", "-qm", "earlier commit");
   const own = git(f.repo, "rev-parse", branch); const refs = allRefs(f);
   const result = await execute(input(f, { output: "pr" }, { resume: true }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
-  assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
-  held(f, result, /^Blocked: Cannot resume: ticket\/proj-12-add-a-greeting holds 1 commit that is not in the base commit .+ or the base moved back; only an uncommitted candidate is resumed, and nothing was changed\. Evidence: /u);
+  assert.equal(result.state, "refused"); assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]); untouched(f);
+  held(f, result, /^Refused: Cannot resume: ticket\/proj-12-add-a-greeting holds 1 commit that is not in the base commit .+ or the base moved back; only an uncommitted candidate is resumed, and nothing was changed\. Evidence: /u);
   assert.equal(git(f.repo, "rev-parse", branch), own); assert.equal(allRefs(f), refs); assert.equal(pushed(), `refs/heads/main ${tip}`); assert.equal(gh(), undefined);
 });
 
 test("a pr run whose local base has a commit the remote lacks is refused with today's message, also when the remote has moved on", async context => {
   const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const tip = publishElsewhere(f); ahead(f, 1); const refs = allRefs(f);
   const result = await execute(input(f, { output: "pr" }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() });
-  assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
-  const run = held(f, result, /^Blocked: Base HEAD has 1 unpublished local commit that is not in the default branch main on origin, /u);
+  assert.equal(result.state, "refused"); assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]); untouched(f);
+  const run = held(f, result, /^Refused: Base HEAD has 1 unpublished local commit that is not in the default branch main on origin, /u);
   assert.ok(result.output.summary.includes(`and the pull request would carry them. The base must be pushed first; nothing was changed. Checked commit: ${f.head}. Evidence: `));
   assert.equal(existsSync(f.worktree), false); assert.equal(existsSync(join(run.directory, "base.json")), false);
   assert.equal(allRefs(f), refs); assert.equal(pushed(), `refs/heads/main ${tip}`); assert.equal(gh(), undefined);
@@ -4901,7 +5241,7 @@ for (const output of ["branch", "patch", "pr"]) {
     assert.ok(calls().some(call => call.startsWith("rev-parse --verify --quiet HEAD^{commit}")));
     assert.equal(pushed(), "");
     if (output === "pr") {
-      assert.equal(result.state, "blocked");
+      assert.equal(result.state, "refused");
       assert.deepEqual(network, [`ls-remote --symref ${hosted}.git HEAD`]); assert.equal(calls().some(call => call.startsWith("worktree add")), false);
       return;
     }
@@ -5362,7 +5702,7 @@ test("the catalog describes rebase, reverify, rebasedFrom, and the invariant tha
   assert.match(prose, /never stops with (?:\S+ ){1,4}commit on the ticket branch/iu, "the catalog does not state the invariant");
   // A base that moved is rebased onto now, so the catalog may not still say the candidate is delivered on the older commit as it is.
   assert.doesNotMatch(prose, /without rebasing|nothing is rebased|or rebase a candidate onto a base that moved/iu);
-  // A rewritten or moved-back base ends blocked for delivery by hand, and adopt goes on refusing such a branch.
+  // A rewritten or moved-back base asks to be handed off for delivery by hand, and adopt goes on refusing such a branch.
   assert.match(prose, /moved back|rewritten/iu); assert.match(prose, /by hand/iu);
 });
 
@@ -5685,11 +6025,11 @@ for (const [label, damage, names] of damages) {
       investigator: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
     });
     // The answers the plan was made from cannot be read back, so the candidate is not reviewed or delivered without them.
-    assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
-    const run = held(again, result, /^Blocked: Cannot resume: /u);
+    assert.equal(result.state, "refused"); assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]); untouched(f);
+    const run = held(again, result, /^Refused: Cannot resume: /u);
     assert.match(run.delivery.reason, /^Cannot resume: /u); assert.ok(run.delivery.reason.includes(file), `${run.delivery.reason} does not name ${file}`);
     if (names) assert.match(run.delivery.reason, names, "the refusal does not name the entry and its field");
-    assert.deepEqual([run.delivery.outcome, run.delivery.resumed, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.result.checks.length], ["blocked", undefined, false, false, null, 0]);
+    assert.deepEqual([run.delivery.outcome, run.delivery.resumed, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.result.checks.length], ["refused", undefined, false, false, null, 0]);
     assert.equal(Object.hasOwn(run.delivery, "assumptions"), false); assert.equal(run.result.agentInvocations, 0);
     assert.deepEqual(snapshot(), before);
   });
@@ -5980,8 +6320,9 @@ test("a delivery after a replay records the commit on the new tip, not the one a
 });
 
 test("a run that does not deliver records no delivered commit: a failed pull request leaves its committed branch without one", async context => {
-  const f = fixture(context); remote(f); fakeGh(context, f, 1);
-  const run = blocked(f, await execute(input(f, { output: "pr" })), /gh pr failed; inspect .+gh-pr\.log/u, 1);
+  const f = fixture(context); remote(f); fakeGh(context, f, 1); const human = person("hand off");
+  const result = await untilEnd(input(f, { output: "pr" }), {}, human); retried(result, 3);
+  const run = steppedOff(f, result, "deliver", "deliverDecide", /gh pr failed; inspect .+gh-pr\.log/u, human, 1); untouched(f);
   assert.equal(run.delivery.commit, git(f.repo, "rev-parse", branch)); assert.equal(deliveredAs(f), "");
 });
 
@@ -6154,27 +6495,52 @@ test("with resume, setup that fails on the new tip stops a delivered ticket ther
 
 for (const [label, repository, reason, states, checked] of [
   ["a setup command that fails where the worktree was recreated", { setup: [command("process.exit(3)", { name: "install" })] }, /\bsetup\b|\binstall\b/iu,
-    ["shape", "prepare", "failure", "blocked"], [["setup", "install", false]]],
+    ["shape", "prepare", "refuse", "refused"], [["setup", "install", false]]],
   ["a setup command that leaves an unignored file where the worktree was recreated", { setup: [command('require("fs").writeFileSync("setup-output.txt", "leftover")', { name: "install" })] }, /\bsetup\b|\binstall\b/iu,
-    ["shape", "prepare", "failure", "blocked"], [["setup", "install", true]]],
-  ["gates that fail on the delivered commit when the base has not moved", { checks: [command('console.log("the gate refuses"); process.exit(1)')] }, /\bgates?\b|\bchecks?\b|\bverif|\btests\b/iu,
-    ["shape", "prepare", "rebase", "failure", "blocked"], [["verify", "tests", false], ["verify", "tests", false]]],
+    ["shape", "prepare", "refuse", "refused"], [["setup", "install", true]]],
 ] as const) {
-  test(`with resume, ${label} refuse${label.startsWith("gates") ? "" : "s"} the delivered ticket: the recreated worktree is removed, and the branch, its record, and every other ref are as they were`, async context => {
+  test(`with resume, ${label} refuses the delivered ticket: the recreated worktree is removed, and the branch, its record, and every other ref are as they were`, async context => {
     const f = fixture(context); const delivered = await deliverFirst(f); const before = everything(f); const again = next(f, 2);
     const result = await execute(input(again, repository, { resume: true }), nobody);
-    // It ends by itself, as other refusals do: nothing to repair in a tree that passed before, and nobody to ask.
-    assert.equal(result.state, "blocked"); assert.deepEqual(result.states, states); untouched(f);
-    const run = held(again, result, /^Blocked: Cannot resume: /u); assert.match(run.delivery.reason, reason);
+    // It ends by itself, as other refusals do: setup that fails on a commit already delivered leaves nothing to repair, and nobody to ask.
+    assert.equal(result.state, "refused"); assert.deepEqual(result.states, states); untouched(f);
+    const run = refused(again, result, reason); assert.match(run.delivery.reason, /^Cannot resume: /u);
     assert.doesNotMatch(result.output.summary, /Worktree kept/u); assert.equal(existsSync(f.worktree), false);
     assert.deepEqual(everything(f), before); assert.deepEqual([git(f.repo, "rev-parse", branch), deliveredAs(f)], [delivered, delivered]);
-    assert.deepEqual([run.delivery.outcome, run.delivery.commit, run.delivery.worktreeRemoved, run.result.outcome, run.result.agentInvocations], ["blocked", null, true, "blocked", 0]);
+    assert.deepEqual([run.delivery.outcome, run.delivery.commit, run.delivery.worktreeRemoved, run.result.outcome, run.result.agentInvocations], ["refused", null, true, "blocked", 0]);
     // The receipt does not say the delivered commit passed: this run's own checks are all it has.
     assert.notEqual(run.result.checksPassed, true); assert.deepEqual(ran(run), checked);
   });
 }
 
-test("with resume in pr mode, a delivered ticket is not taken up: the run ends blocked saying the pull request is brought up to date at its host, and nothing is changed or asked of the remote", async context => {
+test("with resume, gates that fail on a redelivered commit when the base has not moved go to the repair loop, as any red check does, and are never offered as retry", async context => {
+  const f = fixture(context); const delivered = await deliverFirst(f); const again = next(f, 2); let edits = 0; let reviews = 0;
+  // A gate the delivered greeting does not meet; the repaired one does.
+  const checks = [command(), command('if (!require("fs").readFileSync("greeting.txt", "utf8").includes("again")) { console.log("greeting.txt does not say again"); process.exit(1); }', { name: "again-gate" })];
+  const human = person();
+  const result = await execute(input(again, { checks }, { resume: true }), {
+    ...nobody,
+    implementer: request => {
+      edits++;
+      // With the implementer: the delivered commit is undone on its own base, so the candidate is uncommitted there, and the failed gate is named.
+      assert.equal(git(request.cwd, "rev-parse", "HEAD"), f.head); assert.equal(candidate(request.cwd).status, "?? greeting.test.txt\n?? greeting.txt");
+      assert.match(request.prompt.split("Current failure/feedback: ")[1] ?? "", /again-gate/u);
+      writeFileSync(join(request.cwd, "greeting.txt"), "hello again\n"); return ok();
+    },
+    reviewer: () => { reviews++; return review(); },
+  }, human);
+  assert.equal(result.state, "delivered"); untouched(f); assert.deepEqual([edits, reviews, human.requests.length], [1, 1, 0]);
+  assert.deepEqual(result.states, ["shape", "prepare", "rebase", "repairBudget", "repairTarget", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult",
+    "commit", "rebase", "deliver", "success", "delivered"]);
+  for (const state of ["stepFailed", "stepDecide", "keepDecide", "refuse", "stuck"]) assert.equal(result.states.includes(state), false, state);
+  const commit = onTip(f, f.head); assert.notEqual(commit, delivered); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello again");
+  const run = held(again, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u"));
+  assert.deepEqual([run.delivery.outcome, run.delivery.baseCommit, run.delivery.commit, run.delivery.redelivered, run.result.checksPassed, run.result.repairs], ["delivered", f.head, commit, undefined, true, 1]);
+  assert.deepEqual(ran(run), [["verify", "tests", true], ["verify", "again-gate", false], ["verify", "again-gate", false], ["verify", "tests", true], ["verify", "again-gate", true]]);
+  assert.equal(deliveredAs(f), commit);
+});
+
+test("with resume in pr mode, a delivered ticket is not taken up: the run is refused, saying the pull request is brought up to date at its host, and nothing is changed or asked of the remote", async context => {
   const path = process.env.PATH; const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const calls = recordGit(context, f);
   context.after(() => { process.env.PATH = path; });
   // The first pull request was closed without merging and handed off: its branch keeps the delivered commit and its record.
@@ -6187,10 +6553,10 @@ test("with resume in pr mode, a delivered ticket is not taken up: the run ends b
   advance(f); git(f.repo, "push", "-q", "origin", "main");
   rmSync(join(f.root, "bin/args")); const before = [everything(f), pushed(), gh.views()]; const since = calls().length; const again = next(f, 2);
   const result = await execute(input(again, { output: "pr", setup: [command("process.exit(1)", { name: "install" })] }, { resume: true }), nobody);
-  assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
-  const run = held(again, result, /^Blocked: .*\bpull request\b.*\bhost\b/iu); assert.doesNotMatch(result.output.summary, /Worktree kept/u);
+  assert.equal(result.state, "refused"); assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]); untouched(f);
+  const run = held(again, result, /^Refused: .*\bpull request\b.*\bhost\b/iu); assert.doesNotMatch(result.output.summary, /Worktree kept/u);
   assert.deepEqual([run.delivery.outcome, run.delivery.commit, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.result.checks.length, run.result.agentInvocations],
-    ["blocked", null, false, false, 0, 0]);
+    ["refused", null, false, false, 0, 0]);
   assert.deepEqual([everything(f), pushed(), gh.views()], before); assert.equal(git(f.repo, "rev-parse", branch), delivered); assert.equal(gh(), undefined);
   assert.deepEqual(calls().slice(since).filter(call => /^(?:ls-remote|fetch|push|worktree add)(?:\s|$)/u.test(call)), []);
 });
@@ -6227,14 +6593,14 @@ const refusals: [label: string, arrange: (f: Fixture) => unknown, reason?: RegEx
   ["a branch still at its base", f => { branchOnly(f); }, /worktree directory .+ does not exist; nothing was changed/u],
 ];
 for (const [label, arrange, reason] of refusals) {
-  test(`resume with no worktree and ${label} blocks without changing anything`, async context => {
+  test(`resume with no worktree and ${label} is refused without changing anything`, async context => {
     const f = fixture(context); await arrange(f); const before = everything(f); const again = next(f, 2);
     const result = await execute(input(again, { setup: [command("process.exit(1)", { name: "install" })] }, { resume: true }), nobody);
-    assert.equal(result.state, "blocked"); assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); untouched(f);
-    const run = held(again, result, /^Blocked: Cannot resume: /u); if (reason) assert.match(run.delivery.reason, reason);
+    assert.equal(result.state, "refused"); assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]); untouched(f);
+    const run = held(again, result, /^Refused: Cannot resume: /u); if (reason) assert.match(run.delivery.reason, reason);
     assert.doesNotMatch(result.output.summary, /Worktree kept/u);
     assert.deepEqual([run.delivery.outcome, run.delivery.resumed, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.result.checks.length, run.result.agentInvocations],
-      ["blocked", undefined, false, false, null, 0, 0]);
+      ["refused", undefined, false, false, null, 0, 0]);
     assert.deepEqual(everything(f), before);
   });
 }
@@ -6296,24 +6662,26 @@ for (const stale of [true, false]) {
     if (stale) rmSync(registered, { recursive: true, force: true });
     const before = everything(f); const again = next(f, 2);
     const result = await execute(input(again, {}, { resume: true }), nobody);
-    assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]);
-    const run = held(again, result, /^Blocked: Cannot resume: the worktree could not be recreated/u);
+    assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]);
+    const run = held(again, result, /^Refused: Cannot resume: the worktree could not be recreated/u);
     assert.deepEqual(everything(f), before);
     assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.result.checks.length], [false, false, 0]);
   });
 }
 
-test("failed withdrawal reports the recreated worktree as kept and never claims that nothing changed", async context => {
+test("failed withdrawal is still refused, reports the recreated worktree as kept, and never claims that nothing changed", async context => {
   const f = fixture(context); const delivered = await deliverFirst(f); const again = next(f, 2);
+  // Setup locks the recreated worktree and then fails, so the withdrawal that follows cannot remove it.
   const result = await execute(input(again, {
-    setup: [{ name: "lock", command: ["git", "worktree", "lock", f.worktree] }],
-    checks: [command("process.exit(1)")],
+    setup: [{ name: "lock", command: ["git", "worktree", "lock", f.worktree] }, command("process.exit(1)", { name: "install" })],
   }, { resume: true }), nobody);
-  assert.deepEqual(result.states, ["shape", "prepare", "rebase", "failure", "blocked"]);
-  const run = held(again, result, /^Blocked: Cannot resume: .*recreated worktree could not be removed/u);
-  assert.match(result.output.summary, /Worktree kept at /u);
+  assert.equal(result.state, "refused"); assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]);
+  const run = refused(again, result, /^Cannot resume: .*recreated worktree could not be removed/u);
+  assert.match(result.output.summary, /^Refused: Cannot resume: .*recreated worktree could not be removed/u);
+  assert.ok(result.output.summary.includes(`Worktree kept at ${f.worktree}.`));
   assert.doesNotMatch(result.output.summary, /nothing was changed/iu);
-  assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.result.checksPassed], [true, false, null, false]);
+  assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit], [true, false, null]); assert.notEqual(run.result.checksPassed, true);
+  assert.ok(existsSync(f.worktree));
   assert.deepEqual([git(f.repo, "rev-parse", branch), deliveredAs(f)], [delivered, delivered]);
 });
 
@@ -6324,9 +6692,140 @@ test("resume with a regular file as the worktree root refuses without changing a
     git(f.repo, "config", "--local", "--list"), readFileSync(root, "utf8")];
   const before = snapshot();
   const result = await execute(input(f, { setup: [command("process.exit(1)")] }, { resume: true }), nobody);
-  assert.deepEqual(result.states, ["shape", "prepare", "failure", "blocked"]); assert.equal(result.state, "blocked"); untouched(f);
-  const run = held(f, result, /^Blocked: Cannot resume: worktree directory .+ does not exist; nothing was changed\. Evidence: /u);
+  assert.deepEqual(result.states, ["shape", "prepare", "refuse", "refused"]); assert.equal(result.state, "refused"); untouched(f);
+  const run = held(f, result, /^Refused: Cannot resume: worktree directory .+ does not exist; nothing was changed\. Evidence: /u);
   assert.deepEqual([run.delivery.outcome, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit,
-    run.result.outcome, run.result.checks.length, run.result.agentInvocations], ["blocked", false, false, null, "blocked", 0, 0]);
+    run.result.outcome, run.result.checks.length, run.result.agentInvocations], ["refused", false, false, null, "blocked", 0, 0]);
   assert.deepEqual(snapshot(), before);
+});
+
+/** The text of a level-two or level-three section, up to the next heading of the same or a higher level. */
+function sectionOf(text: string, heading: string) {
+  const start = text.search(new RegExp(`^(#{2,3}) ${heading}\\b`, "mu"));
+  if (start < 0) return undefined;
+  const level = /^#+/u.exec(text.slice(start))![0].length;
+  const rest = text.slice(start).split("\n").slice(1).join("\n");
+  const end = rest.search(new RegExp(`^#{1,${level}} `, "mu"));
+  return end < 0 ? rest : rest.slice(0, end);
+}
+test("the ticket-task page gives each step that can fail its recovery in one table, the catalog's Recovery section links to it, and no document lists blocked among ticket-task's endings", () => {
+  const page = readFileSync(resolve("docs/workflows/ticket-task.md"), "utf8");
+  const table = sectionOf(page, "Recovery by step");
+  assert.ok(table !== undefined, "docs/workflows/ticket-task.md has no Recovery by step section");
+  const rows = table.split("\n").filter(line => line.startsWith("|"));
+  for (const step of ["shape", "prepare", "commit", "rebase", "deliver", "success", "cleanUp", "dropLocal", "archive", "remove"]) {
+    assert.ok(rows.some(row => row.split("|")[1]!.includes(`\`${step}\``)), `the recovery table has no row for ${step}`);
+  }
+  const prose = table.replace(/\s+/gu, " ");
+  for (const said of [/`retry`/u, /`hand off`/u, /`discard`/u, /`refused`/u, /`delivered`/u, /repair/iu, /\b(?:1|one) minute\b|`1m`/iu, /\b(?:3|three)\b/u]) assert.match(prose, said);
+  const recovery = sectionOf(readFileSync(resolve("docs/catalog.md"), "utf8"), "Recovery");
+  assert.ok(recovery?.includes("workflows/ticket-task.md#recovery-by-step"), "the catalog's Recovery section does not link to the ticket-task recovery table");
+  // Ticket-task's final states, as each document lists them.
+  const results = sectionOf(page, "Results") ?? "";
+  assert.doesNotMatch(results, /\*\*`blocked`\*\*/u, "the ticket-task page still lists blocked as an ending");
+  assert.match(results, /\*\*`refused`\*\*/u, "the ticket-task page does not list refused as an ending");
+  assert.doesNotMatch(page, /\bblocked\(\(/u, "the ticket-task diagram still has a blocked ending");
+  const catalog = readFileSync(resolve("docs/catalog.md"), "utf8");
+  const finals = statements(catalog).filter(said => said.startsWith("Final states are "));
+  assert.equal(finals.length, 1, "the catalog lists ticket-task's final states once");
+  assert.doesNotMatch(finals[0]!, /`blocked`/u); assert.match(finals[0]!, /`refused`/u);
+  const readme = sectionOf(readFileSync(resolve("README.md"), "utf8"), "Ticket delivery") ?? "";
+  assert.ok(readme, "README.md has no Ticket delivery section");
+  assert.doesNotMatch(readme, /ends `blocked`|\bblocks before\b/u, "the README still says a ticket run ends blocked");
+  assert.match(readme, /`refused`/u, "the README does not name the refused ending");
+});
+
+test("delivery retry after recording fails reuses the pull request that was already opened", async context => {
+  const f = fixture(context); remote(f); const gh = fakeGh(context, f);
+  const bin = join(f.root, "bin"); const lock = join(f.repo, ".git/config.lock"); const creates = join(f.root, "creates");
+  renameSync(join(bin, "gh"), join(bin, "gh-fake"));
+  writeFileSync(join(bin, "gh"), [
+    "#!/bin/sh",
+    `"${bin}/gh-fake" "$@" || exit $?`,
+    `if [ "$1" = pr ] && [ "$2" = create ]; then echo create >> "${creates}"; touch "${lock}"; fi`,
+  ].join("\n") + "\n", { mode: 0o755 });
+  const human = person(() => { rmSync(lock); return "retry"; });
+  const result = await untilEnd(input(f, { output: "pr" }), {}, human);
+  const run = merged(f, result); untouched(f);
+  assert.equal(readFileSync(creates, "utf8"), "create\n"); viewed(gh, 1);
+  assert.equal(result.sleeps.length, 0, "configuration failures ask immediately");
+  assert.equal(human.requests.length, 1); stepAsked(f, human.requests[0], "deliver", /git config failed; inspect .+git-config\.log/u, deliverChoices);
+  asksWritten(run.directory, human.requests);
+  assert.equal(result.states.filter(state => state === "commit").length, 1);
+  assert.equal(result.states.filter(state => state === "review").length, 1);
+  assert.equal(result.states.filter(state => state === "deliver").length, 2);
+  assert.deepEqual(run.result.decisions, [{ stage: "deliverDecide", response: "retry" }]);
+});
+
+test("commit retry restores the verified index even when the candidate was already partly staged", async context => {
+  const f = fixture(context); const hook = join(f.repo, ".git/hooks/pre-commit");
+  writeFileSync(hook, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  const human = person(() => {
+    assert.equal(git(f.worktree, "diff", "--cached", "--name-only"), "greeting.txt");
+    rmSync(hook); return "retry";
+  });
+  const result = await execute(input(f), {
+    implementer: request => { const result = implement(request); git(request.cwd, "add", "greeting.txt"); return result; },
+  }, human);
+  assert.equal(result.state, "delivered"); untouched(f);
+  assert.equal(result.states.filter(state => state === "review").length, 1);
+  assert.equal(result.states.filter(state => state === "commit").length, 2);
+  assert.equal(human.requests.length, 1); stepAsked(f, human.requests[0], "commit", /git commit failed/u, stepChoices);
+  assert.deepEqual(evidence(f).result.decisions, [{ stage: "stepDecide", response: "retry" }]);
+});
+
+test("confirmed local discard retries only dropLocal after its deletion fails", async context => {
+  const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f, 0, ["CLOSED"]);
+  const holder = join(f.root, "holder"); let placed = false;
+  const human = person("discard", "confirm discard", () => { git(f.repo, "worktree", "remove", "--force", holder); return "retry"; });
+  const result = await untilEnd(input(f, { output: "pr" }), {}, human, entry => {
+    if (String(entry.value) === "dropLocal" && !placed) { placed = true; git(f.repo, "worktree", "add", "-q", holder, branch); }
+  });
+  retried(result, 3); viewed(gh, 1); untouched(f);
+  assert.equal(result.state, "abandoned"); assert.deepEqual(result.states.slice(-3), ["dropLocal", "mergeAbandon", "abandoned"]);
+  assert.equal(result.states.includes("cleanUp"), false);
+  assert.equal(result.states.filter(state => state === "dropLocal").length, 2);
+  assert.equal(human.requests.length, 3); mergeRetryAsked(human.requests[2], /git branch failed/u);
+  const run = held(f, result, /^Abandoned: /u); asksWritten(run.directory, human.requests.slice(2));
+  assert.equal(pushed(), `refs/heads/${branch} ${run.delivery.commit}`);
+  assert.equal(git(f.repo, "branch", "--list", branch), "");
+  const receipt = JSON.parse(readFileSync(join(run.directory, "merge.json"), "utf8"));
+  assert.deepEqual([receipt.outcome, receipt.localDeleted, receipt.remoteDeleted], ["abandoned", true, false]);
+  assert.deepEqual(run.result.decisions, []);
+  assert.deepEqual([1, 2, 3].map(n => JSON.parse(readFileSync(join(run.directory, `human-${n}.json`), "utf8"))), [
+    { stage: "mergeDecide", response: "discard" }, { stage: "confirmMergeDiscard", response: "confirm discard" }, { stage: "mergeRetryDecide", response: "retry" },
+  ]);
+});
+
+test("setup configuration can fail twice and ask twice before retry continues the same worktree", async context => {
+  const f = fixture(context); const lock = join(f.repo, ".git/config.lock"); let locked = false;
+  const human = person("retry", () => { rmSync(lock); return "retry"; });
+  const result = await execute(input(f), {}, human, {
+    onEnter: entry => {
+      if (String(entry.value) === "setup" && !locked) { locked = true; writeFileSync(lock, ""); }
+    },
+  });
+  assert.equal(result.state, "delivered"); untouched(f);
+  assert.equal(result.states.filter(state => state === "prepare").length, 1);
+  assert.equal(result.states.filter(state => state === "setup").length, 3);
+  assert.equal(human.requests.length, 2);
+  for (const request of human.requests) stepAsked(f, request, "setup", /git config failed; inspect .+git-config\.log/u, stepChoices);
+  asksWritten(evidence(f).directory, human.requests);
+});
+
+test("a completion receipt that cannot confirm passing verification ends refused instead of claiming delivery", async context => {
+  const f = fixture(context); const saved = checkpointed();
+  const result = await execute(input(f), {}, person(), {
+    ...saved.options,
+    onEnter: entry => {
+      saved.options.onEnter!(entry);
+      // Exercise finish's downgrade without changing the candidate or its review rules.
+      if (String(entry.value) === "success") saved.data()!.task.lastChecksPassed = false;
+    },
+  });
+  assert.equal(result.state, "refused"); assert.deepEqual(result.states.slice(-2), ["success", "refused"]);
+  const run = evidence(f);
+  assert.deepEqual([run.result.outcome, run.delivery.outcome], ["blocked", "refused"]);
+  assert.match(run.delivery.reason, /final checkout no longer matches passing verification/u);
+  assert.match(result.output.summary, /^Refused: /u);
 });
