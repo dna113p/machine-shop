@@ -722,7 +722,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         ticket.title,
         ...(ticket.summary ? ["## Summary", ticket.summary] : []),
         ...(saved.assumptions.length ? ["## Assumptions", saved.assumptions.map(({ question, answer, why }) => `- ${flat(question)} Assumed: ${flat(answer)} (${flat(why)})`).join("\n")] : []),
-        "## Checks", repository.checks.map(name => `- ${name}: passed`).join("\n"),
+        "## Checks", repository.checks.map(name => `- ${name}: passed${(saved.task.flaky ?? []).includes(name) ? " (flaky: failed once, passed when run again alone)" : ""}`).join("\n"),
         // The helper has already taken the summary out of a JSON report; one that is still an object is evidence, not text for a reader.
         "## Review", jsonObject(saved.reviewSummary) ? "The reviewer approved this change without a written summary; its report is kept with the run evidence." : saved.reviewSummary,
         ...(saved.reviewNotes.length ? ["## Review notes", saved.reviewNotes.map(note => `- ${flat(note.text)}${flat(note.where) ? ` (${flat(note.where)})` : ""}`).join("\n")] : []),
@@ -1501,7 +1501,8 @@ function parseTicket(input: unknown, saved: TaskData) {
   const stuck = data.stuck === undefined ? "park" : data.stuck;
   if (stuck !== "ask" && stuck !== "park") throw new Error('stuck must be "ask" or "park"');
 
-  const repo = object(data.repository, "repository", ["name", "path", "base", "setup", "checks", "output", "remote", "draft", "redCheck"]);
+  const repo = object(data.repository, "repository", ["name", "path", "base", "setup", "checks", "rerunFailedChecks", "output", "remote", "draft", "redCheck"]);
+  if (repo.rerunFailedChecks !== undefined && typeof repo.rerunFailedChecks !== "boolean") throw new Error("repository.rerunFailedChecks must be a boolean");
   const redCheck = repo.redCheck === undefined ? "tests" : text(repo.redCheck, "repository.redCheck");
   const name = text(repo.name, "repository.name");
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(name)) throw new Error("repository.name must be one path segment of letters, digits, '.', '_', or '-'");
@@ -1522,6 +1523,7 @@ function parseTicket(input: unknown, saved: TaskData) {
   const work = taskRun("ticket-task", {
     task: [`Ticket ${id}: ${title}`, ...(ticket.body?.trim() ? [ticket.body] : [])].join("\n\n"),
     workspace: worktree, checks: repo.checks, maxRepairs: data.maxRepairs ?? 3, maxReviewRounds: data.maxReviewRounds,
+    rerunFailedChecks: repo.rerunFailedChecks,
   }, { checks: true, git: "clean", evidenceRoot }, saved);
   const checks = (repo.checks as { name: string }[]).map(c => c.name);
   if (redGreen && !checks.includes(redCheck)) throw new Error(`repository.redCheck names missing check: ${redCheck}`);

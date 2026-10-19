@@ -2275,13 +2275,14 @@ test("checks failing until the repair budget is exhausted wait for a decision, a
     implementer: request => { edits++; return implement(request); }, reviewer: () => assert.fail(),
   }, human);
   const run = handedOff(f, result, /budget exhausted \(2\)/u, human);
-  assert.equal(edits, 3); assert.deepEqual(run.result.checks.map(c => c.passed), [true, false, false, false]);
+  // Each failed round runs the gate once more by itself, and it fails again.
+  assert.equal(edits, 3); assert.deepEqual(run.result.checks.map(c => c.passed), [true, false, false, false, false, false, false]);
   assert.equal(pushed(), ""); assert.equal(gh(), undefined);
   assert.equal(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), "hello\n");
   const [request, ...others] = human.requests; assert.deepEqual(others, []);
   assert.deepEqual([request!.suggestions, request!.choices], [stuckDecisions, undefined]);
-  for (const part of ["Ticket PROJ-12: Add a greeting", `Repair budget exhausted (2). verify: tests did not meet its expected result; inspect ${run.result.checks[3].log}`,
-    "Repair rounds used: 2 of 2.", `Worktree: ${f.worktree}`, `Branch: ${branch}`]) assert.ok(request!.prompt.includes(part), part);
+  for (const part of ["Ticket PROJ-12: Add a greeting", "Repair budget exhausted (2). verify: tests did not meet its expected result; inspect ",
+    run.result.checks[5].log, run.result.checks[6].log, "Repair rounds used: 2 of 2.", `Worktree: ${f.worktree}`, `Branch: ${branch}`]) assert.ok(request!.prompt.includes(part), part);
 });
 
 test("review feedback is repaired once through fresh checks and another review", async context => {
@@ -2314,7 +2315,7 @@ test("the default gate budget allows three repairs before failing checks wait fo
   }, human);
   const run = handedOff(f, result, /Repair budget exhausted \(3\)/u, human);
   assert.deepEqual([edits, run.result.repairs, run.result.reviewRounds, run.result.checksPassed], [4, 3, 0, false]);
-  assert.deepEqual(run.result.checks.map(check => check.passed), [true, false, false, false, false]);
+  assert.deepEqual(run.result.checks.map(check => check.passed), [true, false, false, false, false, false, false, false, false]);
   assert.equal(human.requests.length, 1);
   assert.ok(human.requests[0]!.prompt.includes("Repair rounds used: 3 of 3."));
 });
@@ -2369,7 +2370,7 @@ test("more rounds can be chosen again each time the budget runs out", async cont
   assert.equal(edits, 6); assert.equal(result.states.filter(state => state === "decide").length, 3);
   assert.deepEqual(human.requests.map(request => /Repair rounds used: .+/u.exec(request.prompt)![0]),
     ["Repair rounds used: 1 of 1.", "Repair rounds used: 1 of 1 in this budget, 2 in all.", "Repair rounds used: 1 of 1 in this budget, 3 in all."]);
-  assert.deepEqual([run.result.repairs, run.result.checks.length], [3, 7]);
+  assert.deepEqual([run.result.repairs, run.result.checks.length], [3, 13]);
   assert.deepEqual(run.result.decisions.map((made: any) => made.response), ["more rounds", "more rounds", "hand off"]);
 });
 
@@ -2511,7 +2512,7 @@ test("the extra review budget keeps spent repair rounds and reports when no revi
   }, human);
   const run = handedOff(f, result, /Repair budget exhausted \(1\)/u, human);
   assert.deepEqual([edits, reviews, run.result.repairs], [3, 1, 1]);
-  assert.deepEqual(run.result.checks.map(check => check.passed), [true, false, true, false]);
+  assert.deepEqual(run.result.checks.map(check => check.passed), [true, false, false, true, false, false]);
   assert.ok(extraRoundLine(standingOf(human.requests[0]!.prompt)));
   assert.match(standingOf(human.requests[0]!.prompt), /No review has finished in the extra round yet/u);
 });
@@ -3247,7 +3248,7 @@ for (const [label, extra] of [
       reviewer: (request: Request) => { if (++reviews === 1) { before = candidate(request.cwd); tip = advance(f); } return review(); },
     };
     let at = f; let result = await execute(input(f, { checks }, extra), agents, human);
-    const failed = [["red", "tests", true], ["verify", "tests", true], ["verify", "later-gate", true], ["reverify", "tests", true], ["reverify", "later-gate", false]];
+    const failed = [["red", "tests", true], ["verify", "tests", true], ["verify", "later-gate", true], ["reverify", "tests", true], ["reverify", "later-gate", false], ["reverify", "later-gate", false]];
     const evidenced = (run: { result: any }) => run.result.checks.map((check: any) => [check.phase, check.name, check.passed]);
     if (parks) {
       const stop = questionedIn("repairBudget", f, result, /Repair budget exhausted \(0\)\..*later-gate/su, human); untouched(f);
@@ -3264,7 +3265,7 @@ for (const [label, extra] of [
     assert.deepEqual([run.delivery.baseCommit, run.delivery.commit, run.result.outcome, run.result.checksPassed], [tip, commit, "completed", true]);
     // The second rebase finds the branch on the tip and goes on to delivery.
     assert.deepEqual(result.states.slice(-5), ["commit", "rebase", "deliver", "success", "delivered"]);
-    if (parks) { assert.deepEqual(phases(run), ["verify", "verify", "verify", "verify"]); assert.equal(human.requests.length, 1); return; }
+    if (parks) { assert.deepEqual(phases(run), ["verify", "verify", "verify", "verify", "verify"]); assert.equal(human.requests.length, 1); return; }
     assert.deepEqual(result.states.slice(result.states.indexOf("commit")), ["commit", "rebase", "repairBudget", ...(asks ? ["stuck", "decide"] : []), "repairTarget", "change",
       "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "delivered"]);
     // verify ran the gates on the new base, so they are not run a second time as `reverify`.
@@ -3466,7 +3467,7 @@ test("an ignore stop leaves no setup output that only the tip's rules ignore bes
   assert.match(run.delivery.reason, /\.gitignore/u); assert.ok(names(run.delivery.reason, seen.tip), "the reason names the new tip");
   // Setup did write into cache/ on the tip, where the rule kept the tree clean; the gate then failed there.
   assert.deepEqual(run.result.checks.map((check: any) => [check.phase, check.name, check.passed]), [["setup", "install", true], ["red", "tests", true],
-    ["verify", "tests", true], ["verify", "later-gate", true], ["setup", "install", true], ["reverify", "tests", true], ["reverify", "later-gate", false]]);
+    ["verify", "tests", true], ["verify", "later-gate", true], ["setup", "install", true], ["reverify", "tests", true], ["reverify", "later-gate", false], ["reverify", "later-gate", false]]);
   assert.match(readFileSync(run.result.checks[0].log, "utf8"), /wrote kept only/u); assert.match(readFileSync(run.result.checks[4].log, "utf8"), /wrote cache on the tip/u);
   restored(run); assert.deepEqual([seen.edits, seen.reviews], [1, 1]);
 });
@@ -4616,7 +4617,7 @@ for (const exhausted of ["review", "gates"]) {
     assert.deepEqual([run.result.repairs, run.result.reviewRounds], [2, 2]);
     assert.ok(run.prompt.includes(`Repair rounds used: 2 of ${exhausted === "gates" ? 2 : 3}.`));
     assert.ok(run.prompt.includes(`Review rounds used: 2 of ${exhausted === "review" ? 2 : 3}.`));
-    assert.deepEqual(run.result.checks.map(check => check.passed), exhausted === "review" ? [true, false, false, true, true, true] : [true, true, true, false, false, false]);
+    assert.deepEqual(run.result.checks.map(check => check.passed), exhausted === "review" ? [true, false, false, false, false, true, true, true] : [true, true, true, false, false, false, false, false, false]);
     assert.deepEqual(candidate(f.worktree), before);
   });
 }
@@ -4797,6 +4798,46 @@ test("missing named red checks fail construction while redGreen false needs no n
   assert.doesNotThrow(() => mod.default(runtime, input(f, { redCheck: "absent" }, { redGreen: false })));
   for (const redGreen of [null, "true", 0]) assert.throws(() => mod.default(runtime, input(f, {}, { redGreen })), /redGreen must be a boolean/u);
   for (const redCheck of [null, "", false]) assert.throws(() => mod.default(runtime, input(f, { redCheck })), /repository.redCheck must be a non-empty string/u);
+  assert.deepEqual(readdirSync(f.root), ["widgets"]);
+});
+
+/** A gate that fails its first run and passes after it, printing and counting each run in a file outside every checkout. */
+function flakyGate(f: Fixture, name = "lint") {
+  const file = join(f.root, `${name}-runs`);
+  const code = `const fs = require("fs"); const runs = (fs.existsSync(process.argv[1]) ? Number(fs.readFileSync(process.argv[1], "utf8")) : 0) + 1;
+fs.writeFileSync(process.argv[1], String(runs)); console.log(${JSON.stringify(name)} + " run " + runs); process.exit(runs === 1 ? 1 : 0);`;
+  return { gate: { name, command: [process.execPath, "-e", code, file] }, runs: () => existsSync(file) ? Number(readFileSync(file, "utf8")) : 0 };
+}
+
+test("a gate that fails once and passes when run again alone is delivered as passed, marked flaky in the receipt and the pull request body, without a repair round", async context => {
+  const f = fixture(context); remote(f); fakeGh(context, f); const lint = flakyGate(f); let edits = 0;
+  const result = await execute(input(f, { output: "pr", checks: [command(), lint.gate] }), { implementer: request => { edits++; return implement(request); } });
+  const run = merged(f, result);
+  assert.deepEqual([edits, lint.runs(), run.result.repairs, run.result.checksPassed], [1, 2, 0, true]);
+  assert.deepEqual(run.result.checks.map((check: any) => [check.phase, check.name, check.passed, check.flaky === true]),
+    [["red", "tests", true, false], ["verify", "tests", true, false], ["verify", "lint", false, true], ["verify", "lint", true, true]]);
+  // Both outputs are kept.
+  assert.match(readFileSync(run.result.checks[2].log, "utf8"), /lint run 1/u); assert.match(readFileSync(run.result.checks[3].log, "utf8"), /lint run 2/u);
+  assert.equal(readFileSync(join(run.directory, "pull-request.md"), "utf8"),
+    "Add a greeting\n\n## Summary\n\nWrite hello to greeting.txt.\n\n## Checks\n\n- tests: passed\n- lint: passed (flaky: failed once, passed when run again alone)\n\n## Review\n\nGreeting matches the ticket\n\nTicket: PROJ-12\n");
+});
+
+test("repository.rerunFailedChecks: false runs each gate once, so a gate that would pass the second time takes a repair round, as today", async context => {
+  const f = fixture(context); const lint = flakyGate(f); let edits = 0;
+  const result = await execute(input(f, { checks: [command(), lint.gate], rerunFailedChecks: false }), { implementer: request => { edits++; return implement(request); } });
+  assert.equal(result.state, "delivered");
+  const run = evidence(f);
+  assert.deepEqual([edits, lint.runs(), run.result.repairs, run.result.checksPassed], [2, 2, 1, true]);
+  assert.deepEqual(run.result.checks.map((check: any) => [check.phase, check.name, check.passed, check.flaky === true]),
+    [["red", "tests", true, false], ["verify", "tests", true, false], ["verify", "lint", false, false], ["verify", "tests", true, false], ["verify", "lint", true, false]]);
+});
+
+test("a non-boolean repository.rerunFailedChecks is refused before execution, by its full name", context => {
+  const f = fixture(context);
+  for (const value of ["no", 1, null]) {
+    const data: any = input(f); data.repository.rerunFailedChecks = value;
+    assert.throws(() => mod.default(runtime, data), /repository\.rerunFailedChecks must be a boolean/u);
+  }
   assert.deepEqual(readdirSync(f.root), ["widgets"]);
 });
 
@@ -5706,7 +5747,7 @@ test("with resume, gates that fail on a delivered ticket's replayed tree are a g
   const commit = onTip(f, tip); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello later");
   const run = held(again, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u"));
   // On this road the gates are the helper's `verify` from the start, so the receipt never says a tree passed that did not.
-  assert.deepEqual(ran(run), [["verify", "tests", true], ["verify", "later-gate", false], ["verify", "tests", true], ["verify", "later-gate", true]]);
+  assert.deepEqual(ran(run), [["verify", "tests", true], ["verify", "later-gate", false], ["verify", "later-gate", false], ["verify", "tests", true], ["verify", "later-gate", true]]);
   assert.deepEqual([run.delivery.baseCommit, run.delivery.commit, run.result.checksPassed, run.result.repairs], [tip, commit, true, 1]);
   assert.equal(rebasedFrom(f, run, started), delivered); assert.equal(deliveredAs(f), commit);
 });
@@ -5732,7 +5773,7 @@ for (const [label, repository, reason, states, checked] of [
   ["a setup command that leaves an unignored file where the worktree was recreated", { setup: [command('require("fs").writeFileSync("setup-output.txt", "leftover")', { name: "install" })] }, /\bsetup\b|\binstall\b/iu,
     ["shape", "prepare", "failure", "blocked"], [["setup", "install", true]]],
   ["gates that fail on the delivered commit when the base has not moved", { checks: [command('console.log("the gate refuses"); process.exit(1)')] }, /\bgates?\b|\bchecks?\b|\bverif|\btests\b/iu,
-    ["shape", "prepare", "rebase", "failure", "blocked"], [["verify", "tests", false]]],
+    ["shape", "prepare", "rebase", "failure", "blocked"], [["verify", "tests", false], ["verify", "tests", false]]],
 ] as const) {
   test(`with resume, ${label} refuse${label.startsWith("gates") ? "" : "s"} the delivered ticket: the recreated worktree is removed, and the branch, its record, and every other ref are as they were`, async context => {
     const f = fixture(context); const delivered = await deliverFirst(f); const before = everything(f); const again = next(f, 2);

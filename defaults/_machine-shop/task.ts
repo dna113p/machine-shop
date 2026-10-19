@@ -14,6 +14,7 @@ interface Assignment {
   task: string;
   workspace: string;
   checks: Check[];
+  rerunFailedChecks: boolean;
   maxRepairs: number;
   maxReviewRounds: number;
   regression?: Regression;
@@ -26,6 +27,8 @@ interface Evidence {
   signal: string | null;
   error?: string;
   passed: boolean;
+  flaky?: boolean;
+  rerun?: boolean;
   expected: string;
   log: string;
 }
@@ -69,6 +72,7 @@ function reportSummary(stage: string, event: Event): string {
 export function taskData() {
   return {
     evidence: [] as Evidence[],
+    flaky: [] as string[],
     reports: [] as AgentReport[],
     reportRecovery: {} as Record<string, ReportRecovery>,
     pendingReport: { type: "pending" } as Event,
@@ -181,13 +185,29 @@ export function taskRun(name: string, input: unknown, policy: Policy, saved: Tas
 
   function checks(phase = "verify"): Event {
     // Every gate runs, so one repair round sees every failure instead of the first one alone.
+    saved.flaky = [];
     const before = policy.git === "none" ? undefined : fingerprint(workspace);
-    const failed = assignment.checks.filter(command => !check(command, phase));
+    const firstFailures = assignment.checks.flatMap(command => check(command, phase)
+      ? [] : [{ command, entries: [saved.evidence.at(-1)!] }]);
+    // Only failed gates run again, serially, after the entire first pass.
+    const failed = firstFailures.filter(({ command, entries }) => {
+      if (!assignment.rerunFailedChecks) return true;
+      const passed = check(command, phase);
+      const rerun = saved.evidence.at(-1)!;
+      entries.push(rerun);
+      if (passed) {
+        for (const entry of entries) entry.flaky = true;
+        saved.flaky.push(command.name);
+      } else rerun.rerun = true;
+      return !passed;
+    });
     let passed = failed.length === 0;
-    if (failed.length > 1) {
-      const logs = saved.evidence.filter(entry => entry.phase === phase && !entry.passed).slice(-failed.length);
-      saved.reason = `${phase}: ${failed.length} checks did not meet their expected results: ${logs.map(entry => `${entry.name} (inspect ${entry.log})`).join(", ")}`;
-    }
+    const logs = (entries: Evidence[]) => entries.map(entry => entry.log).join(", ");
+    if (passed) saved.reason = "";
+    else if (failed.length === 1) {
+      const { command, entries } = failed[0]!;
+      saved.reason = `${phase}: ${command.name} did not meet its expected result; inspect ${logs(entries)}`;
+    } else saved.reason = `${phase}: ${failed.length} checks did not meet their expected results: ${failed.map(({ command, entries }) => `${command.name} (inspect ${logs(entries)})`).join(", ")}`;
     const after = policy.git === "none" ? undefined : fingerprint(workspace);
     if (before !== after) {
       passed = false;
@@ -380,7 +400,7 @@ export function resultStates(work: TaskRun, { operation, final }: MachinePrimiti
 
 function parseAssignment(input: unknown, policy: Policy): Assignment {
   const value: unknown = typeof input === "string" ? JSON.parse(input) : input;
-  const data = object(value, "input", ["task", "workspace", "checks", "maxRepairs", "maxReviewRounds", "regression"]);
+  const data = object(value, "input", ["task", "workspace", "checks", "rerunFailedChecks", "maxRepairs", "maxReviewRounds", "regression"]);
   const task = text(data.task, "task");
   const workspace = text(data.workspace, "workspace");
   if (!isAbsolute(workspace)) throw new Error("workspace must be an absolute path");
@@ -388,6 +408,8 @@ function parseAssignment(input: unknown, policy: Policy): Assignment {
   const maxRepairs = integer(data.maxRepairs ?? 1, "maxRepairs", 0, 3);
   const maxReviewRounds = integer(data.maxReviewRounds === undefined ? 2 : data.maxReviewRounds, "maxReviewRounds", 0, 5);
   if (data.checks !== undefined && !Array.isArray(data.checks)) throw new Error("checks must be an array");
+  if (data.rerunFailedChecks !== undefined && typeof data.rerunFailedChecks !== "boolean") throw new Error("rerunFailedChecks must be a boolean");
+  if (!policy.checks && data.rerunFailedChecks !== undefined) throw new Error("This read-only workflow does not support rerunFailedChecks");
   const checks = ((data.checks ?? []) as unknown[]).map((entry, i) => parseCheck(entry, `checks[${i}]`));
   if (checks.length > 20 || (policy.checks && checks.length === 0)) throw new Error("Provide between 1 and 20 explicit checks for this workflow");
   if (new Set(checks.map(c => c.name)).size !== checks.length) throw new Error("Check names must be unique");
@@ -402,7 +424,7 @@ function parseAssignment(input: unknown, policy: Policy): Assignment {
   if (policy.regression && !regression) throw new Error("fix-bug requires regression with failureExitCode and failureIncludes");
   if (!policy.regression && regression) throw new Error("regression is only supported by fix-bug");
   if (!policy.checks && checks.length > 0) throw new Error("This read-only workflow does not run checks; use verify-checks separately");
-  return { task, workspace: resolve(workspace), checks, maxRepairs, maxReviewRounds, ...(regression ? { regression } : {}) };
+  return { task, workspace: resolve(workspace), checks, rerunFailedChecks: data.rerunFailedChecks !== false, maxRepairs, maxReviewRounds, ...(regression ? { regression } : {}) };
 }
 export function parseCheck(value: unknown, name: string): Check {
   const data = object(value, name, ["name", "command", "timeoutMs"]);

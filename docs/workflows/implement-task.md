@@ -25,6 +25,7 @@ Unknown fields are refused.
 | `task` | yes | — | What to do, with enough scope and acceptance criteria to act without your conversation. At most 20,000 characters. |
 | `workspace` | yes | — | Absolute path to the project's Git checkout root, not a subdirectory. |
 | `checks` | yes, 1–20 | — | Commands to run, in order, as `{ name, command, timeoutMs }`. `command` is an argv array with no shell; `timeoutMs` defaults to 60000 and caps at 600000. Every check runs even after one fails. |
+| `rerunFailedChecks` | no | `true` | Run each failed gate once more, alone, after all gates have run. A passing rerun is marked `flaky`, with both logs kept and no repair round used. Set `false` to require first-time passes. |
 | `maxRepairs` | no | `1` | How many more rounds a failed check or a `revise` review may get, 0–3. |
 
 From [examples/implementation.json](../../examples/implementation.json):
