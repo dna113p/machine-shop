@@ -153,7 +153,9 @@ begins, every stuck question says it was used and gives the reviewer's latest
 `newSinceLastRound`, or says no review has finished in it yet.
 
 A stuck run sleeps on one Human question, keeping its worktree and branch.
-The prompt says what is needed, lists open questions and evidence, and suggests
+The first sentence says what is needed, including the question count or fault.
+The prompt then gives the stopped stage and budgets, the questions or remaining
+reason once, and evidence. It suggests
 `more rounds`, `hand off`, `archive`, and `discard`; discard still asks for confirmation.
 Any other reply is an answer: like `more rounds`, it renews both budgets, clears
 the owner questions, and returns to the stage that stopped.
@@ -171,7 +173,8 @@ go to its implementer, then through the normal scope check, checks, and review.
 ### When it is stuck
 
 - A stuck run sleeps on one Human question, keeping its worktree and branch.
-- The question says what is needed, with open questions and evidence. It
+- The first sentence says what is needed. The stage and budgets follow, then
+  open questions or the remaining reason once, and evidence. It
   suggests `more rounds`, `hand off`, `archive`, and `discard`; discard still
   asks for confirmation.
 - Any other reply is an answer: like `more rounds`, it renews both budgets,

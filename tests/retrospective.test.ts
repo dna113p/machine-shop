@@ -82,6 +82,17 @@ const scopeRecommended = "Widen Scope to include docs/catalog.md";
 const scope = (ticket: string) => question(ticket, `Fixture ticket ${ticket}`, "falsifyResult",
   `Ticket owner must settle 1 open questions:\n1. ${scopeQuestion} Options: ${scopeRecommended} (recommended); Leave docs out Why: the catalog lists every Machine.`);
 const scopeFalsify = { type: "questions", summary: "Scope leaves out the catalog.", questions: [{ text: scopeQuestion, options: [scopeRecommended, "Leave docs out"], recommended: scopeRecommended, assumable: false, why: "The catalog lists every Machine." }] };
+/**
+ * A stuck question as ticket-task.ts writes it since org-26: what is needed in its first sentence, where the run stands under the
+ * ticket's id alone, then the reason or the questions once under Needs, when there is more to say.
+ */
+const newQuestion = (ticket: string, state: string, first: string, needs = "") =>
+  `${first}\n\nTicket ${ticket}. Stopped in ${state}.\nRepair rounds used: 1 of 3.\nReview rounds used: 3 of 3.\n${needs ? `Needs: ${needs}\n` : ""}Worktree: /fixture/worktrees/${ticket}\nBranch: ticket/${ticket}\nEvidence: /fixture/evidence/${ticket}\n${options}`;
+/** The confirmation a discard asks for since org-26, with the stop's whole reason once under Needs. */
+const newDiscard = (ticket: string, state: string, needs: string) =>
+  `Discard the candidate for ticket ${ticket}?\n\nTicket ${ticket}. Stopped in ${state}.\nRepair rounds used: 1 of 3.\nReview rounds used: 3 of 3.\nThe candidate will not be saved: no archive branch is made, and its uncommitted and committed work on that branch is lost.\nNeeds: ${needs}\nWorktree: /fixture/worktrees/${ticket}\nBranch: ticket/${ticket}\nEvidence: /fixture/evidence/${ticket}\nconfirm discard: remove the worktree /fixture/worktrees/${ticket} and delete the branch ticket/${ticket} in /fixture.\ngo back: return to the decision with the candidate kept.`;
+/** A first sentence over 100 characters as the question shows it: as many whole words as fit with an ellipsis. */
+const cut = (sentence: string) => sentence.split(" ").reduce((kept, word) => `${kept} ${word}…`.trimStart().length <= 100 ? `${kept} ${word}`.trimStart() : kept, "") + "…";
 
 /**
  * The analyst's contract, as the plan sets it: its prompt carries the extracted stops as one-line JSON (an array, or an object
@@ -174,6 +185,39 @@ test("the report groups two spent review budgets under one cause, marks all thre
   assert.doesNotMatch(group.body, new RegExp(scoped, "u"));
   assert.match(once.body, new RegExp(scoped, "u"));
   assert.doesNotMatch(once.body, new RegExp(`${first}|${second}`, "u"));
+});
+
+test("a stuck question in the new layout gives the same ticket, stage and grouping key as the same stop in the old one", async context => {
+  const ws = workspace(context);
+  const where = "src/hub.ts:120";
+  const remains = `One blocker remains: an echo clears the reopened focus (${where}).\nBlocker: Recognize every queued echo, not only the last one (${where})`;
+  const outside = `Paths outside the ticket Scope after change: ${Array.from({ length: 6 }, (_, index) => `"docs/a-long-page-name-${index}.md"`).join(", ")}.`;
+  const long = `${outside} Scope: greeting.txt, greeting.test.txt.`;
+  const malformed = "questions must be an array of 1–10 entries";
+  const kept = "The report is kept in /fixture/evidence/falsify-2.json.";
+  const pairs: [string, string, string[]][] = [
+    ["budget", "reviewBudget", [budget("alpha", where), newQuestion("alpha", "reviewBudget", "Review budget used up (3 of 3).", remains)]],
+    ["scope", "falsifyResult", [scope("alpha"), newQuestion("alpha", "falsifyResult", "Answer 1 open question before any code is written.",
+      `1. ${scopeQuestion} Options: ${scopeRecommended} (recommended); Leave docs out Why: the catalog lists every Machine.`)]],
+    ["long", "scopeAfterChange", [question("alpha", "Fixture ticket alpha", "scopeAfterChange", long), newQuestion("alpha", "scopeAfterChange", cut(outside), long)]],
+    ["falsify", "falsifyResult", [
+      question("alpha", "Fixture ticket alpha", "falsifyResult", `The falsify report's questions were missing or malformed twice: ${malformed}. ${kept}`),
+      newQuestion("alpha", "falsifyResult", `The falsify report was malformed twice: ${malformed}.`, kept)]],
+    // A discard confirmation keys as the stuck question it confirms.
+    ["discard", "reviewBudget", [budget("alpha", where), newDiscard("alpha", "reviewBudget", `Review budget used up (3 of 3).\n${remains}`)]],
+  ];
+  assert.ok(outside.length > 100, "the long reason's first sentence is cut in the new layout");
+  for (const [name, , layouts] of pairs) layouts.forEach((text, index) => run(ws, `run-${name}-${index ? "new" : "old"}`, { questions: [text], answers: ["Owner's answer: continue."] }));
+  const prompts: string[] = [];
+  const { state } = await execute([ws], analyst(prompts, causeOf));
+  assert.equal(state, "done");
+  const stops = prompts.flatMap(stopsIn);
+  const of = (id: string) => stops.find(stop => String(stop.id).includes(`/${id}/`)) ?? assert.fail(`no stop for ${id} in ${JSON.stringify(stops)}`);
+  for (const [name, stage] of pairs) {
+    const [old, fresh] = [of(`run-${name}-old`), of(`run-${name}-new`)];
+    assert.deepEqual([fresh.ticket, fresh.stage], ["alpha", stage], name);
+    assert.deepEqual([fresh.ticket, fresh.stage, fresh.key], [old.ticket, old.stage, old.key], name);
+  }
 });
 
 test("hand off, archive and discard answers stay marked as needing a person whatever the analyst says", async context => {

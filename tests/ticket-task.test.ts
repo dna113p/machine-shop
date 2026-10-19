@@ -237,14 +237,33 @@ function candidate(cwd: string, ignored = false) {
     files: [...new Set(names)].sort().map(name => [name, statSync(join(cwd, name)).mode & 0o111, readFileSync(join(cwd, name), "base64")]),
   };
 }
+/**
+ * A hand-off's hold says what happened in its first sentence, short and without the branch, then the reason and the decision,
+ * and only then the branch, the kept worktree, and the evidence.
+ */
+function handOffSummary(summary: string, worktree: string) {
+  const first = summary.split(/(?<=[.!?…])\s/u)[0]!;
+  assert.match(first, /^Handed off: /u); assert.ok(first.length < 120, `the first sentence is under 120 characters: ${first}`);
+  assert.equal(first.includes(branch), false, `the first sentence does not name the branch: ${first}`);
+  assert.ok(summary.includes(`Decision: hand off. Branch: ${branch}. Worktree kept at ${worktree}. Evidence: `), summary);
+}
+/**
+ * A stop's reason as a person reads it in the question and the hold: a spent budget is used up, with the rounds it allowed,
+ * and the owner's questions are counted in a sentence of their own.
+ */
+const spoken = (reason: RegExp) => new RegExp(reason.source
+  .replace(/budget exhausted \\\((\d+)\\\)/gu, "budget used up \\($1 of $1\\)")
+  .replace(/(\d+ open questions?):/gu, "$1 (?:before any code is written|the reviewer raised)\\."), reason.flags);
 /** A handed-off run went through the decision, not the failure path, and left the worktree on its uncommitted ticket branch. */
 function handedOff(f: Fixture, result: { state: unknown; output: any; states: string[] }, reason: RegExp, human: { requests: Ask[] }) {
   assert.equal(result.state, "handedOff"); assert.deepEqual(result.states.slice(-3), ["decide", "handOff", "handedOff"]); assert.equal(result.states.includes("failure"), false);
-  assert.match(human.requests.at(-1)!.prompt, reason);
-  const run = held(f, result, reason); untouched(f);
+  // The question says the reason as its first sentence and what follows it under Needs; the receipt keeps it as it was written.
+  const prompt = human.requests.at(-1)!.prompt; const needs = prompt.indexOf("\nNeeds: ") >= 0 ? needsIn(prompt, f.worktree) : "";
+  assert.match(oneLine(`${prompt.split("\n")[0]}\n${needs}`), spoken(reason));
+  const run = held(f, result, spoken(reason)); untouched(f);
   assert.deepEqual([run.result.outcome, run.delivery.outcome, run.delivery.decision], ["blocked", "handed-off", "hand off"]); assert.match(run.delivery.reason, reason);
   assert.equal(git(f.repo, "rev-parse", branch), f.head); assert.equal(git(f.worktree, "symbolic-ref", "HEAD"), `refs/heads/${branch}`);
-  assert.ok(result.output.summary.includes(`Decision: hand off. Worktree kept at ${f.worktree}. Evidence: `));
+  handOffSummary(result.output.summary, f.worktree);
   assert.deepEqual([run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.delivery.commit, run.delivery.archive], [true, false, null, undefined]);
   return run;
 }
@@ -261,7 +280,8 @@ const askedAgain = [
   { text: "Should the greeting end with a newline?", where: "greeting.txt:2" },
 ];
 const discussions = (questions: { text: string; where: string }[]) => questions.map(question => ({ severity: "discussion", ...question }));
-const openQuestions = /^Answer the open questions?:$/u;
+/** The first sentence of a stop for the owner's questions: their count, and whether they hold up the code or came from the reviewer. */
+const openQuestions = /^Answer \d+ open questions? (?:before any code is written|the reviewer raised)\.$/u;
 /** One numbered line per question with where it was raised, in the reviewer's order. */
 const questionLines = (questions: { text: string; where: string }[]) => questions.map((question, index) => `${index + 1}. ${question.text} (${question.where})`);
 /** A gap as the investigator reports it from falsify: the question, the answers it could take, the one recommended, whether that one is safe to assume, and why. */
@@ -308,20 +328,32 @@ function needsIn(prompt: string, worktree: string) {
   assert.ok(start >= 0 && end > start, `the question says what is needed before where the worktree is:\n${prompt}`);
   return prompt.slice(start + "\nNeeds: ".length, end);
 }
+/** How often a text appears in another, overlapping matches aside. */
+const occurrences = (text: string, part: string) => text.split(part).length - 1;
+/** The one line of a stuck question that says where the run stands: the ticket's id, never its title, and the state that stopped. */
+const standsAt = (stoppedIn: string) => `Ticket PROJ-12. Stopped in ${stoppedIn}.`;
 /**
- * A stuck run asks one question whose prompt is the park note's text: what stopped it and where, what is needed, and where to look,
- * with the four decisions offered as suggestions rather than the only replies. It never sends anyone to run the ticket again. Returns the need.
+ * A stuck run asks one question whose prompt is the park note's text: what is needed in one short first sentence, where the run stands
+ * under the ticket's id alone, the reason or the questions once, and where to look, with the four decisions offered as suggestions rather
+ * than the only replies. It never repeats the ticket's title, and never sends anyone to run the ticket again.
+ * Returns the need: the first sentence, followed by what its `Needs: ` line says when it has one.
  */
 function stuckQuestion(f: Fixture, request: Ask | undefined, stoppedIn: string): string {
   assert.ok(request, "the stuck run asked its question");
-  assert.equal(request.prompt.split("\n")[0], "Ticket PROJ-12 is stuck: answer what is needed");
+  const [first, blank, stands] = request.prompt.split("\n");
+  // A first sentence too long for that is cut after a whole word, with an ellipsis that counts toward the 100.
+  assert.ok(first!.length < 100 || (first!.length === 100 && first!.endsWith("…")), `the first sentence is under 100 characters: ${first}`);
+  assert.doesNotMatch(first!, /^Ticket \S+ is stuck/u); assert.equal(blank, "");
+  assert.equal(stands, standsAt(stoppedIn));
+  // The run's label already carries the title, and the reason is said once, not under a standing line of its own.
+  assert.equal(request.prompt.includes("Add a greeting"), false, "the question does not repeat the ticket's title");
+  assert.doesNotMatch(request.prompt, /This run is stuck and needs a decision|is stuck: answer what is needed/u);
   assert.deepEqual(request.suggestions, stuckDecisions); assert.equal(request.choices, undefined);
-  assert.ok(request.prompt.includes(`Stopped in ${stoppedIn}.`), `Stopped in ${stoppedIn}.`);
   assert.ok(request.prompt.includes(`\nWorktree: ${f.worktree}\nBranch: ${branch}\nEvidence: `));
   // Any reply that is not one of the decisions is taken as the answer.
   assert.ok(request.prompt.split("\n").some(line => line.startsWith("any other reply: ")), "the question says what any other reply does");
   assert.equal(request.prompt.includes(nextStep), false); assert.doesNotMatch(request.prompt, /resume: true/u);
-  return needsIn(request.prompt, f.worktree);
+  return request.prompt.includes("\nNeeds: ") ? `${first}\n${needsIn(request.prompt, f.worktree)}` : first!;
 }
 /**
  * Where a run parked before, it now asks its one question and writes no park note. Answered with hand off, it ends as any hand-off does:
@@ -334,7 +366,7 @@ function questioned(f: Fixture, result: { state: unknown; output: any; states: s
   const run = handedOff(f, result, reason, human);
   const [request] = human.requests;
   const needs = stuckQuestion(f, request, result.states.at(-5)!);
-  assert.ok(request!.prompt.includes(`Evidence: ${run.directory}`)); assert.match(needs, reason);
+  assert.ok(request!.prompt.includes(`Evidence: ${run.directory}`)); assert.match(oneLine(needs), spoken(reason));
   assert.equal(existsSync(join(run.directory, "park.txt")), false); assert.equal(Object.hasOwn(run.delivery, "park"), false);
   asksWritten(run.directory, [request!]);
   assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "hand off" }]);
@@ -351,7 +383,13 @@ function asksWritten(directory: string, requests: readonly Ask[], from = 1) {
   assert.equal(existsSync(join(directory, `question-${from + requests.length}.txt`)), false, `no question-${from + requests.length}.txt`);
   assert.equal(existsSync(join(directory, "park.txt")), false);
 }
-/** What a stuck run's question says above what it needs: the decision line, why it stopped, and the budgets. */
+/** A need as `stuckQuestion` returns it, as the prompt shows it: its first sentence on the first line, and the rest under `Needs: `. */
+function showsNeed(prompt: string, need: string, worktree: string) {
+  const [first, ...rest] = need.split("\n");
+  assert.ok(prompt.startsWith(`${first}\n\n`), prompt);
+  if (rest.length) assert.ok(prompt.includes(`\nNeeds: ${rest.join("\n")}\nWorktree: ${worktree}\n`), prompt);
+}
+/** What a stuck run's question says above what it needs: the first sentence, where the run stands, and the budgets. */
 const standingOf = (prompt: string) => prompt.slice(0, prompt.indexOf("\nNeeds: "));
 /** The answers a prompt carries: what follows its own `Answers from the ticket owner:` heading line. */
 const answersIn = (prompt: string) => prompt.split(/^Answers from the ticket owner:\n+/mu)[1] ?? "";
@@ -512,7 +550,7 @@ test("two questions both reworded in the next review go to the owner together, e
   const run = handedOff(f, result, new RegExp(`${counted(2)}:\\s${lines.map(literal).join("\\s")}`, "u"), human);
   assert.deepEqual([edits, reviews], [2, 2]);
   assert.deepEqual(run.delivery.reason.split("\n").slice(1), lines);
-  assert.ok(human.requests[0]!.prompt.includes(`${counted(2)}:\n${lines.join("\n")}\n`));
+  assert.ok(human.requests[0]!.prompt.startsWith(`Answer ${counted(2)} the reviewer raised.\n`)); assert.ok(human.requests[0]!.prompt.includes(`\nNeeds: ${lines.join("\n")}\n`));
   for (const question of asked) assert.equal(run.delivery.reason.includes(question.text), false, question.text);
 });
 
@@ -525,8 +563,8 @@ test("open questions with the park policy are asked, not parked: the question nu
   const lines = questionLines(askedAgain);
   const [reason, needs]: string[][] = [run.delivery.reason.split("\n"), run.needs.split("\n")];
   assert.match(reason[0]!, /\b2 open questions:$/u); assert.deepEqual(reason.slice(1), lines);
-  assert.match(needs[0]!, openQuestions); assert.deepEqual(needs.slice(1), lines);
-  assert.ok(run.prompt.includes(`Needs: ${needs[0]}\n${lines.join("\n")}\nWorktree: ${f.worktree}\n`));
+  assert.equal(needs[0], `Answer ${counted(2)} the reviewer raised.`); assert.deepEqual(needs.slice(1), lines);
+  showsNeed(run.prompt, run.needs, f.worktree);
 });
 
 test("a different question in the next review is asked alone", async context => {
@@ -609,7 +647,7 @@ for (const cause of ["not converging", "open questions", "malformed report"]) {
     assert.equal(result.state, "delivered"); assert.deepEqual([edits, reviews, human.requests.length], [rounds + 1, rounds + 1 + sentBack, 1]);
     assert.match(human.requests[0]!.prompt, /send the standing findings back to the implementer/u);
     assert.match(human.requests[0]!.prompt, cause === "malformed report" ? /Malformed review report: newSinceLastRound/u : new RegExp(cause, "u"));
-    if (!needsRepair) assert.ok(human.requests[0]!.prompt.includes(`${counted(2)}:\n${questionLines(open).join("\n")}\n`));
+    if (!needsRepair) assert.ok(human.requests[0]!.prompt.includes(`\nNeeds: ${questionLines(open).join("\n")}\n`));
     held(f, result, /^Delivered/u);
   });
 }
@@ -699,7 +737,7 @@ test("a reviewer blocked event needs only its summary and does not require a str
     },
     reviewer: () => ++reviews === 1 ? ok("blocked", "Cannot inspect the generated output") : review("revise", "Handle empty input", { newSinceLastRound: "none" }),
   }, human);
-  assert.ok(human.requests[0]!.prompt.includes("This run is stuck and needs a decision: Cannot inspect the generated output\n\n"));
+  assert.match(human.requests[0]!.prompt.split("\n")[0]!, /^Cannot inspect the generated output$/u);
   assert.doesNotMatch(human.requests[0]!.prompt, /Malformed/u);
   handedOff(f, result, /not converging/u, human); assert.deepEqual([edits, reviews], [3, 3]);
 });
@@ -1255,7 +1293,7 @@ for (const [policy, assume] of [["park", undefined], [undefined, undefined], ["p
     for (const [index, asked] of questions.entries()) optionsFirst(needs[index + 1]!, index + 1, asked);
     // With assume off the assumable question is the owner's like the other, and nothing is said of what would have been assumed.
     assert.doesNotMatch(run.needs, /would have assumed/iu);
-    assert.ok(run.prompt.includes(`Needs: ${run.needs}\nWorktree: ${f.worktree}\n`));
+    showsNeed(run.prompt, run.needs, f.worktree);
     for (const question of questions) assert.ok(run.delivery.reason.includes(question.text), question.text);
     assert.deepEqual(run.result.agents, [{ stage: "falsify", outcome: "questions", summary: "The ticket leaves two things open" }]);
     assert.equal(result.states[3], "falsify"); assert.equal(result.states.some(state => state === "plan" || state === "planReview" || state === "test" || state === "change"), false);
@@ -1346,7 +1384,7 @@ for (const [label, questions, named, reason] of [
       // The question's own words say "questions", so the field is named by questionField's reason, which it gives whole.
       const run = questioned(f, result, named, human);
       for (const said of [run.needs, run.delivery.reason, result.output.summary]) {
-        assert.ok(said.includes(reason), said); assert.match(said, /\bmissing or malformed twice\b/u); assert.doesNotMatch(said, /Malformed/u);
+        assert.ok(said.includes(reason), said); assert.match(said, /\bThe falsify report was malformed twice: /u); assert.doesNotMatch(said, /Malformed/u);
       }
       // The first report went back once with the same reason; the second is the one the question sends a person to.
       assert.equal(prompts.length, 2); assert.ok(prompts[1]!.includes(reason)); assert.equal(prompts[0]!.includes(reason), false);
@@ -1409,7 +1447,7 @@ test("two malformed falsify reports are asked about after the second in plain wo
     falsify: request => { prompts.push(request.prompt); return reports[prompts.length - 1]!; },
     plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
   }, human);
-  const run = questioned(f, result, /\bmissing or malformed twice\b/u, human);
+  const run = questioned(f, result, /\bThe falsify report was malformed twice: /u, human);
   assert.equal(prompts.length, 2); assert.equal(result.states.at(-5), "falsifyResult");
   assert.deepEqual(result.states.filter(isPlanning), ["falsify", "falsify"]);
   assert.ok(prompts[1]!.includes(notAList));
@@ -1421,6 +1459,33 @@ test("two malformed falsify reports are asked about after the second in plain wo
   assert.ok(readFileSync(file, "utf8").includes(language.text));
   assert.deepEqual(numberedLines(run.needs.split("\n")), []); assert.equal(existsSync(join(run.directory, "assumptions.json")), false);
   assert.equal(run.result.agentInvocations, 2); assert.equal(candidate(f.worktree).status, "");
+});
+
+test("a run stuck on a falsify report malformed twice gives the fault in its first sentence, once, and where the report is kept under it", async context => {
+  const f = fixture(context); const human = person("hand off");
+  const fault = "questions[0].why must be a non-empty string";
+  const reports = [{ type: "questions", summary: "The ticket leaves the language open" }, gaps([without(language, "why")])];
+  let calls = 0;
+  const result = await execute(input(f), {
+    falsify: () => reports[calls++]!,
+    plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+  }, human);
+  const run = questioned(f, result, /The falsify report was malformed twice: /u, human);
+  const [first] = run.prompt.split("\n");
+  assert.equal(first, `The falsify report was malformed twice: ${fault}.`); assert.ok(first!.length < 100, first);
+  assert.equal(occurrences(run.prompt, fault), 1);
+  assert.ok(run.prompt.includes(`\nNeeds: The report is kept in ${join(run.directory, "falsify-2.json")}.\nWorktree: `), run.prompt);
+});
+
+test("a run stuck on a review report malformed twice gives the fault in its first sentence, and only there", async context => {
+  const f = fixture(context); const human = person("hand off");
+  const result = await execute(input(f), { reviewer: () => review("approved", "Claims approval", { criteria: undefined }) }, human);
+  handedOff(f, result, /Malformed review report: criteria must be an array\./u, human);
+  const [request, ...others] = human.requests; assert.deepEqual(others, []);
+  stuckQuestion(f, request, "reviewResult");
+  assert.equal(request!.prompt.split("\n")[0], "Malformed review report: criteria must be an array.");
+  assert.equal(occurrences(request!.prompt, "criteria must be an array"), 1);
+  assert.ok(result.output.summary.startsWith("Handed off: Malformed review report: criteria must be an array. Decision: hand off. "), result.output.summary);
 });
 
 for (const valid of [false, true]) {
@@ -1438,7 +1503,7 @@ for (const valid of [false, true]) {
     assert.ok(prompts[1]!.includes(`Your last report was malformed: ${notAList}. Return it again in the required shape.`));
     if (valid) assert.doesNotMatch(prompts[2]!, /Your last report was malformed/u);
     else assert.ok(prompts[2]!.includes(`Your last report was malformed: ${secondReason}. Return it again in the required shape.`));
-    const run = held(f, result, /missing or malformed twice/u);
+    const run = held(f, result, /The falsify report was malformed twice: /u);
     assert.ok(run.delivery.reason.includes(notAList));
     assert.ok(run.delivery.reason.includes(join(run.directory, "falsify-3.json")));
     assert.deepEqual([run.result.repairs, run.result.reviewRounds], [0, 0]);
@@ -1587,7 +1652,7 @@ test("with assume on, a mixed report asks the one question that is not assumable
     const line = others.find(one => one.includes(other.text)) ?? "";
     assert.ok(line.indexOf(other.recommended, line.indexOf(other.text) + other.text.length) > 0, `${other.text} is not listed with the answer ${other.recommended}`);
   }
-  assert.ok(run.prompt.includes(`Needs: ${run.needs}\nWorktree: ${f.worktree}\n`));
+  showsNeed(run.prompt, run.needs, f.worktree);
   // Nothing was assumed: the run stopped before plan, and a stop records no assumptions.
   assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
   assert.equal(result.states.some(state => state === "plan" || state === "planReview" || state === "test" || state === "change"), false);
@@ -1615,9 +1680,9 @@ test("more rounds after a mixed report returns to falsify, and a report then who
   assert.deepEqual(route(result.states), ["falsify", "decide", "falsify", "plan", "planReview", "test", "change", "review"]);
   // The decision shows the one question that stopped the run, and beside it what the run would have assumed.
   const shown = human.requests[0]!.prompt; assert.equal(human.requests.length, 1);
-  assert.match(shown, /\b1 open question:/u); assert.ok(shown.includes(`1. ${language.text}`));
+  assert.equal(shown.split("\n")[0], "Answer 1 open question before any code is written."); assert.ok(shown.includes(`1. ${language.text}`));
   assert.match(shown, /would have assumed/iu);
-  const others = standingOf(shown).slice(shown.search(/would have assumed/iu));
+  const others = needsIn(shown, f.worktree).slice(needsIn(shown, f.worktree).search(/would have assumed/iu));
   assert.ok(others.includes(beside.text) && others.includes(beside.recommended)); assert.equal(others.includes(language.text), false);
   // The second report is the one that stands: its answer is assumed, and nothing of the first is left over.
   assert.doesNotMatch(planned, /Current failure\/feedback:/u);
@@ -1700,8 +1765,9 @@ test("a second plan revision whose summary runs over several lines and 600 chara
     tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
   }, human);
   const run = questioned(f, result, /The plan still names no test/u, human);
-  const needs = `Clarify how to resolve this blocker: ${oneLine(feedback)}`.slice(0, 600) + "…";
-  assert.equal(run.needs, needs);
+  // The first sentence is what is needed; the rest of the summary follows under Needs, on one line cut at 600 characters.
+  const needs = `${oneLine(feedback.slice("The plan still names no test.".length))}`.slice(0, 600) + "…";
+  assert.equal(run.needs, `The plan still names no test.\n${needs}`);
   // The full reason stays in the receipt.
   assert.equal(run.delivery.reason, feedback);
   assert.equal(run.prompt.split("\n").find(line => line.startsWith("Needs: ")), `Needs: ${needs}`);
@@ -1864,7 +1930,7 @@ test("a too broad verdict asks one question holding the note's text, and an answ
   // The one question is the park note's text: the reason with the suggested split, what is needed, and where to look.
   assert.equal(human.requests.length, 1);
   const needs = stuckQuestion(f, human.requests[0], "planReviewResult");
-  assert.match(human.requests[0]!.prompt, splitSaid); assert.match(needs, /^Clarify how to resolve this blocker: /u); assert.match(needs, splitSaid);
+  assert.match(human.requests[0]!.prompt, splitSaid); assert.doesNotMatch(needs, /^Clarify how/u); assert.match(needs, splitSaid);
   // The planner is asked again with the answer, and so is everyone after it; no prompt before the question had it.
   assert.equal(plans.length, 2);
   assert.equal(plans[0]!.includes(answer), false); assert.equal(later.planReview![0]!.includes(answer), false);
@@ -2055,7 +2121,7 @@ test("an answer to a spent review budget renews the budgets as more rounds does 
   const at = result.states.indexOf("decide");
   assert.deepEqual(result.states.slice(at - 2, at + 3), ["reviewBudget", "stuck", "decide", "repairTarget", "change"]);
   const needs = stuckQuestion(f, human.requests[0], "reviewBudget");
-  assert.match(needs, /^Explain how to resolve the remaining findings: Review budget exhausted \(1\)\. Finding 2/u);
+  assert.match(needs, /^Review budget used up \(1 of 1\)\.\nFinding 2/u);
   // The round after the answer is briefed with the findings that stopped the run and with the answer, not with the spent budget.
   const feedback = prompts[2]!.split("Current failure/feedback: ")[1] ?? "";
   assert.ok(feedback.includes("Finding 2"), feedback); assert.ok(feedback.includes(answer), feedback); assert.doesNotMatch(feedback, /budget exhausted/u);
@@ -2094,6 +2160,32 @@ for (const assume of [true, false]) {
     assert.equal(existsSync(join(run.directory, "assumptions.json")), false);
   });
 }
+
+test("a run stuck on six falsify questions counts them in a first sentence under 100 characters, gives each question with its options and why once, and offers the same decisions", async context => {
+  const f = fixture(context); const human = person("hand off");
+  const six = Array.from({ length: 6 }, (_, index) => gap(`Which greeting goes on line ${index + 1}?`, {
+    options: [`Greeting ${index + 1}a`, `Greeting ${index + 1}b`], recommended: `Greeting ${index + 1}b`, why: `Line ${index + 1} is not named in the ticket.`,
+  }));
+  const result = await execute(input(f, {}, { assume: false }), {
+    falsify: () => gaps(six, "Six lines are open"),
+    plan: () => assert.fail(), planReview: () => assert.fail(), tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+  }, human);
+  const run = questioned(f, result, /Which greeting goes on line 1\?/u, human);
+  const lines = run.prompt.split("\n");
+  // What is needed, then where the run stands, once, then the questions, once, under Needs.
+  assert.deepEqual(lines.slice(0, 5), ["Answer 6 open questions before any code is written.", "", standsAt("falsifyResult"), "Repair rounds used: 0 of 3.", "Review rounds used: 0 of 2."]);
+  assert.equal(needsIn(run.prompt, f.worktree), six.map((asked, index) => `${index + 1}. ${asked.text} Options: ${asked.recommended} (recommended); ${asked.options[0]} Why: ${asked.why}`).join("\n"));
+  for (const asked of six) for (const part of [asked.text, ...asked.options, asked.why]) assert.equal(occurrences(run.prompt, part), 1, part);
+  // The decisions, their wording, and what each does are as before.
+  assert.deepEqual(lines.slice(-5), [
+    "hand off: stop here and keep the worktree and branch exactly as they are, with nothing committed, for another workflow or a person. (recommended)",
+    "more rounds: restart the repair budget and return to falsify with the standing feedback.",
+    `archive: commit the candidate as delivery would have and keep that commit as the branch ${archiveBranch}, then remove the worktree and delete ${branch}. Ignored files are not kept.`,
+    "discard: remove the worktree and delete the branch without saving the candidate; asks for confirmation first.",
+    "any other reply: answer the question and return to the stage that stopped with fresh budgets and this answer as standing feedback.",
+  ]);
+  assert.ok(result.output.summary.startsWith("Handed off: Answer 6 open questions before any code is written. "), result.output.summary);
+});
 
 test("a plan over 16000 characters goes back once with the exact fault, then is refused as an empty one is", async context => {
   const f = fixture(context); const human = person("hand off"); const plans: string[] = [];
@@ -2259,7 +2351,7 @@ test("a tester blocker waits for a decision with what is missing, before any imp
   const f = fixture(context); const human = person("hand off");
   const result = await execute(input(f), { tester: () => ok("blocked", "Acceptance criteria\nare missing"), implementer: () => assert.fail(), reviewer: () => assert.fail() }, human);
   handedOff(f, result, /Acceptance criteria\s+are missing/u, human);
-  assert.ok(result.output.summary.startsWith(`Handed off on ${branch}: Acceptance criteria are missing. Decision: hand off. Worktree kept at ${f.worktree}. Evidence: `));
+  assert.ok(result.output.summary.startsWith(`Handed off: Acceptance criteria are missing. Decision: hand off. Branch: ${branch}. Worktree kept at ${f.worktree}. Evidence: `), result.output.summary);
 });
 
 test("an implementer blocker waits for a decision without green checks, review, or a commit", async context => {
@@ -2281,8 +2373,12 @@ test("checks failing until the repair budget is exhausted wait for a decision, a
   assert.equal(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), "hello\n");
   const [request, ...others] = human.requests; assert.deepEqual(others, []);
   assert.deepEqual([request!.suggestions, request!.choices], [stuckDecisions, undefined]);
-  for (const part of ["Ticket PROJ-12: Add a greeting", "Repair budget exhausted (2). verify: tests did not meet its expected result; inspect ",
-    run.result.checks[5].log, run.result.checks[6].log, "Repair rounds used: 2 of 2.", `Worktree: ${f.worktree}`, `Branch: ${branch}`]) assert.ok(request!.prompt.includes(part), part);
+  // The spent budget is the first sentence, and what failed last is said once, under it.
+  assert.equal(request!.prompt.split("\n")[0], "Repair budget used up (2 of 2).");
+  const failed = `verify: tests did not meet its expected result; inspect ${run.result.checks[5].log}`;
+  for (const part of [standsAt("repairBudget"), `Needs: ${failed}`, run.result.checks[6].log,
+    "Repair rounds used: 2 of 2.", `Worktree: ${f.worktree}`, `Branch: ${branch}`]) assert.ok(request!.prompt.includes(part), part);
+  assert.equal(occurrences(request!.prompt, failed), 1); assert.equal(request!.prompt.includes("Add a greeting"), false);
 });
 
 test("review feedback is repaired once through fresh checks and another review", async context => {
@@ -2347,7 +2443,7 @@ test("more rounds restarts the budget with the standing findings, and an approva
   }, human);
   assert.equal(result.state, "delivered"); assert.deepEqual([prompts.length, reviews, human.requests.length], [3, 3, 1]);
   assert.deepEqual(result.states.slice(-15), ["reviewBudget", "stuck", "decide", "repairTarget", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult", "commit", "rebase", "deliver", "success", "delivered"]);
-  assert.ok(human.requests[0]!.prompt.includes("Review budget exhausted (1). Finding 2"));
+  assert.ok(human.requests[0]!.prompt.startsWith("Review budget used up (1 of 1).\n")); assert.ok(human.requests[0]!.prompt.includes("\nNeeds: Finding 2"));
   // The pass a person granted is briefed exactly as the ordinary repair before it was.
   assert.ok(prompts[1]!.includes("Current failure/feedback: Finding 1")); assert.ok(prompts[2]!.includes("Current failure/feedback: Finding 2"));
   assert.doesNotMatch(prompts[2]!, /budget exhausted/u);
@@ -2402,7 +2498,7 @@ test("a spent review budget whose last revise has only in-Scope blockers goes ba
   // More rounds then renews the budget as ever, but the extra round is not given again: the next spent budget asks straight away.
   assert.deepEqual(asked, [4, 6]); assert.equal(reviewed.length, 6);
   assert.equal(result.states.filter(state => state === "stuck").length, 2);
-  assert.match(stuckQuestion(f, human.requests[0], "reviewBudget"), /^Explain how to resolve the remaining findings: Review budget exhausted \(1\)\. Review 4/u);
+  assert.match(stuckQuestion(f, human.requests[0], "reviewBudget"), /^Review budget used up \(1 of 1\)\.\nReview 4/u);
   // The implementer's first pass in the extra round carries the blocker that spent the budget, and it stands for the round's later pass too.
   assert.ok(prompts[2]!.includes("Blocker 2"), prompts[2]);
   assert.ok(prompts[3]!.includes("Blocker 2"), prompts[3]); assert.ok(prompts[3]!.includes("Blocker 3"), prompts[3]);
@@ -2478,7 +2574,7 @@ test("a run that stops after its extra review round says the round was used and 
   const run = handedOff(f, result, /budget exhausted \(0\)\. Review 2/u, human);
   assert.equal(reviews, 2);
   const [request] = human.requests;
-  assert.match(stuckQuestion(f, request, "reviewBudget"), /^Explain how to resolve the remaining findings: Review budget exhausted \(0\)\. Review 2/u);
+  assert.match(stuckQuestion(f, request, "reviewBudget"), /^Review budget used up \(0 of 0\)\.\nReview 2/u);
   // Said above what is needed, with the reviewer's own account of what was new in the round.
   assert.ok(extraRoundLine(standingOf(request!.prompt)), request!.prompt);
   assert.ok(standingOf(request!.prompt).includes("New in round 2"), request!.prompt);
@@ -2494,7 +2590,7 @@ test("a run stopped another way during its extra review round says the round was
   handedOff(f, result, /The greeting file is locked/u, human);
   assert.deepEqual([edits, reviews, human.requests.length], [4, 3, 1]);
   const [request] = human.requests;
-  assert.match(stuckQuestion(f, request, "change"), /^Clarify how to resolve this blocker: The greeting file is locked/u);
+  assert.match(stuckQuestion(f, request, "change"), /^The greeting file is locked/u);
   assert.ok(extraRoundLine(standingOf(request!.prompt)), request!.prompt);
   assert.ok(standingOf(request!.prompt).includes("New in round 3"), request!.prompt);
 });
@@ -2717,11 +2813,13 @@ test("discard then go back returns to the decision with the worktree, branch, an
   assert.deepEqual(between, before); assert.deepEqual(candidate(f.worktree), before);
   const [first, confirm, second] = human.requests;
   assert.deepEqual(confirm!.choices, ["confirm discard", "go back"]);
-  assert.equal(first!.prompt.split("\n")[0], "Ticket PROJ-12 is stuck: answer what is needed");
+  assert.equal(first!.prompt.split("\n")[0], "Review budget used up (0 of 0).");
   assert.equal(confirm!.prompt.split("\n")[0], "Discard the candidate for ticket PROJ-12?");
   for (const request of [first!, confirm!]) {
-    assert.equal(request.prompt.split("\n")[1], "");
-    assert.match(request.prompt, /Stopped in reviewBudget\./u);
+    assert.equal(request.prompt.split("\n")[1], ""); assert.equal(request.prompt.split("\n")[2], standsAt("reviewBudget"));
+    assert.equal(request.prompt.includes("Add a greeting"), false);
+    // The reason is said once in each: under the first sentence in the question, and under Needs in the confirmation.
+    assert.equal(occurrences(request.prompt, "Blocker: Handle the empty case (outside-scope.txt:1)"), 1);
     assert.match(request.prompt, /Repair rounds used: 0 of 0\./u); assert.match(request.prompt, /Review rounds used: 0 of 0\./u);
     assert.ok(request.prompt.includes(`Evidence: ${run.directory}`));
     assert.doesNotMatch(request.prompt, /^#/mu);
@@ -2729,7 +2827,9 @@ test("discard then go back returns to the decision with the worktree, branch, an
   assert.ok(first!.prompt.indexOf("hand off:") < first!.prompt.indexOf("more rounds:"));
   assert.match(first!.prompt, /hand off: .+ \(recommended\)/u);
   assert.ok(confirm!.prompt.indexOf("confirm discard:") < confirm!.prompt.indexOf("go back:"));
-  assert.doesNotMatch(confirm!.prompt, /Needs:|\(recommended\)/u);
+  assert.doesNotMatch(confirm!.prompt, /\(recommended\)/u);
+  assert.ok(confirm!.prompt.includes("\nNeeds: Review budget used up (0 of 0).\n"), confirm!.prompt);
+  assert.ok(confirm!.prompt.indexOf("will not be saved") < confirm!.prompt.indexOf("\nNeeds: "));
   for (const part of [f.worktree, branch, "will not be saved"]) assert.ok(confirm!.prompt.includes(part), part);
   assert.deepEqual([second!.prompt, second!.suggestions], [first!.prompt, first!.suggestions]); assert.deepEqual(first!.suggestions, stuckDecisions);
   assert.deepEqual(run.result.decisions.map((made: any) => `${made.stage}: ${made.response}`), ["decide: discard", "confirmDiscard: go back", "decide: hand off"]);
@@ -2848,13 +2948,13 @@ function uncommitted(f: Fixture, run: { delivery: any } | undefined, base: strin
 function questionedIn(state: string, f: Fixture, result: { state: unknown; output: any; states: string[] }, reason: RegExp, human: { requests: Ask[] }) {
   assert.equal(result.state, "handedOff"); assert.deepEqual(result.states.slice(-5), [state, "stuck", "decide", "handOff", "handedOff"]);
   for (const other of ["park", "parked", "failure"]) assert.equal(result.states.includes(other), false, other);
-  const run = held(f, result, new RegExp(`^Handed off on ${branch}: `, "u"));
+  const run = held(f, result, /^Handed off: /u);
   assert.deepEqual([run.result.outcome, run.delivery.outcome, run.delivery.decision], ["blocked", "handed-off", "hand off"]);
   assert.match(run.delivery.reason, reason);
   const request = human.requests.at(-1)!; const needs = stuckQuestion(f, request, state);
-  assert.ok(request.prompt.includes(run.delivery.reason)); assert.ok(request.prompt.includes(`Evidence: ${run.directory}`));
+  assert.match(oneLine(needs), spoken(reason)); assert.ok(request.prompt.includes(`Evidence: ${run.directory}`));
   assert.equal(existsSync(join(run.directory, "park.txt")), false); assert.equal(Object.hasOwn(run.delivery, "park"), false);
-  assert.ok(result.output.summary.includes(`Decision: hand off. Worktree kept at ${f.worktree}. Evidence: `));
+  handOffSummary(result.output.summary, f.worktree);
   return Object.assign(run, { prompt: request.prompt, needs });
 }
 /** What `rebasedFrom` records: the base the run started from and the commit approved first, the ticket's own commit on that base. */
@@ -3009,9 +3109,9 @@ test("a conflict met again after more rounds stops again in the same run, and ha
     assert.match(request.prompt, /Stopped in rebase\./u); assert.match(request.prompt, /greeting\.txt/u); assert.ok(names(request.prompt, tip));
   }
   assert.match(prompts[1]!.split("Current failure/feedback: ")[1] ?? "", /greeting\.txt/u);
-  const run = held(f, result, new RegExp(`^Handed off on ${branch}: `, "u")); untouched(f);
+  const run = held(f, result, /^Handed off: /u); untouched(f);
   assert.deepEqual([run.result.outcome, run.delivery.outcome, run.delivery.decision, run.delivery.archive], ["blocked", "handed-off", "hand off", undefined]);
-  assert.ok(result.output.summary.includes(`Decision: hand off. Worktree kept at ${f.worktree}. Evidence: `));
+  handOffSummary(result.output.summary, f.worktree);
   uncommitted(f, run, started, before!);
 });
 
@@ -3808,6 +3908,8 @@ test("a resumed candidate whose conflicts the implementer cannot settle within t
   const ref = savedAsItStood(f, run.directory, started, files);
   // What the owner is asked names the conflicted file and where the saved candidate is.
   assert.match(run.needs, /greeting\.txt/u); assert.ok(run.prompt.includes(ref), "the question names the saved candidate");
+  // The spent budget and the conflict it left are the first sentence.
+  assert.match(run.prompt.split("\n")[0]!, /^Repair budget used up \(1 of 1\) with 1 unsettled conflict in "?greeting\.txt"?\.$/u);
   assert.equal(git(f.repo, "show", `${ref}:greeting.txt`), "hello");
   // Nothing was committed: the branch is on the tip with the unsettled candidate in the worktree.
   assert.equal(git(f.repo, "rev-parse", branch), tip); assert.equal(git(f.repo, "rev-list", "--count", `${tip}..${branch}`), "0");
@@ -4166,6 +4268,12 @@ test("a remote that refuses to delete the merged ticket branch ends the run bloc
   assert.equal(pushed(), `refs/heads/${branch} ${run.delivery.commit}`);
 });
 
+/** A delivered pull request's later ending says what happened first, without the branch, then the pull request and where the branch is. */
+function settled(summary: string, after: string) {
+  const first = summary.split(/(?<=[.!?…])\s/u)[0]!;
+  assert.ok(first.length < 120, first); assert.equal(first.includes(branch), false, first);
+  assert.match(first, /closed without merging\.$/u); assert.ok(summary.includes(` ${after}`), summary);
+}
 for (const choice of ["hand off", "discard"] as const) {
   test(`a pull request closed without merging goes to the decision whatever the stuck setting, offering only hand off and discard; ${choice === "hand off" ? "hand off ends handedOff with the branch kept" : "a confirmed discard deletes the local branch only"}`, async context => {
     const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f, 0, ["CLOSED"]);
@@ -4180,12 +4288,14 @@ for (const choice of ["hand off", "discard"] as const) {
     // Only a merge deletes the pushed branch.
     assert.equal(pushed(), `refs/heads/${branch} ${commit}`);
     if (choice === "hand off") {
-      assert.equal(result.state, "handedOff"); held(f, result, /^Handed off/u);
+      assert.equal(result.state, "handedOff"); held(f, result, /^Handed off: /u);
+      settled(result.output.summary, `Pull request: ${url}. Branch: ${branch}, kept locally and on origin. Evidence: `);
       assert.equal(confirmation, undefined); assert.equal(git(f.repo, "rev-parse", branch), commit);
       return;
     }
     assert.deepEqual(confirmation!.choices, ["confirm discard", "go back"]);
-    assert.equal(result.state, "abandoned"); held(f, result, /^Abandoned/u);
+    assert.equal(result.state, "abandoned"); held(f, result, /^Abandoned: /u);
+    settled(result.output.summary, `Pull request: ${url}. Branch: ${branch}, deleted locally; the pushed branch is kept on origin. Evidence: `);
     assert.equal(git(f.repo, "branch", "--list", branch), ""); assert.equal(git(f.repo, "cat-file", "-t", commit), "commit");
   });
 }
@@ -4546,7 +4656,7 @@ test("review findings returned as a JSON object reach the implementer and the Hu
   const run = handedOff(f, result, /budget exhausted \(1\)\. Handle the empty case/u, human);
   assert.ok(prompts[1]!.endsWith("Current failure/feedback: Handle the empty case\nBlocker: Handle the empty case (greeting.txt:1)"));
   assert.equal(run.delivery.reason, "Review budget exhausted (1). Handle the empty case\nBlocker: Handle the empty case (greeting.txt:1)");
-  assert.ok(result.output.summary.startsWith(`Handed off on ${branch}: Review budget exhausted (1). Handle the empty case Blocker: Handle the empty case (greeting.txt:1). Decision: hand off.`));
+  assert.ok(result.output.summary.startsWith(`Handed off: Review budget used up (1 of 1). Handle the empty case Blocker: Handle the empty case (greeting.txt:1). Decision: hand off. Branch: ${branch}.`), result.output.summary);
   assert.deepEqual(run.result.agents.filter((agent: any) => agent.stage === "review").map((agent: any) => agent.summary), Array(4).fill("Handle the empty case"));
 });
 
@@ -4863,8 +4973,8 @@ test("a long blocker is capped in what the question says is needed and kept whol
     reviewer: request => { before = candidate(request.cwd); return ok("blocked", reason); },
   }, human);
   const run = questioned(f, result, /Specify the greeting language/u, human);
-  const needs = `Clarify how to resolve this blocker: ${reason.replace(/\s+/gu, " ")}`.slice(0, 600) + "…";
-  assert.equal(run.needs, needs);
+  const needs = `${oneLine(reason.slice("Specify the greeting language.".length))}`.slice(0, 600) + "…";
+  assert.equal(run.needs, `Specify the greeting language.\n${needs}`);
   assert.equal(run.delivery.reason, reason);
   assert.equal(Object.keys(run.delivery)[0], "schemaVersion");
   assert.equal(run.prompt.split("\n").find(line => line.startsWith("Needs: ")), `Needs: ${needs}`);
@@ -4885,7 +4995,7 @@ for (const exhausted of ["review", "gates"]) {
       reviewer: () => ownerReview(`Finding ${++reviews}`),
     }, human);
     const run = questioned(f, result, exhausted === "review" ? /Review budget exhausted \(2\)/u : /Repair budget exhausted \(2\)/u, human);
-    assert.match(run.needs, /^Explain how to resolve the remaining findings: /u);
+    assert.match(run.needs, exhausted === "review" ? /^Review budget used up \(2 of 2\)\.\n/u : /^Repair budget used up \(2 of 2\)\.\n/u);
     assert.deepEqual([edits, reviews], [5, exhausted === "review" ? 3 : 2]);
     assert.deepEqual([run.result.repairs, run.result.reviewRounds], [2, 2]);
     assert.ok(run.prompt.includes(`Repair rounds used: 2 of ${exhausted === "gates" ? 2 : 3}.`));
@@ -5507,7 +5617,7 @@ for (const [label, extra, report, calls] of [
     assert.equal(result.state, "handedOff"); assert.deepEqual(route(result.states), [...Array.from({ length: calls }, () => "falsify"), "decide"]);
     assert.equal(human.requests.length, 1); const note = human.requests[0]!.prompt; stuckQuestion(again, human.requests[0], "falsifyResult");
     assert.equal(existsSync(file), false, "the earlier run's answers are still saved though this run's falsify assumed nothing"); assert.deepEqual(savedIn(f), []);
-    const run = held(again, result, new RegExp(`^Handed off on ${branch}: `, "u"));
+    const run = held(again, result, /^Handed off: /u);
     assert.deepEqual([run.delivery.outcome, run.delivery.resumed], ["handed-off", true]);
     assert.equal(existsSync(join(run.directory, "assumptions.json")), false); assert.equal(Object.hasOwn(run.delivery, "assumptions"), false);
     assert.equal(existsSync(join(run.directory, "park.txt")), false);
@@ -5599,9 +5709,10 @@ test("under stuck ask, a stop for review questions that follows more rounds afte
   assert.deepEqual([falsified, reviews, human.requests.length], [2, 2, 2]);
   const [first, second] = human.requests.map(request => request.prompt) as [string, string];
   // The first decision did show each planning question with its own options and reason.
-  for (const [index, question] of planned.entries()) optionsFirst(numberedLines(standingOf(first).split("\n"))[index]!, index + 1, question);
+  for (const [index, question] of planned.entries()) optionsFirst(numberedLines(needsIn(first, f.worktree).split("\n"))[index]!, index + 1, question);
   // The second shows what the reviewer asked, each on its numbered line with where it was raised and nothing after it, and needs the same.
-  assert.ok(second.includes(`${counted(2)}:\n${lines.join("\n")}\n`), second); assert.deepEqual(numberedLines(standingOf(second).split("\n")), lines);
+  assert.ok(second.startsWith(`Answer ${counted(2)} the reviewer raised.\n`), second);
+  for (const line of lines) assert.equal(occurrences(second, line), 1, line);
   assert.deepEqual(numberedLines(needsIn(second, f.worktree).split("\n")), lines);
   assert.deepEqual(run.delivery.reason.split("\n").slice(1), lines);
   for (const text of [second, run.delivery.reason, result.output.summary]) {
@@ -5625,12 +5736,13 @@ test("under stuck ask with assume on, a stop for review questions that follows m
   assert.deepEqual([falsified, reviews, human.requests.length], [2, 2, 2]);
   const [first, second] = human.requests.map(request => request.prompt) as [string, string];
   // The first decision did show the owner's question with its options, and after it the gap the run would have assumed with its answer.
-  assert.match(first, /\b1 open question:/u); assert.equal(numberedLines(standingOf(first).split("\n")).length, 1); optionsFirst(numberedLines(standingOf(first).split("\n"))[0]!, 1, language);
+  assert.equal(first.split("\n")[0], "Answer 1 open question before any code is written."); assert.equal(numberedLines(needsIn(first, f.worktree).split("\n")).length, 1); optionsFirst(numberedLines(needsIn(first, f.worktree).split("\n"))[0]!, 1, language);
   assert.match(first, /would have assumed/iu);
-  const others = standingOf(first).slice(first.search(/would have assumed/iu));
+  const others = needsIn(first, f.worktree).slice(needsIn(first, f.worktree).search(/would have assumed/iu));
   assert.ok(others.indexOf(beside.recommended, others.indexOf(beside.text) + beside.text.length) > 0, `${beside.text} is not listed with the answer ${beside.recommended}`);
   // The second shows what the reviewer asked, each on its numbered line with where it was raised and nothing after it, and needs the same.
-  assert.ok(second.includes(`${counted(2)}:\n${lines.join("\n")}\n`), second); assert.deepEqual(numberedLines(standingOf(second).split("\n")), lines);
+  assert.ok(second.startsWith(`Answer ${counted(2)} the reviewer raised.\n`), second);
+  for (const line of lines) assert.equal(occurrences(second, line), 1, line);
   assert.deepEqual(numberedLines(needsIn(second, f.worktree).split("\n")), lines);
   assert.deepEqual(run.delivery.reason.split("\n").slice(1), lines);
   for (const text of [second, run.delivery.reason, result.output.summary]) {
@@ -5654,7 +5766,7 @@ test("a question for review questions without more rounds, in a run whose two fa
   assert.match(reason[0]!, /\b2 open questions:$/u); assert.deepEqual(reason.slice(1), lines);
   assert.match(needs[0]!, openQuestions); assert.deepEqual(needs.slice(1), lines);
   const note = run.prompt;
-  assert.ok(note.includes(`Needs: ${needs[0]}\n${lines.join("\n")}\nWorktree: ${f.worktree}\n`));
+  showsNeed(note, run.needs, f.worktree);
   for (const text of [run.delivery.reason, run.needs, note, result.output.summary]) {
     for (const stale of taken.flatMap(question => [question.text, ...question.options, oneLine(question.why)])) assert.equal(oneLine(text).includes(stale), false, stale);
     assert.doesNotMatch(text, /Options:|Why:|would have assumed/iu);
@@ -5708,10 +5820,10 @@ test("under Needs, each option, the reason, and each question and answer the run
   shownAt(needs[4]!, replaced.recommended, shownAt(needs[4]!, replaced.text));
   shownAt(needs[5]!, newline.recommended, shownAt(needs[5]!, newline.text));
   for (const line of needs) for (const field of long) assert.equal(line.includes(oneLine(field)), false, `${oneLine(field).slice(0, 40)}… is whole under Needs`);
-  // The reason for the stop is never cut: the receipt holds it whole, and so does the question above its needs.
-  const standing = run.prompt.slice(0, run.prompt.indexOf("\nNeeds: "));
-  for (const field of long) for (const [where, text] of [["delivery.json", run.delivery.reason], ["the question", standing]] as const) {
-    assert.ok(oneLine(text).includes(oneLine(field)), `the reason in ${where} does not hold ${oneLine(field).slice(0, 40)}… whole`);
+  // The receipt holds the reason for the stop whole; the question gives each question once, cut under Needs, and nowhere whole.
+  for (const field of long) {
+    assert.ok(oneLine(run.delivery.reason).includes(oneLine(field)), `the reason in delivery.json does not hold ${oneLine(field).slice(0, 40)}… whole`);
+    assert.equal(oneLine(run.prompt).includes(oneLine(field)), false, `${oneLine(field).slice(0, 40)}… is whole in the question`);
   }
   assert.doesNotMatch(result.output.summary, /\n/u);
 });
@@ -5737,7 +5849,7 @@ test("a rebase stop whose cleanup cannot remove a setup output says that cleanin
   assert.match(run.delivery.reason, /\bclean/iu, "the reason does not say that cleaning failed");
   assert.ok(run.delivery.reason.includes(log), `${run.delivery.reason} does not name ${log}`);
   const note = run.prompt;
-  assert.ok(note.slice(0, note.indexOf("\nNeeds: ")).includes(log), "the question's standing section does not name the log");
+  assert.ok(oneLine(run.needs).includes(log), "what the question says is needed does not name the log"); assert.equal(occurrences(note, log), 1);
   // The candidate is the approved one, uncommitted on the base it was approved on, beside the one output that could not be removed.
   assert.equal(candidate(f.worktree, true).status, "?? cache/out.txt\n?? greeting.test.txt\n?? greeting.txt\n!! kept/out.txt");
   assert.deepEqual(candidate(f.worktree).files.filter(([name]) => name !== "cache/out.txt"), seen.before!.files);
