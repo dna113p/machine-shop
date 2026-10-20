@@ -46,7 +46,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     firstApproved: null as { baseCommit: string; commit: string } | null,
     rebasedFrom: null as { baseCommit: string; commit: string } | null,
     rebaseSteps: 0,
-    moved: null as { from: string; to: string; ref: string; patch: string; conflicts: string[]; settled: string[] } | null,
+    moved: null as { from: string; to: string; ref: string; patch: string; conflicts: string[]; settled: string[]; at?: "resume" | "delivery" } | null,
     created: false,
     adopted: false,
     removed: false,
@@ -212,6 +212,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           return { type: "stuck" };
         }
         saved.moved = JSON.parse(readFileSync(record, "utf8"));
+        saved.moved!.at = "resume";
         saved.moved!.conflicts = [...new Set([...saved.moved!.conflicts, ...conflicts])];
         return conflict();
       }
@@ -374,7 +375,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   });
   const moveRecord = () => join(git(worktree, "rev-parse", "--absolute-git-dir"), "ticket-task-move.json");
   const movedPrompt = () => saved.moved ? [
-    `The resume move from ${saved.moved.from} onto base ${saved.moved.to} ${saved.baseCommit === saved.moved.to ? "was applied" : "was restored on its old base"}. Saved candidate: ${saved.moved.ref} (${saved.moved.patch}).`,
+    `The ${saved.moved.at === "delivery" ? "delivery" : "resume"} move from ${saved.moved.from} onto base ${saved.moved.to} ${saved.baseCommit === saved.moved.to ? "was applied" : "was restored on its old base"}. Saved candidate: ${saved.moved.ref} (${saved.moved.patch}).`,
     ...(saved.moved.settled.length ? [`Settled conflicts: ${saved.moved.settled.map(path => JSON.stringify(path)).join(", ")}. Check that both sides' intent survives.`] : []),
   ] : [];
   function conflict(): Event {
@@ -389,8 +390,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: "conflicted" };
   }
 
-  /** Preserve an unapproved candidate off-branch, then apply it to the current base before any checks or review. */
-  function moveOnto(tip: string): Event {
+  /** Preserve the candidate off-branch, then apply it to the current base before fresh checks and review. */
+  function moveOnto(tip: string, at: "resume" | "delivery" = "resume"): Event {
     if (repository.output === "pr" && !published(tip)) return { type: "stuck" };
     const original = saved.baseCommit;
     let snapshot = "";
@@ -412,7 +413,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       git(worktree, "update-ref", ref, snapshot);
       const patch = join(work.open(), "saved-candidate.patch");
       writeFileSync(patch, rawGit("diff", "--binary", "--no-ext-diff", "--no-textconv", original, snapshot), { flag: "wx", mode: 0o600 });
-      saved.moved = { from: original, to: tip, ref, patch, conflicts: [], settled: [] };
+      saved.moved = { from: original, to: tip, ref, patch, conflicts: [], settled: [], at };
     }
     try {
       git(worktree, "reset", "--quiet", "--hard", tip);
@@ -682,8 +683,19 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (!replay.ok) {
       const conflicts = git(worktree, "diff", "--name-only", "--diff-filter=U");
       restore();
+      if (conflicts && !saved.moved) {
+        saved.reviewsFrom = saved.reviews.length;
+        saved.rebasedFrom ??= saved.firstApproved;
+        const moved = moveOnto(tip, "delivery");
+        if (moved.type === "conflicted" || moved.type === "resumed") {
+          work.block(`Replay onto ${tip} conflicted in ${conflicts.split("\n").join(", ")}; the run moved the approved candidate onto ${tip} itself, once per run.`
+            + (moved.type === "conflicted" ? ` ${work.status().reason}` : ""));
+        }
+        return moved;
+      }
       return stop(`Replay onto ${tip} failed${conflicts ? ` with conflicts in ${conflicts.split("\n").join(", ")}` : " (Git or a hook refused it)"}. `
-        + `The approved candidate is uncommitted on ${original}; a resumed run moves it onto the current base and sends conflicts to the implementer to settle. Inspect rebase logs in ${work.open()}.`);
+        + `The approved candidate is uncommitted on ${original}; a resumed run moves it onto the current base and sends conflicts to the implementer to settle. Inspect rebase logs in ${work.open()}.`
+        + (conflicts && saved.moved ? ` This run already moved its candidate once, ${saved.moved.at === "delivery" ? "after a replay conflict" : "when it resumed"}, so it does not move again.` : ""));
     }
     const count = git(worktree, "rev-list", "--count", `${tip}..HEAD`);
     if (count === "0") {
@@ -1476,7 +1488,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       archive: operation(archive, { archived: "remove" }),
       remove: operation(remove, { removed: "abandon" }),
       commit: operation(commit, { committed: "rebase", failed: "stepFailed" }),
-      rebase: operation(stopped("rebase", rebase), { current: "deliver", rebased: "deliver", review: "verify", failed: "repairBudget", stuck: "stuck", blocked: "refuse", handBack: "stepFailed" }),
+      rebase: operation(stopped("rebase", rebase), { current: "deliver", rebased: "deliver", conflicted: "change", resumed: "scopeAfterChange", review: "verify", failed: "repairBudget", stuck: "stuck", blocked: "refuse", handBack: "stepFailed" }),
       deliver: operation(deliver, { delivered: "success", unreachable: "stepFailed", failed: "stepFailed" }, { retry: { on: "unreachable", times: 3, wait: "1m" } }),
       success: operation(() => conclude("completed"), { delivered: repository.output === "pr" ? "checkMerge" : "delivered", kept: "delivered", refused: "refused" }),
       checkMerge: operation(checkMerge, { merged: "cleanUp", waiting: "awaitMerge", decide: "mergeDecide" }),
