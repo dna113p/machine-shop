@@ -45,6 +45,24 @@ Production migrations and publishing are deliberately not generic defaults.
 Ticket operations use [recovery by step](workflows/ticket-task.md#recovery-by-step),
 including bounded Operation retries and questions specific to each failed step.
 
+### Replay conflicts at delivery
+
+On a delivery replay conflict, ticket-task restores the approved candidate, moves
+it onto the tip it tried, and sends conflicts to the implementer in the same run.
+The run moves once; a second replay conflict stops with the existing recovery text
+and says the run already moved its candidate once.
+A move in `prepare` when the run resumed counts toward this once-per-run limit.
+Settling conflicts uses the existing repair budget; scope and required checks
+lead to a fresh review, then commit, rebase, and delivery.
+Evidence names the replay conflict, its files, and the tip the candidate moved onto.
+Git or hook refusals without conflicts, rewritten bases, unpublished bases, and
+bases that already hold the change still stop as before.
+
+On 2026-10-19, org-26 stopped replaying onto `9a2d15a` with conflicts in
+`tests/ticket-task.test.ts`, and org-47 stopped replaying onto `0bc2c5a` with
+conflicts in `ticket-task.ts`. Both required a person to hand off and resume;
+the resumed runs used this same move and settling path to deliver.
+
 ### Failed checks
 
 After every gate has run, the shared check Operation runs each failed gate
@@ -446,7 +464,7 @@ is.
 | `verify` | The required checks; a failure goes to the repair budget |
 | `review`, `reviewResult` | Capture the structured report; the Operation preserves the unchanged-checkout guard and judges criteria, finding severity, and progress to approve, revise, or apply the stuck policy |
 | `commit` | One commit of everything except `.machine-runs`, even if an Agent staged it: subject is the ticket title, body is `Ticket: <id>` |
-| `rebase` | Resolve the current base; replay exactly the approved ticket commit onto a forward tip. Rerun setup, then `reverify` for an equal patch (`verify` on a resumed delivered commit) or `verify` and fresh review for a changed patch. An unchanged-base delivered resume runs `verify` without replay. Undo the replayed commit before any new stop, repair, or re-review; if ignore rules on the tip would drop added files, restore the candidate on its original base through `stuck` |
+| `rebase` | Resolve the current base; replay exactly the approved ticket commit onto a forward tip. A replay conflict moves the candidate onto that tip and sends conflicts to the implementer once in the same run, then scope, checks, and fresh review; a prior move in `prepare` counts, and a second conflict stops. Rerun setup, then `reverify` for an equal patch (`verify` on a resumed delivered commit) or `verify` and fresh review for a changed patch. An unchanged-base delivered resume runs `verify` without replay. Undo the replayed commit before any new stop, repair, or re-review; if ignore rules on the tip would drop added files, restore the candidate on its original base through `stuck` |
 | `deliver` | `branch`: keep the branch. `patch`: `git format-patch` for base..HEAD into the evidence directory. `pr`: `git push --no-follow-tags <remote URL>` of the approved commit to the ticket branch alone, then `gh pr create --repo <host/owner/repository>`. After these succeed, every mode records `branch.<name>.ticketDelivered` in local Git configuration |
 | `success` | Remove the worktree and write the delivery receipts once; branch and patch end `delivered`, pull requests go to `checkMerge`; a kept worktree ends `delivered` immediately with its path and cleanup log |
 | `checkMerge`, `awaitMerge` | Ask `gh pr view <url>` for the pull request state every 10 minutes; an open request or fewer than three consecutive failures waits again |
@@ -653,9 +671,12 @@ Every stop added here obeys one invariant: a run never stops with the workflow's
 commit on the ticket branch. Before a stop, repair, or re-review, the commit is
 undone with a mixed reset, its recorded hash is cleared, and verification is
 reopened. A conflict aborts the rebase and restores the approved candidate
-uncommitted on its original base. The reason names the conflicting paths and
-new tip: a resumed run saves the candidate, moves it onto the current base,
-and sends conflicts to the implementer before checks and review. A replay leaving
+uncommitted on its original base. If the run has not already moved its candidate,
+it saves the candidate, moves it onto the attempted tip, and sends conflicts to
+the implementer in the same run before scope, checks, and fresh review. Evidence
+names the conflicting paths and new tip. A prior move, including one in `prepare`,
+instead stops with the existing text and says the run already moved once.
+A replay leaving
 no commit similarly restores
 the candidate and stops through `stuck`, saying the base already holds the
 change; resume alone repeats this stop too. A refusing hook, missing patch id,

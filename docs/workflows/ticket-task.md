@@ -189,9 +189,25 @@ flowchart TD
   class stuck no
 ```
 
-### Resumed conflicts
+### Resumed conflicts and replay conflicts at delivery
 
-If moving a resumed candidate onto the current base conflicts, the implementer
+On a delivery replay conflict, the run restores the approved candidate, moves it
+onto the tip it tried, and sends conflicts to the implementer in the same run.
+The run moves once; a second replay conflict stops with the existing recovery text
+and says the run already moved its candidate once.
+A move in `prepare` when the run resumed counts toward this once-per-run limit.
+The settling round uses the existing repair budget, and the moved change gets a
+fresh review after scope and required checks, before commit, rebase, and delivery.
+Evidence names the replay conflict, its files, and the tip the candidate moved onto.
+A replay refused by Git or a hook without conflicts, a rewritten base, an
+unpublished base, or a base that already holds the change still stops as before.
+
+This removes the manual handoff and resume needed on 2026-10-19 for org-26
+(replay onto `9a2d15a` conflicted in `tests/ticket-task.test.ts`) and org-47
+(replay onto `0bc2c5a` conflicted in `ticket-task.ts`). Both resumed runs used
+this same move and settling path to deliver.
+
+If moving a candidate onto the current base conflicts, the implementer
 removes every conflict marker while keeping both sides' intent, without staging
 or committing. The run stages each settled conflict itself, including deletions
 as removals. For a conflict without markers, the prompt names the file and what
@@ -281,7 +297,7 @@ interface. Choices are restricted to the actions available at that step.
 | `prepare` | Refusals before creating a worktree end `refused` without a question or cleanup. New-worktree setup runs separately in `setup`. Delivered-resume adoption refusals retain the delivery record and remove only the recreated worktree; failed removal names the kept worktree. |
 | `setup` | A failed configuration or setup command, or leftover files, asks `retry`, `hand off`, or `discard`. |
 | `commit` | A failed `git commit` asks `retry`, `hand off`, or `discard`. An empty candidate, stale checks, or changed HEAD, branch, commit content, or message asks only `hand off` or `discard`. |
-| `rebase` | Red checks on a redelivered commit enter the repair loop. A rewritten or backward base asks only `hand off` or `discard`; an unresolved base during delivered-resume verification ends `refused`. Existing replay conflicts and repair rules still apply. |
+| `rebase` | Red checks on a redelivered commit enter the repair loop. A replay conflict moves the candidate onto the attempted tip and sends conflicts to the implementer once in the same run, then scope, checks, and fresh review; a prior move in `prepare` counts, and a second conflict stops. A rewritten or backward base asks only `hand off` or `discard`; an unresolved base during delivered-resume verification ends `refused`. |
 | `deliver` | Push and `gh` failures retry automatically, then ask `retry` or `hand off`. Other delivery failures ask immediately. A known pull request URL is reused on retry. |
 | `success` | Failure to remove the worktree still ends `delivered` immediately, naming the worktree and `git-worktree.log`; no merge wait starts. |
 | `cleanUp` | Retry automatically, then ask the merge decision with `retry` added: `retry`, `hand off`, or `discard`. |

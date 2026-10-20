@@ -142,7 +142,7 @@ See the [diagram](docs/workflows/ticket-task.md#flow).
 5. **Gates and review.** The repository's checks, then a structured review
    that the Machine judges itself.
 6. **Commit, rebase, deliver.** If the base moved, the commit is replayed onto
-   it and checked again.
+   it and checked again; a conflict there goes to the implementer once, in the same run.
 
 A spent review budget returns to the implementer once with a fresh review budget
 when the last verdict is `revise`, every finding names a path inside Scope,
