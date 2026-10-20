@@ -348,3 +348,27 @@ and retain the helper's `blocked` outcome in `result.json`.
 
 The catalog's [ticket delivery](../catalog.md#ticket-delivery) section has the
 resume rules, evidence files, and every stop.
+
+## Wrapping it
+
+A wrapper exports its own `default` factory, which calls
+`ticketTask(primitives, …)`, and its own `description`. It also re-exports
+`agentRoles` and `endings` from `ticket-task.ts`. These lines match the umbrella's
+`.machines/ticket.ts`; adjust the import path for your checkout:
+
+```ts
+import ticketTask, { agentRoles as ticketTaskRoles } from "../machine-shop/ticket-task.ts";
+
+export const description = "Carry one local ticket using this project's configuration.";
+export const agentRoles = ticketTaskRoles;
+export { endings } from "../machine-shop/ticket-task.ts";
+```
+
+`ticket-task.ts` declares its endings with `defineEndings`. A module whose final
+states take endings must export `endings`, or the run is refused at start.
+
+Run plain `npm ci` in the Machine Shop checkout the wrapper imports from.
+`ticket-task.ts` imports `defineEndings` as a value from `@dna113p/machines`, so
+that checkout needs its own dependencies installed; otherwise loading fails with
+`Cannot find package '@dna113p/machines'`. Do not use `--omit=dev`: the package
+is a devDependency in Machine Shop.

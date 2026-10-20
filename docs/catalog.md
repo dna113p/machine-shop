@@ -310,6 +310,11 @@ without consuming the reviewer's revision allowance. A free-form answer also
 renews both budgets. `stuck` no longer changes anything:
 `"park"` (the default) and `"ask"` both use the same Human question.
 
+A wrapper exports its own default factory and `description`, and re-exports
+`agentRoles` and `endings` from `ticket-task.ts`; see [Wrapping it](workflows/ticket-task.md#wrapping-it)
+for the lines to copy. The Machine Shop checkout it imports from needs its own
+plain `npm ci`, including dev dependencies.
+
 ```json
 {
   "ticket": { "id": "PROJ-12", "title": "Add the empty state", "body": "## Goal\nShow an empty state.\n## Scope\n- src/widgets/**\n## Acceptance\n- An empty list shows No widgets.\n## Forbidden\n- nothing beyond the scope above" },
