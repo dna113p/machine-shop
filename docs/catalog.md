@@ -45,6 +45,28 @@ Production migrations and publishing are deliberately not generic defaults.
 Ticket operations use [recovery by step](workflows/ticket-task.md#recovery-by-step),
 including bounded Operation retries and questions specific to each failed step.
 
+### Explaining a stop
+
+Ticket-task offers an optional `presenter` role on every stop question, including
+discard confirmations. With Machines `^0.7.1`, bind it to a small, read-only model
+preset from `machine agents` by adding `--agent presenter=small` to the launch
+command (replace `small` with your preset's name). No binding is required.
+
+The runtime supplies the run's map, current Human state, trail and recent Agent
+summaries. Ticket-task adds the stopped stage and reason, rounds used and limits,
+last check results and logs, latest review verdict and criteria, report send-back
+history, diff files with added and removed line counts, and the evidence directory
+where the presenter can read the reports. Binary line counts are `null`; an
+unavailable diff is omitted. After delivery, the diff uses the saved base and
+delivered commit even though the worktree is gone.
+
+The presenter can add a headline, recommendation, explanation of each option and
+an HTML page with the run's map and what passed. Only the presenter marks
+`discard` or `confirm discard` as discarding. Prompts, options and answer matching
+stay unchanged. Its recommendation is advice layered over the existing prompt,
+which still labels `hand off` recommended. With no presenter, or if presentation
+fails, the original question goes out unchanged.
+
 ### Replay conflicts at delivery
 
 On a delivery replay conflict, ticket-task restores the approved candidate, moves
@@ -312,8 +334,9 @@ renews both budgets. `stuck` no longer changes anything:
 
 A wrapper exports its own default factory and `description`, and re-exports
 `agentRoles` and `endings` from `ticket-task.ts`; see [Wrapping it](workflows/ticket-task.md#wrapping-it)
-for the lines to copy. The Machine Shop checkout it imports from needs its own
-plain `npm ci`, including dev dependencies.
+for the lines to copy. Preserve the presenter's `{ description, optional: true }`
+role declaration; plain strings declare required roles. The Machine Shop checkout
+it imports from needs its own plain `npm ci`, including dev dependencies.
 
 ```json
 {

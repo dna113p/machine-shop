@@ -12,6 +12,7 @@ export const agentRoles = {
   tester: "Writes failing tests for the ticket's acceptance criteria before implementation",
   implementer: "Implements the ticket and its tests in the worktree",
   reviewer: "Reviews evidence and the resulting change without editing",
+  presenter: { description: "Explains a stopped run's question from its evidence; a small model is enough", optional: true },
 };
 
 export const endings = defineEndings({
@@ -833,6 +834,52 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
 
   /** Where an archive keeps the candidate: this run's branch name with archive/ in place of ticket/. */
   const archiveBranch = () => `archive/${saved.branch.slice("ticket/".length)}`;
+  /** Presentation reads evidence only; a missing candidate or Git failure must not prevent the question. */
+  function diffFiles() {
+    try {
+      const cwd = saved.removed ? repository.path : worktree;
+      if (!saved.baseCommit || (saved.removed && !saved.commitHash)) return undefined;
+      const diff = git(cwd, "diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv",
+        saved.baseCommit, ...(saved.removed ? [saved.commitHash] : []), "--", ".", ":(exclude).machine-runs");
+      const count = (value: string) => value === "-" ? null : Number(value);
+      const files = diff.split("\0").filter(Boolean).map(entry => {
+        const [added, removed, ...path] = entry.split("\t");
+        return { path: path.join("\t"), added: count(added!), removed: count(removed!) };
+      });
+      if (!saved.removed) {
+        const untracked = git(cwd, "ls-files", "--others", "--exclude-standard", "-z", "--", ".", ":(exclude).machine-runs");
+        for (const path of untracked.split("\0").filter(Boolean)) {
+          // Git counts text, binary files and symlinks consistently with the tracked diff.
+          const result = run("git", ["diff", "--no-index", "--numstat", "-z", "--no-ext-diff", "--no-textconv", "--", "/dev/null", path], cwd);
+          if (result.status !== 0 && result.status !== 1) return undefined;
+          const [added = "0", removed = "0"] = result.stdout.split("\t");
+          files.push({ path, added: count(added), removed: count(removed) });
+        }
+      }
+      return files;
+    } catch { return undefined; }
+  }
+  function runFacts(kind: "stuck" | "step" | "merge") {
+    const { reason, ...rounds } = work.status();
+    const review = saved.reviews.slice(saved.reviewsFrom).at(-1);
+    const checks = [...new Map(saved.task.evidence.map(check => [check.name, check])).values()]
+      .map(({ name, phase, exitCode, passed, log, flaky }) => ({ name, phase, exitCode, passed, log, flaky }));
+    return JSON.stringify({
+      stage: kind === "stuck" ? saved.stoppedIn : kind === "step" ? saved.failedStep : saved.mergeFailedIn || "checkMerge",
+      reason: kind === "merge" ? saved.mergeReason : reason,
+      rounds: { ...rounds, extraRound: saved.extraRound, extraReviewRounds: saved.extraReviewRounds },
+      checks, lastChecksPassed: saved.task.lastChecksPassed,
+      review: review ? { verdict: review.type, criteria: review.criteria, summary: review.summary, findings: review.findings, newSinceLastRound: review.newSinceLastRound } : null,
+      reports: {
+        sentBack: saved.task.reportFaults > 0 || saved.questionsReturned,
+        reportRecovery: saved.task.reportRecovery, malformedReviews: saved.malformedReviews,
+        reviewSummaryFault: saved.reviewSummaryFault, planningReports: saved.planningReports,
+        questionsReturned: saved.questionsReturned, questionsFault: saved.questionsFault,
+      },
+      files: diffFiles(), evidenceDirectory: saved.task.directory, worktree, branch: saved.branch, prUrl: saved.prUrl,
+      questionFile: saved.questions ? join(saved.task.directory, `question-${saved.questions}.txt`) : undefined,
+    });
+  }
   const standing = () => {
     const { repairs, totalRepairs, maxRepairs, reviewRounds, totalReviewRounds, maxReviewRounds } = work.status();
     const latest = saved.reviews.slice(saved.extraRoundFrom).findLast(event => event.type !== "blocked" && !reviewField(event, ticket.sections.acceptance)) as ReviewReport | undefined;
@@ -1478,13 +1525,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           { guard: choseDecision("discard"), target: "confirmDiscard", actions: decide },
           { target: "repairTarget", actions: continueWork },
         ],
-      }, { suggestions: decisions }),
+      }, { present: "presenter", presentWith: () => runFacts("stuck"), suggestions: decisions }),
       confirmDiscard: human(discardPrompt, {
         submitted: [
           { guard: chose("confirm discard"), target: "remove", actions: ({ event }: { event: Event }) => { work.choice("confirmDiscard", event, confirmations); saved.discardConfirmed = true; } },
           { target: "stuck", actions: ({ event }: { event: Event }) => { work.choice("confirmDiscard", event, confirmations); } },
         ],
-      }, { choices: confirmations }),
+      }, { present: "presenter", presentWith: () => runFacts("stuck"), choices: confirmations }),
       archive: operation(archive, { archived: "remove" }),
       remove: operation(remove, { removed: "abandon" }),
       commit: operation(commit, { committed: "rebase", failed: "stepFailed" }),
@@ -1499,14 +1546,14 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           { guard: chose("hand off"), target: "mergeHandOff", actions: mergeDecide },
           { target: "confirmMergeDiscard", actions: mergeDecide },
         ],
-      }, { choices: mergeDecisions }),
+      }, { present: "presenter", presentWith: () => runFacts("merge"), choices: mergeDecisions }),
       confirmMergeDiscard: human(() => mergePrompt(true), {
         submitted: [
           { guard: chose("confirm discard"), target: "dropLocal", actions: ({ event }: { event: Event }) => { work.choice("confirmMergeDiscard", event, confirmations); } },
           { guard: () => !!saved.mergeFailedIn, target: "mergeRetryDecide", actions: ({ event }: { event: Event }) => { work.choice("confirmMergeDiscard", event, confirmations); } },
           { target: "mergeDecide", actions: ({ event }: { event: Event }) => { work.choice("confirmMergeDiscard", event, confirmations); } },
         ],
-      }, { choices: confirmations }),
+      }, { present: "presenter", presentWith: () => runFacts("merge"), choices: confirmations }),
       dropLocal: operation(mergeStep("dropLocal", dropLocal), { removed: "mergeAbandon", failed: "mergeFailed" }, { retry: { on: "failed", times: 3, wait: "1m" } }),
       mergeHandOff: operation(() => settle("handedOff"), { handedOff: "handedOff" }),
       mergeAbandon: operation(() => settle("abandoned"), { abandoned: "abandoned" }),
@@ -1521,7 +1568,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           { guard: chose("hand off"), target: "mergeHandOff", actions: mergeRetryDecision },
           { target: "confirmMergeDiscard", actions: mergeRetryDecision },
         ],
-      }, { choices: stepDecisions }),
+      }, { present: "presenter", presentWith: () => runFacts("merge"), choices: stepDecisions }),
       retryMergeStep: operation(() => ({ type: saved.mergeFailedIn }), { cleanUp: "cleanUp", dropLocal: "dropLocal" }),
       stepFailed: operation(stepFailed, { delivery: "deliverDecide", retryable: "stepDecide", keep: "keepDecide" }),
       stepDecide: human(() => stepPrompt(), {
@@ -1530,26 +1577,26 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           { guard: chose("hand off"), target: "handOff", actions: stepDecision("stepDecide", stepDecisions) },
           { target: "confirmStepDiscard", actions: stepDecision("stepDecide", stepDecisions) },
         ],
-      }, { choices: stepDecisions }),
+      }, { present: "presenter", presentWith: () => runFacts("step"), choices: stepDecisions }),
       keepDecide: human(() => stepPrompt(), {
         submitted: [
           { guard: chose("hand off"), target: "handOff", actions: stepDecision("keepDecide", mergeDecisions) },
           { target: "confirmStepDiscard", actions: stepDecision("keepDecide", mergeDecisions) },
         ],
-      }, { choices: mergeDecisions }),
+      }, { present: "presenter", presentWith: () => runFacts("step"), choices: mergeDecisions }),
       deliverDecide: human(() => stepPrompt(), {
         submitted: [
           { guard: chose("retry"), target: "retryStep", actions: stepDecision("deliverDecide", deliveryDecisions) },
           { target: "handOff", actions: stepDecision("deliverDecide", deliveryDecisions) },
         ],
-      }, { choices: deliveryDecisions }),
+      }, { present: "presenter", presentWith: () => runFacts("step"), choices: deliveryDecisions }),
       retryStep: operation(() => ({ type: saved.failedStep }), { setup: "setup", commit: "commit", deliver: "deliver" }),
       confirmStepDiscard: human(() => stepPrompt(true), {
         submitted: [
           { guard: chose("confirm discard"), target: "remove", actions: ({ event }: { event: Event }) => { work.choice("confirmStepDiscard", event, confirmations); saved.discardConfirmed = true; } },
           { target: "stepFailed", actions: ({ event }: { event: Event }) => { work.choice("confirmStepDiscard", event, confirmations); } },
         ],
-      }, { choices: confirmations }),
+      }, { present: "presenter", presentWith: () => runFacts("step"), choices: confirmations }),
       refuse: operation(() => conclude("refused"), { refused: "refused" }),
       handOff: operation(() => conclude("handed-off"), { handedOff: "handedOff" }),
       abandon: operation(() => conclude("abandoned"), { abandoned: "abandoned" }),

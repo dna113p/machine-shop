@@ -6,7 +6,7 @@ import { delimiter, join, relative, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
-import { runtime } from "./runtime.ts";
+import { launcher, runtime } from "./runtime.ts";
 
 const mod = await import(pathToFileURL(resolve("ticket-task.ts")).href);
 const branch = "ticket/proj-12-add-a-greeting";
@@ -114,7 +114,10 @@ const tester = (request: { cwd: string }) => {
   return ok("completed", "greeting.test.txt requires the implementation file");
 };
 const implement = (request: { cwd: string }) => { writeFileSync(join(request.cwd, "greeting.txt"), "hello\n"); return ok(); };
-type Ask = { prompt: string; choices?: readonly string[]; suggestions?: readonly string[] };
+type Ask = {
+  prompt: string; choices?: readonly string[]; suggestions?: readonly string[];
+  headline?: string; recommended?: string; effects?: Record<string, string>; discards?: readonly string[]; reason?: string; page?: string;
+};
 type Request = { prompt: string; cwd: string; outcomes: readonly string[] };
 type Runner = (request: Request) => unknown;
 // Quotes, a backslash, and line breaks show whether a prompt carries the plan as it was written or as JSON.
@@ -144,6 +147,7 @@ type RunHooks = Pick<NonNullable<Parameters<typeof runtime.run>[1]>, "continueAt
 /**
  * Agents are given by role, where `reviewer` is the review of the implementation, or by state name for falsify, plan, and planReview;
  * `investigator` stands for both of that role's states, which is how a test says that neither may run.
+ * A `presenter` is bound only when a test gives one, as a run with no presenter preset has none.
  */
 async function execute(assignment: unknown, agents: Record<string, Runner> = {}, human: (request: Ask) => string = person(), options: RunHooks & { primitives?: typeof runtime } = {}) {
   const { primitives = runtime, ...hooks } = options;
@@ -162,7 +166,10 @@ async function execute(assignment: unknown, agents: Record<string, Runner> = {},
     return (agents[state] ?? (role === "investigator" ? agents.investigator : undefined) ?? stage.answer)(request);
   };
   const result = await runtime.run(mod.default(primitives, assignment), {
-    agents: Object.fromEntries(["tester", "investigator", "implementer", "reviewer"].map(role => [role, staged(role)])),
+    agents: {
+      ...Object.fromEntries(["tester", "investigator", "implementer", "reviewer"].map(role => [role, staged(role)])),
+      ...(agents.presenter ? { presenter: agents.presenter } : {}),
+    },
     human, onState: state => states.push(String(state)), ...hooks,
   });
   return { state: result.value, output: result.output as any, states };
@@ -455,13 +462,19 @@ function abandoned(f: Fixture, result: { state: unknown; output: any; states: st
   return run;
 }
 
-test("construction has no effects and declares exactly the four roles", context => {
+test("construction has no effects and declares exactly the four required roles and the optional presenter", context => {
   const f = fixture(context);
   assert.match(mod.description, /\S/u); assert.doesNotMatch(mod.description, /\n/u);
   for (const data of [input(f, { output: "pr", setup: [command()] }), JSON.stringify(input(f))]) {
     assert.deepEqual(runtime.requiredAgentNames(mod.default(runtime, data)), ["implementer", "investigator", "reviewer", "tester"]);
+    assert.deepEqual(runtime.optionalAgentNames(mod.default(runtime, data)), ["presenter"]);
   }
-  assert.deepEqual(Object.keys(mod.agentRoles).sort(), ["implementer", "investigator", "reviewer", "tester"]);
+  assert.deepEqual(Object.keys(mod.agentRoles).sort(), ["implementer", "investigator", "presenter", "reviewer", "tester"]);
+  for (const role of ["implementer", "investigator", "reviewer", "tester"]) assert.match(mod.agentRoles[role], /\S/u, role);
+  // A role used only to present a question is declared optional, or the launcher refuses the Machine.
+  assert.deepEqual(Object.keys(mod.agentRoles.presenter).sort(), ["description", "optional"]);
+  assert.equal(mod.agentRoles.presenter.optional, true); assert.match(mod.agentRoles.presenter.description, /\S/u);
+  assert.doesNotMatch(mod.agentRoles.presenter.description, /\n/u);
   const states = Object.keys(mod.default(runtime, input(f)).states);
   for (const state of ["falsify", "plan", "planReview"]) assert.ok(states.includes(state), state);
   for (const state of ["triage", "triageResult"]) assert.equal(states.includes(state), false, state);
@@ -469,10 +482,28 @@ test("construction has no effects and declares exactly the four roles", context 
   assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), "main"); untouched(f);
 });
 
-test("Machine Shop depends on the Machines release that declares endings and retries Operations", () => {
+test("Machine Shop depends on the Machines release whose presenter can recommend a suggestion, with its lock file", () => {
   const manifest = JSON.parse(readFileSync(resolve("package.json"), "utf8"));
-  assert.equal(manifest.devDependencies["@dna113p/machines"], "^0.6.0");
-  assert.equal(typeof runtime.defineEndings, "function");
+  assert.equal(manifest.devDependencies["@dna113p/machines"], "^0.7.1");
+  const lock = JSON.parse(readFileSync(resolve("package-lock.json"), "utf8"));
+  assert.equal(lock.packages[""].devDependencies["@dna113p/machines"], "^0.7.1");
+  const locked = lock.packages["node_modules/@dna113p/machines"];
+  const [major, minor, patch] = String(locked.version).split(".").map(Number);
+  assert.ok(major === 0 && minor === 7 && patch! >= 1, `the lock file holds Machines ${locked.version}`);
+  assert.ok(String(locked.resolved).endsWith(`/machines-${locked.version}.tgz`), locked.resolved); assert.match(locked.integrity, /^sha512-/u);
+  for (const name of ["defineEndings", "optionalAgentNames"] as const) assert.equal(typeof runtime[name], "function", name);
+});
+
+test("the launcher prepares ticket-task with no presenter bound, and with a preset named for the presenter", async context => {
+  const f = fixture(context); const home = join(f.root, "home"); mkdirSync(join(home, ".machines"), { recursive: true });
+  // Preparing a run starts nothing, so a runner that throws shows it was never called.
+  const presets = ["investigator", "tester", "implementer", "reviewer", "small"].map(name => `  ${name}: { description: "Fixture ${name}", runner: idle },`);
+  writeFileSync(join(home, ".machines", "agents.ts"), ['const idle = () => { throw new Error("nothing runs while a run is prepared"); };', "export default () => ({", ...presets, "});", ""].join("\n"));
+  for (const agents of [undefined, { presenter: "small" }]) {
+    const prepared = await launcher.prepareMachineRun({ cwd: home, home, machine: resolve("ticket-task.ts"), input: input(f), ...(agents ? { agents } : {}) });
+    assert.equal(prepared.description, mod.description);
+  }
+  assert.deepEqual(readdirSync(f.root).sort(), ["home", "widgets"]); untouched(f);
 });
 
 test("every final state takes a declared ending, and nothing is left that ends blocked", context => {
@@ -1616,6 +1647,184 @@ test("a run stuck on a review report malformed twice gives the fault in its firs
   assert.equal(request!.prompt.split("\n")[0], "Malformed review report: criteria must be an array.");
   assert.equal(occurrences(request!.prompt, "criteria must be an array"), 1);
   assert.ok(result.output.summary.startsWith("Handed off: Malformed review report: criteria must be an array. Decision: hand off. "), result.output.summary);
+});
+
+/** The Human request a presenter was given, as the runtime writes it on its own line of the presenter's prompt. */
+const presentedRequest = (prompt: string): Ask => JSON.parse(prompt.split("\n").find(line => line.startsWith("Request: "))!.slice("Request: ".length));
+/** The facts the Machine gave the presenter: the last section of its prompt. */
+function factsOf(prompt: string) {
+  const at = prompt.indexOf("\n\nMachine facts: ");
+  assert.ok(at >= 0, "the presenter was given the Machine's facts");
+  const facts = prompt.slice(at + "\n\nMachine facts: ".length); assert.match(facts, /\S/u, "the Machine's facts are not empty");
+  return facts;
+}
+/** What a presenter adds to a question: a headline, the recommended option, what each option does, which destroy work, why, and a page. */
+const explanation = (asked: Ask, recommended: string) => {
+  const options = asked.choices ?? asked.suggestions ?? [];
+  return {
+    headline: `Choose ${recommended}: the run stopped where it can still finish.`, recommended,
+    effects: Object.fromEntries(options.map(option => [option, `What ${option} does, in one line.`])),
+    discards: options.filter(option => ["discard", "confirm discard"].includes(option) && option !== recommended),
+    reason: `${recommended} fits this stop.`,
+    page: `<h2>Where the run stopped</h2><pre class="mermaid">flowchart LR\n  review --> decide</pre><ul><li>${options.join("</li><li>")}</li></ul>`,
+  };
+};
+/** A presenter as a small model would be bound: it keeps what it was given and explains each question, recommending what `pick` chooses. */
+function presenter(pick: (asked: Ask) => string) {
+  const prompts: string[] = []; const asked: Ask[] = [];
+  return Object.assign((request: Request) => {
+    prompts.push(request.prompt); const question = presentedRequest(request.prompt); asked.push(question);
+    return { type: "presented", ...explanation(question, pick(question)) };
+  }, { prompts, asked });
+}
+// The reviewer approves and every check passes, but the report is malformed: it goes back once, comes back malformed again, and the run stops.
+const approvedButMalformed = () => review("approved", "Approves the greeting", { newSinceLastRound: false });
+
+test("a stuck run with a presenter bound publishes its question with the presenter's headline, recommendation and page, the options unchanged, and more rounds matched as before", async context => {
+  const f = fixture(context); const human = person("more rounds"); const explain = presenter(() => "more rounds"); let reviews = 0;
+  const result = await execute(input(f), { presenter: explain, reviewer: () => ++reviews <= 2 ? approvedButMalformed() : review() }, human);
+  assert.equal(result.state, "delivered"); assert.deepEqual([human.requests.length, explain.prompts.length, reviews], [1, 1, 3]);
+  const [request] = human.requests; stuckQuestion(f, request, "reviewResult");
+  const run = held(f, result, /^Delivered/u); asksWritten(run.directory, [request!]);
+  // The presenter was given the question the state built, and the person sees that question with only the presenter's fields added.
+  assert.deepEqual(explain.asked, [{ prompt: request!.prompt, suggestions: stuckDecisions }]);
+  assert.deepEqual(request, { prompt: request!.prompt, suggestions: stuckDecisions, ...explanation(explain.asked[0]!, "more rounds") });
+  assert.deepEqual([request!.recommended, request!.discards], ["more rounds", ["discard"]]);
+  assert.match(request!.page!, /<pre class="mermaid">/u);
+  // more rounds is the decision it was: back to the stage that stopped, with fresh budgets.
+  assert.equal(result.states[result.states.indexOf("decide") + 1], "repairTarget");
+  assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }]);
+});
+
+test("the presenter of a stuck run is given the stage, the reason, the last check results, the review verdict with its criteria, the diff's files and the evidence", async context => {
+  const f = fixture(context); const human = person("hand off"); const explain = presenter(() => "more rounds");
+  const result = await execute(input(f), { presenter: explain, reviewer: approvedButMalformed }, human);
+  const run = handedOff(f, result, /Malformed review report/u, human);
+  assert.equal(explain.prompts.length, 1); const facts = factsOf(explain.prompts[0]!);
+  // Where the run stopped, and why.
+  assert.match(facts, /\breviewResult\b/u); assert.match(facts, /\bnewSinceLastRound\b/u);
+  // The last check results: the required check by name, and that it passed.
+  const verify = run.result.checks.filter((check: { phase: string }) => check.phase === "verify").at(-1);
+  assert.ok(verify, "the checks ran before the review"); assert.equal(verify.passed, true);
+  assert.ok(facts.includes(verify.name), verify.name); assert.match(facts, /\bpass(?:ed)?\b/iu);
+  // The review verdict and the criteria it gave.
+  assert.match(facts, /\bapproved\b/u); assert.ok(facts.includes(criterion), criterion);
+  // The diff's files, and where the reports are kept so the presenter can read them.
+  for (const file of ["greeting.txt", "greeting.test.txt"]) assert.ok(facts.includes(file), file);
+  assert.ok(facts.includes(run.directory), run.directory);
+  const details = JSON.parse(facts);
+  assert.deepEqual(details.files, [
+    { path: "greeting.test.txt", added: 1, removed: 0 },
+    { path: "greeting.txt", added: 1, removed: 0 },
+  ]);
+  assert.deepEqual(details.checks.map(({ name, phase, exitCode, passed, log }: any) => ({ name, phase, exitCode, passed, log })),
+    [{ name: verify.name, phase: "verify", exitCode: 0, passed: true, log: verify.log }]);
+  assert.equal(details.reports.sentBack, true);
+  assert.deepEqual(details.reports.malformedReviews, [0, 1]);
+  assert.equal(details.rounds.extraRound, "unused");
+  assert.equal(details.questionFile, join(run.directory, "question-1.txt"));
+});
+
+test("presenter diff facts count staged and untracked files, preserving unusual paths and binary counts", async context => {
+  const f = fixture(context); const human = person("hand off"); const explain = presenter(() => "more rounds");
+  const unusual = "odd\tname\n.bin";
+  const result = await execute(scoped(input(f), "odd*"), {
+    presenter: explain, reviewer: approvedButMalformed,
+    implementer: request => {
+      implement(request); git(request.cwd, "add", "greeting.txt", "greeting.test.txt");
+      writeFileSync(join(request.cwd, unusual), Buffer.from([0, 1, 2]));
+      return ok();
+    },
+  }, human);
+  handedOff(f, result, /Malformed review report/u, human);
+  assert.deepEqual(JSON.parse(factsOf(explain.prompts[0]!)).files, [
+    { path: "greeting.test.txt", added: 1, removed: 0 },
+    { path: "greeting.txt", added: 1, removed: 0 },
+    { path: unusual, added: null, removed: null },
+  ]);
+});
+
+test("a failed presenter diff read omits the diff while the question still carries the other facts", async context => {
+  const f = fixture(context); const calls = recordGit(context, f); const wrapper = join(f.root, "git-bin", "git");
+  writeFileSync(wrapper, readFileSync(wrapper, "utf8").replace("exec ", 'if [ "$1" = diff ] && [ "$2" = --numstat ]; then exit 1; fi\nexec '));
+  const human = person("hand off"); const explain = presenter(() => "more rounds");
+  const result = await execute(input(f), { presenter: explain, reviewer: approvedButMalformed }, human);
+  handedOff(f, result, /Malformed review report/u, human);
+  assert.ok(calls().some(call => call.startsWith("diff --numstat")));
+  const facts = JSON.parse(factsOf(explain.prompts[0]!));
+  assert.equal(Object.hasOwn(facts, "files"), false); assert.equal(facts.stage, "reviewResult");
+  assert.equal(human.requests[0]!.recommended, "more rounds");
+});
+
+test("with no presenter bound, a stuck question goes out exactly as before: its prompt and suggestions, nothing more", async context => {
+  const f = fixture(context); const human = person("hand off");
+  // The Machine offers a presenter; this run binds none.
+  assert.deepEqual(runtime.optionalAgentNames(mod.default(runtime, input(f))), ["presenter"]);
+  const result = await execute(input(f), { reviewer: approvedButMalformed }, human);
+  const run = handedOff(f, result, /Malformed review report/u, human);
+  const [request, ...others] = human.requests; assert.deepEqual(others, []);
+  assert.deepEqual(request, { prompt: request!.prompt, suggestions: stuckDecisions });
+  stuckQuestion(f, request, "reviewResult"); asksWritten(run.directory, [request!]);
+  assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "hand off" }]);
+});
+
+test("with no presenter bound, a step question goes out exactly as before: its prompt and choices, nothing more", async context => {
+  const f = fixture(context); const human = person("hand off");
+  assert.deepEqual(runtime.optionalAgentNames(mod.default(runtime, input(f))), ["presenter"]);
+  const result = await execute(input(f, { setup: [command("process.exit(3)")] }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() }, human);
+  steppedOff(f, result, "setup", "stepDecide", /setup: tests did not meet/u, human, 0);
+  assert.deepEqual(human.requests[0], { prompt: human.requests[0]!.prompt, choices: stepChoices });
+});
+
+for (const failure of ["throws", "returns no presented event"]) {
+  test(`a presenter that ${failure} leaves the stuck question exactly as it is without one, and more rounds is matched as before`, async context => {
+    const f = fixture(context); const human = person("more rounds"); let presented = 0; let reviews = 0;
+    const result = await execute(input(f), {
+      presenter: () => { presented++; if (failure === "throws") throw new Error("The presenter's model is unavailable"); return ok("completed", "Nothing to present"); },
+      reviewer: () => ++reviews <= 2 ? approvedButMalformed() : review(),
+    }, human);
+    assert.equal(result.state, "delivered"); assert.deepEqual([presented, human.requests.length], [1, 1]);
+    const [request] = human.requests;
+    assert.deepEqual(request, { prompt: request!.prompt, suggestions: stuckDecisions }); stuckQuestion(f, request, "reviewResult");
+    const run = held(f, result, /^Delivered/u); asksWritten(run.directory, [request!]);
+    assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }]);
+  });
+}
+
+test("with a presenter bound, Discard. still asks for confirmation, whose choices are unchanged, and go back returns to the stuck question", async context => {
+  const f = fixture(context); const human = person("Discard.", "go back", "hand off"); const explain = presenter(asked => asked.choices ? "go back" : "more rounds");
+  const result = await execute(input(f), { presenter: explain, reviewer: approvedButMalformed }, human);
+  handedOff(f, result, /Malformed review report/u, human);
+  assert.deepEqual(result.states.filter(state => ["decide", "confirmDiscard"].includes(state)), ["decide", "confirmDiscard", "decide"]);
+  const [decide, confirm, again] = human.requests; assert.equal(human.requests.length, 3); assert.equal(explain.prompts.length, 3);
+  for (const asked of [decide!, again!]) {
+    assert.deepEqual(asked, { prompt: asked.prompt, suggestions: stuckDecisions, ...explanation({ prompt: asked.prompt, suggestions: stuckDecisions }, "more rounds") });
+  }
+  assert.deepEqual(explain.asked[1], { prompt: confirm!.prompt, choices: ["confirm discard", "go back"] });
+  assert.deepEqual(confirm, { prompt: confirm!.prompt, choices: ["confirm discard", "go back"], ...explanation(explain.asked[1]!, "go back") });
+  assert.deepEqual(confirm!.discards, ["confirm discard"]);
+  const run = evidence(f); asksWritten(run.directory, [decide!, again!]);
+  assert.deepEqual(run.result.decisions.map((made: any) => `${made.stage}: ${made.response}`), ["decide: Discard.", "confirmDiscard: go back", "decide: hand off"]);
+});
+
+test("with a presenter bound, a reply that is not a choice is refused on a confirmation as before, even the presenter's own label", async context => {
+  const f = fixture(context); const human = person("discard", "confirm discard (discards work)"); const explain = presenter(asked => asked.choices ? "go back" : "more rounds");
+  await assert.rejects(execute(input(f), { presenter: explain, reviewer: approvedButMalformed }, human), /Expected one of: confirm discard, go back/u);
+  assert.equal(explain.prompts.length, 2); assert.deepEqual(human.requests[1]!.discards, ["confirm discard"]);
+  assert.ok(existsSync(f.worktree), "nothing was removed");
+});
+
+test("a step question with a presenter bound is explained with the step's facts, its choices unchanged, and hand off matched as before", async context => {
+  const f = fixture(context); const human = person("hand off"); const explain = presenter(() => "retry");
+  const result = await execute(input(f, { setup: [command("process.exit(3)")] }), { presenter: explain, investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() }, human);
+  const run = steppedOff(f, result, "setup", "stepDecide", /setup: tests did not meet/u, human, 0);
+  const [request] = human.requests;
+  assert.deepEqual(explain.asked, [{ prompt: request!.prompt, choices: stepChoices }]);
+  assert.deepEqual(request, { prompt: request!.prompt, choices: stepChoices, ...explanation(explain.asked[0]!, "retry") });
+  assert.deepEqual([request!.recommended, request!.discards], ["retry", ["discard"]]);
+  const facts = factsOf(explain.prompts[0]!);
+  assert.match(facts, /\bsetup\b/u); assert.match(facts, /tests did not meet/u);
+  assert.ok(facts.includes(run.result.checks[0].name)); assert.ok(facts.includes(run.directory), run.directory);
 });
 
 for (const valid of [false, true]) {
@@ -4654,6 +4863,26 @@ test("a cleanUp that fails four times asks with retry added to the merge decisio
   const receipt = JSON.parse(readFileSync(join(run.directory, "merge.json"), "utf8"));
   assert.deepEqual([receipt.outcome, receipt.localDeleted, receipt.remoteDeleted], ["merged", true, true]);
   assert.equal(pushed(), ""); assert.equal(git(f.repo, "branch", "--list", branch), ""); assert.equal(existsSync(f.worktree), false);
+});
+
+test("a merge question with a presenter bound is explained with the merge step's facts, its choices unchanged, and hand off matched as before", async context => {
+  const f = fixture(context); remote(f); fakeGh(context, f); refusingDeletes(f); const human = person("hand off"); const explain = presenter(() => "retry");
+  const result = await untilEnd(input(f, { output: "pr" }), { presenter: explain }, human);
+  assert.equal(result.state, "handedOff"); assert.deepEqual(result.states.slice(-3), ["mergeRetryDecide", "mergeHandOff", "handedOff"]);
+  assert.equal(human.requests.length, 1); const [request] = human.requests; mergeRetryAsked(request, /git push failed deleting/u);
+  assert.deepEqual(explain.asked, [{ prompt: request!.prompt, choices: mergeRetryChoices }]);
+  assert.deepEqual(request, { prompt: request!.prompt, choices: mergeRetryChoices, ...explanation(explain.asked[0]!, "retry") });
+  assert.deepEqual([request!.recommended, request!.discards], ["retry", ["discard"]]);
+  const run = held(f, result, /^Handed off: /u); asksWritten(run.directory, human.requests);
+  const facts = factsOf(explain.prompts[0]!);
+  assert.match(facts, /\bcleanUp\b/u); assert.match(facts, /git push failed deleting/u); assert.ok(facts.includes(url), url);
+  assert.ok(facts.includes(run.directory), run.directory);
+  assert.equal(existsSync(f.worktree), false);
+  assert.deepEqual(JSON.parse(facts).files, [
+    { path: "greeting.test.txt", added: 1, removed: 0 },
+    { path: "greeting.txt", added: 1, removed: 0 },
+  ], "the delivered diff remains available after the worktree and local branch are removed");
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "human-1.json"), "utf8")), { stage: "mergeRetryDecide", response: "hand off" });
 });
 
 test("a local branch that cannot be deleted after a merge is retried, then asks; retry once it can be deleted completes the merge wait", async context => {

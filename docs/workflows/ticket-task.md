@@ -291,6 +291,25 @@ Automatic retries use Operation `retry`: 3 further attempts, each after `1m`
 Questions are saved as `question-<n>.txt` and answered through the usual Human
 interface. Choices are restricted to the actions available at that step.
 
+All nine stop questions use the optional `presenter` role: `decide`,
+`confirmDiscard`, `stepDecide`, `keepDecide`, `deliverDecide`,
+`confirmStepDiscard`, `mergeDecide`, `mergeRetryDecide` and `confirmMergeDiscard`.
+The presenter receives the run's map and history from Machines. `presentWith`
+adds the stopped stage (the failed step for step or merge recovery), reason,
+repair and review budgets, extra-round state, last check results with exit codes
+and logs, latest review verdict and criteria, report send-back history, diff
+files with line counts, and the evidence directory. It also names the worktree,
+branch, pull request and latest question file when available. After worktree
+removal, diff facts compare the saved base with the delivered commit. Binary
+line counts are `null`; a failed diff read is omitted without preventing the question.
+
+The presenter may supply a headline, recommendation, option explanations and an
+HTML page showing where the run stopped and what passed. Only it marks `discard`
+or `confirm discard` as discarding. Its recommendation is advice on top of the
+unchanged prompt's `hand off (recommended)` text. The choices, suggestions and
+answer matching stay the same. Without a bound presenter, or if it fails, the
+question goes out exactly as before.
+
 | Step | Recovery |
 | --- | --- |
 | `shape` | Missing ticket sections end `refused`, a declared failed ending, with the reason. |
@@ -364,6 +383,12 @@ export const agentRoles = ticketTaskRoles;
 export { endings } from "../machine-shop/ticket-task.ts";
 ```
 
+Keep `agentRoles.presenter` in its object form, `{ description, optional: true }`;
+the four working roles remain required strings. Machines refuses a presenter
+declared as a required role. To enable explanations, add `--agent presenter=small`
+to your launch command, using a small, read-only model preset listed by
+`machine agents`. Leaving it unbound is supported; no umbrella binding is needed.
+
 `ticket-task.ts` declares its endings with `defineEndings`. A module whose final
 states take endings must export `endings`, or the run is refused at start.
 
@@ -371,4 +396,5 @@ Run plain `npm ci` in the Machine Shop checkout the wrapper imports from.
 `ticket-task.ts` imports `defineEndings` as a value from `@dna113p/machines`, so
 that checkout needs its own dependencies installed; otherwise loading fails with
 `Cannot find package '@dna113p/machines'`. Do not use `--omit=dev`: the package
-is a devDependency in Machine Shop.
+is a devDependency in Machine Shop. Machine Shop requires `^0.7.1`, which allows
+presenters to recommend suggestions as well as restricted choices.
