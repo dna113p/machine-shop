@@ -141,8 +141,9 @@ See the [diagram](docs/workflows/ticket-task.md#flow).
 4. **Implement.** A change outside the ticket's Scope is sent back.
 5. **Gates and review.** The repository's checks, then a structured review
    that the Machine judges itself.
-6. **Commit, rebase, deliver.** If the base moved, the commit is replayed onto
-   it and checked again; a conflict there goes to the implementer once, in the same run.
+6. **Commit, rebase, deliver.** Wait for the repository’s turn, holding it through
+   delivery. If the base moved, replay onto it and check again. A conflict goes
+   to the implementer once, releasing the turn and reacquiring it before commit.
 
 A spent review budget returns to the implementer once with a fresh review budget
 when the last verdict is `revise`, every finding names a path inside Scope,
