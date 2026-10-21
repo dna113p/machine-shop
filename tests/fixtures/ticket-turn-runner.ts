@@ -7,9 +7,8 @@ import { runtime, runtimeLocation } from "../runtime.ts";
 import "./runtime-imports.ts";
 
 const config = JSON.parse(readFileSync(process.argv[2]!, "utf8"));
-const { createRunStatusPublisher } = await import(runtimeLocation.endsWith(".ts")
-  ? new URL("run-status.ts", runtimeLocation).href
-  : import.meta.resolve("@dna113p/machines/run-status"));
+// The publisher lives beside the runtime's entry point: the package's "./run-status" subpath is the viewer, not this file.
+const { createRunStatusPublisher } = await import(new URL(runtimeLocation.endsWith(".ts") ? "run-status.ts" : "run-status.js", runtimeLocation).href);
 const publisher = createRunStatusPublisher({
   id: process.env.MACHINES_RUN_PARENT!, machine: "ticket-task", path: resolve("ticket-task.ts"), cwd: process.cwd(),
 });
