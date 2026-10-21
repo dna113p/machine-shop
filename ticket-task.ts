@@ -2,8 +2,8 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { appendFileSync, closeSync, existsSync, lstatSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { defineEndings, type Event, type MachinePrimitives } from "@dna113p/machines";
-import { repositoryTurn, taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
-import { brief, opening } from "./defaults/_machine-shop/brief.ts";
+import { evidenceHuman, evidenceLog, writeStuckEvidence, repositoryTurn, taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
+import { brief, opening, excerpt, evidenceFacts, evidencePage, type EvidenceBlock } from "./defaults/_machine-shop/brief.ts";
 import { outsideScope } from "./defaults/_machine-shop/scope.ts";
 
 export const description = "Carry one local ticket for one Git repository from an isolated worktree through falsification, planning, plan review, implementation, checks, and review to a delivered branch, patch, or pull request; a pull request is then watched until it merges, when its branch is deleted and the ticket completes; a stuck run sleeps on a Human question.";
@@ -892,8 +892,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const { reason, ...rounds } = work.status();
     const review = saved.reviews.slice(saved.reviewsFrom).at(-1);
     const checks = [...new Map(saved.task.evidence.map(check => [check.name, check])).values()]
-      .map(({ name, phase, exitCode, passed, log, flaky }) => ({ name, phase, exitCode, passed, log, flaky }));
-    return JSON.stringify({
+      .map(({ name, phase, exitCode, passed, log, flaky }) => ({ name, phase, exitCode, passed, log, flaky,
+        ...(!passed ? { tail: evidenceLog(log) } : {}),
+      }));
+    return {
+      repository: { name: repository.name, path: repository.path }, ticket: { id: ticket.id, title: ticket.title },
+      plan: saved.plan, planningReport: saved.planningReport, questions: saved.ownerQuestions, wouldAssume: saved.wouldAssume,
+      moved: saved.moved,
+      candidate: { worktreeRemoved: saved.removed, pushed: saved.pushed, localBranchDeleted: saved.localDeleted,
+        remoteBranchDeleted: saved.remoteDeleted, baseCommit: saved.baseCommit, commit: saved.commitHash },
       stage: kind === "stuck" ? saved.stoppedIn : kind === "step" ? saved.failedStep : saved.mergeFailedIn || "checkMerge",
       reason: kind === "merge" ? saved.mergeReason : reason,
       rounds: { ...rounds, extraRound: saved.extraRound, extraReviewRounds: saved.extraReviewRounds },
@@ -907,7 +914,69 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       },
       files: diffFiles(), evidenceDirectory: saved.task.directory, worktree, branch: saved.branch, prUrl: saved.prUrl,
       questionFile: saved.questions ? join(saved.task.directory, `question-${saved.questions}.txt`) : undefined,
-    });
+    };
+  }
+  /** Keep strings literal in terminal evidence, including multi-line questions and log excerpts. */
+  function evidenceText(value: unknown): string {
+    if (value === undefined || value === null) return "None recorded.";
+    if (typeof value !== "object") return String(value);
+    if (Array.isArray(value)) return value.map(item => evidenceText(item)).join("\n\n");
+    return Object.entries(value).filter(([, item]) => item !== undefined)
+      .map(([key, item]) => `${key}: ${evidenceText(item)}`).join("\n");
+  }
+  function questionEvidence(kind: "stuck" | "step" | "merge", choices: readonly string[], confirm: boolean) {
+    const facts = runFacts(kind);
+    const options = kind === "stuck" ? confirm ? discardOptions() : stuckOptions()
+      : kind === "step" ? stepOptions(confirm) : mergeOptions(confirm);
+    const short = (value: string) => excerpt(value.replace(/\s+/gu, " ").trim(), 160).replace(/\s+/gu, " ");
+    const effects = Object.fromEntries(choices.map(name => {
+      // Long branch/worktree names belong in the breadcrumb, not in the 160-character effect.
+      const does = name === "archive" ? "commit and save the candidate on its archive branch, then remove the worktree and ticket branch; ignored files are not kept."
+        : name === "confirm discard" ? kind === "merge" ? saved.remoteDeleted
+          ? "delete only the local branch; the remote branch is already deleted; leave the ticket open."
+          : "delete only the local branch; keep the pushed branch and leave the ticket open."
+          : "remove the worktree and delete the ticket branch without saving its committed or uncommitted work."
+        : options.find(option => option.name === name)!.does;
+      return [name, short(does)];
+    }));
+    const recommended = confirm ? "go back" : "hand off";
+    const headline = short(`${ticket.id}: ${confirm ? "Confirm discarding work" : `Decision needed at ${facts.stage}`}`);
+    const reason = confirm ? "Keep the candidate until you choose how to proceed."
+      : "Keep the work available while a person or another workflow resolves this stop.";
+    const breadcrumb = `${repository.name}: ${repository.path}\nTicket: ${ticket.id} — ${ticket.title}\nBranch: ${saved.branch}\nWorktree: ${worktree}`;
+    const stopped = `Stopped in ${facts.stage}: ${facts.reason}`;
+    const files = facts.files;
+    const diffStat = files === undefined ? "Diff unavailable."
+      : `${files.length} files changed, ${files.reduce((sum, file) => sum + (file.added ?? 0), 0)} insertions, ${files.reduce((sum, file) => sum + (file.removed ?? 0), 0)} deletions; binary counts are shown as binary.`;
+    const blocks: EvidenceBlock[] = [
+      { title: "Rounds", text: evidenceText(facts.rounds) },
+      ...(saved.ownerQuestions ? [{ title: "Open questions and options", text: questionLines() + wouldAssumeLines() }] : []),
+      ...(saved.plan ? [{ title: "Plan", text: saved.plan }] : []),
+      ...(kind === "stuck" && ["falsify", "plan", "planReview"].includes(saved.repairing)
+        ? [{ title: "Planning report and objection", text: evidenceText(saved.planningReport) }] : []),
+      { title: "Changed files", text: diffStat, ...(files === undefined ? {} : { table: {
+        headings: ["File", "Added", "Removed"], rows: files.map(file => [file.path, String(file.added ?? "binary"), String(file.removed ?? "binary")]),
+      } }) },
+      ...facts.checks.filter(check => !check.passed).map(({ tail, ...check }) => ({
+        title: `Failing gate: ${check.name}`, text: evidenceText(check), tail,
+      })),
+      { title: "Passing checks", text: evidenceText(facts.checks.filter(check => check.passed)) },
+      ...(facts.review ? [{ title: "Review", text: evidenceText(facts.review) }, {
+        title: "Unmet criteria and open findings", text: evidenceText({
+          unmet: Array.isArray(facts.review.criteria) ? facts.review.criteria.filter(item => item?.met === false) : facts.review.criteria,
+          findings: facts.review.findings,
+        }),
+      }] : []),
+      ...(saved.moved ? [{ title: "Replay conflicts and saved candidate", text: evidenceText(saved.moved) }] : []),
+      { title: "Candidate", text: evidenceText(facts.candidate) },
+      { title: "Reports and evidence", text: evidenceText(facts.reports) + `\nEvidence: ${facts.evidenceDirectory}\n${facts.prUrl ? `Pull request: ${facts.prUrl}\n` : ""}${facts.questionFile ?? ""}` },
+    ];
+    const page = evidencePage({ headline, stopped, breadcrumb, blocks, effects, recommended });
+    const selected = { ...facts, diffStat, effects, recommended };
+    writeStuckEvidence(work.open(), `# ${headline}\n\n${breadcrumb}\n\n${stopped}\n\n${evidenceText(selected)}`, page);
+    return { presentation: { headline, page, effects, recommended, reason,
+      discards: choices.filter(choice => choice === "discard" || choice === "confirm discard"),
+    }, facts: evidenceFacts(selected) };
   }
   const standing = () => {
     const { repairs, totalRepairs, maxRepairs, reviewRounds, totalReviewRounds, maxReviewRounds } = work.status();
@@ -922,27 +991,29 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const locations = () => [`Worktree: ${worktree}`, `Branch: ${saved.branch}`, `Evidence: ${work.open()}`,
     ...(saved.moved ? [`Saved candidate: ${saved.moved.ref} (${saved.moved.patch})`] : []),
     ...(saved.moved?.conflicts.length ? [`Unsettled conflicts: ${saved.moved.conflicts.map(path => JSON.stringify(path)).join(", ")}`] : [])];
+  const stuckOptions = () => [
+    { name: "more rounds", does: saved.repairing === "falsify" || saved.repairing === "plan" || saved.repairing === "planReview"
+      ? `restart the repair budget and return to ${saved.repairing} with the standing feedback.`
+      : `restart the repair budget and send the standing findings back to the ${saved.repairing === "test" ? "tester" : "implementer"}.` },
+    { name: "hand off", does: "stop here and keep the worktree and branch exactly as they are, with nothing committed, for another workflow or a person.", recommended: true },
+    { name: "archive", does: `commit the candidate as delivery would have and keep that commit as the branch ${archiveBranch()}, then remove the worktree and delete ${saved.branch}. Ignored files are not kept.` },
+    { name: "discard", does: "remove the worktree and delete the branch without saving the candidate; asks for confirmation first." },
+    { name: "any other reply", does: "answer the question and return to the stage that stopped with fresh budgets and this answer as standing feedback." },
+  ];
   const stuckPrompt = () => brief({
     decision: asking().first, standing: standing(),
     needs: asking().rest || undefined, evidence: locations(),
-    options: [
-      { name: "more rounds", does: saved.repairing === "falsify" || saved.repairing === "plan" || saved.repairing === "planReview"
-        ? `restart the repair budget and return to ${saved.repairing} with the standing feedback.`
-        : `restart the repair budget and send the standing findings back to the ${saved.repairing === "test" ? "tester" : "implementer"}.` },
-      { name: "hand off", does: "stop here and keep the worktree and branch exactly as they are, with nothing committed, for another workflow or a person.", recommended: true },
-      { name: "archive", does: `commit the candidate as delivery would have and keep that commit as the branch ${archiveBranch()}, then remove the worktree and delete ${saved.branch}. Ignored files are not kept.` },
-      { name: "discard", does: "remove the worktree and delete the branch without saving the candidate; asks for confirmation first." },
-      { name: "any other reply", does: "answer the question and return to the stage that stopped with fresh budgets and this answer as standing feedback." },
-    ],
+    options: stuckOptions(),
   });
+  const discardOptions = () => [
+    { name: "confirm discard", does: `remove the worktree ${worktree} and delete the branch ${saved.branch} in ${repository.path}.` },
+    { name: "go back", does: "return to the decision with the candidate kept." },
+  ];
   const discardPrompt = () => brief({
     decision: `Discard the candidate for ticket ${ticket.id}?`,
     standing: `${standing()}\nThe candidate will not be saved: no archive branch is made, and its uncommitted and committed work on that branch is lost.`,
     needs: fullAsking(), evidence: locations(),
-    options: [
-      { name: "confirm discard", does: `remove the worktree ${worktree} and delete the branch ${saved.branch} in ${repository.path}.` },
-      { name: "go back", does: "return to the decision with the candidate kept." },
-    ],
+    options: discardOptions(),
   });
   const questionCount = () => `${saved.ownerQuestions!.length} open question${saved.ownerQuestions!.length === 1 ? "" : "s"}`;
   const questionText = (question: { text: string; where: string }, cap = Infinity) => {
@@ -1145,18 +1216,19 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: outcome };
   }
 
+  const mergeOptions = (confirm = false) => confirm ? [
+    { name: "confirm discard", does: `delete only the local branch ${saved.branch} in ${repository.path}.` },
+    { name: "go back", does: "return to the decision with the branch kept." },
+  ] : [
+    ...(saved.mergeFailedIn ? [{ name: "retry", does: `rerun ${saved.mergeFailedIn} only.` }] : []),
+    { name: "hand off", does: "keep the branch and leave the ticket open for someone else.", recommended: true },
+    { name: "discard", does: "delete only the local branch after confirmation and leave the ticket open." },
+  ];
   const mergePrompt = (confirm = false) => brief({
     decision: confirm ? `Discard the local branch for ticket ${ticket.id}?` : `Decide what happens to ticket ${ticket.id}`,
     standing: `${saved.mergeReason}\nPull request: ${saved.prUrl}\nBranch: ${saved.branch}\nThe worktree has already been removed. ${saved.remoteDeleted ? "The pushed branch has already been deleted." : "The pushed branch will be kept."}`,
     evidence: [`Evidence: ${work.open()}`],
-    options: confirm ? [
-      { name: "confirm discard", does: `delete only the local branch ${saved.branch} in ${repository.path}.` },
-      { name: "go back", does: "return to the decision with the branch kept." },
-    ] : [
-      ...(saved.mergeFailedIn ? [{ name: "retry", does: `rerun ${saved.mergeFailedIn} only.` }] : []),
-      { name: "hand off", does: "keep the branch and leave the ticket open for someone else.", recommended: true },
-      { name: "discard", does: "delete only the local branch after confirmation and leave the ticket open." },
-    ],
+    options: mergeOptions(confirm),
   });
 
   const record = (stage: string) => ({ event }: { event: Event }) => { saved.stoppedIn = stage; work.receive(event); };
@@ -1399,18 +1471,19 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: step === "rebase" ? "handBack" : type };
   }
   const stepChoices = () => saved.failedStep === "deliver" ? deliveryDecisions : saved.retryable ? stepDecisions : mergeDecisions;
+  const stepOptions = (confirm = false) => confirm ? [
+    { name: "confirm discard", does: `remove the worktree ${worktree} and delete the branch ${saved.branch}.` },
+    { name: "go back", does: "return to the decision with the candidate kept." },
+  ] : stepChoices().map(name => ({ name, does: {
+    retry: `rerun ${saved.failedStep} only after its error is resolved.`,
+    "hand off": "keep the worktree and branch for another workflow or a person.",
+    discard: "remove the worktree and branch without saving the candidate, after confirmation.",
+  }[name] }));
   const stepPrompt = (confirm = false) => brief({
     decision: confirm ? `Discard the candidate for ticket ${ticket.id}?` : `Ticket ${ticket.id}: ${saved.failedStep} failed`,
     standing: `${saved.failedStep}: ${work.status().reason}${confirm ? "\nThe candidate will not be saved: its uncommitted and committed work will be lost." : ""}`,
     evidence: locations(),
-    options: confirm ? [
-      { name: "confirm discard", does: `remove the worktree ${worktree} and delete the branch ${saved.branch}.` },
-      { name: "go back", does: "return to the decision with the candidate kept." },
-    ] : stepChoices().map(name => ({ name, does: {
-      retry: `rerun ${saved.failedStep} only after its error is resolved.`,
-      "hand off": "keep the worktree and branch for another workflow or a person.",
-      discard: "remove the worktree and branch without saving the candidate, after confirmation.",
-    }[name] })),
+    options: stepOptions(confirm),
   });
   function stepFailed(): Event {
     releaseTurn();
@@ -1562,7 +1635,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         writeFileSync(join(work.open(), `question-${++saved.questions}.txt`), stuckPrompt() + "\n", { mode: 0o600 });
         return { type: "ask" };
       }, { ask: "decide" }),
-      decide: human(stuckPrompt, {
+      decide: evidenceHuman(human, stuckPrompt, {
         submitted: [
           { guard: ({ event }: { event: Event }) => typeof event.value === "string" && !event.value.trim(), target: "stuck" },
           // Back to the planning or editing stage that stopped, including the tester after a failed red.
@@ -1572,13 +1645,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           { guard: choseDecision("discard"), target: "confirmDiscard", actions: decide },
           { target: "repairTarget", actions: continueWork },
         ],
-      }, { present: "presenter", presentWith: () => runFacts("stuck"), suggestions: decisions }),
-      confirmDiscard: human(discardPrompt, {
+      }, { present: "presenter", suggestions: decisions }, () => questionEvidence("stuck", decisions, false)),
+      confirmDiscard: evidenceHuman(human, discardPrompt, {
         submitted: [
           { guard: chose("confirm discard"), target: "remove", actions: ({ event }: { event: Event }) => { work.choice("confirmDiscard", event, confirmations); saved.discardConfirmed = true; } },
           { target: "stuck", actions: ({ event }: { event: Event }) => { work.choice("confirmDiscard", event, confirmations); } },
         ],
-      }, { present: "presenter", presentWith: () => runFacts("stuck"), choices: confirmations }),
+      }, { present: "presenter", choices: confirmations }, () => questionEvidence("stuck", confirmations, true)),
       archive: operation(archive, { archived: "remove" }),
       remove: operation(remove, { removed: "abandon" }),
       commit: operation(inTurn(commit, ["committed"]), { committed: "rebase", failed: "stepFailed" }),
@@ -1594,19 +1667,19 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       checkMerge: operation(checkMerge, { merged: "cleanUp", waiting: "awaitMerge", decide: "mergeDecide" }),
       awaitMerge: wait({ every: "10m" }, { due: "checkMerge" }),
       cleanUp: operation(mergeStep("cleanUp", cleanUp), { merged: "merged", failed: "mergeFailed" }, { retry: { on: "failed", times: 3, wait: "1m" } }),
-      mergeDecide: human(() => mergePrompt(), {
+      mergeDecide: evidenceHuman(human, () => mergePrompt(), {
         submitted: [
           { guard: chose("hand off"), target: "mergeHandOff", actions: mergeDecide },
           { target: "confirmMergeDiscard", actions: mergeDecide },
         ],
-      }, { present: "presenter", presentWith: () => runFacts("merge"), choices: mergeDecisions }),
-      confirmMergeDiscard: human(() => mergePrompt(true), {
+      }, { present: "presenter", choices: mergeDecisions }, () => questionEvidence("merge", mergeDecisions, false)),
+      confirmMergeDiscard: evidenceHuman(human, () => mergePrompt(true), {
         submitted: [
           { guard: chose("confirm discard"), target: "dropLocal", actions: ({ event }: { event: Event }) => { work.choice("confirmMergeDiscard", event, confirmations); } },
           { guard: () => !!saved.mergeFailedIn, target: "mergeRetryDecide", actions: ({ event }: { event: Event }) => { work.choice("confirmMergeDiscard", event, confirmations); } },
           { target: "mergeDecide", actions: ({ event }: { event: Event }) => { work.choice("confirmMergeDiscard", event, confirmations); } },
         ],
-      }, { present: "presenter", presentWith: () => runFacts("merge"), choices: confirmations }),
+      }, { present: "presenter", choices: confirmations }, () => questionEvidence("merge", confirmations, true)),
       dropLocal: operation(mergeStep("dropLocal", dropLocal), { removed: "mergeAbandon", failed: "mergeFailed" }, { retry: { on: "failed", times: 3, wait: "1m" } }),
       mergeHandOff: operation(() => settle("handedOff"), { handedOff: "handedOff" }),
       mergeAbandon: operation(() => settle("abandoned"), { abandoned: "abandoned" }),
@@ -1615,41 +1688,41 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         writeFileSync(join(work.open(), `question-${++saved.questions}.txt`), mergePrompt() + "\n", { mode: 0o600 });
         return { type: "ask" };
       }, { ask: "mergeRetryDecide" }),
-      mergeRetryDecide: human(() => mergePrompt(), {
+      mergeRetryDecide: evidenceHuman(human, () => mergePrompt(), {
         submitted: [
           { guard: chose("retry"), target: "retryMergeStep", actions: mergeRetryDecision },
           { guard: chose("hand off"), target: "mergeHandOff", actions: mergeRetryDecision },
           { target: "confirmMergeDiscard", actions: mergeRetryDecision },
         ],
-      }, { present: "presenter", presentWith: () => runFacts("merge"), choices: stepDecisions }),
+      }, { present: "presenter", choices: stepDecisions }, () => questionEvidence("merge", stepDecisions, false)),
       retryMergeStep: operation(() => ({ type: saved.mergeFailedIn }), { cleanUp: "cleanUp", dropLocal: "dropLocal" }),
       stepFailed: operation(stepFailed, { delivery: "deliverDecide", retryable: "stepDecide", keep: "keepDecide" }),
-      stepDecide: human(() => stepPrompt(), {
+      stepDecide: evidenceHuman(human, () => stepPrompt(), {
         submitted: [
           { guard: chose("retry"), target: "retryStep", actions: stepDecision("stepDecide", stepDecisions) },
           { guard: chose("hand off"), target: "handOff", actions: stepDecision("stepDecide", stepDecisions) },
           { target: "confirmStepDiscard", actions: stepDecision("stepDecide", stepDecisions) },
         ],
-      }, { present: "presenter", presentWith: () => runFacts("step"), choices: stepDecisions }),
-      keepDecide: human(() => stepPrompt(), {
+      }, { present: "presenter", choices: stepDecisions }, () => questionEvidence("step", stepDecisions, false)),
+      keepDecide: evidenceHuman(human, () => stepPrompt(), {
         submitted: [
           { guard: chose("hand off"), target: "handOff", actions: stepDecision("keepDecide", mergeDecisions) },
           { target: "confirmStepDiscard", actions: stepDecision("keepDecide", mergeDecisions) },
         ],
-      }, { present: "presenter", presentWith: () => runFacts("step"), choices: mergeDecisions }),
-      deliverDecide: human(() => stepPrompt(), {
+      }, { present: "presenter", choices: mergeDecisions }, () => questionEvidence("step", mergeDecisions, false)),
+      deliverDecide: evidenceHuman(human, () => stepPrompt(), {
         submitted: [
           { guard: chose("retry"), target: "retryStep", actions: stepDecision("deliverDecide", deliveryDecisions) },
           { target: "handOff", actions: stepDecision("deliverDecide", deliveryDecisions) },
         ],
-      }, { present: "presenter", presentWith: () => runFacts("step"), choices: deliveryDecisions }),
+      }, { present: "presenter", choices: deliveryDecisions }, () => questionEvidence("step", deliveryDecisions, false)),
       retryStep: operation(() => ({ type: saved.failedStep }), { setup: "setup", commit: "commit", deliver: "deliver" }),
-      confirmStepDiscard: human(() => stepPrompt(true), {
+      confirmStepDiscard: evidenceHuman(human, () => stepPrompt(true), {
         submitted: [
           { guard: chose("confirm discard"), target: "remove", actions: ({ event }: { event: Event }) => { work.choice("confirmStepDiscard", event, confirmations); saved.discardConfirmed = true; } },
           { target: "stepFailed", actions: ({ event }: { event: Event }) => { work.choice("confirmStepDiscard", event, confirmations); } },
         ],
-      }, { present: "presenter", presentWith: () => runFacts("step"), choices: confirmations }),
+      }, { present: "presenter", choices: confirmations }, () => questionEvidence("step", confirmations, true)),
       refuse: operation(() => conclude("refused"), { refused: "refused" }),
       handOff: operation(() => conclude("handed-off"), { handedOff: "handedOff" }),
       abandon: operation(() => conclude("abandoned"), { abandoned: "abandoned" }),

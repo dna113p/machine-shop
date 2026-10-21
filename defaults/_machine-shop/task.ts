@@ -5,6 +5,68 @@ import { isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Event, MachinePrimitives } from "@dna113p/machines";
 
+/** Read only the selected log tail; leave the complete log in place. Missing logs are evidence too. */
+export function evidenceLog(log: string): string {
+  try {
+    const lines = readFileSync(log, "utf8").replace(/\r?\n$/u, "").split(/\r?\n/u);
+    return [...(lines.length > 30 ? [`[${lines.length - 30} lines omitted; see stuck.md and the original log ${log}.]`] : []),
+      ...lines.slice(-30)].join("\n");
+  } catch (error) {
+    return `Log unavailable: ${log} (${(error as NodeJS.ErrnoException).code ?? "read failed"}).`;
+  }
+}
+
+/** Re-entry replaces the current question's note, without changing numbered questions or original logs. */
+export function writeStuckEvidence(directory: string, text: string, page: string): void {
+  writeFileSync(join(directory, "stuck.md"), `${text}\n\n## Question page\n\n${page}\n`, { mode: 0o600 });
+}
+
+interface QuestionPresentation {
+  headline: string;
+  page: string;
+  recommended: string;
+  effects: Record<string, string>;
+  discards: string[];
+  reason: string;
+}
+
+/** Late-bound evidence for static Human options, with a narrow fallback for older request validators. */
+export function evidenceHuman<const T extends Readonly<Record<string, unknown>>>(
+  human: MachinePrimitives["human"], prompt: () => string, on: T,
+  options: Parameters<MachinePrimitives["human"]>[2],
+  prepare: () => { presentation: QuestionPresentation; facts: string },
+) {
+  let facts = "";
+  let legacy = false;
+  const base = { ...options, presentWith: () => facts };
+  const unsupported = (error: unknown) => {
+    if (!(error instanceof Error)) return false;
+    const match = /^Unknown Human request fields?: (.+)$/u.exec(error.message);
+    return !!match && match[1]!.split(/,\s*/u).every(field =>
+      ["headline", "page", "recommended", "effects", "discards", "reason"].includes(field));
+  };
+  const make = (presentation: Partial<QuestionPresentation>) => {
+    try { return human(prompt, on, legacy ? base : { ...base, ...presentation }); }
+    catch (error) {
+      if (legacy || !unsupported(error)) throw error;
+      legacy = true;
+      return human(prompt, on, base);
+    }
+  };
+  // No snapshot or filesystem access at discovery/construction time.
+  const state = make({ page: "" });
+  return { ...state, invoke: { ...state.invoke, input: () => {
+    const prepared = prepare();
+    facts = prepared.facts;
+    try { return make(prepared.presentation).invoke.input(); }
+    catch (error) {
+      if (legacy || !unsupported(error)) throw error;
+      legacy = true;
+      return make({}).invoke.input();
+    }
+  } } };
+}
+
 /** Mechanical coordination only; the definition chooses which steps hold a turn. */
 export function repositoryTurn(repository: string, directory: string, runId: string) {
   // The common Git directory identifies aliases and linked worktrees of one repository.
