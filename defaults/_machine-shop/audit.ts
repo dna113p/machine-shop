@@ -198,13 +198,23 @@ export function validateProposal(summary: unknown, inventory: Inventory): Propos
     || JSON.stringify((gates.found as Gate[]).map(gateKey).sort()) !== JSON.stringify(inventory.gates.found.map(gateKey).sort())
     || JSON.stringify([...gates.missing].sort()) !== JSON.stringify([...inventory.gates.missing].sort())) throw new Error("gates must retain the found commands and missing classes from inventory");
   if (!Array.isArray(body.findings) || body.findings.length > 200) throw new Error("findings must be an array of at most 200 items");
-  // A finding may cite a run stop, or an inventoried file: an instruction file that was read, a CI file, or a gate's name.
+  // A finding may cite a run stop, or an inventoried file: an instruction file key (read, or recorded null, which evidences
+  // that the file is missing), a CI file, or a gate's name. A fault names the finding and the item, so one send-back can fix it.
   const evidence = new Set([...inventory.runs.stops.flatMap(stop => [stop.id, ...stop.locations]),
-    ...Object.entries(inventory.instructions).filter(([, content]) => content !== null).map(([key]) => key),
-    ...Object.keys(inventory.ci), ...inventory.gates.found.map(gate => gate.name)]);
-  for (const finding of body.findings) {
-    if (!object(finding) || !text(finding.reason) || !text(finding.route) || !Array.isArray(finding.evidence) || !finding.evidence.length
-      || finding.evidence.some(item => !evidence.has(item)) || (!routes.has(finding.route) && !gateClasses.includes(finding.route as GateClass))) throw new Error("Each finding needs a known route or gate class, and evidence from the inventory: a stop id or location, an instruction or CI file key, or a gate name");
+    ...Object.keys(inventory.instructions), ...Object.keys(inventory.ci), ...inventory.gates.found.map(gate => gate.name)]);
+  const accepted = "a stop id or location, an instruction file key (also one the inventory records as null, which is evidence that the file is missing), a CI file key, or a found gate name";
+  const quote = (value: unknown) => { const json = JSON.stringify(value) ?? String(value); return json.length > 200 ? `${json.slice(0, 199)}…` : json; };
+  for (const [index, finding] of body.findings.entries()) {
+    const label = `Finding ${index + 1} of ${body.findings.length}`;
+    if (!object(finding) || !text(finding.reason) || !text(finding.route) || !Array.isArray(finding.evidence) || !finding.evidence.length) {
+      throw new Error(`${label} needs a non-empty reason, a route and a non-empty evidence array`);
+    }
+    const named = `${label} (route ${quote(finding.route)}, reason ${quote(finding.reason.length > 80 ? `${finding.reason.slice(0, 79)}…` : finding.reason)})`;
+    const unknown = finding.evidence.filter(item => !evidence.has(item));
+    if (unknown.length) throw new Error(`${named} cites evidence the inventory does not hold: ${unknown.map(quote).join(", ")}. Evidence must be ${accepted}`);
+    if (!routes.has(finding.route) && !gateClasses.includes(finding.route as GateClass)) {
+      throw new Error(`${named} names a route that is neither a proposed Machine (${[...routes].join(", ") || "none proposed"}) nor a gate class (${gateClasses.join(", ")})`);
+    }
   }
   return body as unknown as Proposal;
 }
