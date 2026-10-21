@@ -1,32 +1,13 @@
 # ticket-task
 
-Carry one local ticket from its own worktree to a delivered branch, patch, or
-pull request.
+Carry one local ticket from an isolated Git worktree to a branch, patch, or pull
+request. The Machine commits and, in `pr` mode, pushes its branch and opens a
+pull request. Delivery ends there. It never merges, tags, force-pushes, or edits
+the source checkout's working tree. This root workflow runs from source; the
+installer does not copy it.
 
-The big one. Planning is read-only, tests come first by default, and the
-Machine, not the reviewer, decides whether a review passed. Unlike the defaults,
-**it commits**, and with `"output": "pr"` it pushes its own branch and opens a
-pull request. It never merges, tags, force-pushes, or touches the source
-checkout's working tree. A stuck run sleeps on one Human question, keeping
-the worktree and branch until it is answered.
-
-It runs from source; the installer never copies it.
-
-| | |
-| --- | --- |
-| Agent roles | `investigator`, `tester`, `implementer`, `reviewer` |
-| Agent calls, at most | 42 at the default budgets with a stable base; 20 with both budgets at 0 |
-| Checkout | its own new worktree; the source checkout is left alone |
-| Source | [ticket-task.ts](../../ticket-task.ts) |
-
-Each falsify, plan, plan review, test, change, and review report gets one
-send-back to the same Agent state and role with the exact validation fault,
-using [report recovery](../catalog.md#recovery). The run status says the report
-was sent back. A second malformed plan, plan review, test, change, or review
-report takes the existing stuck route with `<stage> report was malformed twice:
-<fault>` and the path of the retained report. Both malformed reports are kept.
-The call ceiling includes these send-backs; they spend no repair round, review
-round, or plan revision.
+Required roles are `investigator`, `tester`, `implementer`, and `reviewer`.
+The optional `presenter` can explain the sole Human question at `stuck`.
 
 ## Input
 
@@ -63,392 +44,212 @@ round, or plan revision.
 | `repository.draft` | no | `true` | Whether `pr` mode opens a draft. |
 | `worktreeRoot` | yes | — | Absolute directory for the worktree, outside the repository. |
 | `evidenceRoot` | yes | — | Absolute directory for run evidence, outside the repository and worktree. |
-| `maxRepairs` | no | `3` | Rounds for a failed scope, red, or green gate, 0–3. |
+| `maxRepairs` | no | `3` | Rounds for a failed implementation scope or green gate, 0–3. |
 | `maxReviewRounds` | no | `2` | Rounds for a `revise` review, 0–5. |
 | `redGreen` | no | `true` | Write failing tests first. `false` skips the tester and the red check. |
 | `assume` | no | `false` | Let `falsify` answer questions whose cautious answer loses nothing, and record them, instead of stopping. |
 | `stuck` | no | `"park"` | `stuck` no longer changes anything: both `"park"` and `"ask"` sleep on the same Human question. |
 | `resume` | no | `false` | Pick up the worktree a hand-off or block left, or a delivered commit whose worktree is gone. |
 
-Each repository has one turn from commit through rebase, repeated gates and delivery.
-A lock beside the worktrees directory, under `.machine-runs/repository-turns/`,
-records the run ID and PID using the canonical Git repository identity. Other
-runs poll and publish `<title>: waiting for the repository's turn` in the run
-status, restoring the active sentence when they acquire the turn or stop;
-a stale lock whose PID is gone is reclaimed
-with a log line. A waiting run replays onto the current base and runs
-the gates again when it moved. The turn is released before repair, review,
-a person’s decision, completion or a stopped run. A replay conflict uses the
-existing once-per-run repair allowance, reacquiring the turn before commit and
-replay; a second conflict keeps the existing stop. Delivery never advances the
-base itself or stacks onto unmerged ticket branches.
-
-Every state publishes one sentence about the ticket in `now` and at the start of `note`,
-including after checkpoint continuation. For example, falsification says
-`<title>: checking whether the ticket is sound`, planning says
-`<title>: planning; the plan review is next`, tests say
-`<title>: writing the failing tests`, and implementation says
-`<title>: implementing; gates not yet run`. Gates name the configured checks,
-such as `<title>: running lint, types, tests`. Review names the current attempt
-and its budget, counting the initial review plus permitted revisions:
-`<title>: under review, round 1 of 2`. An extra review budget is identified explicitly.
-A stop says `<title>: stuck at <stage>, needs you`; pull request delivery says
-`<title>: delivered as pull request #N`. Merge waiting, cleanup, and every ending
-have their own sentences. Releasing the repository turn never clears the status.
-
-Whitespace is collapsed to keep each sentence on one line. Sentences are limited
-to 200 Unicode characters; long titles are shortened with an ellipsis without
-splitting a Unicode character, preserving the stage meaning. An unusually long
-stage description (such as a list of check names) is capped at 160 characters
-to leave room for the title. The note's opening sentence supports runtimes that
-silently ignore `now`. Once a handoff page exists, the note also names its saved
-`handoff.html` path. Explicit unknown-`now` or unknown-`page` validation errors retry
-without just those fields; unrelated status errors still fail visibly.
-
-At delivery, each stop and discard confirmation, and every ending, the run composes
-an escaped Drip kit page without a model call. Its title is the ticket title. The
-breadcrumb names the repository and path, ticket id, branch, and pull request or
-patch path when available. A one-sentence outcome and a now/done/decided/needs recap
-precede the changed-file line counts, passed/failed/skipped gate chips, failing
-log tails, and the review verdict, criteria and findings by severity. Done lists
-stages that passed; decided records accepted falsify assumptions. Stops reuse the
-question's evidence, including open questions, plans, conflicts and report faults.
-Required gate chips use the latest verification or reverification result, and
-show skipped until verification runs. Setup and red-proof chips are labelled
-separately; a passed red proof means the tests failed as expected.
-
-The complete escaped UTF-8 page stays below 200,000 bytes. Bounded sections and
-lists mark omitted bytes, files, gates or blocks; each displayed failed gate keeps
-its diagnostic tail. Full logs and reports remain in the evidence directory.
-File counts are captured before destructive cleanup and saved in checkpoints.
-Delivery can also read its diff from the saved base and commit after cleanup.
-The verified completion result determines the ending page, including a completion
-that the helper refuses. Merge waiting retains the delivered page; merge or a
-later stop replaces it with that outcome.
-
-The page is always saved as `handoff.html` in the run evidence directory, and every
-later note includes both the page and its artifact pointer, including after
-checkpoint continuation. This also supports runtimes that silently ignore `page`.
-An older runtime that explicitly rejects it receives the note with the file path.
-Publication adds no Agent invocation and changes no transitions or declared endings.
-
-In `pr` mode, resume also moves an uncommitted candidate onto the published tip
-when the local base is behind. Before delivery, a run whose local base remains
-behind its starting commit reads the recorded remote base again: it keeps the
-same base if the tip is unchanged, replays onto a newer tip, and refuses a tip
-that was rewritten or moved back. A local base with unpublished commits is
-still refused.
-
 ## Flow
 
-🤖 Agent · ⚙️ Operation · 🧪 check gate · 🙋 Human · ⭘ end ([key](README.md#reading-the-diagrams))
-
-To keep the picture small, two kinds of edge are left out. An Agent that
-blocks, and a planning or review result that cannot go on, both go to ⏸ stuck.
-Expected operational failures follow the recovery paths below.
+There are 14 working states: six Agents, seven Operations, and one Human.
+The four endings are additional. Each Agent validates and records its report
+inside its own state, allowing one send-back with the exact fault. This applies
+to falsify, plan, plan review, test, implement, and review reports. A second
+malformed report stops at `stuck`; both reports remain as evidence. Falsify keeps
+its one send-back allowance across owner continuations. Planning
+and review guard the sealed checkout, and `judge` applies review policy rather
+than trusting the reviewer's verdict word.
 
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
 flowchart TD
-  shape["⚙️ <b>shape</b><br/>all four sections?"]
-  prepare["⚙️ <b>prepare</b><br/>worktree and branch"]
-  falsify(["🤖 <b>falsify</b> · investigator<br/>is the ticket wrong or vague?"])
-  falsifyResult["⚙️ <b>falsifyResult</b><br/>questions stop, or are assumed"]
-  plan(["🤖 <b>plan</b> · investigator<br/>concise files and tests"])
-  planResult["⚙️ <b>planResult</b><br/>capture and guard worktree"]
-  planReview(["🤖 <b>planReview</b> · reviewer"])
-  planReviewResult["⚙️ <b>planReviewResult</b><br/>one revision allowed"]
-  test(["🤖 <b>test</b> · tester<br/>a failing test per criterion"])
-  scopeAfterTest{{"🧪 <b>scopeAfterTest</b><br/>only Scope paths touched?"}}
-  red{{"🧪 <b>red</b><br/>new tests must fail"}}
-  change(["🤖 <b>change</b> · implementer<br/>makes the tests pass"])
-  scopeAfterChange{{"🧪 <b>scopeAfterChange</b>"}}
-  verify{{"🧪 <b>verify</b><br/>the repository's gates"}}
-  review(["🤖 <b>review</b> · reviewer<br/>criteria and tagged findings"])
-  reviewResult["⚙️ <b>reviewResult</b><br/>the Machine judges it"]
-  reviewBudget["⚙️ <b>reviewBudget</b><br/>maxReviewRounds, default 2"]
-  repairBudget["⚙️ <b>repairBudget</b><br/>maxRepairs, default 3"]
-  repairTarget["⚙️ <b>repairTarget</b><br/>to the stage that stopped"]
-  commit["⚙️ <b>commit</b>"]
-  rebase["⚙️ <b>rebase</b><br/>replays onto a moved base"]
-  deliver["⚙️ <b>deliver</b><br/>branch, patch, or pull request"]
-  delivered(("✅ delivered"))
-  refused(("⛔ refused"))
-  stuck(("⏸ stuck"))
-
-  shape -->|prepared| prepare
-  shape -->|"missing sections"| refused
-  prepare -->|created| setup["⚙️ setup"] -->|prepared| falsify
-  prepare -->|prepared| falsify
-  prepare -->|refused| refused
-  prepare -->|"resumed with edits"| scopeAfterChange
-  prepare -->|redeliver| rebase
-  falsify --> falsifyResult
-  falsifyResult -->|"malformed, once"| falsify
-  falsifyResult -->|"sound, or assumed"| plan
-  falsifyResult -->|"open questions"| stuck
-  plan --> planResult
-  planResult -->|planned| planReview --> planReviewResult
-  planReviewResult -->|revise| plan
-  planReviewResult -->|tooBroad| stuck
-  planReviewResult -->|approved| test
-  planReviewResult -.->|"approved, redGreen off"| change
-  test --> scopeAfterTest
-  scopeAfterTest -->|passed| red
-  red -->|"proved red"| change
-  change --> scopeAfterChange
-  scopeAfterChange -->|passed| verify
-  verify -->|passed| review --> reviewResult
-  reviewResult -->|revise| reviewBudget
-  reviewBudget -->|retry| change
-  reviewBudget -->|"exhausted, fixable, once"| change
-  reviewResult -->|approved| commit --> rebase
-  rebase -->|"current, or rebased"| deliver --> success["⚙️ success<br/>remove worktree, write delivery receipt"]
-  success -->|"branch, patch, or worktree kept"| delivered
-  success -->|"pull request"| checkMerge["⚙️ checkMerge<br/>gh pr view"]
-  checkMerge -->|"open, or fewer than 3 failures"| awaitMerge["awaitMerge<br/>sleep 10 minutes"]
-  awaitMerge --> checkMerge
-  checkMerge -->|merged| cleanUp["⚙️ cleanUp<br/>delete remote and local branch"]
-  cleanUp --> merged(("✅ merged"))
-  cleanUp -->|"3 retries, then failed"| mergeRetryDecide[/"🙋 mergeRetryDecide<br/>retry, hand off, discard"/]
-  checkMerge -->|"closed, or 3 consecutive failures"| mergeDecide[/"🙋 mergeDecide<br/>hand off or discard"/]
-  mergeDecide -->|"hand off"| handedOff(("🤝 handedOff"))
-  mergeDecide -->|discard| confirmMergeDiscard[/"🙋 confirmMergeDiscard"/]
-  confirmMergeDiscard -->|"go back"| mergeDecide
-  confirmMergeDiscard -->|"confirm discard"| dropLocal["⚙️ dropLocal<br/>keep pushed branch"]
-  dropLocal --> abandoned(("🗑️ abandoned"))
-  dropLocal -->|"3 retries, then failed"| mergeRetryDecide
-  mergeRetryDecide -->|"retry failed step"| retryMergeStep["cleanUp or dropLocal"]
-  retryMergeStep --> cleanUp & dropLocal
-  mergeRetryDecide -->|"hand off"| handedOff
-  mergeRetryDecide -->|discard| confirmMergeDiscard
-  confirmMergeDiscard -->|"go back after failure"| mergeRetryDecide
-  setup & commit -->|"retryable failure"| stepDecide[/"🙋 stepDecide<br/>retry, hand off, discard"/]
-  commit & rebase -->|"cannot retry"| keepDecide[/"🙋 keepDecide<br/>hand off, discard"/]
-  stepDecide -->|"retry failed step"| retryStep["setup or commit"]
-  retryStep --> setup & commit
-  stepDecide & keepDecide -->|"hand off"| handedOff
-  stepDecide & keepDecide -->|discard| confirmStepDiscard[/"🙋 confirmStepDiscard"/]
-  confirmStepDiscard -->|"go back"| stepFailed["ask the failed step's question again"]
-  stepFailed --> stepDecide & keepDecide
-  confirmStepDiscard -->|"confirm discard"| remove["⚙️ remove"] --> abandoned
-  deliver -->|"3 network retries, then failed; other failures immediately"| deliverDecide[/"🙋 deliverDecide<br/>retry, hand off"/]
-  deliverDecide -->|retry| deliver
-  deliverDecide -->|"hand off"| handedOff
-  rebase -->|"patch changed"| verify
-  scopeAfterTest & red & scopeAfterChange & verify -->|failed| repairBudget
-  rebase -->|"gates failed"| repairBudget
-  repairBudget -->|retry| repairTarget
-  repairTarget --> test & change
-  repairBudget & reviewBudget -->|exhausted| stuck
-
-  classDef agent fill:#dbeafe,stroke:#2563eb,color:#0f172a
-  classDef op fill:#f1f5f9,stroke:#64748b,color:#0f172a
-  classDef gate fill:#ede9fe,stroke:#7c3aed,color:#0f172a
-  classDef good fill:#dcfce7,stroke:#16a34a,color:#0f172a
-  classDef bad fill:#fee2e2,stroke:#dc2626,color:#0f172a
-  classDef no fill:#fde68a,stroke:#b45309,color:#0f172a
-  class falsify,plan,planReview,test,change,review agent
-  class shape,prepare,setup,falsifyResult,planResult,planReviewResult,reviewResult,reviewBudget,repairBudget,repairTarget,commit,rebase,deliver op
-  class scopeAfterTest,red,scopeAfterChange,verify gate
-  class delivered good
-  class refused bad
-  class stuck no
+  prepare["prepare: worktree, setup, resume"] --> falsify([falsify])
+  prepare -->|failure| stuck{"stuck: owner answer"}
+  prepare -->|missing sections or unsafe adoption| refused((refused))
+  falsify --> plan([plan]) --> planReview([planReview])
+  falsify -->|questions| stuck
+  planReview -->|approved| test([test]) --> red["red: scope and prove red"]
+  planReview -->|revise once| plan
+  planReview -->|too broad| stuck
+  planReview -->|redGreen off| implement([implement])
+  red -->|passed| implement --> gate["gate: scope and every check"]
+  red -->|not red| stuck
+  gate -->|passed| review(["review: sealed checkout"]) --> judge[judge]
+  gate -->|failed with budget| implement
+  gate -->|budget spent| stuck
+  judge -->|approved| commit[commit] --> rebase["rebase: turn, replay, gates"]
+  judge -->|revise with budget| implement
+  judge -->|needs owner| stuck
+  rebase -->|validated candidate| deliver[deliver] --> delivered((delivered))
+  rebase -->|changed candidate| gate
+  rebase -->|conflict or failure| stuck
+  commit -->|failure| stuck
+  deliver -->|failure| stuck
+  stuck -->|continue by saved origin| prepare & falsify & plan & test & implement & gate & rebase
+  stuck -->|hand off| handedOff((handedOff))
+  stuck -->|discard| abandoned((abandoned))
 ```
 
-### Resumed conflicts and replay conflicts at delivery
+`falsify` asks whether the ticket is wrong, already done, impossible, or
+underspecified. With `assume: true`, conservative answers that lose nothing
+are recorded as assumptions; scope, product, and irreversible decisions still
+need the owner. `plan` names files and tests, and `planReview` permits one revision.
+By default, `test` writes acceptance tests before `red` proves they fail.
+`implement` must preserve those tests and stay within Scope. `gate` checks Scope
+and runs every configured check, retaining all failures for the next repair.
 
-On a delivery replay conflict, the run restores the approved candidate, moves it
-onto the tip it tried, and sends conflicts to the implementer in the same run.
-The run moves once; a second replay conflict stops with the existing recovery text
-and says the run already moved its candidate once.
-A move in `prepare` when the run resumed counts toward this once-per-run limit.
-The settling round uses the existing repair budget, and the moved change gets a
-fresh review after scope and required checks, before commit, rebase, and delivery.
-Evidence names the replay conflict, its files, and the tip the candidate moved onto.
-A replay refused by Git or a hook without conflicts, a rewritten base, an
-unpublished base, or a base that already holds the change still stops as before.
+Repair counters default to 3 (range 0–3); review counters default to 2
+(range 0–5). They are updated on transitions and do not consume each other's
+budget. Malformed-report send-backs and the one plan revision consume neither.
+A spent review budget grants one extra review budget only for a `revise` report
+with a blocker, all finding paths in Scope, and no discussion. Repairs already
+used still count. The extra allowance is available once per run, including
+after owner answers. Its triggering blockers remain in later implementer
+prompts, and every later question states that it was used and includes the
+latest `newSinceLastRound` or says no review has finished in it yet.
+A `blocked` review stops immediately. Unchanged blockers with nothing new and
+repeated discussion questions also need the owner. Minor notes are retained
+without forcing a revision. With a stable base the ceiling is 42 Agent calls
+at default budgets, 20 with both budgets zero, or 18 with `redGreen: false`,
+including report send-backs; an owner continuation grants fresh budgets.
 
-This removes the manual handoff and resume needed on 2026-10-19 for org-26
-(replay onto `9a2d15a` conflicted in `tests/ticket-task.test.ts`) and org-47
-(replay onto `0bc2c5a` conflicted in `ticket-task.ts`). Both resumed runs used
-this same move and settling path to deliver.
+## Continuing a stop
 
-If moving a candidate onto the current base conflicts, the implementer
-removes every conflict marker while keeping both sides' intent, without staging
-or committing. The run stages each settled conflict itself, including deletions
-as removals. For a conflict without markers, the prompt names the file and what
-Git left in the worktree; leaving it alone keeps that version. Files with markers
-remain unsettled, count against the repair budget, and are named when the run asks
-for help. Once settled, scope checks, required checks, and review run normally.
+`stuck` saves the origin, reason, original reports and log references before
+sleeping. Its suggestions are `continue`, `hand off`, and `discard`; free text
+also continues and stays verbatim in every later Agent prompt. Decision names
+ignore case, surrounding whitespace, and trailing punctuation. Empty text
+asks again. There is no route straight from `stuck` to `deliver`.
 
-### When stuck
+| Origin and reason | Continue destination | What the answer supplies |
+| --- | --- | --- |
+| `prepare`: setup failed | `prepare` | Retry preparation after the owner resolves the fault. |
+| `falsify`: questions | `plan` | Treat the owner's text as assumptions; an explicit scope change returns to `falsify`. |
+| `planReview`: too broad | `plan` | Revise the plan using the narrowed scope. |
+| `red`: not red | `test` | Repair the acceptance tests. |
+| `gate`: repair budget spent | `implement` | Repair with a fresh budget and the owner's answer. |
+| `judge`: review budget spent | `implement` | Address findings with the owner's answer and fresh budgets. |
+| `rebase`: conflict or replay failure | `rebase` | Re-enter replay; an uncommitted candidate returns to implementation, gates, and review. |
 
-Once per run, a spent review budget returns to the implementer with a fresh
-review budget if the last verdict is `revise`, every finding names a path inside
-Scope, at least one is a blocker, and none is a discussion. A leading `./` and
-trailing `:line` or `:line-range` are removed before matching Scope. The triggering
-blockers stay in the implementer's prompt; repair rounds already used still count.
-A second spent budget, any pathless or outside-Scope finding, or no blocker asks
-the owner. A `blocked` review still stops immediately. Every stuck question after
-the extra round begins says it was used and gives the latest well-formed review's
-`newSinceLastRound` from that point, or says no review has finished in it yet.
-An owner answer does not grant another automatic extra round.
+A blocked tester or implementer returns to that Agent. A malformed planning
+report returns to planning; a malformed review returns to implementation.
+Commit failures continue through gates and review. Delivery failures return
+through rebase, retaining a known pull request URL so creation is not repeated.
+A process restored directly at delivery also stops at `stuck`: its earlier
+repository turn no longer protects replay.
+A previously reviewed candidate may reuse its review after replay, but a rebase
+continuation reruns every gate even when the base is unchanged. An unreviewed
+candidate cannot reach commit.
 
-The plan reviewer prefers concise plans and sends back unnecessary detail as
-an ordinary revision. A `tooBroad` verdict stops the run with a suggested split
-into smaller tickets in the question; answering or choosing `more rounds`
-returns to the planner.
+`hand off` ends directly at `handedOff`, retaining the worktree and branch.
+`discard` ends directly at `abandoned`, removing this run's worktree and branch.
+The suggestion carries discarding metadata so Drip asks for confirmation; there
+are no confirmation states in the Machine. Removal errors fail visibly with
+retained command evidence.
 
-The question starts with what is needed: the number of open questions, the
-malformed report's fault, or the spent budget. Its opening is at most 100
-characters, cut at a word boundary with an ellipsis when needed. Then it gives
-the ticket id without its title, the stopped stage, budgets and any extra review
-round, followed by the questions or remaining reason once, and evidence locations.
-Discard confirmation keeps the same order, with the stop reason under Needs.
-Each question is written as `question-<n>.txt` in the evidence directory, numbered from 1 across re-asks and continuation
-after sleep. The four decisions
-are suggestions. Any other reply is an answer and works like `more rounds`:
-it renews both budgets, clears the owner questions, and returns to the stage
-that stopped in the same worktree.
-Answers remain under
-`Answers from the ticket owner:` in later Agent prompts, including the planner
-after a falsify question. Discard still requires its second confirmation.
-The four decisions match ignoring case, surrounding whitespace and trailing
-punctuation (`. , ; : ! ? …`). The raw reply is kept in the Human evidence,
-and the canonical decision is recorded in `delivery.json`; `confirm discard`
-and `go back` stay exact.
+Each stop writes `question-<n>.txt`, numbered across re-asks and checkpoint
+continuations. `stuck.md` retains full selected evidence and a deterministic
+HTML page: origin, reason, questions/options, plan, changed files, failing log
+tails, review findings and replay conflicts. Each failed log contributes its
+last 30 lines, with an independent byte allowance. Escaped pages and presenter
+facts stay below 200,000 UTF-8 bytes and mark omitted content. Original reports
+and logs remain intact. Missing diffs or logs do not prevent the question.
+The optional presenter receives these facts through `presentWith`; the
+Machine's fields prevail if the presenter fails or proposes other fields.
+Older runtimes rejecting presentation fields receive the original question
+and can read the saved page. Unrelated errors propagate.
 
-```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 16, "rankSpacing": 26, "padding": 6, "diagramPadding": 4}}}%%
-flowchart LR
-  stuck["⚙️ <b>stuck</b>"]
-  decide[/"🙋 <b>decide</b><br/>more rounds, hand off,<br/>archive, or discard"/]
-  confirmDiscard[/"🙋 <b>confirmDiscard</b><br/>a second yes before deleting"/]
-  archive["⚙️ <b>archive</b><br/>keeps an archive branch"]
-  remove["⚙️ <b>remove</b><br/>deletes worktree and branch"]
-  again(["↩ the stage that stopped,<br/>with fresh budgets"])
-  handedOff(("🤝 handedOff"))
-  abandoned(("🗑️ abandoned"))
+## Resume and delivery safety
 
-  stuck --> decide
-  decide -->|"answer or more rounds"| again
-  decide -->|"hand off"| handedOff
-  decide -->|archive| archive --> remove
-  decide -->|discard| confirmDiscard
-  confirmDiscard -->|"confirm discard"| remove
-  confirmDiscard -->|"go back"| stuck
-  remove --> abandoned
+See the catalog’s [Recovery guidance](../catalog.md#recovery) for shared evidence
+and budget conventions.
 
-  classDef op fill:#f1f5f9,stroke:#64748b,color:#0f172a
-  classDef human fill:#fef3c7,stroke:#d97706,color:#0f172a
-  classDef no fill:#fde68a,stroke:#b45309,color:#0f172a
-  classDef back fill:#dbeafe,stroke:#2563eb,color:#0f172a,stroke-dasharray:4 3
-  class stuck,archive,remove op
-  class decide,confirmDiscard human
-  class handedOff,abandoned no
-  class again back
-```
+A kept worktree resumes through `prepare`, which validates repository identity,
+branch ownership, and ancestry before adopting it. Worktree-local
+`ticket-task-resume.json` preserves the saved origin, unanswered falsify questions,
+owner answers, plan, and evidence location across separate runs. Unanswered
+falsify questions return to `stuck`, with their options and evidence, until the
+owner answers; handing off does not authorize planning. Otherwise preparation returns to the saved origin;
+a candidate without saved-origin metadata goes through `gate` and review,
+while a clean worktree without metadata starts at `falsify`.
 
-## Recovery by step
+The branch is `ticket/<id-slug>-<title-slug>` (or `ticket/<id-slug>` if the title
+leaves no slug); the worktree is `<worktreeRoot>/<repository.name>--<id-slug>`.
+The id is lowercased with characters outside `[a-z0-9._-]` replaced by `-`.
+The title uses lowercase ASCII words separated by `-`, cut at a word boundary
+to 48 characters. `branch.<name>.ticket` records ownership. A matching ticket
+commit or the legacy exact id-only branch name can also establish ownership.
+Unresolved ownership refuses adoption or a second run beside that branch.
+The existing branch name survives ticket retitling; another ticket's files and
+branches are never cleaned up.
 
-Every retry reruns only the failed Operation, without a new commit or review.
-Automatic retries use Operation `retry`: 3 further attempts, each after `1m`
-(one minute). Only `deliver`, `cleanUp`, and `dropLocal` retry automatically.
-Questions are saved as `question-<n>.txt` and answered through the usual Human
-interface. Choices are restricted to the actions available at that step.
+When the base advances, preparation saves an uncommitted candidate in
+`saved-candidate.patch` and `refs/machine-shop/saved/<id-slug>/<hash>`, runs
+setup on the clean new base, and applies it there. Ignore rules that would drop
+added files, unsafe setup output, or changed HEAD restore the candidate and
+stop. Conflicts retain both sides in `resume-conflicts.diff` and
+`ticket-task-move.json`. The implementer removes conflict markers and preserves
+both intents; the Operation stages resolved files and still checks Scope.
+A delivery replay conflict stops for the owner before this repair. The run
+moves a conflicted candidate once; a second conflict needs another decision.
 
-All nine stop questions use the optional `presenter` role: `decide`,
-`confirmDiscard`, `stepDecide`, `keepDecide`, `deliverDecide`,
-`confirmStepDiscard`, `mergeDecide`, `mergeRetryDecide` and `confirmMergeDiscard`.
-Each question gets a deterministic page, headline, effects for every offered
-choice and a recommendation, without a model call. The page carries the repository,
-ticket id and title, branch and worktree, followed by a sentence naming the stopped
-stage and reason. Saved evidence includes questions with options and recommendations,
-the plan and plan-review objection, a changed-files table with diff stat, failing
-gate log tails, unmet review criteria and open findings, and replay conflict paths
-with the saved candidate reference. Missing logs or diffs are identified explicitly.
-After worktree removal, the diff compares the saved base and delivered commit.
+Saved `ticket-task-assumptions.json` belongs to the worktree's Git directory,
+outside the candidate. Candidate resume validates it before proceeding, records
+`assumptions.json` in the new evidence, and includes it in prompts, the PR body,
+and `delivery.json`. A clean run's falsification replaces its old assumptions.
 
-The page uses escaped Drip kit HTML: recap sections, status chips, tables with
-headers and preformatted logs. It contains no scripts, styles or links. Gate logs
-contribute their last 30 lines. Each failing gate gets its own budget for its
-identity and diagnostic tail in both the page and presenter facts, before passing
-check metadata. Oversized tails retain their end. Every variable block is byte-budgeted after HTML
-escaping, keeping the whole page below 200,000 UTF-8 bytes. Each cut says how much
-was omitted and points to `stuck.md`. The same evidence goes to the optional
-presenter through `presentWith`, with an independent serialized-facts byte budget.
-The presenter also receives the run's map and history from Machines.
+With no worktree, resume can adopt a recorded delivered commit and continue
+at `rebase`. Exactly one owned branch must hold exactly one ticket commit above
+an ancestor of the current base, with the expected title and `Ticket: <id>` line.
+The local `branch.<name>.ticketDelivered` record must match its tip; an absent
+or mismatched delivery record refuses resume without changes. Merge commits,
+unrelated history, multiple commits, unresolved siblings, or a changed title
+are refused. In `pr` mode a delivered resume is refused because the pull request
+is brought up to date at its host. Recreation runs setup again; failed setup
+removes only the recreated worktree, retaining the branch and delivery record.
+An unchanged base still runs every gate and records `redelivered: true` when
+the same commit is delivered again. A changed patch requires a fresh review.
 
-Before the Human waits, `stuck.md` in the run's evidence directory receives the full
-selected evidence and generated page. It is refreshed on re-entry and confirmations;
-numbered `question-<n>.txt` files and original logs remain intact. This also works
-after sleep and after the worktree is removed. An older runtime rejecting the
-presentation fields receives the original request, while the generated page stays
-in `stuck.md` only. Other validation errors propagate.
+Each repository holds one turn from commit through replay, gates and delivery.
+The lock under `.machine-runs/repository-turns/` records repository identity,
+run ID and PID; waiting publishes its status, and a dead owner's lock is reclaimed
+with evidence. Repair, review, Human sleep, completion, and errors release the
+turn. Delivery never advances the base or stacks onto another ticket branch.
 
-The Machine's presentation fields take precedence over optional presenter output
-and remain available without a presenter or if it fails. `hand off` is recommended,
-or `go back` for discard confirmations. Destructive choices are marked. The choices,
-suggestions, answer matching and endings stay the same.
-
-| Step | Recovery |
-| --- | --- |
-| `shape` | Missing ticket sections end `refused`, a declared failed ending, with the reason. |
-| `prepare` | Refusals before creating a worktree end `refused` without a question or cleanup. New-worktree setup runs separately in `setup`. Delivered-resume adoption refusals retain the delivery record and remove only the recreated worktree; failed removal names the kept worktree. |
-| `setup` | A failed configuration or setup command, or leftover files, asks `retry`, `hand off`, or `discard`. |
-| `commit` | A failed `git commit` asks `retry`, `hand off`, or `discard`. An empty candidate, stale checks, or changed HEAD, branch, commit content, or message asks only `hand off` or `discard`. |
-| `rebase` | Red checks on a redelivered commit enter the repair loop. A replay conflict moves the candidate onto the attempted tip and sends conflicts to the implementer once in the same run, then scope, checks, and fresh review; a prior move in `prepare` counts, and a second conflict stops. A rewritten or backward base asks only `hand off` or `discard`; an unresolved base during delivered-resume verification ends `refused`. |
-| `deliver` | Push and `gh` failures retry automatically, then ask `retry` or `hand off`. Other delivery failures ask immediately. A known pull request URL is reused on retry. |
-| `success` | Failure to remove the worktree still ends `delivered` immediately, naming the worktree and `git-worktree.log`; no merge wait starts. |
-| `cleanUp` | Retry automatically, then ask the merge decision with `retry` added: `retry`, `hand off`, or `discard`. |
-| `dropLocal` | Retry automatically, then ask `retry`, `hand off`, or `discard`. Retry returns only to this failed step. |
-| `archive` | A failure throws and fails the run visibly with the error and any log; the owner already chose archive. |
-| `remove` | A failure throws and fails the run visibly with the error and any log; the owner already authorized removal. |
-
-`discard` always asks for confirmation. Before delivery it removes the worktree
-and ticket branch; during the merge wait it removes only the local branch.
-`hand off` keeps the remaining work. Neither choice grants extra repair or
-review rounds.
+Commit checks the verified checkout fingerprint, expected tree, branch, HEAD,
+subject and ticket line, including after hooks. Replay accepts only a forward
+base and an equivalent patch; changed patches return through gates and review.
+In `pr` mode the base must be published. The recorded remote URL and base branch
+control push and PR creation, independent of other local Git or `gh` settings.
+Push sends only the ticket branch, without tags or force.
+Once that push succeeds, recovery from PR creation or delivery-record failures
+keeps the published commit, even if the base advances. Continuation reacquires
+the repository turn and reruns every gate on that commit before retrying delivery.
+A failed gate keeps the published commit for another continuation; it never
+rebases or resets it. An already-created pull request is reused.
 
 ## Results
 
-`delivered` and `merged` are declared successful endings. `handedOff` and
-`abandoned` are declared cancelled endings because they follow a person's
-choice to stop this run; they do not claim the ticket was completed.
-`refused` is a declared failed ending, with the reason recorded.
+- **`delivered`** succeeds at the branch, patch, or pull request. Worktree cleanup
+  failure still succeeds, naming the leftover path and cleanup log.
+- **`handedOff`** cancels with the candidate kept for a person or another workflow.
+- **`abandoned`** cancels after the person's discard choice removes the candidate.
+- **`refused`** fails for malformed tickets, unsafe preparation/adoption, or an
+  unverified completion, with the reason retained.
 
-After delivery removes the worktree, a pull request run checks `gh pr view`
-every 10 minutes until it merges. With the sleep option, as used by Dispatch,
-the run sleeps while waiting for the merge, saving its state between checks.
-Only a reported merge permits remote branch deletion; an already absent remote
-branch counts as deleted. Other cleanup failures retry and then ask the merge decision with `retry` added.
+Every ending returns `{ "action": "hold", "summary": "…" }`.
+`delivery.json` records the ticket, repository, branch, base, commit, output,
+worktree retention/removal, resume details, decisions and review notes.
+`result.json` retains helper outcomes, gates, budgets and Agent reports.
+Delivery records `branch.<name>.ticketDelivered` before cleanup. PR delivery
+does not wait for a merge or delete the pushed branch.
 
-A pull request closed without merging, or three consecutive `gh` failures
-(including unexpected states), goes to `mergeDecide` regardless of `stuck`.
-It shows the reason and offers only hand off or discard. Hand off keeps the
-branch; confirmed discard deletes only the local branch and keeps the pushed
-branch. Both leave the ticket open.
-
-The `merged` final returns exactly `{ "action": "complete", "summary": "…" }`,
-so Machines Dispatch closes the ticket. Every other final returns exactly
-`{ "action": "hold", "summary": "…" }`. `delivery.json` and `result.json`
-record delivery once, before waiting; `merge.json` records the later outcome,
-pull request URL, branch, check and failure counts, deletion flags, and any
-reason or decision. Read that later receipt after a merge decision.
-A delivered ticket with a kept worktree records `delivery.json` outcome
-`delivered`, `worktreeRemoved: false`, and no reason; `result.json` records
-`completed` with an empty reason. Refusals record `refused` in `delivery.json`
-and retain the helper's `blocked` outcome in `result.json`.
-
-- ✅ **`delivered`**: committed and delivered as a branch or patch, or as a pull request whose worktree could not be removed.
-- ✅ **`merged`**: the pull request merged and the ticket branch was deleted locally and remotely.
-- 🤝 **`handedOff`**: a person chose to hand the work to someone else; after pull request delivery, the worktree is already gone and the branch is kept.
-- 🗑️ **`abandoned`**: archived to `archive/<slug>` and removed, or discarded after a second confirmation.
-- ⛔ **`refused`**: the ticket shape or preparation was refused, or final verification could not be confirmed, with the reason. This is a declared failed ending; `delivered` and `merged` are succeeded endings, and `handedOff` and `abandoned` are cancelled endings.
-
-The catalog's [ticket delivery](../catalog.md#ticket-delivery) section has the
-resume rules, evidence files, and every stop.
+Every state publishes a one-line `now` and note. Stops, delivery and endings
+also save `handoff.html` with a recap, changed-file counts, gate chips, log tails,
+and review findings. Required gate chips stay skipped before verification;
+setup and red-proof evidence have separate labels. Notes keep the artifact path
+after checkpoint continuation, including on runtimes that ignore pages.
 
 ## Wrapping it
 
@@ -478,5 +279,5 @@ Run plain `npm ci` in the Machine Shop checkout the wrapper imports from.
 `ticket-task.ts` imports `defineEndings` as a value from `@dna113p/machines`, so
 that checkout needs its own dependencies installed; otherwise loading fails with
 `Cannot find package '@dna113p/machines'`. Do not use `--omit=dev`: the package
-is a devDependency in Machine Shop. Machine Shop requires `^0.7.1`, which allows
+is a devDependency in Machine Shop. Machine Shop requires `^0.8.0`, which allows
 presenters to recommend suggestions as well as restricted choices.

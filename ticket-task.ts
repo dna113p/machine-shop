@@ -6,7 +6,7 @@ import { evidenceHuman, evidenceLog, writeStuckEvidence, repositoryTurn, taskNow
 import { brief, opening, excerpt, evidenceFacts, evidencePage, handoffPage, type EvidenceBlock } from "./defaults/_machine-shop/brief.ts";
 import { outsideScope } from "./defaults/_machine-shop/scope.ts";
 
-export const description = "Carry one local ticket for one Git repository from an isolated worktree through falsification, planning, plan review, implementation, checks, and review to a delivered branch, patch, or pull request; a pull request is then watched until it merges, when its branch is deleted and the ticket completes; a stuck run sleeps on a Human question.";
+export const description = "Carry one local ticket for one Git repository from an isolated worktree through falsification, planning, plan review, implementation, checks, and review to a delivered branch, patch, or pull request; a stuck run sleeps on a Human question.";
 export const agentRoles = {
   investigator: "Tries to falsify the ticket, then plans its implementation without editing",
   tester: "Writes failing tests for the ticket's acceptance criteria before implementation",
@@ -16,28 +16,28 @@ export const agentRoles = {
 };
 
 export const endings = defineEndings({
-  delivered: { kind: "succeeded" }, merged: { kind: "succeeded" },
+  delivered: { kind: "succeeded" },
   handedOff: { kind: "cancelled" }, abandoned: { kind: "cancelled" }, refused: { kind: "failed" },
 });
 
 const publishTimeoutMs = 120_000;
 // A sandboxed harness may be unable to start the project's checks at all. That is not a blocker: the checks are the workflow's to run.
 const cannotRun = "Run the checks you can. If your environment cannot run them, as when a sandbox refuses to start processes, say which and why in your summary and still return completed: the workflow runs every required check itself after you return. Return blocked only for something a person must decide or supply.";
-const decisions = ["more rounds", "hand off", "archive", "discard"] as const;
+const decisions = ["continue", "hand off", "discard"] as const;
 const decisionOf = (value: unknown) => {
   if (typeof value !== "string") return undefined;
   const normalized = value.trim().replace(/[.,;:!?…]+$/u, "").trim().toLowerCase();
   return decisions.find(decision => decision === normalized);
 };
-const confirmations = ["confirm discard", "go back"] as const;
-const stepDecisions = ["retry", "hand off", "discard"] as const;
-const deliveryDecisions = ["retry", "hand off"] as const;
-const mergeDecisions = ["hand off", "discard"] as const;
-
 export default function ticketTask(p: MachinePrimitives, input: unknown) {
-  const { machine, operation, agent, human, wait, final } = p;
+  const { machine, operation, agent, human, final } = p;
   type PlanningStage = "falsify" | "plan" | "planReview";
+  type Origin = "prepare" | PlanningStage | "test" | "red" | "implement" | "gate" | "review" | "judge" | "commit" | "rebase" | "deliver";
   const saved = p.data({
+    origin: "prepare" as Origin,
+    agentRoute: "",
+    previousEvidence: "",
+    recheckBase: false,
     pushed: false,
     branch: "",
     baseCommit: "",
@@ -56,7 +56,6 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     questions: 0,
     stoppedIn: "",
     discardConfirmed: false,
-    archived: null as { branch: string; commit: string } | null,
     reviewSummary: "",
     reviewSummaryFault: "",
     standingReview: null as string | null,
@@ -70,15 +69,6 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     reviewsFrom: 0,
     reviewNotes: [] as { text: string; where: string }[],
     prUrl: "",
-    mergeChecks: 0,
-    ghFailures: 0,
-    mergeReason: "",
-    mergeDecision: "",
-    failedStep: "setup" as "setup" | "commit" | "rebase" | "deliver",
-    retryable: false,
-    mergeFailedIn: "" as "" | "cleanUp" | "dropLocal",
-    localDeleted: false,
-    remoteDeleted: false,
     // Where prepare found the base published: the remote's URL and the pull request base branch there, its default branch by name when the base names none.
     // The push and the pull request go there, whatever the remote, the local refs, and gh's own configuration are by then.
     checked: "",
@@ -102,13 +92,12 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     passedStages: [] as string[],
     handoff: null as { page: string; path: string } | null,
     handoffFiles: null as { path: string; added: number | null; removed: number | null }[] | null,
-    stopKind: "stuck" as "stuck" | "step" | "merge",
     task: taskData(),
   });
   const { ticket, repository, prefix, worktree, evidenceRoot, resume, redGreen, assume, work, branch: named } = parseTicket(input, saved.task);
   let turn: ReturnType<typeof repositoryTurn> | undefined;
-  const lifetime = new AbortController();
   let turnHeld = false;
+  const lifetime = new AbortController();
   let waitingForTurn = false;
   let activeMeaning = "checking the ticket's required sections";
   const publishNow = (meaning: string) => taskNow(p.status, ticket.title, meaning, saved.handoff);
@@ -130,15 +119,11 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     turnHeld = true;
   };
   // Keep the turn only on transitions that remain in the delivery stretch.
-  const inTurn = (run: () => Event, keep: readonly string[], replayOnAcquire = false) => async () => {
+  const inTurn = (run: () => Event, keep: readonly string[]) => async () => {
     try {
-      const replay = replayOnAcquire && !turnHeld && !saved.pushed;
       await takeTurn();
       lifetime.signal.throwIfAborted();
-      // A sleeping delivery retry lost its turn. Recheck the base before any unpublished delivery.
-      // Once pushed, preserve that exact commit so a partial PR delivery remains idempotent.
-      const rebased = replay ? stopped("rebase", rebase)() : undefined;
-      const result = rebased && !["current", "rebased"].includes(rebased.type) ? rebased : run();
+      const result = run();
       if (!keep.includes(result.type)) releaseTurn();
       return result;
     } catch (error) { releaseTurn(); throw error; }
@@ -149,6 +134,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   // Answers remain in every later stage's prompt, including after a sleeping run continues.
   const prompt = (instruction: string, stage?: string) => [
     work.prompt(instruction, stage),
+    ...(saved.previousEvidence ? [`Earlier run's evidence: ${saved.previousEvidence}`] : []),
     ...(saved.answers.length ? ["Answers from the ticket owner:", ...saved.answers] : []),
   ].join("\n\n");
 
@@ -285,10 +271,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
 
   function setup(): Event {
     // Git keeps the record with the branch: it follows a rename and goes when the branch is deleted.
-    if (!attempt("git", ["config", "--local", `branch.${saved.branch}.ticket`, ticket.slug], repository.path, undefined, undefined, true).ok) return stepFailure("setup", true);
-    if (!repository.setup.every(command => work.check(command, "setup"))) return stepFailure("setup", true);
+    if (!attempt("git", ["config", "--local", `branch.${saved.branch}.ticket`, ticket.slug], repository.path, undefined, undefined, true).ok) return stepFailure("setup");
+    if (!repository.setup.every(command => work.check(command, "setup"))) return stepFailure("setup");
     if (pending() !== "") {
-      return stepFailure("setup", true, "A setup command changed tracked or unignored files in the worktree; they would be committed with the ticket. Ignore its outputs in the repository.");
+      return stepFailure("setup", "A setup command changed tracked or unignored files in the worktree; they would be committed with the ticket. Ignore its outputs in the repository.");
     }
     return { type: "prepared" };
   }
@@ -375,8 +361,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }
     }
     saved.baseCommit = tip;
-    // A clean resume plans afresh; only a candidate carries the answers its plan used.
-    if (pending() !== "") {
+    // Legacy clean worktrees start afresh. A saved origin also carries the assumptions its plan used.
+    if (pending() !== "" || existsSync(join(git(worktree, "rev-parse", "--absolute-git-dir"), "ticket-task-resume.json"))) {
       const directory = run("git", ["rev-parse", "--path-format=absolute", "--git-dir"], worktree);
       if (!directory.ok) return work.block(`Cannot resume: cannot locate ticket-task-assumptions.json in the worktree's Git directory: ${directory.detail}; nothing was changed.`);
       const file = join(directory.stdout, "ticket-task-assumptions.json");
@@ -584,29 +570,29 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
 
   function commit(): Event {
     if (git(worktree, "rev-parse", "HEAD") !== saved.baseCommit || run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${saved.branch}`) {
-      return stepFailure("commit", false, `An Agent committed or moved HEAD or ${saved.branch} itself; only this workflow commits. Nothing was delivered.`);
+      return stepFailure("commit", `An Agent committed or moved HEAD or ${saved.branch} itself; only this workflow commits. Nothing was delivered.`);
     }
-    if (!work.accept()) return stepFailure("commit", false);
+    if (!work.accept()) return stepFailure("commit");
     const index = git(worktree, "write-tree");
     // Unstaging afterwards also drops run evidence an Agent staged by force; an exclude pathspec fails outright on an ignored .machine-runs.
     git(worktree, "add", "--all");
     git(worktree, "reset", "--quiet", "--", ".machine-runs");
-    if (run("git", ["diff", "--cached", "--quiet"], worktree).ok) return stepFailure("commit", false, "Nothing to commit: the approved candidate does not differ from its base commit.");
+    if (run("git", ["diff", "--cached", "--quiet"], worktree).ok) return stepFailure("commit", "Nothing to commit: the approved candidate does not differ from its base commit.");
     const tree = git(worktree, "write-tree");
     if (!attempt("git", ["commit", "--quiet", "-m", ticket.title, "-m", `Ticket: ${ticket.id}`], worktree, undefined, undefined, true).ok) {
       // Restore the pre-commit index so accept() can compare the same verified candidate on retry.
       git(worktree, "read-tree", index);
-      return stepFailure("commit", true);
+      return stepFailure("commit");
     }
     // Commit hooks run, but only the approved tree under the ticket's own message may be delivered.
     const [origin, subject, ...body] = git(worktree, "log", "-1", "--no-show-signature", "--format=%T %P%n%s%n%b").split("\n");
     if (origin !== `${tree} ${saved.baseCommit}` || pending() !== "" || subject !== ticket.title || !body.some(line => flat(line) === flat(`Ticket: ${ticket.id}`))) {
-      return stepFailure("commit", false, `A commit hook or Git configuration changed the approved candidate or its commit message; ${saved.branch} holds that unapproved commit and nothing was delivered.`);
+      return stepFailure("commit", `A commit hook or Git configuration changed the approved candidate or its commit message; ${saved.branch} holds that unapproved commit and nothing was delivered.`);
     }
     const head = git(worktree, "rev-parse", "HEAD");
     // A hook can also detach HEAD or reset the branch; the ticket branch itself must hold the approved commit.
     if (run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${saved.branch}` || git(repository.path, "rev-parse", `refs/heads/${saved.branch}`) !== head) {
-      return stepFailure("commit", false, `A commit hook or Git configuration moved HEAD or ${saved.branch} away from the approved commit; nothing was delivered.`);
+      return stepFailure("commit", `A commit hook or Git configuration moved HEAD or ${saved.branch} away from the approved commit; nothing was delivered.`);
     }
     saved.commitHash = head;
     saved.firstApproved ??= { baseCommit: saved.baseCommit, commit: head };
@@ -614,7 +600,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: "committed" };
   }
 
-  /** Every new stop or return to an Agent leaves an uncommitted candidate on the ticket's own branch. */
+  /** Before publication, replay failures return an uncommitted candidate on the ticket's own branch. */
   function undo(onto: string): void {
     if (run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${saved.branch}`) {
       git(worktree, "symbolic-ref", "HEAD", `refs/heads/${saved.branch}`);
@@ -697,7 +683,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     };
     if (!run("git", ["merge-base", "--is-ancestor", original, tip], repository.path).ok) {
       undo(original);
-      return stepFailure("rebase", false, `Base ${original} was rewritten or moved back to ${tip}; the ticket must be delivered by hand.`);
+      return stepFailure("rebase", `Base ${original} was rewritten or moved back to ${tip}; the ticket must be delivered by hand.`);
     }
     if (repository.output === "pr") {
       remote ??= readRemoteTip();
@@ -843,7 +829,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const directory = work.open();
     if (repository.output === "patch") {
       const made = attempt("git", ["format-patch", "--output-directory", directory, `${saved.baseCommit}..HEAD`], worktree, undefined, undefined, true);
-      if (!made.ok) return stepFailure("deliver", true);
+      if (!made.ok) return stepFailure("deliver");
       saved.patches = made.stdout.split("\n").filter(Boolean);
     }
     if (repository.output === "pr") {
@@ -852,7 +838,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       if (!hosted) throw new Error("Prepared pull request remote no longer names a hosted repository");
       // The only ref ever pushed is this run's own branch at the approved commit, without force and whatever push.followTags says.
       // It goes to the URL prepare checked, read once: a remote reconfigured since then, as an Agent can do, is not asked again.
-      if (!attempt("git", ["push", "--no-follow-tags", saved.checked, `${saved.commitHash}:refs/heads/${saved.branch}`], worktree, publishTimeoutMs, undefined, true).ok) return stepFailure("deliver", true, undefined, "unreachable");
+      if (!attempt("git", ["push", "--no-follow-tags", saved.checked, `${saved.commitHash}:refs/heads/${saved.branch}`], worktree, publishTimeoutMs, undefined, true).ok) return stepFailure("deliver", undefined, "unreachable");
       saved.pushed = true;
       if (!saved.prUrl) {
         const body = join(directory, "pull-request.md");
@@ -869,20 +855,19 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         // The base is always named, and is the one prepare compared with the remote, not one read again from refs or configuration that may have changed since.
         const opened = attempt("gh", ["pr", "create", "--repo", hosted, ...(repository.draft ? ["--draft"] : []), "--base", saved.checkedBase,
           "--head", saved.branch, "--title", ticket.title, "--body-file", body], worktree, publishTimeoutMs, undefined, true);
-        if (!opened.ok) return stepFailure("deliver", true, undefined, "unreachable");
+        if (!opened.ok) return stepFailure("deliver", undefined, "unreachable");
         saved.prUrl = opened.stdout.split(/\s+/u).findLast(word => /^https?:\/\/\S+$/u.test(word)) ?? "";
-        if (!saved.prUrl) return stepFailure("deliver", true, `gh pr create printed no pull request URL; inspect ${saved.branch} on ${repository.remote}.`);
+        if (!saved.prUrl) return stepFailure("deliver", `gh pr create printed no pull request URL; inspect ${saved.branch} on ${repository.remote}.`);
       }
     }
-    if (!attempt("git", ["config", "--local", `branch.${saved.branch}.ticketDelivered`, saved.commitHash], repository.path, undefined, undefined, true).ok) return stepFailure("deliver", true);
+    if (!attempt("git", ["config", "--local", `branch.${saved.branch}.ticketDelivered`, saved.commitHash], repository.path, undefined, undefined, true).ok) return stepFailure("deliver");
     passed("deliver");
     // The next state's status lifecycle publishes this pair, as it does on continuation.
-    composeHandoff("Delivered the checked changes.", "", "stuck");
+    composeHandoff("Delivered the checked changes.", "");
     return { type: "delivered" };
   }
 
-  /** Where an archive keeps the candidate: this run's branch name with archive/ in place of ticket/. */
-  const archiveBranch = () => `archive/${saved.branch.slice("ticket/".length)}`;
+
   /** Presentation reads evidence only; a missing candidate or Git failure must not prevent the question. */
   function diffFiles() {
     try {
@@ -908,7 +893,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       return files;
     } catch { return undefined; }
   }
-  function runFacts(kind: "stuck" | "step" | "merge") {
+  function runFacts() {
     const { reason, ...rounds } = work.status();
     const review = saved.reviews.slice(saved.reviewsFrom).at(-1);
     // Keep the latest attempt per phase and name, in execution order. A red
@@ -927,13 +912,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       repository: { name: repository.name, path: repository.path }, ticket: { id: ticket.id, title: ticket.title },
       plan: saved.plan, planningReport: saved.planningReport, questions: saved.ownerQuestions, wouldAssume: saved.wouldAssume,
       moved: saved.moved,
-      candidate: { worktreeRemoved: saved.removed, pushed: saved.pushed, localBranchDeleted: saved.localDeleted,
-        remoteBranchDeleted: saved.remoteDeleted, baseCommit: saved.baseCommit, commit: saved.commitHash },
-      stage: kind === "stuck" ? saved.stoppedIn : kind === "step" ? saved.failedStep : saved.mergeFailedIn || "checkMerge",
-      reason: kind === "merge" ? saved.mergeReason : reason,
+      candidate: { worktreeRemoved: saved.removed, pushed: saved.pushed, baseCommit: saved.baseCommit, commit: saved.commitHash },
+      stage: saved.stoppedIn,
+      reason,
       rounds: { ...rounds, extraRound: saved.extraRound, extraReviewRounds: saved.extraReviewRounds },
       checks, lastChecksPassed: saved.task.lastChecksPassed,
       review: review ? { verdict: review.type, criteria: review.criteria, summary: review.summary, findings: review.findings, newSinceLastRound: review.newSinceLastRound } : null,
+      recentReports: saved.task.reports.slice(-6),
       reports: {
         sentBack: saved.task.reportFaults > 0 || saved.questionsReturned,
         reportRecovery: saved.task.reportRecovery, malformedReviews: saved.malformedReviews,
@@ -953,14 +938,14 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       .map(([key, item]) => `${key}: ${evidenceText(item)}`).join("\n");
   }
   function snapshotFiles() {
-    // Keep the last readable candidate before archive/discard or delivery removes it.
+    // Keep the last readable candidate before discard or delivery removes it.
     // After removal the saved base and commit can still refresh a delivered diff.
     if (saved.removed && saved.handoffFiles !== null) return saved.handoffFiles;
     const files = diffFiles();
     if (files !== undefined) saved.handoffFiles = files;
     return saved.handoffFiles;
   }
-  function evidenceBlocks(facts: ReturnType<typeof runFacts>, kind: "stuck" | "step" | "merge") {
+  function evidenceBlocks(facts: ReturnType<typeof runFacts>) {
     const files = facts.files;
     const diffStat = files === undefined ? "Diff unavailable."
       : `${files.length} files changed, ${files.reduce((sum, file) => sum + (file.added ?? 0), 0)} insertions, ${files.reduce((sum, file) => sum + (file.removed ?? 0), 0)} deletions; binary counts are shown as binary.`;
@@ -968,7 +953,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       { title: "Rounds", text: evidenceText(facts.rounds) },
       ...(saved.ownerQuestions ? [{ title: "Open questions and options", text: questionLines() + wouldAssumeLines() }] : []),
       ...(saved.plan ? [{ title: "Plan", text: saved.plan }] : []),
-      ...(kind === "stuck" && ["falsify", "plan", "planReview"].includes(saved.repairing)
+      ...(["falsify", "plan", "planReview"].includes(saved.repairing)
         ? [{ title: "Planning report and objection", text: evidenceText(saved.planningReport) }] : []),
       { title: "Changed files", text: diffStat, ...(files === undefined ? {} : { table: {
         headings: ["File", "Added", "Removed"], rows: files.map(file => [file.path, String(file.added ?? "binary"), String(file.removed ?? "binary")]),
@@ -985,13 +970,14 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }] : []),
       ...(saved.moved ? [{ title: "Replay conflicts and saved candidate", text: evidenceText(saved.moved) }] : []),
       { title: "Candidate", text: evidenceText(facts.candidate) },
+      { title: "Agent summaries", text: evidenceText(facts.recentReports) },
       { title: "Reports and evidence", text: evidenceText(facts.reports) + `\nEvidence: ${facts.evidenceDirectory}\n${facts.prUrl ? `Pull request: ${facts.prUrl}\n` : ""}${facts.questionFile ?? ""}` },
     ];
     return { blocks, diffStat };
   }
 
-  function composeHandoff(outcome: string, needs: string, kind = saved.stopKind, facts = runFacts(kind)) {
-    const { blocks } = evidenceBlocks(facts, kind);
+  function composeHandoff(outcome: string, needs: string, facts = runFacts()) {
+    const { blocks } = evidenceBlocks(facts);
     const review = facts.review;
     const reviewBlocks: EvidenceBlock[] = review ? [
       { title: `Verdict: ${review.verdict}`, text: evidenceText(review.summary) },
@@ -1024,39 +1010,32 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     });
     saved.handoff = writeHandoff(work.open(), page);
   }
-  function publishHandoff(outcome: string, needs: string, kind = saved.stopKind, facts = runFacts(kind)) {
-    composeHandoff(outcome, needs, kind, facts);
+  function publishHandoff(outcome: string, needs: string, facts = runFacts()) {
+    composeHandoff(outcome, needs, facts);
     publishNow(activeMeaning);
   }
-  function questionEvidence(kind: "stuck" | "step" | "merge", choices: readonly string[], confirm: boolean) {
-    saved.stopKind = kind;
-    const facts = runFacts(kind);
-    const options = kind === "stuck" ? confirm ? discardOptions() : stuckOptions()
-      : kind === "step" ? stepOptions(confirm) : mergeOptions(confirm);
+  function questionEvidence() {
+    const choices = decisions;
+    const facts = runFacts();
+    const options = stuckOptions();
     const short = (value: string) => excerpt(value.replace(/\s+/gu, " ").trim(), 160).replace(/\s+/gu, " ");
     const effects = Object.fromEntries(choices.map(name => {
       // Long branch/worktree names belong in the breadcrumb, not in the 160-character effect.
-      const does = name === "archive" ? "commit and save the candidate on its archive branch, then remove the worktree and ticket branch; ignored files are not kept."
-        : name === "confirm discard" ? kind === "merge" ? saved.remoteDeleted
-          ? "delete only the local branch; the remote branch is already deleted; leave the ticket open."
-          : "delete only the local branch; keep the pushed branch and leave the ticket open."
-          : "remove the worktree and delete the ticket branch without saving its committed or uncommitted work."
-        : options.find(option => option.name === name)!.does;
+      const does = options.find(option => option.name === name)!.does;
       return [name, short(does)];
     }));
-    const recommended = confirm ? "go back" : "hand off";
-    const headline = short(`${ticket.id}: ${confirm ? "Confirm discarding work" : `Decision needed at ${facts.stage}`}`);
-    const reason = confirm ? "Keep the candidate until you choose how to proceed."
-      : "Keep the work available while a person or another workflow resolves this stop.";
+    const recommended = "hand off";
+    const headline = short(`${ticket.id}: Decision needed at ${facts.stage}`);
+    const reason = "Keep the work available while a person or another workflow resolves this stop.";
     const breadcrumb = `${repository.name}: ${repository.path}\nTicket: ${ticket.id} — ${ticket.title}\nBranch: ${saved.branch}\nWorktree: ${worktree}`;
     const stopped = `Stopped in ${facts.stage}: ${facts.reason}`;
-    const { blocks, diffStat } = evidenceBlocks(facts, kind);
+    const { blocks, diffStat } = evidenceBlocks(facts);
     const page = evidencePage({ headline, stopped, breadcrumb, blocks, effects, recommended });
     const selected = { ...facts, diffStat, effects, recommended };
     writeStuckEvidence(work.open(), `# ${headline}\n\n${breadcrumb}\n\n${stopped}\n\n${evidenceText(selected)}`, page);
-    publishHandoff(`Stopped in ${facts.stage}; a decision is needed.`, facts.reason, kind, facts);
+    publishHandoff(`Stopped in ${facts.stage}; a decision is needed.`, facts.reason, facts);
     return { presentation: { headline, page, effects, recommended, reason,
-      discards: choices.filter(choice => choice === "discard" || choice === "confirm discard"),
+      discards: choices.filter(choice => choice === "discard"),
     }, facts: evidenceFacts(selected) };
   }
   const standing = () => {
@@ -1070,31 +1049,19 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     ].join("\n");
   };
   const locations = () => [`Worktree: ${worktree}`, `Branch: ${saved.branch}`, `Evidence: ${work.open()}`,
+    ...(saved.previousEvidence ? [`Earlier run's evidence: ${saved.previousEvidence}`] : []),
     ...(saved.moved ? [`Saved candidate: ${saved.moved.ref} (${saved.moved.patch})`] : []),
     ...(saved.moved?.conflicts.length ? [`Unsettled conflicts: ${saved.moved.conflicts.map(path => JSON.stringify(path)).join(", ")}`] : [])];
   const stuckOptions = () => [
-    { name: "more rounds", does: saved.repairing === "falsify" || saved.repairing === "plan" || saved.repairing === "planReview"
-      ? `restart the repair budget and return to ${saved.repairing} with the standing feedback.`
-      : `restart the repair budget and send the standing findings back to the ${saved.repairing === "test" ? "tester" : "implementer"}.` },
-    { name: "hand off", does: "stop here and keep the worktree and branch exactly as they are, with nothing committed, for another workflow or a person.", recommended: true },
-    { name: "archive", does: `commit the candidate as delivery would have and keep that commit as the branch ${archiveBranch()}, then remove the worktree and delete ${saved.branch}. Ignored files are not kept.` },
-    { name: "discard", does: "remove the worktree and delete the branch without saving the candidate; asks for confirmation first." },
-    { name: "any other reply", does: "answer the question and return to the stage that stopped with fresh budgets and this answer as standing feedback." },
+    { name: "continue", does: `return to ${destination()} with the owner's answer and fresh budgets.` },
+    { name: "hand off", does: "stop here and keep the worktree and branch exactly as they are for another workflow or a person.", recommended: true },
+    { name: "discard", does: "remove the worktree and delete the branch without saving the candidate; Drip confirms this choice." },
+    { name: "any other reply", does: "answer the question and continue with this answer as standing feedback." },
   ];
   const stuckPrompt = () => brief({
     decision: asking().first, standing: standing(),
     needs: asking().rest || undefined, evidence: locations(),
     options: stuckOptions(),
-  });
-  const discardOptions = () => [
-    { name: "confirm discard", does: `remove the worktree ${worktree} and delete the branch ${saved.branch} in ${repository.path}.` },
-    { name: "go back", does: "return to the decision with the candidate kept." },
-  ];
-  const discardPrompt = () => brief({
-    decision: `Discard the candidate for ticket ${ticket.id}?`,
-    standing: `${standing()}\nThe candidate will not be saved: no archive branch is made, and its uncommitted and committed work on that branch is lost.`,
-    needs: fullAsking(), evidence: locations(),
-    options: discardOptions(),
   });
   const questionCount = () => `${saved.ownerQuestions!.length} open question${saved.ownerQuestions!.length === 1 ? "" : "s"}`;
   const questionText = (question: { text: string; where: string }, cap = Infinity) => {
@@ -1109,7 +1076,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     ? `\nHad these been the only questions, the run would have assumed:\n${saved.wouldAssume.map(question => `- ${capped(question.text, cap)} → ${capped(question.recommended, cap)}`).join("\n")}` : "";
   function asking(reason = work.status().reason): { first: string; rest: string } {
     if (saved.ownerQuestions) return {
-      first: `Answer ${questionCount()} ${saved.stoppedIn === "falsifyResult" ? "before any code is written" : "the reviewer raised"}.`,
+      first: `Answer ${questionCount()} ${saved.stoppedIn === "falsify" ? "before any code is written" : "the reviewer raised"}.`,
       rest: `${questionLines(600)}${wouldAssumeLines(600)}`,
     };
     const why = flat(reason);
@@ -1128,10 +1095,6 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const split = opening(why);
     return { first: split.first, rest: capped(split.rest, 600) };
   }
-  function fullAsking(): string {
-    const { first, rest } = asking();
-    return first.endsWith("…") && rest.startsWith(first.slice(0, -1)) ? rest : [first, rest].filter(Boolean).join("\n");
-  }
   function summaryReason(reason: string, split = opening(flat(reason))): string {
     return [split.first, capped(split.rest, 600)].filter(Boolean).map(part => part.replace(/[^.!?…]$/u, "$&.")).join(" ");
   }
@@ -1143,47 +1106,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return result;
   };
 
-  /** Saves what delivery would have committed as a commit on a branch of its own, which outlives the worktree and the ticket branch. */
-  function archive(): Event {
-    snapshotFiles();
-    const name = archiveBranch();
-    const failure = "The candidate could not be archived, so nothing was removed";
-    if (run("git", ["show-ref", "--verify", "--quiet", `refs/heads/${name}`], repository.path).ok) {
-      throw new Error(`${failure}: branch ${name} already exists in ${repository.path}, and nothing was staged.`);
-    }
-    // Whether the candidate still matches its checks is settled here; the archive commit is this workflow's own and is not drift.
-    work.retire();
-    // Staged as commit stages it, so ignored files stay out here as they would have there.
-    if (!attempt("git", ["add", "--all"], worktree, undefined, failure).ok || !attempt("git", ["reset", "--quiet", "--", ".machine-runs"], worktree, undefined, failure).ok) throw new Error(work.status().reason);
-    const head = () => git(worktree, "rev-parse", "HEAD");
-    const parent = head();
-    if (run("git", ["diff", "--cached", "--quiet"], worktree).ok) {
-      // Removal without anything saved belongs to a confirmed discard alone. Commits an Agent made on the branch are a candidate, archived as they are.
-      if (parent === saved.baseCommit) throw new Error(`${failure}: the candidate does not differ from its base commit ${saved.baseCommit}, so there is nothing to archive; discard removes it.`);
-    } else {
-      const tree = git(worktree, "write-tree"); const title = `Archive: ${ticket.title}`;
-      if (!attempt("git", ["commit", "--quiet", "--no-verify", "-m", title, "-m", `Ticket: ${ticket.id}`], worktree, undefined, failure).ok) throw new Error(work.status().reason);
-      // --no-verify skips only the hooks that can refuse a commit. One that runs after it can reset HEAD and leave a clean worktree without the candidate.
-      const [origin, subject, ...body] = git(worktree, "log", "-1", "--no-show-signature", "--format=%T %P%n%s%n%b").split("\n");
-      if (origin !== `${tree} ${parent}`) {
-        throw new Error(`${failure}: a commit hook or Git configuration moved HEAD off the archive commit or changed what it holds, so ${name} would not hold the candidate; HEAD is at ${head()}.`);
-      }
-      // One that prepares the message still runs too, and the archive is found again by its subject and its ticket.
-      if (subject !== title || !body.some(line => flat(line) === flat(`Ticket: ${ticket.id}`))) {
-        throw new Error(`${failure}: a commit hook or Git configuration changed the archive commit's message, so ${name} would not name the ticket; HEAD is at ${head()}, which holds the candidate.`);
-      }
-    }
-    // Whatever the commit left behind would be deleted with the worktree.
-    if (pending() !== "") throw new Error(`${failure}: the worktree is not clean after the archive commit, so ${name} would not hold all of the candidate.`);
-    const commit = head();
-    if (!attempt("git", ["branch", name, commit], worktree, undefined, failure).ok) throw new Error(work.status().reason);
-    saved.archived = { branch: name, commit };
-    return { type: "archived" };
-  }
-
-  /** Removes this run's own worktree and branch, and nothing else, once the candidate is archived or a Human confirmed losing it. */
+  /** Removes this run's own worktree and branch, and nothing else, after the person chooses discard. */
   function remove(): Event {
-    if (!saved.archived && !saved.discardConfirmed) throw new Error("The worktree and branch are removed only after an archive or a confirmed discard");
+    if (!saved.discardConfirmed) throw new Error("The worktree and branch are removed only after discard");
     snapshotFiles();
     work.retire();
     if (!attempt("git", ["worktree", "remove", "--force", worktree], repository.path).ok) throw new Error(work.status().reason);
@@ -1214,7 +1139,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ...(saved.rebasedFrom ? { rebasedFrom: saved.rebasedFrom } : {}),
       ...(finished && saved.redelivered ? { redelivered: true } : {}),
       ...(saved.assumptions.length ? { assumptions: saved.assumptions } : {}),
-      ...(saved.prUrl ? { prUrl: saved.prUrl } : {}), ...(saved.patches.length ? { patches: saved.patches } : {}), ...(saved.archived ? { archive: saved.archived } : {}),
+      ...(saved.prUrl ? { prUrl: saved.prUrl } : {}), ...(saved.patches.length ? { patches: saved.patches } : {}),
       worktree, ...(saved.adopted ? { resumed: true } : {}), worktreeCreated: saved.created, worktreeRemoved: saved.removed, reviewNotes: saved.reviewNotes,
     }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     const reasonBrief = flat(reason).replace(/^(.{600}).+$/u, "$1…").replace(/[^.!?…]$/u, "$&.");
@@ -1223,8 +1148,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ...(finished && saved.taken ? [saved.redelivered ? "The base has not moved, so the same commit was delivered again unchanged."
         : `The delivered commit ${saved.taken} was replayed onto the new base ${saved.baseCommit}.`] : []),
       ...(saved.decision ? [`Decision: ${saved.decision}.`] : []),
-      ...(saved.archived ? [`Candidate archived on ${saved.archived.branch} at ${saved.archived.commit}.`] : []),
-      ...(outcome === "abandoned" ? [`Worktree and ${saved.branch} removed${saved.archived ? "" : " without saving the candidate"}.`] : []),
+      ...(outcome === "abandoned" ? [`Worktree and ${saved.branch} removed without saving the candidate.`] : []),
       ...(outcome === "handed-off" ? [`Branch: ${saved.branch}.`] : []),
       ...((saved.created || saved.adopted) && !saved.removed ? [`Worktree kept at ${worktree}${finished ? `; it could not be removed: inspect ${directory}/git-worktree.log.` : "."}`] : []),
       `Evidence: ${directory}`,
@@ -1233,110 +1157,6 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: outcome === "handed-off" ? "handedOff" : outcome === "delivered" && !saved.removed ? "kept" : outcome };
   }
 
-  function checkMerge(): Event {
-    const args = ["pr", "view", saved.prUrl, "--json", "state", "--jq", ".state"];
-    const checked = run("gh", args, repository.path, publishTimeoutMs);
-    saved.mergeChecks++;
-    if (checked.ok && ["OPEN", "MERGED", "CLOSED"].includes(checked.stdout)) {
-      saved.ghFailures = 0;
-      if (checked.stdout === "MERGED") return { type: "merged" };
-      if (checked.stdout === "CLOSED") {
-        saved.mergeReason = `Pull request ${saved.prUrl} was closed without merging.`;
-        return { type: "decide" };
-      }
-      return { type: "waiting" };
-    }
-    const detail = checked.ok ? `Unexpected gh state: ${JSON.stringify(checked.stdout)}` : checked.detail || checked.stdout || "gh exited unsuccessfully without a message";
-    const log = join(work.open(), `gh-pr-view-${saved.mergeChecks}.log`);
-    // A state continued from its checkpoint runs again, so this log may already exist.
-    writeFileSync(log, `gh ${args.join(" ")}\n${checked.stdout}\n${detail}\n`, { mode: 0o600 });
-    if (++saved.ghFailures < 3) return { type: "waiting" };
-    saved.mergeReason = `gh failed 3 times in a row: ${detail}; inspect ${log}`;
-    return { type: "decide" };
-  }
-
-  function dropLocal(): Event {
-    // A run continued after a crash may find the branch already deleted; only Git's clean "no such ref" skips the delete.
-    const shown = run("git", ["show-ref", "--verify", "--quiet", `refs/heads/${saved.branch}`], repository.path);
-    const missing = !shown.ok && shown.status === 1 && !shown.detail;
-    if (!shown.ok && !missing) return mergeFailure(`git show-ref could not tell whether ${saved.branch} exists: ${shown.detail || `exit ${shown.status}`}`);
-    if (!missing && !attempt("git", ["branch", "-D", saved.branch], repository.path, undefined, undefined, true).ok) return { type: "failed" };
-    saved.localDeleted = true;
-    return { type: "removed" };
-  }
-
-  /** Only a MERGED answer permits deleting the pushed branch, at the URL used for delivery. */
-  function cleanUp(): Event {
-    const ref = `refs/heads/${saved.branch}`;
-    const listArgs = ["ls-remote", "--heads", saved.checked, ref];
-    const listed = attempt("git", listArgs, repository.path, publishTimeoutMs, undefined, true);
-    if (!listed.ok) return { type: "failed" };
-    if (listed.stdout) {
-      const args = ["push", "--no-follow-tags", saved.checked, "--delete", ref];
-      const deleted = run("git", args, repository.path, publishTimeoutMs);
-      if (!deleted.ok) {
-        // The host can delete the branch between our query and push. Only a successful empty query excuses the failed push.
-        const remaining = attempt("git", listArgs, repository.path, publishTimeoutMs, undefined, true);
-        const log = join(work.open(), "git-push.log");
-        writeFileSync(log, `git ${args.join(" ")}\n${deleted.stdout}\n${deleted.detail}\n`, { mode: 0o600 });
-        if (!remaining.ok) return { type: "failed" };
-        if (remaining.stdout) return mergeFailure(`git push failed deleting ${saved.branch}; inspect ${log}`);
-      }
-    }
-    saved.remoteDeleted = true;
-    if (dropLocal().type === "failed") return { type: "failed" };
-    return settle("merged");
-  }
-
-  // Delivery and result receipts were already written before waiting; this receipt records the later ending, and a continued run may write it again.
-  function settle(outcome: "merged" | "handedOff" | "abandoned"): Event {
-    const directory = work.open();
-    if (outcome === "merged") passed("merge");
-    const reason = saved.mergeReason;
-    const remoteKept = saved.remoteDeleted ? `The pushed branch was already deleted on ${repository.remote}.` : `The pushed branch is kept on ${repository.remote}.`;
-    writeFileSync(join(directory, "merge.json"), JSON.stringify({
-      schemaVersion: 1, outcome, prUrl: saved.prUrl, branch: saved.branch, checks: saved.mergeChecks,
-      ghFailures: saved.ghFailures, localDeleted: saved.localDeleted, remoteDeleted: saved.remoteDeleted,
-      ...(reason ? { reason } : {}), ...(saved.mergeDecision ? { decision: saved.mergeDecision } : {}),
-    }, null, 2) + "\n", { mode: 0o600 });
-    const ending = {
-      merged: `Merged ${saved.prUrl}; deleted ${saved.branch} locally and on ${repository.remote}.`,
-      handedOff: `${reason ? `Handed off: ${summaryReason(reason)}` : "Handed off."} Pull request: ${saved.prUrl}. Branch: ${saved.branch}, ${saved.remoteDeleted ? `kept locally. ${remoteKept}` : `kept locally and on ${repository.remote}.`}`,
-      abandoned: `${reason ? `Abandoned: ${summaryReason(reason)}` : "Abandoned."} Pull request: ${saved.prUrl}. Branch: ${saved.branch}, deleted locally${saved.remoteDeleted ? `. ${remoteKept}` : `; the pushed branch is kept on ${repository.remote}.`}`,
-    }[outcome];
-    saved.held = { action: outcome === "merged" ? "complete" : "hold", summary: `${ending} Evidence: ${directory}` };
-    publishHandoff({ merged: "Merged the pull request and removed the ticket branches.", handedOff: "Handed off the delivered ticket.", abandoned: "Abandoned the delivered ticket." }[outcome], outcome === "merged" ? "" : reason, "merge");
-    return { type: outcome };
-  }
-
-  const mergeOptions = (confirm = false) => confirm ? [
-    { name: "confirm discard", does: `delete only the local branch ${saved.branch} in ${repository.path}.` },
-    { name: "go back", does: "return to the decision with the branch kept." },
-  ] : [
-    ...(saved.mergeFailedIn ? [{ name: "retry", does: `rerun ${saved.mergeFailedIn} only.` }] : []),
-    { name: "hand off", does: "keep the branch and leave the ticket open for someone else.", recommended: true },
-    { name: "discard", does: "delete only the local branch after confirmation and leave the ticket open." },
-  ];
-  const mergePrompt = (confirm = false) => brief({
-    decision: confirm ? `Discard the local branch for ticket ${ticket.id}?` : `Decide what happens to ticket ${ticket.id}`,
-    standing: `${saved.mergeReason}\nPull request: ${saved.prUrl}\nBranch: ${saved.branch}\nThe worktree has already been removed. ${saved.remoteDeleted ? "The pushed branch has already been deleted." : "The pushed branch will be kept."}`,
-    evidence: [`Evidence: ${work.open()}`],
-    options: mergeOptions(confirm),
-  });
-
-  const record = (stage: string) => ({ event }: { event: Event }) => { saved.stoppedIn = stage; work.receive(event); };
-  // Valid editing reports retain the existing route; only refused summaries need a recovery Operation.
-  const hasSummary = (stage: string) => ({ event }: { event: Event }) => {
-    try { work.summary(stage, event); return true; }
-    catch { return false; }
-  };
-  const recordValid = (stage: string) => ({ event }: { event: Event }) => {
-    saved.stoppedIn = stage;
-    work.receive(event);
-    work.reported(stage);
-    if (event.type === "completed") passed(stage);
-  };
-  const rememberPlanning = ({ event }: { event: Event }) => { saved.planningReport = event; };
   function reportFault(stage: string, result: { type: "sendBack" | "invalid"; fault: string; path: string }): Event {
     if (result.type === "sendBack") {
       taskStatus(p.status, { note: `The ${stage} report was sent back with its validation fault.` }, saved.handoff);
@@ -1453,10 +1273,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }
     }
   };
-  function reviewResult(): Event {
+  function validateReview(event: Event): Event {
+    recordReview({ event });
     // Keep the helper's read-only guard, but judge the report here instead of trusting its event type.
-    if (work.unchanged().type === "changed") return { type: "blocked" };
-    const event = saved.reviews.at(-1)!;
+    if (work.unchanged().type === "changed") return stopAt("review");
     const result = work.sendBack("review", event, () => {
       if (saved.reviewSummaryFault) throw new Error(saved.reviewSummaryFault);
       const fault = event.type === "blocked" ? undefined : reviewField(event, ticket.sections.acceptance);
@@ -1466,20 +1286,25 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (result.type !== "valid") saved.malformedReviews.push(saved.reviews.length - 1);
     if (result.type === "sendBack") return reportFault("review", result);
     if (result.type === "valid") work.resetReport("review");
-    if (result.type === "valid" && event.type === "blocked") return work.block(saved.reviewSummary);
+    if (result.type === "invalid") { saved.standingReview = reviewFeedback(event); reportFault("review", result); return stopAt("review"); }
+    return { type: "valid" };
+  }
+  function reviewFeedback(event: Event): string {
     // Even a malformed report can contain useful findings. Keep them apart from the Machine's stop reason.
-    const feedback = [
+    return [
       saved.reviewSummary,
       ...(Array.isArray(event.criteria) ? event.criteria.flatMap((criterion, index) => criterion?.met === false && ticket.sections.acceptance[index]
         ? [`Unmet criterion: ${ticket.sections.acceptance[index]}${typeof criterion.evidence === "string" ? ` (${criterion.evidence})` : ""}`] : []) : []),
       ...(Array.isArray(event.findings) ? event.findings.flatMap(finding => (finding?.severity === "blocker" || finding?.severity === "discussion") && typeof finding.text === "string"
         ? [`${finding.severity === "blocker" ? "Blocker" : "Discussion"}: ${finding.text}${typeof finding.where === "string" ? ` (${finding.where})` : ""}`] : []) : []),
     ].join("\n");
+  }
+  function reviewResult(): Event {
+    if (work.unchanged().type === "changed") return { type: "blocked" };
+    const event = saved.reviews.at(-1)!;
+    if (event.type === "blocked") return work.block(saved.reviewSummary);
+    const feedback = reviewFeedback(event);
     const stop = (reason: string) => { saved.standingReview = feedback; return work.block(reason); };
-    if (result.type === "invalid") {
-      saved.standingReview = feedback;
-      return reportFault("review", result);
-    }
     const report = event as ReviewReport;
     const unmet = report.criteria.flatMap((criterion, index) => criterion.met ? [] : [ticket.sections.acceptance[index]!]);
     const blockers = report.findings.filter(finding => finding.severity === "blocker");
@@ -1540,65 +1365,165 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }
     return work.reviewRound();
   }
-  const chose = (value: string) => ({ event }: { event: Event }) => event.value === value;
-  const choseDecision = (value: typeof decisions[number]) => ({ event }: { event: Event }) => decisionOf(event.value) === value;
-  const decide = ({ event }: { event: Event }) => { saved.decision = decisionOf(work.choice("decide", event))!; };
-  const continueWork = ({ event }: { event: Event }) => {
-    const reply = work.choice("decide", event);
-    saved.decision = decisionOf(reply) ?? reply;
-    if (saved.decision !== "more rounds") {
-      saved.answers.push(saved.decision);
-    }
-    work.renew();
-    // Falsify deliberately retains its allowance even across an owner's continuation.
-    for (const stage of ["plan", "planReview", "test", "change", "review"]) work.resetReport(stage);
-    if (saved.extraRound === "running") saved.extraRound = "used";
-    saved.ownerQuestions = null;
-    saved.wouldAssume = [];
-    if (saved.standingReview !== null) work.block(saved.standingReview);
-    saved.standingReview = null;
-  };
-  /** Expected failures retain the error and select only recovery choices that can act. */
-  function stepFailure(step: typeof saved.failedStep, retryable: boolean, reason?: string, type = "failed"): Event {
-    saved.failedStep = step; saved.retryable = retryable;
+  /** Git failures retain their evidence; the containing Operation chooses the origin. */
+  function stepFailure(step: "setup" | "commit" | "rebase" | "deliver", reason?: string, type = "failed"): Event {
     if (reason !== undefined) work.block(reason);
     return { type: step === "rebase" ? "handBack" : type };
   }
-  const stepChoices = () => saved.failedStep === "deliver" ? deliveryDecisions : saved.retryable ? stepDecisions : mergeDecisions;
-  const stepOptions = (confirm = false) => confirm ? [
-    { name: "confirm discard", does: `remove the worktree ${worktree} and delete the branch ${saved.branch}.` },
-    { name: "go back", does: "return to the decision with the candidate kept." },
-  ] : stepChoices().map(name => ({ name, does: {
-    retry: `rerun ${saved.failedStep} only after its error is resolved.`,
-    "hand off": "keep the worktree and branch for another workflow or a person.",
-    discard: "remove the worktree and branch without saving the candidate, after confirmation.",
-  }[name] }));
-  const stepPrompt = (confirm = false) => brief({
-    decision: confirm ? `Discard the candidate for ticket ${ticket.id}?` : `Ticket ${ticket.id}: ${saved.failedStep} failed`,
-    standing: `${saved.failedStep}: ${work.status().reason}${confirm ? "\nThe candidate will not be saved: its uncommitted and committed work will be lost." : ""}`,
-    evidence: locations(),
-    options: stepOptions(confirm),
-  });
-  function stepFailed(): Event {
-    releaseTurn();
-    writeFileSync(join(work.open(), `question-${++saved.questions}.txt`), stepPrompt() + "\n", { mode: 0o600 });
-    return { type: saved.failedStep === "deliver" ? "delivery" : saved.retryable ? "retryable" : "keep" };
+
+  const resumeFile = () => join(git(worktree, "rev-parse", "--absolute-git-dir"), "ticket-task-resume.json");
+  const destination = (answer = ""): Origin => {
+    switch (saved.origin) {
+      case "falsify": return /scope\s+(?:has\s+)?chang(?:e|ed|es|ing)/iu.test(answer) ? "falsify" : saved.ownerQuestions ? "plan" : "falsify";
+      case "planReview": return "plan";
+      case "red": case "test": return "test";
+      case "gate": case "judge": case "review": case "implement": return "implement";
+      case "commit": return "gate";
+      case "deliver": return "rebase";
+      default: return saved.origin;
+    }
+  };
+  function rememberStop(origin = saved.origin === "falsify" && saved.ownerQuestions ? "falsify" : destination()) {
+    if (!(saved.created || saved.adopted) || saved.removed || !existsSync(worktree)) return;
+    // A destination is only valid after the owner answers. A separate run must
+    // recover unanswered questions, not mistake a hand-off for that answer.
+    const pendingFalsify = saved.origin === "falsify" && saved.ownerQuestions ? [
+      ...saved.ownerQuestions.map(({ text, options, recommended, why }) => ({ text, options, recommended, why, assumable: false })),
+      ...saved.wouldAssume,
+    ] : undefined;
+    writeFileSync(resumeFile(), JSON.stringify({ ticket: ticket.id, branch: saved.branch, origin,
+      pendingFalsify, answers: saved.answers, plan: saved.plan, reason: work.status().reason, evidence: work.open() }) + "\n", { mode: 0o600 });
   }
-  const stepDecision = (stage: string, choices: readonly string[]) => ({ event }: { event: Event }) => {
-    const choice = work.choice(stage, event, choices);
-    if (choice === "hand off" || choice === "discard") saved.decision = choice;
-  };
-  function mergeFailure(reason: string): Event { work.block(reason); return { type: "failed" }; }
-  const mergeStep = (step: "cleanUp" | "dropLocal", run: () => Event) => () => {
-    const result = run();
-    if (result.type === "failed") saved.mergeFailedIn = step;
-    return result;
-  };
-  const mergeRetryDecision = ({ event }: { event: Event }) => {
-    const choice = work.choice("mergeRetryDecide", event, stepDecisions);
-    if (choice !== "retry") saved.mergeDecision = choice;
-  };
-  const mergeDecide = ({ event }: { event: Event }) => { saved.mergeDecision = work.choice("mergeDecide", event, mergeDecisions); };
+  function stopAt(origin: Origin): Event {
+    releaseTurn();
+    saved.origin = origin; saved.stoppedIn = origin;
+    writeFileSync(join(work.open(), `question-${++saved.questions}.txt`), stuckPrompt() + "\n", { flag: "wx", mode: 0o600 });
+    rememberStop();
+    return { type: "stuck" };
+  }
+  function continueWork({ event }: { event: Event }) {
+    const reply = work.choice("stuck", event);
+    const next = destination(reply);
+    saved.decision = decisionOf(reply) ?? reply;
+    saved.answers.push(reply);
+    if (saved.origin === "falsify" && saved.ownerQuestions && destination(reply) === "plan") {
+      saved.assumptions = saved.ownerQuestions.map(question => ({ question: question.text, answer: reply,
+        options: [...new Set([...(question.options ?? []), reply])], why: "The ticket owner supplied this answer." }));
+      saved.assumptionsJson = JSON.stringify(saved.assumptions, null, 2) + "\n";
+      writeFileSync(join(git(worktree, "rev-parse", "--absolute-git-dir"), "ticket-task-assumptions.json"), saved.assumptionsJson, { mode: 0o600 });
+      writeFileSync(join(work.open(), "assumptions.json"), saved.assumptionsJson, { mode: 0o600 });
+    }
+    work.renew();
+    for (const stage of ["plan", "planReview", "test", "change", "review"]) work.resetReport(stage);
+    if (saved.extraRound === "running") saved.extraRound = "used";
+    saved.ownerQuestions = null; saved.wouldAssume = [];
+    if (saved.standingReview !== null) work.block(saved.standingReview);
+    saved.standingReview = null;
+    if (["rebase", "deliver"].includes(saved.origin)) saved.recheckBase = true;
+    rememberStop(next);
+  }
+  function endDecision({ event }: { event: Event }) {
+    saved.decision = decisionOf(work.choice("stuck", event))!;
+    if (saved.decision === "discard") { saved.discardConfirmed = true; remove(); conclude("abandoned"); }
+    else { rememberStop(); conclude("handed-off"); }
+  }
+
+  /** Validation and its single send-back belong to the Agent state, before it can leave. */
+  function checkedAgent(instruction: () => string, outcomes: readonly string[], using: string,
+    validate: (event: Event) => Event, routes: Record<string, string>) {
+    const on = Object.fromEntries(outcomes.map(outcome => [outcome, { actions: ({ event }: { event: Event }) => {
+      saved.agentRoute = validate(event).type;
+    } }]));
+    const state = agent(instruction, on, { using, cwd: worktree });
+    return { ...state, always: Object.entries(routes).map(([outcome, target]) => ({
+      guard: () => saved.agentRoute === outcome, target, reenter: true,
+      actions: () => { saved.agentRoute = ""; },
+    })) };
+  }
+  function planning(stage: PlanningStage, event: Event, validate: () => Event): Event {
+    saved.planningReport = event;
+    const result = stopped(stage, validate)();
+    return result.type === "blocked" ? stopAt(stage) : result;
+  }
+  function editing(stage: "test" | "change", event: Event): Event {
+    work.receive(event);
+    const result = work.reported(stage, result => reportFault(stage, result));
+    if (result.type === "completed") passed(stage);
+    return result.type === "blocked" ? stopAt(stage === "change" ? "implement" : "test") : result;
+  }
+  function prepareRun(): Event {
+    if (shape().type === "blocked") return conclude("refused");
+    const result = saved.created || saved.adopted ? { type: "created" } : prepare();
+    if (result.type === "blocked") return conclude("refused");
+    if (result.type === "redeliver") return { type: "rebase" };
+    if (result.type === "stuck") return stopAt("prepare");
+    if (result.type === "created" && setup().type !== "prepared") return stopAt("prepare");
+    if (resume && saved.adopted && existsSync(resumeFile())) {
+      const record = JSON.parse(readFileSync(resumeFile(), "utf8"));
+      const origins: Origin[] = ["prepare", "falsify", "plan", "planReview", "test", "implement", "gate", "rebase"];
+      if (record.ticket !== ticket.id || record.branch !== saved.branch || !origins.includes(record.origin)
+        || !Array.isArray(record.answers) || record.answers.some((answer: unknown) => typeof answer !== "string")
+        || typeof record.plan !== "string" || typeof record.reason !== "string" || typeof record.evidence !== "string"
+        || (record.pendingFalsify !== undefined && (record.origin !== "falsify" || questionField(record.pendingFalsify)
+          || !record.pendingFalsify.some((question: FalsifyQuestion) => !question.assumable)))) {
+        work.block(`Cannot resume: invalid saved origin in ${resumeFile()}; nothing was changed.`);
+        return conclude("refused");
+      }
+      saved.answers = record.answers; saved.plan = record.plan; saved.previousEvidence = record.evidence; work.block(record.reason);
+      if (record.pendingFalsify) {
+        const questions = record.pendingFalsify as FalsifyQuestion[];
+        saved.ownerQuestions = questions.filter(question => !question.assumable)
+          .map(({ text, options, recommended, why }) => ({ text, where: "", options, recommended, why }));
+        saved.wouldAssume = questions.filter(question => question.assumable);
+        work.seal();
+        return stopAt("falsify");
+      }
+      if (result.type === "conflicted") return { type: "implement" };
+      if (record.origin === "prepare" && setup().type !== "prepared") return stopAt("prepare");
+      work.seal();
+      return { type: record.origin === "prepare" ? "falsify" : record.origin };
+    }
+    if (result.type === "conflicted") return { type: "implement" };
+    if (result.type === "resumed") return { type: "gate" };
+    work.start();
+    return { type: "falsify" };
+  }
+  function gate(): Event {
+    saved.repairing = "change";
+    const scopeResult = unsettled() ?? scope("change");
+    const result = scopeResult.type === "passed" ? work.checks() : scopeResult;
+    if (result.type === "passed") { passed("verify"); work.seal(); return { type: "passed" }; }
+    return work.repair().type === "retry" ? { type: "retry" } : stopAt("gate");
+  }
+  function replay(): Event {
+    // Publishing makes the commit immutable: retry PR creation or recording on
+    // that same commit, even if the base advanced while the owner was away.
+    // A failed gate must keep it too; undo/rebase would require a force push.
+    if (saved.pushed) {
+      if (git(worktree, "rev-parse", "HEAD") !== saved.commitHash || pending() !== "") {
+        work.block("The published candidate changed locally; restore the pushed commit and clean worktree before continuing delivery.");
+        return stopAt("rebase");
+      }
+      if (work.checks("reverify").type !== "passed") return stopAt("rebase");
+      saved.recheckBase = false;
+      return { type: "deliver" };
+    }
+    // A conflict or failed setup left an uncommitted candidate. It must pass the normal checks and review again.
+    if (!saved.commitHash) return { type: "implement" };
+    const result = rebase();
+    if (["current", "rebased"].includes(result.type)) {
+      // A successful replay already ran every gate. An unchanged base still needs fresh gates after an owner answer.
+      if (saved.recheckBase && result.type === "current") {
+        if (work.checks("reverify").type !== "passed") { undo(saved.baseCommit); return stopAt("rebase"); }
+      }
+      saved.recheckBase = false;
+      return { type: "deliver" };
+    }
+    if (result.type === "review" || result.type === "resumed") return { type: "gate" };
+    if (result.type === "blocked") return conclude("refused");
+    if (result.type === "failed" && work.repair().type === "retry") return { type: "implement" };
+    return stopAt("rebase");
+  }
   const definition = {
     entry: ({ self }) => { self.subscribe({ error: stopTurn }); },
     // An invoked lifecycle actor also starts on checkpoint continuation, when entry actions do not.
@@ -1609,45 +1534,29 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       restoreSnapshot: () => ({ status: "active" as const, output: undefined, error: undefined }),
       start: (_snapshot, { self }) => { self.subscribe({ complete: stopTurn, error: stopTurn }); },
     } },
-    initial: "shape", output: ({ event }) => {
+    initial: "prepare", output: ({ event }) => {
       // The done-state event names the final state; keep the declared ending untouched.
       const ending = event.type.slice(event.type.lastIndexOf(".") + 1) as keyof typeof endings;
       publishState(ending);
       return saved.held ?? undefined;
     },
     states: {
-      shape: operation(shape, { prepared: "prepare", blocked: "refuse" }),
-      // A clean resume starts planning afresh. A resumed candidate is held to Scope; red cannot be proved again once implemented.
-      prepare: operation(stopped("prepare", prepare), { prepared: "start", resumed: "scopeAfterChange", conflicted: "change", stuck: "stuck", redeliver: "rebase", blocked: "refuse", created: "setup" }),
-      setup: operation(setup, { prepared: "start", failed: "stepFailed" }),
-      start: operation(work.start, { started: "falsify" }),
-      falsify: agent(() => prompt([
+      prepare: operation(prepareRun, { falsify: "falsify", plan: "plan", planReview: "planReview", test: "test", implement: "implement", gate: "gate", rebase: "rebase", stuck: "stuck", refused: "refused" }),
+      falsify: checkedAgent(() => prompt([
         "Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 entries shaped as { text, options: string[], recommended: string, assumable: boolean, why }, giving the exact questions a person could answer. text and why must be non-empty strings; options must be a non-empty array of non-empty strings; recommended must copy one of those options exactly. Mark assumable true only for a gap whose conservative answer loses nothing if wrong: it stops, refuses, or keeps more. A product decision, a change of scope, or anything irreversible is never assumable.",
         ...(saved.questionsFault ? [saved.questionsFault] : []),
         "Put the questions in the report's questions field, not in the summary or message.",
-      ].join("\n")), {
-        sound: { target: "falsifyResult", actions: rememberPlanning },
-        questions: { target: "falsifyResult", actions: rememberPlanning },
-      }, { using: "investigator", cwd: worktree }),
-      falsifyResult: operation(stopped("falsifyResult", falsifyResult), { sound: "plan", assumed: "plan", reask: "falsify", blocked: "stuck" }),
-      plan: agent(() => prompt([
+      ].join("\n")), ["sound", "questions"], "investigator", event => planning("falsify", event, falsifyResult), { sound: "plan", assumed: "plan", reask: "falsify", stuck: "stuck" }),
+      plan: checkedAgent(() => prompt([
         "Plan the implementation of this sound ticket. Do not edit any file. Cover the acceptance criteria, tests, permitted paths, and required checks. Address any plan review feedback in the stage reports. Return planned with the complete plan as the summary. Keep it concise: name the files and the tests, and do not restate the ticket.",
         ...assumptionsPrompt(),
-      ].join("\n"), "plan"), {
-        planned: { target: "planResult", actions: rememberPlanning },
-      }, { using: "investigator", cwd: worktree }),
-      planResult: operation(stopped("planResult", planResult), { planned: "planReview", reask: "plan", blocked: "stuck" }),
-      planReview: agent(() => prompt([
+      ].join("\n"), "plan"), ["planned"], "investigator", event => planning("plan", event, planResult), { planned: "planReview", reask: "plan", stuck: "stuck" }),
+      planReview: checkedAgent(() => prompt([
         "Review the plan against the ticket, relevant code, scope, acceptance criteria, and tests. Do not edit any file. Return approved with a summary if it is ready to implement, or revise with a summary of what must change. Prefer concise plans: send back as revise a plan that restates the ticket or carries detail the implementer does not need. Return tooBroad if the ticket is too broad for one run, with a summary suggesting a split into smaller tickets, one per line. Only one revision of the plan is allowed.",
         ...assumptionsPrompt(),
         "Plan:", saved.plan,
-      ].join("\n"), "planReview"), {
-        approved: { target: "planReviewResult", actions: rememberPlanning },
-        revise: { target: "planReviewResult", actions: rememberPlanning },
-        tooBroad: { target: "planReviewResult", actions: rememberPlanning },
-      }, { using: "reviewer", cwd: worktree }),
-      planReviewResult: operation(stopped("planReviewResult", planReviewResult), { approved: redGreen ? "test" : "change", reask: "planReview", revise: "plan", blocked: "stuck" }),
-      test: agent(() => {
+      ].join("\n"), "planReview"), ["approved", "revise", "tooBroad"], "reviewer", event => planning("planReview", event, planReviewResult), { approved: redGreen ? "test" : "implement", revise: "plan", reask: "planReview", stuck: "stuck" }),
+      test: checkedAgent(() => {
         saved.repairing = "test";
         return prompt([
           "Write only tests that encode the acceptance criteria below, one or more per criterion, inside the Scope paths below. Do not implement anything and do not change non-test files. The tests must fail now and pass once the ticket is implemented. Leave changes uncommitted.",
@@ -1657,26 +1566,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           "Scope:", ...ticket.sections.scope.map(text => `- ${text}`),
           cannotRun,
         ].join("\n"), "test");
-      }, {
-        completed: [
-          { guard: hasSummary("test"), target: "scopeAfterTest", actions: recordValid("test") },
-          { target: "testReport", actions: record("test") },
-        ],
-        blocked: [
-          { guard: hasSummary("test"), target: "stuck", actions: recordValid("test") },
-          { target: "testReport", actions: record("test") },
-        ],
-      }, { using: "tester", cwd: worktree }),
-      testReport: operation(() => work.reported("test", result => reportFault("test", result)), { reask: "test", completed: "scopeAfterTest", blocked: "stuck" }),
-      scopeAfterTest: operation(() => scope("test"), { passed: "red", failed: "repairBudget" }),
-      red: operation(() => {
-        saved.repairing = "test";
-        const result = work.redCheck(repository.redCheck);
-        saved.provedRed = result.type === "passed";
-        if (saved.provedRed) passed("red");
-        return result;
-      }, { passed: "change", failed: "repairBudget" }),
-      change: agent(() => {
+      }, ["completed", "blocked"], "tester", event => editing("test", event), { completed: "red", reask: "test", stuck: "stuck" }),
+      implement: checkedAgent(() => {
         saved.repairing = "change";
         return prompt([
           "Implement the ticket and its tests. Keep the change focused. Do not weaken checks or expand scope. Leave your changes uncommitted; the workflow commits and delivers them.",
@@ -1695,26 +1586,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           "Resolve discussion findings or explain why they need the ticket owner in your summary.",
           cannotRun,
         ].join("\n"), "change");
-      }, {
-        completed: [
-          { guard: hasSummary("change"), target: "scopeAfterChange", actions: recordValid("change") },
-          { target: "changeReport", actions: record("change") },
-        ],
-        blocked: [
-          { guard: hasSummary("change"), target: "stuck", actions: recordValid("change") },
-          { target: "changeReport", actions: record("change") },
-        ],
-      }, { using: "implementer", cwd: worktree }),
-      changeReport: operation(() => work.reported("change", result => reportFault("change", result)), { reask: "change", completed: "scopeAfterChange", blocked: "stuck" }),
-      scopeAfterChange: operation(() => unsettled() ?? scope("change"), { passed: "verify", failed: "repairBudget" }),
-      verify: operation(() => {
-        saved.repairing = "change";
-        const result = work.checks();
-        if (result.type === "passed") passed("verify");
-        return result;
-      }, { passed: "sealReview", failed: "repairBudget" }),
-      sealReview: operation(work.seal, { sealed: "review" }),
-      review: agent(() => prompt([
+      }, ["completed", "blocked"], "implementer", event => editing("change", event), { completed: "gate", reask: "implement", stuck: "stuck" }),
+      review: checkedAgent(() => prompt([
         "Review the current diff and verification evidence. Do not edit any file. Check acceptance criteria, regressions, scope, and whether tests actually establish the intended behavior.",
         ...movedPrompt(),
         ...assumptionsPrompt(),
@@ -1726,112 +1599,48 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         "On a second or later review, say what is new versus the previous report in newSinceLastRound, or none if nothing is new. Read previous review-<n>.json reports alongside the stage reports in the evidence directory.",
         "For blocked, only the summary is required. For approved or revise, include the full structured report below.",
         'End with one line: MACHINES_EVENT {"type":"approved"|"revise"|"blocked","summary":"<one paragraph>","criteria":[{"text":"<criterion as given>","met":true|false,"evidence":"<file:line or command>"}],"findings":[{"severity":"blocker"|"discussion"|"minor","text":"<finding>","where":"<file:line>"}],"newSinceLastRound":"none"|"<what changed in this round\'s findings>"}',
-      ].join("\n"), "review"), {
-        approved: { target: "reviewResult", actions: recordReview },
-        revise: { target: "reviewResult", actions: recordReview },
-        blocked: { target: "reviewResult", actions: recordReview },
-      }, { using: "reviewer", cwd: worktree }),
-      reviewResult: operation(stopped("reviewResult", reviewResult), { approved: "commit", reask: "review", revise: "reviewBudget", blocked: "stuck" }),
-      repairBudget: operation(stopped("repairBudget", work.repair), { retry: "repairTarget", exhausted: "stuck" }),
-      repairTarget: operation(() => ({ type: saved.repairing }), { falsify: "falsify", plan: "plan", planReview: "planReview", test: "test", change: "change" }),
-      reviewBudget: operation(stopped("reviewBudget", reviewBudget), { retry: "change", exhausted: "stuck" }),
-      // Budget and review stops keep their existing question and continuation rules.
-      stuck: operation(() => {
-        writeFileSync(join(work.open(), `question-${++saved.questions}.txt`), stuckPrompt() + "\n", { mode: 0o600 });
-        return { type: "ask" };
-      }, { ask: "decide" }),
-      decide: evidenceHuman(human, stuckPrompt, {
+      ].join("\n"), "review"), ["approved", "revise", "blocked"], "reviewer", validateReview, { valid: "judge", reask: "review", stuck: "stuck" }),
+      red: operation(() => {
+        saved.repairing = "test";
+        const result = scope("test").type === "passed" ? work.redCheck(repository.redCheck) : { type: "failed" };
+        saved.provedRed = result.type === "passed";
+        if (saved.provedRed) { passed("red"); return result; }
+        return stopAt("red");
+      }, { passed: "implement", stuck: "stuck" }),
+      gate: operation(gate, { passed: "review", retry: "implement", stuck: "stuck" }),
+      judge: operation(() => {
+        const result = reviewResult();
+        if (result.type === "approved") { passed("review"); return result; }
+        if (result.type === "revise" && reviewBudget().type === "retry") return { type: "retry" };
+        return stopAt("judge");
+      }, { approved: "commit", retry: "implement", stuck: "stuck" }),
+      commit: operation(inTurn(() => {
+        const result = commit();
+        return result.type === "committed" ? result : stopAt("commit");
+      }, ["committed"]), { committed: "rebase", stuck: "stuck" }),
+      rebase: operation(inTurn(replay, ["deliver"]), { deliver: "deliver", implement: "implement", gate: "gate", stuck: "stuck", refused: "refused" }),
+      deliver: operation(async () => {
+        // A process restored directly at deliver no longer owns the turn that protected its replay.
+        if (!turnHeld) {
+          work.block("Delivery was interrupted; continue to check the current base and run every gate again before delivery.");
+          return stopAt("deliver");
+        }
+        return inTurn(() => {
+          const result = deliver();
+          return result.type === "delivered" ? conclude("completed") : stopAt("deliver");
+        }, [])();
+      }, { delivered: "delivered", kept: "delivered", refused: "refused", stuck: "stuck" }),
+      stuck: evidenceHuman(human, stuckPrompt, {
         submitted: [
-          { guard: ({ event }: { event: Event }) => typeof event.value === "string" && !event.value.trim(), target: "stuck" },
-          // Back to the planning or editing stage that stopped, including the tester after a failed red.
-          { guard: choseDecision("more rounds"), target: "repairTarget", actions: continueWork },
-          { guard: choseDecision("hand off"), target: "handOff", actions: decide },
-          { guard: choseDecision("archive"), target: "archive", actions: decide },
-          { guard: choseDecision("discard"), target: "confirmDiscard", actions: decide },
-          { target: "repairTarget", actions: continueWork },
+          { guard: ({ event }: { event: Event }) => typeof event.value === "string" && !event.value.trim(), target: "stuck", reenter: true, actions: () => { stopAt(saved.origin); } },
+          { guard: ({ event }: { event: Event }) => decisionOf(event.value) === "hand off", target: "handedOff", actions: endDecision },
+          { guard: ({ event }: { event: Event }) => decisionOf(event.value) === "discard", target: "abandoned", actions: endDecision },
+          ...(["prepare", "falsify", "plan", "planReview", "test", "implement", "gate", "rebase"] as const).map(target => ({
+            guard: ({ event }: { event: Event }) => destination(String(event.value)) === target, target, actions: continueWork,
+          })),
         ],
-      }, { present: "presenter", suggestions: decisions }, () => questionEvidence("stuck", decisions, false)),
-      confirmDiscard: evidenceHuman(human, discardPrompt, {
-        submitted: [
-          { guard: chose("confirm discard"), target: "remove", actions: ({ event }: { event: Event }) => { work.choice("confirmDiscard", event, confirmations); saved.discardConfirmed = true; } },
-          { target: "stuck", actions: ({ event }: { event: Event }) => { work.choice("confirmDiscard", event, confirmations); } },
-        ],
-      }, { present: "presenter", choices: confirmations }, () => questionEvidence("stuck", confirmations, true)),
-      archive: operation(archive, { archived: "remove" }),
-      remove: operation(remove, { removed: "abandon" }),
-      commit: operation(inTurn(commit, ["committed"]), { committed: "rebase", failed: "stepFailed" }),
-      rebase: operation(inTurn(stopped("rebase", rebase), ["current", "rebased"]), { current: "deliver", rebased: "deliver", conflicted: "change", resumed: "scopeAfterChange", review: "verify", failed: "repairBudget", stuck: "stuck", blocked: "refuse", handBack: "stepFailed" }),
-      deliver: operation(inTurn(() => {
-        const result = deliver();
-        return result.type === "failed" ? { type: "deliveryFailed" } : result;
-      }, [], true), {
-        delivered: "success", unreachable: "stepFailed", deliveryFailed: "stepFailed",
-        conflicted: "change", resumed: "scopeAfterChange", review: "verify", failed: "repairBudget", stuck: "stuck", blocked: "refuse", handBack: "stepFailed",
-      }, { retry: { on: "unreachable", times: 3, wait: "1m" } }),
-      success: operation(() => conclude("completed"), { delivered: repository.output === "pr" ? "checkMerge" : "delivered", kept: "delivered", refused: "refused" }),
-      checkMerge: operation(checkMerge, { merged: "cleanUp", waiting: "awaitMerge", decide: "mergeDecide" }),
-      awaitMerge: wait({ every: "10m" }, { due: "checkMerge" }),
-      cleanUp: operation(mergeStep("cleanUp", cleanUp), { merged: "merged", failed: "mergeFailed" }, { retry: { on: "failed", times: 3, wait: "1m" } }),
-      mergeDecide: evidenceHuman(human, () => mergePrompt(), {
-        submitted: [
-          { guard: chose("hand off"), target: "mergeHandOff", actions: mergeDecide },
-          { target: "confirmMergeDiscard", actions: mergeDecide },
-        ],
-      }, { present: "presenter", choices: mergeDecisions }, () => questionEvidence("merge", mergeDecisions, false)),
-      confirmMergeDiscard: evidenceHuman(human, () => mergePrompt(true), {
-        submitted: [
-          { guard: chose("confirm discard"), target: "dropLocal", actions: ({ event }: { event: Event }) => { work.choice("confirmMergeDiscard", event, confirmations); } },
-          { guard: () => !!saved.mergeFailedIn, target: "mergeRetryDecide", actions: ({ event }: { event: Event }) => { work.choice("confirmMergeDiscard", event, confirmations); } },
-          { target: "mergeDecide", actions: ({ event }: { event: Event }) => { work.choice("confirmMergeDiscard", event, confirmations); } },
-        ],
-      }, { present: "presenter", choices: confirmations }, () => questionEvidence("merge", confirmations, true)),
-      dropLocal: operation(mergeStep("dropLocal", dropLocal), { removed: "mergeAbandon", failed: "mergeFailed" }, { retry: { on: "failed", times: 3, wait: "1m" } }),
-      mergeHandOff: operation(() => settle("handedOff"), { handedOff: "handedOff" }),
-      mergeAbandon: operation(() => settle("abandoned"), { abandoned: "abandoned" }),
-      mergeFailed: operation(() => {
-        saved.mergeReason = work.status().reason;
-        writeFileSync(join(work.open(), `question-${++saved.questions}.txt`), mergePrompt() + "\n", { mode: 0o600 });
-        return { type: "ask" };
-      }, { ask: "mergeRetryDecide" }),
-      mergeRetryDecide: evidenceHuman(human, () => mergePrompt(), {
-        submitted: [
-          { guard: chose("retry"), target: "retryMergeStep", actions: mergeRetryDecision },
-          { guard: chose("hand off"), target: "mergeHandOff", actions: mergeRetryDecision },
-          { target: "confirmMergeDiscard", actions: mergeRetryDecision },
-        ],
-      }, { present: "presenter", choices: stepDecisions }, () => questionEvidence("merge", stepDecisions, false)),
-      retryMergeStep: operation(() => ({ type: saved.mergeFailedIn }), { cleanUp: "cleanUp", dropLocal: "dropLocal" }),
-      stepFailed: operation(stepFailed, { delivery: "deliverDecide", retryable: "stepDecide", keep: "keepDecide" }),
-      stepDecide: evidenceHuman(human, () => stepPrompt(), {
-        submitted: [
-          { guard: chose("retry"), target: "retryStep", actions: stepDecision("stepDecide", stepDecisions) },
-          { guard: chose("hand off"), target: "handOff", actions: stepDecision("stepDecide", stepDecisions) },
-          { target: "confirmStepDiscard", actions: stepDecision("stepDecide", stepDecisions) },
-        ],
-      }, { present: "presenter", choices: stepDecisions }, () => questionEvidence("step", stepDecisions, false)),
-      keepDecide: evidenceHuman(human, () => stepPrompt(), {
-        submitted: [
-          { guard: chose("hand off"), target: "handOff", actions: stepDecision("keepDecide", mergeDecisions) },
-          { target: "confirmStepDiscard", actions: stepDecision("keepDecide", mergeDecisions) },
-        ],
-      }, { present: "presenter", choices: mergeDecisions }, () => questionEvidence("step", mergeDecisions, false)),
-      deliverDecide: evidenceHuman(human, () => stepPrompt(), {
-        submitted: [
-          { guard: chose("retry"), target: "retryStep", actions: stepDecision("deliverDecide", deliveryDecisions) },
-          { target: "handOff", actions: stepDecision("deliverDecide", deliveryDecisions) },
-        ],
-      }, { present: "presenter", choices: deliveryDecisions }, () => questionEvidence("step", deliveryDecisions, false)),
-      retryStep: operation(() => ({ type: saved.failedStep }), { setup: "setup", commit: "commit", deliver: "deliver" }),
-      confirmStepDiscard: evidenceHuman(human, () => stepPrompt(true), {
-        submitted: [
-          { guard: chose("confirm discard"), target: "remove", actions: ({ event }: { event: Event }) => { work.choice("confirmStepDiscard", event, confirmations); saved.discardConfirmed = true; } },
-          { target: "stepFailed", actions: ({ event }: { event: Event }) => { work.choice("confirmStepDiscard", event, confirmations); } },
-        ],
-      }, { present: "presenter", choices: confirmations }, () => questionEvidence("step", confirmations, true)),
-      refuse: operation(() => conclude("refused"), { refused: "refused" }),
-      handOff: operation(() => conclude("handed-off"), { handedOff: "handedOff" }),
-      abandon: operation(() => conclude("abandoned"), { abandoned: "abandoned" }),
-      delivered: final(endings.delivered), merged: final(endings.merged), refused: final(endings.refused), handedOff: final(endings.handedOff), abandoned: final(endings.abandoned),
+      }, { present: "presenter", suggestions: decisions }, () => questionEvidence()),
+      delivered: final(endings.delivered), refused: final(endings.refused), handedOff: final(endings.handedOff), abandoned: final(endings.abandoned),
     },
   } satisfies Parameters<typeof machine>[0];
   const states = definition.states;
@@ -1840,42 +1649,20 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     ? `delivered as pull request #${/\/pull\/(\d+)/u.exec(saved.prUrl)?.[1] ?? saved.prUrl}`
     : `delivered as ${repository.output === "patch" ? "a patch" : "a branch"}`;
   const stuckMeaning = () => `stuck at ${saved.stoppedIn}, needs you`;
-  const stepMeaning = () => `stuck at ${saved.failedStep}, needs you`;
-  const mergeMeaning = () => `stuck at ${saved.mergeFailedIn || "checkMerge"}, needs you`;
   const reviewMeaning = () => {
     const { reviewRounds, maxReviewRounds } = work.status();
     const round = saved.extraRound === "running" ? saved.extraReviewRounds : reviewRounds;
     return `under review, round ${round + 1} of ${maxReviewRounds + 1}${saved.extraRound === "running" ? " in the extra review budget" : ""}`;
   };
   const meanings = {
-    shape: "checking the ticket's required sections", prepare: "preparing the ticket worktree",
-    setup: "setting up the ticket worktree", start: "starting the ticket work",
-    falsify: "checking whether the ticket is sound", falsifyResult: "checking the ticket's falsification report",
-    plan: "planning; the plan review is next", planResult: "checking the implementation plan",
-    planReview: "reviewing the implementation plan", planReviewResult: "checking the plan review",
-    test: "writing the failing tests", testReport: "checking the tester's report",
-    scopeAfterTest: "checking that the tests stay within scope", red: "checking that the new tests fail",
-    change: "implementing; gates not yet run", changeReport: "checking the implementation report",
-    scopeAfterChange: "checking that the implementation stays within scope",
-    verify: () => `running ${repository.checks.join(", ")}`,
-    sealReview: "preparing the checked changes for review", review: reviewMeaning,
-    reviewResult: "checking the review findings", repairBudget: "checking the remaining repair budget",
-    repairTarget: "returning to the stage that needs work", reviewBudget: "checking the remaining review budget",
-    stuck: stuckMeaning, decide: stuckMeaning, confirmDiscard: stuckMeaning,
-    archive: "archiving the kept work", remove: "removing the ticket worktree and branch",
+    prepare: "preparing the ticket worktree", falsify: "checking whether the ticket is sound",
+    plan: "planning; the plan review is next", planReview: "reviewing the implementation plan",
+    test: "writing the failing tests", red: "checking that the new tests fail",
+    implement: "implementing; gates not yet run", gate: () => `running ${repository.checks.join(", ")}`,
+    review: reviewMeaning, judge: "checking the review findings", stuck: stuckMeaning,
     commit: "committing the checked changes", rebase: "checking the current base and replaying changes",
-    deliver: "delivering the checked changes", success: deliveredMeaning, delivered: deliveredMeaning,
-    checkMerge: "checking whether the pull request has merged", awaitMerge: "waiting for the pull request to merge",
-    cleanUp: "removing the merged ticket's branches", merged: "merged; ticket complete",
-    mergeDecide: mergeMeaning, confirmMergeDiscard: mergeMeaning, mergeFailed: mergeMeaning,
-    mergeRetryDecide: mergeMeaning, retryMergeStep: "retrying pull request cleanup",
-    dropLocal: "removing the local ticket branch", mergeHandOff: "handed off; work kept",
-    mergeAbandon: "abandoned; pushed branch kept",
-    stepFailed: stepMeaning, stepDecide: stepMeaning, keepDecide: stepMeaning, deliverDecide: stepMeaning,
-    retryStep: () => `retrying ${saved.failedStep}`, confirmStepDiscard: stepMeaning,
-    refuse: "refused; see the recorded reason", refused: "refused; see the recorded reason",
-    handOff: "handed off; work kept", handedOff: "handed off; work kept",
-    abandon: "abandoned", abandoned: "abandoned",
+    deliver: "delivering the checked changes", delivered: deliveredMeaning,
+    refused: "refused; see the recorded reason", handedOff: "handed off; work kept", abandoned: "abandoned",
   } satisfies Record<keyof typeof states, string | (() => string)>;
   function publishState(name: keyof typeof states) {
     const meaning = meanings[name];
