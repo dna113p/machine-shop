@@ -44,7 +44,7 @@ The optional `presenter` can explain the sole Human question at `stuck`.
 | `repository.draft` | no | `true` | Whether `pr` mode opens a draft. |
 | `worktreeRoot` | yes | — | Absolute directory for the worktree, outside the repository. |
 | `evidenceRoot` | yes | — | Absolute directory for run evidence, outside the repository and worktree. |
-| `maxRepairs` | no | `3` | Rounds for a failed implementation scope or green gate, 0–3. |
+| `maxRepairs` | no | `3` | Rounds for a failed implementation scope, green gate or delivery replay conflict, 0–3. |
 | `maxReviewRounds` | no | `2` | Rounds for a `revise` review, 0–5. |
 | `redGreen` | no | `true` | Write failing tests first. `false` skips the tester and the red check. |
 | `assume` | no | `false` | Let `falsify` answer questions whose cautious answer loses nothing, and record them, instead of stopping. |
@@ -83,7 +83,8 @@ flowchart TD
   judge -->|needs owner| stuck
   rebase -->|validated candidate| deliver[deliver] --> delivered((delivered))
   rebase -->|changed candidate| gate
-  rebase -->|conflict or failure| stuck
+  rebase -->|conflict with repair budget| implement
+  rebase -->|budget spent or failure| stuck
   commit -->|failure| stuck
   deliver -->|failure| stuck
   stuck -->|continue by saved origin| prepare & falsify & plan & test & implement & gate & rebase
@@ -130,7 +131,7 @@ asks again. There is no route straight from `stuck` to `deliver`.
 | `red`: not red | `test` | Repair the acceptance tests. |
 | `gate`: repair budget spent | `implement` | Repair with a fresh budget and the owner's answer. |
 | `judge`: review budget spent | `implement` | Address findings with the owner's answer and fresh budgets. |
-| `rebase`: conflict or replay failure | `rebase` | Re-enter replay; an uncommitted candidate returns to implementation, gates, and review. |
+| `rebase`: conflict with the repair budget spent, or replay failure | `rebase` | Re-enter replay; an uncommitted candidate returns to implementation, gates, and review with a fresh budget. |
 
 A blocked tester or implementer returns to that Agent. A malformed planning
 report returns to planning; a malformed review returns to implementation.
@@ -191,8 +192,13 @@ added files, unsafe setup output, or changed HEAD restore the candidate and
 stop. Conflicts retain both sides in `resume-conflicts.diff` and
 `ticket-task-move.json`. The implementer removes conflict markers and preserves
 both intents; the Operation stages resolved files and still checks Scope.
-A delivery replay conflict stops for the owner before this repair. The run
-moves a conflicted candidate once; a second conflict needs another decision.
+A delivery replay conflict takes the same road in the same run: the candidate
+is moved onto the tip, and settling it is one repair round within `maxRepairs`,
+after which gates, review, commit and replay run again. Each conflict in a run
+spends one repair and saves its own candidate (`saved-candidate-<n>.patch` after
+the first), so concurrent tickets on one base settle each other's changes
+without a person. The run asks the owner only when the repair budget is spent
+or the candidate cannot be re-applied to the tip.
 
 Saved `ticket-task-assumptions.json` belongs to the worktree's Git directory,
 outside the candidate. Candidate resume validates it before proceeding, records

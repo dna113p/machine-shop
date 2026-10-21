@@ -49,6 +49,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     rebasedFrom: null as { baseCommit: string; commit: string } | null,
     rebaseSteps: 0,
     moved: null as { from: string; to: string; ref: string; patch: string; conflicts: string[]; settled: string[]; at?: "resume" | "delivery" } | null,
+    moves: 0,
     created: false,
     adopted: false,
     removed: false,
@@ -440,7 +441,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       snapshot = git(worktree, "commit-tree", tree, "-p", original, "-m", ticket.title, "-m", `Ticket: ${ticket.id}`);
       const ref = `refs/machine-shop/saved/${ticket.slug}/${snapshot}`;
       git(worktree, "update-ref", ref, snapshot);
-      const patch = join(work.open(), "saved-candidate.patch");
+      // Each move in a run saves its own patch; the first keeps the name earlier evidence readers know.
+      const patch = join(work.open(), ++saved.moves === 1 ? "saved-candidate.patch" : `saved-candidate-${saved.moves}.patch`);
       writeFileSync(patch, rawGit("diff", "--binary", "--no-ext-diff", "--no-textconv", original, snapshot), { flag: "wx", mode: 0o600 });
       saved.moved = { from: original, to: tip, ref, patch, conflicts: [], settled: [], at };
     }
@@ -714,19 +716,19 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (!replay.ok) {
       const conflicts = git(worktree, "diff", "--name-only", "--diff-filter=U");
       restore();
-      if (conflicts && !saved.moved) {
+      if (conflicts) {
+        // Every conflict is moved onto the tip; replay decides whether the repair budget lets the implementer settle it.
         saved.reviewsFrom = saved.reviews.length;
         saved.rebasedFrom ??= saved.firstApproved;
         const moved = moveOnto(tip, "delivery");
         if (moved.type === "conflicted" || moved.type === "resumed") {
-          work.block(`Replay onto ${tip} conflicted in ${conflicts.split("\n").join(", ")}; the run moved the approved candidate onto ${tip} itself, once per run.`
+          work.block(`Replay onto ${tip} conflicted in ${conflicts.split("\n").join(", ")}; the run moved the approved candidate onto ${tip} itself${saved.moves > 1 ? `, its move ${saved.moves} of this run` : ""}.`
             + (moved.type === "conflicted" ? ` ${work.status().reason}` : ""));
         }
         return moved;
       }
-      return stop(`Replay onto ${tip} failed${conflicts ? ` with conflicts in ${conflicts.split("\n").join(", ")}` : " (Git or a hook refused it)"}. `
-        + `The approved candidate is uncommitted on ${original}; a resumed run moves it onto the current base and sends conflicts to the implementer to settle. Inspect rebase logs in ${work.open()}.`
-        + (conflicts && saved.moved ? ` This run already moved its candidate once, ${saved.moved.at === "delivery" ? "after a replay conflict" : "when it resumed"}, so it does not move again.` : ""));
+      return stop(`Replay onto ${tip} failed (Git or a hook refused it). `
+        + `The approved candidate is uncommitted on ${original}; a resumed run moves it onto the current base and sends conflicts to the implementer to settle. Inspect rebase logs in ${work.open()}.`);
     }
     const count = git(worktree, "rev-list", "--count", `${tip}..HEAD`);
     if (count === "0") {
@@ -1520,6 +1522,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       return { type: "deliver" };
     }
     if (result.type === "review" || result.type === "resumed") return { type: "gate" };
+    // The moved candidate waits uncommitted on the tip with its conflicts; settling them is one repair round, then gates and review run again.
+    if (result.type === "conflicted") return work.repair().type === "retry" ? { type: "implement" } : stopAt("rebase");
     if (result.type === "blocked") return conclude("refused");
     if (result.type === "failed" && work.repair().type === "retry") return { type: "implement" };
     return stopAt("rebase");
