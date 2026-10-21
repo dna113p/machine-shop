@@ -487,14 +487,14 @@ test("construction has no effects and declares exactly the four required roles a
   assert.equal(git(f.repo, "branch", "--format=%(refname:short)"), "main"); untouched(f);
 });
 
-test("Machine Shop depends on the Machines release whose presenter can recommend a suggestion, with its lock file", () => {
+test("Machine Shop depends on the Machines release whose runs publish a now line and a page, with its lock file", () => {
   const manifest = JSON.parse(readFileSync(resolve("package.json"), "utf8"));
-  assert.equal(manifest.devDependencies["@dna113p/machines"], "^0.7.1");
+  assert.equal(manifest.devDependencies["@dna113p/machines"], "^0.8.0");
   const lock = JSON.parse(readFileSync(resolve("package-lock.json"), "utf8"));
-  assert.equal(lock.packages[""].devDependencies["@dna113p/machines"], "^0.7.1");
+  assert.equal(lock.packages[""].devDependencies["@dna113p/machines"], "^0.8.0");
   const locked = lock.packages["node_modules/@dna113p/machines"];
   const [major, minor, patch] = String(locked.version).split(".").map(Number);
-  assert.ok(major === 0 && minor === 7 && patch! >= 1, `the lock file holds Machines ${locked.version}`);
+  assert.ok(major === 0 && minor === 8 && patch! >= 0, `the lock file holds Machines ${locked.version}`);
   assert.ok(String(locked.resolved).endsWith(`/machines-${locked.version}.tgz`), locked.resolved); assert.match(locked.integrity, /^sha512-/u);
   for (const name of ["defineEndings", "optionalAgentNames"] as const) assert.equal(typeof runtime[name], "function", name);
 });

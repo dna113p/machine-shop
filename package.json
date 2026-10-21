@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Selective starter Machines for software implementation, debugging, review, investigation, and release preparation.",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "test": "node --test tests/*.test.ts",
     "typecheck": "node scripts/typecheck.mjs",
@@ -14,7 +16,7 @@
     "smoke:install": "node --test tests/install.test.ts"
   },
   "devDependencies": {
-    "@dna113p/machines": "^0.7.1",
+    "@dna113p/machines": "^0.8.0",
     "@types/node": "^24.0.0",
     "typescript": "^7.0.2"
   }
