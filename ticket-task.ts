@@ -2,7 +2,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { appendFileSync, closeSync, existsSync, lstatSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { defineEndings, type Event, type MachinePrimitives } from "@dna113p/machines";
-import { evidenceHuman, evidenceLog, writeStuckEvidence, repositoryTurn, taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
+import { evidenceHuman, evidenceLog, writeStuckEvidence, repositoryTurn, taskNow, taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
 import { brief, opening, excerpt, evidenceFacts, evidencePage, type EvidenceBlock } from "./defaults/_machine-shop/brief.ts";
 import { outsideScope } from "./defaults/_machine-shop/scope.ts";
 
@@ -105,11 +105,21 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let turn: ReturnType<typeof repositoryTurn> | undefined;
   const lifetime = new AbortController();
   let turnHeld = false;
-  const releaseTurn = () => { turn?.release(); turnHeld = false; p.status({ now: null }); };
+  let waitingForTurn = false;
+  let activeMeaning = "checking the ticket's required sections";
+  const publishNow = (meaning: string) => taskNow(p.status, ticket.title, meaning);
+  const setNow = (meaning: string) => { activeMeaning = meaning; publishNow(meaning); };
+  const releaseTurn = () => {
+    turn?.release(); turnHeld = false;
+    if (waitingForTurn) { waitingForTurn = false; publishNow(activeMeaning); }
+  };
   const stopTurn = () => { lifetime.abort(); releaseTurn(); };
   const takeTurn = async () => {
     turn ??= repositoryTurn(repository.path, join(dirname(dirname(worktree)), ".machine-runs", "repository-turns"), basename(work.open()));
-    await turn.acquire(lifetime.signal, note => { p.status({ now: note || null }); }, message => {
+    await turn.acquire(lifetime.signal, note => {
+      waitingForTurn = !!note;
+      publishNow(note ? "waiting for the repository's turn" : activeMeaning);
+    }, message => {
       appendFileSync(join(work.open(), "repository-turn.log"), message + "\n", { mode: 0o600 });
       console.log(message);
     });
@@ -655,6 +665,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (!resolved.ok || tip === original) {
       if (saved.untested) {
         if (!resolved.ok) return withdraw("the current base no longer resolves");
+        setNow(`running ${repository.checks.join(", ")}`);
         if (work.checks().type !== "passed" || !work.accept()) {
           undo(original); work.reopen(true); saved.repairing = "change";
           saved.reviewsFrom = saved.reviews.length; saved.taken = "";
@@ -800,6 +811,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       work.block(`Base moved from ${original} to ${tip} and the replayed patch differs from the approved patch; verify and review this candidate again.`);
       return { type: "review" };
     }
+    setNow(`running ${repository.checks.join(", ")}`);
     if (work.checks(saved.untested ? "verify" : "reverify").type !== "passed" || (saved.untested && !work.accept())) {
       const stopped = undoOnTip("reverify gates failed");
       work.reopen(true);
@@ -1505,7 +1517,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (choice !== "retry") saved.mergeDecision = choice;
   };
   const mergeDecide = ({ event }: { event: Event }) => { saved.mergeDecision = work.choice("mergeDecide", event, mergeDecisions); };
-  return machine({
+  const definition = {
     entry: ({ self }) => { self.subscribe({ error: stopTurn }); },
     // An invoked lifecycle actor also starts on checkpoint continuation, when entry actions do not.
     invoke: { src: {
@@ -1515,7 +1527,12 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       restoreSnapshot: () => ({ status: "active" as const, output: undefined, error: undefined }),
       start: (_snapshot, { self }) => { self.subscribe({ complete: stopTurn, error: stopTurn }); },
     } },
-    initial: "shape", output: () => saved.held ?? undefined,
+    initial: "shape", output: ({ event }) => {
+      // The done-state event names the final state; keep the declared ending untouched.
+      const ending = event.type.slice(event.type.lastIndexOf(".") + 1) as keyof typeof endings;
+      publishState(ending);
+      return saved.held ?? undefined;
+    },
     states: {
       shape: operation(shape, { prepared: "prepare", blocked: "refuse" }),
       // A clean resume starts planning afresh. A resumed candidate is held to Scope; red cannot be proved again once implemented.
@@ -1728,7 +1745,65 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       abandon: operation(() => conclude("abandoned"), { abandoned: "abandoned" }),
       delivered: final(endings.delivered), merged: final(endings.merged), refused: final(endings.refused), handedOff: final(endings.handedOff), abandoned: final(endings.abandoned),
     },
-  });
+  } satisfies Parameters<typeof machine>[0];
+  const states = definition.states;
+
+  const deliveredMeaning = () => saved.prUrl
+    ? `delivered as pull request #${/\/pull\/(\d+)/u.exec(saved.prUrl)?.[1] ?? saved.prUrl}`
+    : `delivered as ${repository.output === "patch" ? "a patch" : "a branch"}`;
+  const stuckMeaning = () => `stuck at ${saved.stoppedIn}, needs you`;
+  const stepMeaning = () => `stuck at ${saved.failedStep}, needs you`;
+  const mergeMeaning = () => `stuck at ${saved.mergeFailedIn || "checkMerge"}, needs you`;
+  const reviewMeaning = () => {
+    const { reviewRounds, maxReviewRounds } = work.status();
+    const round = saved.extraRound === "running" ? saved.extraReviewRounds : reviewRounds;
+    return `under review, round ${round + 1} of ${maxReviewRounds + 1}${saved.extraRound === "running" ? " in the extra review budget" : ""}`;
+  };
+  const meanings = {
+    shape: "checking the ticket's required sections", prepare: "preparing the ticket worktree",
+    setup: "setting up the ticket worktree", start: "starting the ticket work",
+    falsify: "checking whether the ticket is sound", falsifyResult: "checking the ticket's falsification report",
+    plan: "planning; the plan review is next", planResult: "checking the implementation plan",
+    planReview: "reviewing the implementation plan", planReviewResult: "checking the plan review",
+    test: "writing the failing tests", testReport: "checking the tester's report",
+    scopeAfterTest: "checking that the tests stay within scope", red: "checking that the new tests fail",
+    change: "implementing; gates not yet run", changeReport: "checking the implementation report",
+    scopeAfterChange: "checking that the implementation stays within scope",
+    verify: () => `running ${repository.checks.join(", ")}`,
+    sealReview: "preparing the checked changes for review", review: reviewMeaning,
+    reviewResult: "checking the review findings", repairBudget: "checking the remaining repair budget",
+    repairTarget: "returning to the stage that needs work", reviewBudget: "checking the remaining review budget",
+    stuck: stuckMeaning, decide: stuckMeaning, confirmDiscard: stuckMeaning,
+    archive: "archiving the kept work", remove: "removing the ticket worktree and branch",
+    commit: "committing the checked changes", rebase: "checking the current base and replaying changes",
+    deliver: "delivering the checked changes", success: deliveredMeaning, delivered: deliveredMeaning,
+    checkMerge: "checking whether the pull request has merged", awaitMerge: "waiting for the pull request to merge",
+    cleanUp: "removing the merged ticket's branches", merged: "merged; ticket complete",
+    mergeDecide: mergeMeaning, confirmMergeDiscard: mergeMeaning, mergeFailed: mergeMeaning,
+    mergeRetryDecide: mergeMeaning, retryMergeStep: "retrying pull request cleanup",
+    dropLocal: "removing the local ticket branch", mergeHandOff: "handed off; work kept",
+    mergeAbandon: "abandoned; pushed branch kept",
+    stepFailed: stepMeaning, stepDecide: stepMeaning, keepDecide: stepMeaning, deliverDecide: stepMeaning,
+    retryStep: () => `retrying ${saved.failedStep}`, confirmStepDiscard: stepMeaning,
+    refuse: "refused; see the recorded reason", refused: "refused; see the recorded reason",
+    handOff: "handed off; work kept", handedOff: "handed off; work kept",
+    abandon: "abandoned", abandoned: "abandoned",
+  } satisfies Record<keyof typeof states, string | (() => string)>;
+  function publishState(name: keyof typeof states) {
+    const meaning = meanings[name];
+    setNow(typeof meaning === "function" ? meaning() : meaning);
+  }
+  // Invocation input is also evaluated on checkpoint continuation, unlike entry actions.
+  // Only presentation is added: the original transitions, actors and endings stay intact.
+  const reportingStates = Object.fromEntries(Object.entries(states).map(([name, state]) => {
+    if (!("invoke" in state)) return [name, state];
+    const input = "input" in state.invoke ? state.invoke.input : undefined;
+    return [name, { ...state, invoke: { ...state.invoke, input: () => {
+      publishState(name as keyof typeof states);
+      return typeof input === "function" ? input() : input;
+    } } }];
+  })) as typeof states;
+  return machine({ ...definition, states: reportingStates });
 }
 
 type Assumption = { question: string; answer: string; options: string[]; why: string };
