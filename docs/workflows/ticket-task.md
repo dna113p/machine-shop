@@ -19,9 +19,14 @@ It runs from source; the installer never copies it.
 | Checkout | its own new worktree; the source checkout is left alone |
 | Source | [ticket-task.ts](../../ticket-task.ts) |
 
-Malformed Agent reports use [report recovery](../catalog.md#recovery): one
-send-back to the same role with the exact fault, retained in stage evidence.
-The call ceiling includes these send-backs; repair and review budgets are unchanged.
+Each falsify, plan, plan review, test, change, and review report gets one
+send-back to the same Agent state and role with the exact validation fault,
+using [report recovery](../catalog.md#recovery). The run status says the report
+was sent back. A second malformed plan, plan review, test, change, or review
+report takes the existing stuck route with `<stage> report was malformed twice:
+<fault>` and the path of the retained report. Both malformed reports are kept.
+The call ceiling includes these send-backs; they spend no repair round, review
+round, or plan revision.
 
 ## Input
 

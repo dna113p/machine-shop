@@ -1171,6 +1171,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     work.reported(stage);
   };
   const rememberPlanning = ({ event }: { event: Event }) => { saved.planningReport = event; };
+  function reportFault(stage: string, result: { type: "sendBack" | "invalid"; fault: string; path: string }): Event {
+    if (result.type === "sendBack") {
+      p.status({ note: `The ${stage} report was sent back with its validation fault.` });
+      return { type: "reask" };
+    }
+    return work.block(`The ${stage} report was malformed twice: ${result.fault}. The report is kept in ${result.path}.`);
+  }
   /** Keep the raw report even if its summary is refused; guards and validation run only after capture. */
   function keep(stage: PlanningStage): { summary: string } | { refusal: string } {
     saved.repairing = stage;
@@ -1203,7 +1210,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }, allowance);
     saved.questionsReturned = allowance.returned;
     saved.questionsFault = allowance.feedback;
-    if (result.type === "sendBack") return { type: "reask" };
+    if (result.type === "sendBack") return reportFault("falsify", result);
     if (result.type === "invalid") return work.block("refusal" in kept ? result.fault
       : `The falsify report was malformed twice: ${result.fault}. The report is kept in ${join(work.open(), `falsify-${saved.planningReports.falsify}.json`)}.`);
     if (event.type === "sound") {
@@ -1238,7 +1245,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const kept = keep("plan");
     if (work.unchanged().type === "changed") return { type: "blocked" };
     const result = planningShape("plan", kept);
-    if (result.type !== "valid") return result.type === "sendBack" ? { type: "reask" } : work.block(result.fault);
+    if (result.type !== "valid") return reportFault("plan", result);
     saved.plan = result.report;
     return { type: "planned" };
   }
@@ -1246,7 +1253,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const kept = keep("planReview");
     if (work.unchanged().type === "changed") return { type: "blocked" };
     const result = planningShape("planReview", kept);
-    if (result.type !== "valid") return result.type === "sendBack" ? { type: "reask" } : work.block(result.fault);
+    if (result.type !== "valid") return reportFault("planReview", result);
     if (saved.planningReport.type === "approved") {
       saved.repairing = "change";
       work.block("");
@@ -1291,11 +1298,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       return event as ReviewReport;
     });
     if (result.type !== "valid") saved.malformedReviews.push(saved.reviews.length - 1);
-    if (result.type === "sendBack") return { type: "reask" };
-    // Summary refusal used to fail the run; structured review faults stop for the owner below.
-    if (result.type === "invalid" && saved.reviewSummaryFault) throw new Error(result.fault);
+    if (result.type === "sendBack") return reportFault("review", result);
     if (result.type === "valid") work.resetReport("review");
-    if (event.type === "blocked") return work.block(saved.reviewSummary);
+    if (result.type === "valid" && event.type === "blocked") return work.block(saved.reviewSummary);
     // Even a malformed report can contain useful findings. Keep them apart from the Machine's stop reason.
     const feedback = [
       saved.reviewSummary,
@@ -1305,7 +1310,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         ? [`${finding.severity === "blocker" ? "Blocker" : "Discussion"}: ${finding.text}${typeof finding.where === "string" ? ` (${finding.where})` : ""}`] : []) : []),
     ].join("\n");
     const stop = (reason: string) => { saved.standingReview = feedback; return work.block(reason); };
-    if (result.type === "invalid") return stop(`Malformed review report: ${result.fault}.`);
+    if (result.type === "invalid") {
+      saved.standingReview = feedback;
+      return reportFault("review", result);
+    }
     const report = event as ReviewReport;
     const unmet = report.criteria.flatMap((criterion, index) => criterion.met ? [] : [ticket.sections.acceptance[index]!]);
     const blockers = report.findings.filter(finding => finding.severity === "blocker");
@@ -1487,7 +1495,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           { target: "testReport", actions: record("test") },
         ],
       }, { using: "tester", cwd: worktree }),
-      testReport: operation(() => work.reported("test"), { sendBack: "test", completed: "scopeAfterTest", blocked: "stuck" }),
+      testReport: operation(() => work.reported("test", result => reportFault("test", result)), { reask: "test", completed: "scopeAfterTest", blocked: "stuck" }),
       scopeAfterTest: operation(() => scope("test"), { passed: "red", failed: "repairBudget" }),
       red: operation(() => {
         saved.repairing = "test";
@@ -1524,7 +1532,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           { target: "changeReport", actions: record("change") },
         ],
       }, { using: "implementer", cwd: worktree }),
-      changeReport: operation(() => work.reported("change"), { sendBack: "change", completed: "scopeAfterChange", blocked: "stuck" }),
+      changeReport: operation(() => work.reported("change", result => reportFault("change", result)), { reask: "change", completed: "scopeAfterChange", blocked: "stuck" }),
       scopeAfterChange: operation(() => unsettled() ?? scope("change"), { passed: "verify", failed: "repairBudget" }),
       verify: operation(() => { saved.repairing = "change"; return work.checks(); }, { passed: "sealReview", failed: "repairBudget" }),
       sealReview: operation(work.seal, { sealed: "review" }),
