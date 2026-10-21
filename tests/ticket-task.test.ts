@@ -756,7 +756,7 @@ for (const cause of ["not converging", "open questions", "malformed report"]) {
     }, human);
     assert.equal(result.state, "delivered"); assert.deepEqual([edits, reviews, human.requests.length], [rounds + 1, rounds + 1 + sentBack, 1]);
     assert.match(human.requests[0]!.prompt, /send the standing findings back to the implementer/u);
-    assert.match(human.requests[0]!.prompt, cause === "malformed report" ? /Malformed review report: newSinceLastRound/u : new RegExp(cause, "u"));
+    assert.match(human.requests[0]!.prompt, cause === "malformed report" ? /review report was malformed twice: newSinceLastRound/u : new RegExp(cause, "u"));
     if (!needsRepair) assert.ok(human.requests[0]!.prompt.includes(`\nNeeds: ${questionLines(open).join("\n")}\n`));
     held(f, result, /^Delivered/u);
   });
@@ -900,7 +900,7 @@ for (const [field, extra] of [
   for (const verdict of ["approved", "revise"]) test(`a malformed ${verdict} review ${field} (${JSON.stringify(extra)}) reaches decide with the field named`, async context => {
     const f = fixture(context); const human = person("hand off");
     const result = await execute(input(f), { reviewer: () => review(verdict, "Reviewer verdict must not mask malformed fields", extra) }, human);
-    const run = handedOff(f, result, /Malformed review report/u, human);
+    const run = handedOff(f, result, /review report was malformed twice/u, human);
     assert.ok(run.delivery.reason.includes(field)); assert.ok(existsSync(join(run.directory, "review-1.json")));
   });
 }
@@ -911,7 +911,7 @@ test("an approved report missing criteria is blocked while its minor notes are r
   const result = await execute(input(f), { reviewer: () => review("approved", "Claims approval", {
     criteria: undefined, findings: [{ severity: "minor", ...note }],
   }) }, human);
-  const run = handedOff(f, result, /Malformed review report: criteria/u, human);
+  const run = handedOff(f, result, /review report was malformed twice: criteria/u, human);
   assert.deepEqual(run.delivery.reviewNotes, [note]);
 });
 
@@ -922,8 +922,137 @@ const summaryFault = (stage: string) => `Agent ${stage} must return a non-empty 
 const keptIn = (directory: string, text: string) => holding(directory, [text])
   .filter(name => !["result.json", "delivery.json"].includes(name) && !name.startsWith("question-"));
 
+/** Find an entire raw report, either in its stage file or inside a fault record. */
+function retainedReports(directory: string, report: unknown) {
+  return readdirSync(directory).filter(name => name.endsWith(".json")).flatMap(name => {
+    const path = join(directory, name); const value = JSON.parse(readFileSync(path, "utf8"));
+    return isDeepStrictEqual(value, report) || isDeepStrictEqual(value.event, report) ? [path] : [];
+  });
+}
+/** Budget values at the actual Agent call, including the separate plan and extra-review allowances. */
+function reportBudgets(data: Record<string, any>) {
+  return {
+    repairs: data.task.repairs, reviewRounds: data.task.reviewRounds, planRevisions: data.planRevisions,
+    renewed: data.task.renewed, renewedReviews: data.task.renewedReviews, extraReviewRounds: data.extraReviewRounds,
+  };
+}
+const reportStages = ["plan", "planReview", "test", "change", "review"] as const;
+type ReportStage = typeof reportStages[number];
+const reportRole = (stage: ReportStage) => stage === "test" ? "tester" : stage === "change" ? "implementer" : stage === "review" ? "reviewer" : stage;
+const validReport = (stage: ReportStage, request: Request) => isPlanning(stage) ? planning[stage]!.answer(request)
+  : stage === "test" ? tester(request) : stage === "change" ? implement(request) : review();
+const reportOutcome = (stage: ReportStage) => stage === "plan" ? "planned" : ["planReview", "review"].includes(stage) ? "approved" : "completed";
+
+test("ticket-task documentation names every report covered by the single send-back", () => {
+  const document = readFileSync(resolve("docs/workflows/ticket-task.md"), "utf8");
+  const recovery = document.split(/\n\s*\n/u).filter(paragraph => /send[- ]back|sent back/iu.test(paragraph))
+    .join("\n\n").replace(/[`*_]/gu, "").replace(/\s+/gu, " ");
+  assert.match(recovery, /\bone\b.{0,120}\bsend[- ]back\b|\bsent back\b.{0,40}\bonce\b|\bsend[- ]back\b.{0,40}\bonce\b/iu);
+  for (const stage of [/\bplan\b/iu, /\bplan\s*review\b/iu, /\btest\b/iu, /\bchange\b/iu, /\breview\b/iu]) {
+    assert.match(recovery, stage, "the documentation explicitly includes each ticket report in the send-back policy");
+  }
+});
+
+for (const stage of reportStages) for (const second of ["valid", "malformed"] as const) {
+  test(`${stage} report recovery: malformed then ${second} retains evidence and budgets and ${second === "valid" ? "continues" : "stops as malformed twice"}`, async context => {
+    const f = fixture(context); const saves = checkpointed(); const updates: unknown[] = [];
+    const human = person(...(second === "valid" ? [] : ["hand off"]));
+    const requests: Request[] = []; const budgets: ReturnType<typeof reportBudgets>[] = []; const notesAtCall: string[][] = [];
+    const reports = [ok(reportOutcome(stage), " \n"), ok(reportOutcome(stage), "")];
+    const primitives = { ...saves.options.primitives, status: ((update: Parameters<typeof runtime.status>[0]) => {
+      updates.push(structuredClone(update)); runtime.status(update);
+    }) as typeof runtime.status };
+    const result = await execute(input(f, {}, { maxRepairs: 0, maxReviewRounds: 0 }), {
+      [reportRole(stage)]: (request: Request) => {
+        requests.push(request); budgets.push(reportBudgets(saves.data()!)); notesAtCall.push(statusNotes(updates));
+        assert.ok(requests.length <= 2, `${stage} gets only one send-back`);
+        return requests.length === 1 || second === "malformed" ? reports[requests.length - 1]! : validReport(stage, request);
+      },
+    }, human, { ...saves.options, primitives });
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0]!.cwd, f.worktree); assert.equal(requests[1]!.cwd, f.worktree);
+    assert.deepEqual(requests[1]!.outcomes, requests[0]!.outcomes, "the same Agent role and outcomes serve the retry");
+    assert.doesNotMatch(requests[0]!.prompt, /Your last report was malformed/u);
+    assert.ok(requests[1]!.prompt.includes(sentBack(summaryFault(stage))), "the retry includes the exact validator feedback");
+    const states = ["falsify", ...reportStages];
+    const expected = states.flatMap(name => name === stage ? [name, name] : [name]);
+    assert.deepEqual(route(result.states), second === "valid" ? expected : [...expected.slice(0, expected.lastIndexOf(stage) + 1), "decide"]);
+    const run = second === "valid" ? ended(f, result, "branch")
+      : handedOff(f, result, new RegExp(`${stage} report was malformed twice: ${literal(summaryFault(stage))}`, "u"), human);
+    assert.deepEqual(budgets, [budgets[0], budgets[0]], "sending back does not spend any budget");
+    assert.deepEqual(budgets[0], { repairs: 0, reviewRounds: 0, planRevisions: 0, renewed: 0, renewedReviews: 0, extraReviewRounds: 0 });
+    assert.deepEqual([run.result.repairs, run.result.reviewRounds], [0, 0]);
+    assert.equal(result.states.includes("repairBudget"), false); assert.equal(result.states.includes("reviewBudget"), false);
+    assert.notDeepEqual(retainedReports(run.directory, reports[0]), [], "the first raw report is retained");
+    if (second === "malformed") {
+      const paths = retainedReports(run.directory, reports[1]); assert.notDeepEqual(paths, [], "the second raw report is retained");
+      assert.ok(paths.some(path => run.delivery.reason.includes(path) && human.requests[0]!.prompt.includes(path)
+        && result.output.summary.includes(path)), "the stop names an existing file containing the second report");
+      assert.equal(human.requests.length, 1);
+    } else assert.equal(human.requests.length, 0);
+    assert.ok(notesAtCall[1]!.some(note => /report.*(?:sent|send|sending).*back|(?:sent|send|sending).*back.*report/iu.test(note)),
+      `the run publishes that the ${stage} report was sent back before asking again: ${JSON.stringify(updates)}`);
+  });
+}
+
+for (const faults of [["summary", "structured"], ["structured", "summary"], ["summary", "summary"], ["structured", "structured"]] as const) {
+  test(`review report recovery: ${faults.join(" then ")} shares one send-back and stops with both raw reports`, async context => {
+    const f = fixture(context); const human = person("hand off"); const prompts: string[] = [];
+    const reports = faults.map((fault, index) => fault === "summary" ? review("approved", index ? "" : " \n")
+      : review("approved", `Malformed review attempt ${index + 1}`, { criteria: null }));
+    const faultText = (fault: string) => fault === "summary" ? summaryFault("review") : "criteria must be an array";
+    const result = await execute(input(f), {
+      reviewer: request => {
+        prompts.push(request.prompt); assert.ok(prompts.length <= 2, "summary and structured faults share the allowance");
+        return reports[prompts.length - 1]!;
+      },
+    }, human);
+    assert.equal(prompts.length, 2); assert.ok(prompts[1]!.includes(sentBack(faultText(faults[0]))));
+    const run = handedOff(f, result, new RegExp(`review report was malformed twice: ${literal(faultText(faults[1]))}`, "u"), human);
+    assert.deepEqual(route(result.states), ["falsify", "plan", "planReview", "test", "change", "review", "review", "decide"]);
+    assert.deepEqual([run.result.repairs, run.result.reviewRounds], [0, 0]);
+    for (const report of reports) assert.notDeepEqual(retainedReports(run.directory, report), []);
+    assert.ok(retainedReports(run.directory, reports[1]).some(path => run.delivery.reason.includes(path) && human.requests[0]!.prompt.includes(path)),
+      "the stop points to the complete second report");
+  });
+}
+
+for (const stage of ["test", "change"] as const) {
+  test(`${stage} report recovery: a genuine later entry resets the allowance and only the real repair spends a round`, async context => {
+    const f = fixture(context); const saves = checkpointed(); const prompts: string[] = []; const updates: unknown[] = [];
+    const budgets: ReturnType<typeof reportBudgets>[] = []; let reviews = 0;
+    const primitives = { ...saves.options.primitives, status: ((update: Parameters<typeof runtime.status>[0]) => {
+      updates.push(structuredClone(update)); runtime.status(update);
+    }) as typeof runtime.status };
+    const result = await execute(input(f, {}, { maxRepairs: 1, maxReviewRounds: 1 }), {
+      [reportRole(stage)]: (request: Request) => {
+        prompts.push(request.prompt); budgets.push(reportBudgets(saves.data()!));
+        assert.ok(prompts.length <= 4, "each genuine entry permits exactly one return");
+        if (prompts.length % 2) return ok("completed", " ");
+        if (stage === "test" && prompts.length === 2) {
+          writeFileSync(join(request.cwd, "greeting.test.txt"), "// This test does not fail yet.\n");
+          return ok("completed", "Added greeting.test.txt; the Machine must prove red");
+        }
+        return validReport(stage, request);
+      },
+      reviewer: () => stage === "change" && ++reviews === 1 ? review("revise", "Handle empty input") : review(),
+    }, person(), { ...saves.options, primitives });
+    const run = ended(f, result, "branch"); assert.equal(prompts.length, 4);
+    for (const index of [0, 2]) assert.doesNotMatch(prompts[index]!, /Your last report was malformed/u, "a new entry clears stale shape feedback");
+    for (const index of [1, 3]) assert.ok(prompts[index]!.includes(sentBack(summaryFault(stage))));
+    assert.deepEqual(budgets[1], budgets[0]); assert.deepEqual(budgets[3], budgets[2]);
+    assert.deepEqual(budgets.map(({ repairs, reviewRounds }) => [repairs, reviewRounds]),
+      stage === "test" ? [[0, 0], [0, 0], [1, 0], [1, 0]] : [[0, 0], [0, 0], [0, 1], [0, 1]]);
+    assert.deepEqual([run.result.repairs, run.result.reviewRounds], stage === "test" ? [1, 0] : [0, 1]);
+    assert.equal(result.states.filter(state => state === "repairBudget").length, stage === "test" ? 1 : 0);
+    assert.equal(result.states.filter(state => state === "reviewBudget").length, stage === "change" ? 1 : 0);
+    assert.ok(statusNotes(updates).filter(note => /report.*(?:sent|send|sending).*back|(?:sent|send|sending).*back.*report/iu.test(note)).length >= 2,
+      "both send-backs publish a status update");
+  });
+}
+
 for (const second of ["valid", "malformed"] as const) {
-  test(`a malformed review report goes back once to the reviewer with its fault, and a ${second} second report ${second === "valid" ? "continues" : "stops as today"}`, async context => {
+  test(`a malformed review report goes back once to the reviewer with its fault, and a ${second} second report ${second === "valid" ? "continues" : "stops as malformed twice"}`, async context => {
     const f = fixture(context); const human = person(...(second === "valid" ? [] : ["hand off"])); const prompts: string[] = []; let edits = 0;
     const malformed = () => review("approved", "Claims approval", { criteria: undefined });
     const result = await execute(input(f), {
@@ -936,7 +1065,7 @@ for (const second of ["valid", "malformed"] as const) {
     // The report goes straight back to the reviewer: no repair, no review round.
     assert.deepEqual(route(result.states), ["falsify", "plan", "planReview", "test", "change", "review", "review", ...(second === "valid" ? [] : ["decide"])]);
     assert.equal(result.states.includes("reviewBudget"), false);
-    const run = second === "valid" ? held(f, result, /^Delivered/u) : handedOff(f, result, /Malformed review report: criteria must be an array\./u, human);
+    const run = second === "valid" ? held(f, result, /^Delivered/u) : handedOff(f, result, /review report was malformed twice: criteria must be an array\./u, human);
     if (second === "valid") assert.equal(result.state, "delivered");
     assert.deepEqual([run.result.repairs, run.result.reviewRounds], [0, 0]);
     assert.notDeepEqual(keptIn(run.directory, "criteria must be an array"), [], "the fault is kept in the review's evidence");
@@ -979,13 +1108,6 @@ for (const [role, stage, state] of [["tester", "test", "test"], ["implementer", 
   });
 }
 
-test("a second malformed implementer report from the same entry stops the run as today, after one send-back", async context => {
-  const f = fixture(context); const prompts: string[] = [];
-  await assert.rejects(execute(input(f), {
-    implementer: request => { prompts.push(request.prompt); return { type: "completed", summary: " " }; },
-  }), /non-empty summary/u);
-  assert.equal(prompts.length, 2); assert.ok(prompts[1]!.includes(sentBack(summaryFault("change"))));
-});
 
 for (const [state, outcome] of [["falsify", "sound"], ["plan", "planned"], ["planReview", "approved"]] as const) {
   test(`a blank ${state} summary goes back once to the same role with its exact fault, kept in the evidence, and a valid second report continues`, async context => {
@@ -1018,7 +1140,7 @@ test("a summary fault and a structured review fault share one send-back allowanc
   }, human);
   assert.equal(prompts.length, 2);
   assert.ok(prompts[1]!.includes(sentBack(summaryFault("review"))));
-  const run = handedOff(f, result, /Malformed review report: criteria must be an array\./u, human);
+  const run = handedOff(f, result, /review report was malformed twice: criteria must be an array\./u, human);
   assert.deepEqual([run.result.repairs, run.result.reviewRounds], [0, 0]);
   for (const fault of [summaryFault("review"), "criteria must be an array"]) assert.notDeepEqual(keptIn(run.directory, fault), []);
 });
@@ -1644,12 +1766,13 @@ test("a run stuck on a falsify report malformed twice gives the fault in its fir
 test("a run stuck on a review report malformed twice gives the fault in its first sentence, and only there", async context => {
   const f = fixture(context); const human = person("hand off");
   const result = await execute(input(f), { reviewer: () => review("approved", "Claims approval", { criteria: undefined }) }, human);
-  handedOff(f, result, /Malformed review report: criteria must be an array\./u, human);
+  handedOff(f, result, /review report was malformed twice: criteria must be an array\./u, human);
   const [request, ...others] = human.requests; assert.deepEqual(others, []);
   stuckQuestion(f, request, "reviewResult");
-  assert.equal(request!.prompt.split("\n")[0], "Malformed review report: criteria must be an array.");
+  assert.equal(request!.prompt.split("\n")[0], "The review report was malformed twice: criteria must be an array.");
   assert.equal(occurrences(request!.prompt, "criteria must be an array"), 1);
-  assert.ok(result.output.summary.startsWith("Handed off: Malformed review report: criteria must be an array. Decision: hand off. "), result.output.summary);
+  assert.ok(result.output.summary.startsWith("Handed off: The review report was malformed twice: criteria must be an array. "), result.output.summary);
+  assert.ok(result.output.summary.includes(". Decision: hand off. Branch: "), result.output.summary);
 });
 
 /** The Human request a presenter was given, as the runtime writes it on its own line of the presenter's prompt. */
@@ -1702,7 +1825,7 @@ test("a stuck run with a presenter bound publishes its question with the present
 test("the presenter of a stuck run is given the stage, the reason, the last check results, the review verdict with its criteria, the diff's files and the evidence", async context => {
   const f = fixture(context); const human = person("hand off"); const explain = presenter(() => "more rounds");
   const result = await execute(input(f), { presenter: explain, reviewer: approvedButMalformed }, human);
-  const run = handedOff(f, result, /Malformed review report/u, human);
+  const run = handedOff(f, result, /review report was malformed twice/u, human);
   assert.equal(explain.prompts.length, 1); const facts = factsOf(explain.prompts[0]!);
   // Where the run stopped, and why.
   assert.match(facts, /\breviewResult\b/u); assert.match(facts, /\bnewSinceLastRound\b/u);
@@ -1739,7 +1862,7 @@ test("presenter diff facts count staged and untracked files, preserving unusual 
       return ok();
     },
   }, human);
-  handedOff(f, result, /Malformed review report/u, human);
+  handedOff(f, result, /review report was malformed twice/u, human);
   assert.deepEqual(JSON.parse(factsOf(explain.prompts[0]!)).files, [
     { path: "greeting.test.txt", added: 1, removed: 0 },
     { path: "greeting.txt", added: 1, removed: 0 },
@@ -1752,7 +1875,7 @@ test("a failed presenter diff read omits the diff while the question still carri
   writeFileSync(wrapper, readFileSync(wrapper, "utf8").replace("exec ", 'if [ "$1" = diff ] && [ "$2" = --numstat ]; then exit 1; fi\nexec '));
   const human = person("hand off"); const explain = presenter(() => "more rounds");
   const result = await execute(input(f), { presenter: explain, reviewer: approvedButMalformed }, human);
-  handedOff(f, result, /Malformed review report/u, human);
+  handedOff(f, result, /review report was malformed twice/u, human);
   assert.ok(calls().some(call => call.startsWith("diff --numstat")));
   const facts = JSON.parse(factsOf(explain.prompts[0]!));
   assert.equal(Object.hasOwn(facts, "files"), false); assert.equal(facts.stage, "reviewResult");
@@ -1764,7 +1887,7 @@ test("with no presenter bound, a stuck question goes out exactly as before: its 
   // The Machine offers a presenter; this run binds none.
   assert.deepEqual(runtime.optionalAgentNames(mod.default(runtime, input(f))), ["presenter"]);
   const result = await execute(input(f), { reviewer: approvedButMalformed }, human);
-  const run = handedOff(f, result, /Malformed review report/u, human);
+  const run = handedOff(f, result, /review report was malformed twice/u, human);
   const [request, ...others] = human.requests; assert.deepEqual(others, []);
   assert.deepEqual(request, { prompt: request!.prompt, suggestions: stuckDecisions });
   stuckQuestion(f, request, "reviewResult"); asksWritten(run.directory, [request!]);
@@ -1797,7 +1920,7 @@ for (const failure of ["throws", "returns no presented event"]) {
 test("with a presenter bound, Discard. still asks for confirmation, whose choices are unchanged, and go back returns to the stuck question", async context => {
   const f = fixture(context); const human = person("Discard.", "go back", "hand off"); const explain = presenter(asked => asked.choices ? "go back" : "more rounds");
   const result = await execute(input(f), { presenter: explain, reviewer: approvedButMalformed }, human);
-  handedOff(f, result, /Malformed review report/u, human);
+  handedOff(f, result, /review report was malformed twice/u, human);
   assert.deepEqual(result.states.filter(state => ["decide", "confirmDiscard"].includes(state)), ["decide", "confirmDiscard", "decide"]);
   const [decide, confirm, again] = human.requests; assert.equal(human.requests.length, 3); assert.equal(explain.prompts.length, 3);
   for (const asked of [decide!, again!]) {

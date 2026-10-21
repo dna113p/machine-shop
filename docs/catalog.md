@@ -122,6 +122,13 @@ A report goes back once to the same role with the validator's exact fault:
 `report-fault-<n>.json`. Validators and review rules are unchanged. A second
 malformed report follows the existing stop or failure route.
 
+In ticket-task, each falsify, plan, plan review, test, change, and review report
+gets one send-back to the same Agent state and role, with a run status update
+saying it was sent back. For plan, plan review, test, change, and review, a second
+fault takes the existing stuck route with `<stage> report was malformed twice:
+<fault>` and the retained report's path. Both malformed reports remain in the
+evidence; `work.sendBack` returns the fault record's `path` for this purpose.
+
 The caller owns the allowance. Keep it across the send-back; reset it when a
 new stage entry begins. Ticket falsify deliberately keeps its allowance spent
 even after Human `more rounds`. Retrospective keeps its existing single retry

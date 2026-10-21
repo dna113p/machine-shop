@@ -119,6 +119,8 @@ interface Policy { checks?: boolean; git: "clean" | "snapshot" | "none"; regress
 /** The caller owns this allowance and decides when a new stage entry begins. */
 export interface ReportRecovery { returned: boolean; feedback: string }
 export type ReportResult<T> = { type: "valid"; report: T } | { type: "sendBack" | "invalid"; fault: string; feedback: string };
+type KeptReportResult<T> = Extract<ReportResult<T>, { type: "valid" }>
+  | (Exclude<ReportResult<T>, { type: "valid" }> & { path: string });
 
 /** Validate only report shape here; keep filesystem effects outside the validator. */
 export function sendBack<T>(validate: () => T, allowance: ReportRecovery): ReportResult<T> {
@@ -320,10 +322,12 @@ export function taskRun(name: string, input: unknown, policy: Policy, saved: Tas
   }
 
   /** Keeps the raw refused report and the exact validator fault alongside stage evidence. */
-  function recover<T>(stage: string, event: Event, validate: () => T, allowance = recovery(stage)): ReportResult<T> {
+  function recover<T>(stage: string, event: Event, validate: () => T, allowance = recovery(stage)): KeptReportResult<T> {
     const result = sendBack(validate, allowance);
     if (result.type !== "valid") {
-      writeFileSync(join(open(), `report-fault-${++saved.reportFaults}.json`), JSON.stringify({ stage, event, ...result }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+      const path = join(open(), `report-fault-${++saved.reportFaults}.json`);
+      writeFileSync(path, JSON.stringify({ stage, event, ...result }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+      return { ...result, path };
     }
     return result;
   }
@@ -334,10 +338,11 @@ export function taskRun(name: string, input: unknown, policy: Policy, saved: Tas
     saved.reportRecovery[stage] = { returned: false, feedback: "" };
   }
   function receive(event: Event): void { saved.pendingReport = event; }
-  /** A definition routes sendBack to the same Agent and all valid outcomes as before. */
-  function reported(stage: string): Event {
+  /** A definition can route retained faults itself; by default a second fault still throws. */
+  function reported(stage: string, onFault?: (result: Exclude<KeptReportResult<string>, { type: "valid" }>) => Event): Event {
     const event = saved.pendingReport;
     const result = recover(stage, event, () => reportSummary(stage, event));
+    if (result.type !== "valid" && onFault) return onFault(result);
     if (result.type === "sendBack") return { type: "sendBack" };
     if (result.type === "invalid") throw new Error(result.fault);
     capture(stage, event);
