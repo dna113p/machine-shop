@@ -88,7 +88,10 @@ its source or description. Inventory `roles` describes the installed definition
 (or the catalog when absent); `catalogRoles` describes its current replacement.
 Keep/leave routes bind `roles`; install/refresh routes bind `catalogRoles`.
 Discovery verifies that the applied routing map matches the installed roles. Gates must preserve the inventory's commands and
-missing classes. Run findings cite supplied stop ids or locations and name a
+missing classes. A project's own `.machines/gates.json` is read as an instruction file, and
+each check whose name reads as a class (lint, types, tests, build; smoke, package or install as live)
+is a found gate with its command as written. Findings cite a stop id or location, an
+instruction or CI file key, or a found gate name, and name a
 proposed route or gate class. Validation sends the precise fault back once; a
 second malformed report ends `refused`, without applying anything.
 

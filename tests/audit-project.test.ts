@@ -876,3 +876,36 @@ for (const status of ["current", "modified", "unknown"] as const) {
     assert.deepEqual(tree(f.project), before);
   });
 }
+
+test("the project's own gates.json supplies gates, and a finding may cite an inventoried file or gate name", async context => {
+  const f = fixture(context);
+  mkdirSync(join(f.project, ".machines"), { recursive: true });
+  writeFileSync(join(f.project, ".machines/gates.json"), JSON.stringify({ description: "The one gate list.", checks: [
+    { name: "lint", command: ["{ruff}", "check", "src"], timeoutMs: 60000 },
+    { name: "sportspred-1", command: ["{python}", "shard.py", "1"], timeoutMs: 600000 },
+    { name: "package-smoke", command: ["npm", "run", "smoke:install"], timeoutMs: 120000 },
+  ] }));
+  let attempt = 0;
+  const judge: Analyst = request => {
+    const inventory = inventoryIn(request.prompt);
+    const body = proposal(f, inventory);
+    attempt++;
+    body.findings = attempt === 1
+      ? [{ reason: "A file the inventory never read is not evidence", evidence: ["nope.md"], route: "dev-fix-bug" }]
+      : [
+        { reason: "The gate list names its lint check; a route should hold Agents to it", evidence: [".machines/gates.json:lint", ".machines/gates.json"], route: "dev-fix-bug" },
+        { reason: "The instructions describe checks the inventory cannot class", evidence: ["AGENTS.md"], route: "tests" },
+      ];
+    return proposed(body);
+  };
+  const run = await execute(f, judge);
+  completed(run);
+  assert.equal(run.calls, 2, "an unknown evidence key is sent back once");
+  const lint = run.inventory.gates.found.find(gate => gate.name === ".machines/gates.json:lint");
+  assert.deepEqual(lint, { class: "lint", name: ".machines/gates.json:lint", command: ["{ruff}", "check", "src"] }, "a named check keeps its command as written");
+  assert.ok(run.inventory.gates.found.some(gate => gate.name === ".machines/gates.json:package-smoke" && gate.class === "live"), "a smoke check is the live class");
+  assert.ok(!run.inventory.gates.found.some(gate => gate.name.endsWith("sportspred-1")), "a check whose name reads as no class is left to the analyst as text");
+  assert.ok(!run.inventory.gates.missing.includes("live"));
+  assert.equal(typeof run.inventory.instructions[".machines/gates.json"], "string", "the gate list is read as an instruction file");
+  assert.match(run.page, /gates\.json:lint/u, "the finding is on the page");
+});
