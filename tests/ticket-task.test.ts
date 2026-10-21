@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, fork } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join, relative, resolve } from "node:path";
+import { basename, delimiter, join, relative, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { launcher, runtime } from "./runtime.ts";
+import "./fixtures/runtime-imports.ts";
 
 const mod = await import(pathToFileURL(resolve("ticket-task.ts")).href);
 const branch = "ticket/proj-12-add-a-greeting";
@@ -3435,6 +3438,7 @@ test("a delivery replay conflict moves the approved candidate onto the tip in th
     implementer: request => {
       if (prompts.length === 1) {
         // The conflict is in the worktree, on the tip, with nothing committed.
+        assert.deepEqual(repositoryTurns(f), [], "Conflict repair must release the repository turn");
         assert.equal(git(request.cwd, "rev-parse", "HEAD"), tip); assert.equal(git(f.repo, "rev-parse", branch), tip);
         assert.match(git(request.cwd, "ls-files", "-u"), /\tgreeting\.txt$/mu);
         assert.match(readFileSync(join(request.cwd, "greeting.txt"), "utf8"), /^<<<<<<< /mu);
@@ -3449,7 +3453,7 @@ test("a delivery replay conflict moves the approved candidate onto the tip in th
       assert.equal(readFileSync(join(request.cwd, "greeting.txt"), "utf8"), "hello\nhi\n");
       return review();
     },
-  }, human);
+  }, human, assertRepositoryTurn(f));
   assert.equal(result.state, "delivered"); assert.equal(human.requests.length, 0);
   // The states show the move: from rebase back to the implementer, then scope, checks, a fresh review, commit, and a clean rebase.
   assert.deepEqual(result.states.slice(result.states.indexOf("rebase")), ["rebase", "change", "scopeAfterChange", "verify", "sealReview", "review", "reviewResult",
@@ -3483,7 +3487,7 @@ test("a second replay conflict in the same run stops with today's text, says the
       if (++reviews === 1) moved = advance(f, "greeting.txt", "hi\n"); else tip = advance(f, "greeting.txt", "hey\n");
       return review();
     },
-  }, human);
+  }, human, assertRepositoryTurn(f));
   assert.equal(result.state, "handedOff"); assert.deepEqual(result.states.slice(-5), ["rebase", "stuck", "decide", "handOff", "handedOff"]);
   assert.deepEqual(result.states.filter(state => ["commit", "rebase", "decide", "change", "failure"].includes(state)), ["change", "commit", "rebase", "change", "commit", "rebase", "decide"]);
   assert.equal(reviews, 2); assert.equal(prompts.length, 2); assert.match(prompts[1]!.split("Current failure/feedback: ")[1] ?? "", movedAtDelivery);
@@ -7203,4 +7207,339 @@ test("a completion receipt that cannot confirm passing verification ends refused
   assert.deepEqual([run.result.outcome, run.delivery.outcome], ["blocked", "refused"]);
   assert.match(run.delivery.reason, /final checkout no longer matches passing verification/u);
   assert.match(result.output.summary, /^Refused: /u);
+});
+
+/** Discover ownership records without prescribing the helper's filename or repository-key hash. */
+function repositoryTurns(f: Fixture) {
+  const records: { file: string; owner: { pid: number; [key: string]: unknown } }[] = [];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const file = join(directory, entry.name);
+      // Inspect only shared coordination files, never Git internals, candidates, or per-run evidence/status.
+      if (file === f.repo || entry.name === ".git" || entry.name.startsWith("evidence") || entry.name.startsWith("widgets--")) continue;
+      if (entry.isDirectory()) { visit(file); continue; }
+      if (!entry.isFile()) continue;
+      try {
+        const owner = JSON.parse(readFileSync(file, "utf8"));
+        if (Number.isSafeInteger(owner?.pid) && owner.pid > 0) records.push({ file, owner });
+      } catch (error) {
+        if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+  };
+  visit(f.root);
+  return records;
+}
+
+/** The lock must cover commit/replay/delivery, and must leave Agents and people free to take another turn. */
+function assertRepositoryTurn(f: Fixture): RunHooks & { primitives: typeof runtime } {
+  let state = "";
+  const owned = () => {
+    const turns = repositoryTurns(f);
+    assert.equal(turns.length, 1, `${state} must hold exactly one repository turn`);
+    assert.equal(turns[0]!.owner.pid, process.pid);
+  };
+  return {
+    primitives: {
+      ...runtime,
+      operation: ((run: (...args: any[]) => any, on: any, options: any) => runtime.operation(async (...args: any[]) => {
+        await Promise.resolve();
+        const entered = state;
+        if (["rebase", "deliver"].includes(entered)) owned();
+        const event = await run(...args);
+        if (entered === "commit" && event.type === "committed") owned();
+        return event;
+      }, on, options)) as typeof runtime.operation,
+    },
+    onEnter: entry => {
+      state = String(entry.value);
+      if (["change", "review", "decide", "stepDecide", "keepDecide", "handedOff", "delivered"].includes(state)) {
+        assert.deepEqual(repositoryTurns(f), [], `${state} must release the repository turn`);
+      }
+    },
+  };
+}
+
+function turnFixture(context: TestContext) {
+  const f = fixture(context);
+  writeFileSync(join(f.repo, "greeting.txt"), ["hello", "first=old", ...Array.from({ length: 12 }, (_, n) => `unchanged ${n}`), "second=old", "third=old", ""].join("\n"));
+  git(f.repo, "add", "greeting.txt"); git(f.repo, "commit", "-qm", "shared greeting baseline");
+  f.head = git(f.repo, "rev-parse", "HEAD");
+  git(f.repo, "update-ref", "refs/heads/turn-base", f.head);
+  return f;
+}
+
+type TurnMessage = { type: string; key?: string; state?: string; data?: any; commit?: string; message?: string; request?: number; published?: unknown[] };
+/** Separate processes exercise the file lock rather than an in-memory mutex; all pauses and waits are bounded. */
+function scriptedTurn(context: TestContext, f: Fixture, id: number, hold: string[] = [], line = "second", repositoryPath = f.repo) {
+  const evidenceRoot = join(f.root, `evidence-turn-${id}`);
+  const runId = randomUUID();
+  const assignment = input(f, {
+    path: repositoryPath, base: "refs/heads/turn-base",
+    checks: [command('require("node:assert/strict").match(require("node:fs").readFileSync("greeting.txt", "utf8"), /^hello\\n/);')],
+  }, { evidenceRoot, redGreen: false });
+  assignment.ticket.id = `PROJ-${id}`;
+  const name = `ticket/proj-${id}-add-a-greeting`;
+  const config = join(f.root, `turn-${id}.json`);
+  writeFileSync(config, JSON.stringify({ assignment, branch: name, hold, from: `${line}=old`, to: `${line}=new` }));
+  const child = fork(resolve("tests/fixtures/ticket-turn-runner.ts"), [config], {
+    // Keep Node's preload flags (including the checkout runtime loader), without inheriting test-runner flags.
+    execArgv: process.execArgv.filter(arg => !arg.startsWith("--test")),
+    env: { ...process.env, MACHINES_RUN_PARENT: runId, MACHINES_RUN_STATUS_DIR: join(evidenceRoot, "status") },
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  const messages: TurnMessage[] = [];
+  let output = ""; let request = 0; let exited = false;
+  child.stdout!.on("data", data => { output += data; }); child.stderr!.on("data", data => { output += data; });
+  child.on("message", message => messages.push(message as TurnMessage));
+  const exit = new Promise<void>(resolve => {
+    child.on("exit", () => { exited = true; resolve(); });
+    child.on("error", error => { messages.push({ type: "error", message: error.message }); exited = true; resolve(); });
+  });
+  const stop = async () => { if (!exited) child.kill("SIGKILL"); await exit; };
+  context.after(stop);
+  const waitFor = async (predicate: (message: TurnMessage) => boolean, description: string) => {
+    const deadline = Date.now() + 8_000;
+    while (Date.now() < deadline) {
+      const found = messages.find(predicate);
+      if (found) return found;
+      const error = messages.find(message => message.type === "error");
+      assert.equal(error, undefined, error?.message);
+      assert.equal(exited, false, `Ticket ${id} exited before ${description}: ${output}`);
+      await delay(20);
+    }
+    assert.fail(`Ticket ${id} did not reach ${description}; points: ${messages.filter(message => message.key).map(message => message.key).join(", ")}; ${output}`);
+  };
+  const inspect = async () => {
+    child.send({ type: "inspect", request: ++request });
+    return waitFor(message => message.type === "inspection" && message.request === request, "inspection");
+  };
+  return {
+    child, name, runId, messages, evidenceRoot, stop, inspect,
+    point: (key: string) => waitFor(message => message.type === "point" && message.key === key, key),
+    result: () => waitFor(message => message.type === "result", "delivery"),
+    release: (key: string) => child.send({ type: "release", key }),
+    output: () => output,
+  };
+}
+
+/** Read only the published record's current work, never private data or historical fields. */
+function statusNotes(value: unknown): string[] {
+  if (!value || typeof value !== "object") return [];
+  if (Array.isArray(value)) return value.flatMap(statusNotes);
+  return Object.entries(value).flatMap(([key, entry]) =>
+    ["now", "note"].includes(key) && typeof entry === "string" ? [entry] : []);
+}
+async function waitingForTurn(run: ReturnType<typeof scriptedTurn>) {
+  const deadline = Date.now() + 6_000;
+  while (Date.now() < deadline) {
+    const status = await run.inspect();
+    assert.equal(run.messages.some(message => message.key === "commit:after:1"), false,
+      "The waiting ticket committed while another ticket still owned the repository turn");
+    const note = statusNotes(status.published).find(note => /wait|queue/iu.test(note) && /repository|turn|widgets/iu.test(note));
+    if (note) return note;
+    await delay(25);
+  }
+  assert.fail("A held repository turn must report waiting in now or note without asking a person");
+}
+function ownsTurn(f: Fixture, run: ReturnType<typeof scriptedTurn>, at: TurnMessage) {
+  const turns = repositoryTurns(f);
+  assert.equal(turns.length, 1, "The committed candidate must own a shared repository lock file");
+  assert.equal(turns[0]!.owner.pid, run.child.pid);
+  assert.ok([run.runId, basename(at.data.task.directory)].some(id => JSON.stringify(turns[0]!.owner).includes(id)),
+    "The lock records its owning runtime or evidence run ID");
+  return turns[0]!;
+}
+
+const deliveredTurn = (run: ReturnType<typeof scriptedTurn>, result: TurnMessage) => {
+  assert.equal(result.state, "delivered");
+  assert.equal(result.published?.length, 1, "The runtime publishes this run's status");
+  assert.deepEqual(statusNotes(result.published), [], "Delivery must clear the published waiting message");
+  assert.equal(result.data.task.result.checksPassed, true);
+  const receipt = JSON.parse(readFileSync(join(result.data.task.directory, "delivery.json"), "utf8"));
+  assert.equal(receipt.branch, run.name);
+  return receipt;
+};
+
+test("repository turn: two concurrent tickets edit one file and the waiting ticket replays on the first delivery and reruns its gates", { timeout: 25_000 }, async context => {
+  const f = turnFixture(context);
+  const first = scriptedTurn(context, f, 21, ["review:agent:1", "commit:after:1"], "first");
+  const second = scriptedTurn(context, f, 22, ["review:agent:1", "commit:after:1"]);
+  try {
+    await Promise.all([first.point("review:agent:1"), second.point("review:agent:1")]);
+    first.release("review:agent:1"); await first.point("commit:after:1");
+    second.release("review:agent:1"); await waitingForTurn(second);
+    first.release("commit:after:1"); const a = await first.result(); deliveredTurn(first, a);
+    // The test's integration action advances only this disposable base ref after delivery; ticket-task never merges.
+    git(f.repo, "update-ref", "refs/heads/turn-base", a.commit!, f.head);
+    await second.point("commit:after:1"); second.release("commit:after:1");
+    const b = await second.result(); const receipt = deliveredTurn(second, b);
+    assert.equal(git(f.repo, "rev-parse", `${second.name}^`), a.commit, "The second ticket is directly on the first delivered commit");
+    assert.equal(receipt.baseCommit, a.commit);
+    const contents = git(f.repo, "show", `${second.name}:greeting.txt`);
+    assert.match(contents, /^first=new$/mu); assert.match(contents, /^second=new$/mu);
+    assert.deepEqual(b.data.task.result.checks.map((check: any) => [check.phase, check.passed]), [["verify", true], ["reverify", true]]);
+    assert.deepEqual(repositoryTurns(f), [], "Delivery releases the repository turn"); untouched(f);
+  } finally { await Promise.all([first.stop(), second.stop()]); }
+});
+
+test("repository turn: a live owner's file records run and PID, reports waiting, and admits the waiter only after release", { timeout: 25_000 }, async context => {
+  const f = turnFixture(context); const alias = join(f.root, "widgets-alias"); symlinkSync(f.repo, alias);
+  const owner = scriptedTurn(context, f, 31, ["commit:after:1"], "first");
+  let waiter: ReturnType<typeof scriptedTurn> | undefined;
+  try {
+    const committed = await owner.point("commit:after:1");
+    const held = ownsTurn(f, owner, committed);
+    // A second spelling of the same checkout and a separate evidence root must still share this turn.
+    waiter = scriptedTurn(context, f, 32, ["commit:after:1"], "second", alias);
+    await waitingForTurn(waiter);
+    assert.deepEqual(repositoryTurns(f), [held], "A live owner's lock cannot be stolen or replaced by a waiter");
+    owner.release("commit:after:1"); deliveredTurn(owner, await owner.result());
+    const acquired = await waiter.point("commit:after:1"); ownsTurn(f, waiter, acquired);
+    const status = await waiter.inspect();
+    assert.equal(status.published?.length, 1);
+    assert.deepEqual(statusNotes(status.published), [], "Acquiring the turn must clear the published waiting message before replay and delivery");
+    waiter.release("commit:after:1"); deliveredTurn(waiter, await waiter.result());
+    assert.deepEqual(repositoryTurns(f), []); untouched(f);
+  } finally { await owner.stop(); await waiter?.stop(); }
+});
+
+test("repository turn: competing waiters reclaim a dead PID once, log the takeover, and remain exclusive", { timeout: 25_000 }, async context => {
+  const f = turnFixture(context); const owner = scriptedTurn(context, f, 41, ["commit:after:1"], "first");
+  const waiters: ReturnType<typeof scriptedTurn>[] = [];
+  try {
+    const held = ownsTurn(f, owner, await owner.point("commit:after:1"));
+    waiters.push(scriptedTurn(context, f, 42, ["commit:after:1"], "second"), scriptedTurn(context, f, 43, ["commit:after:1"], "third"));
+    await Promise.all(waiters.map(waitingForTurn));
+    await owner.stop();
+    assert.throws(() => process.kill(owner.child.pid!, 0), { code: "ESRCH" });
+    const winner = await Promise.race(waiters.map(async run => ({ run, at: await run.point("commit:after:1") })));
+    const loser = waiters.find(run => run !== winner.run)!;
+    ownsTurn(f, winner.run, winner.at);
+    await waitingForTurn(loser);
+    const logs = winner.run.output() + readdirSync(winner.at.data.task.directory).filter(name => name.endsWith(".log"))
+      .map(name => readFileSync(join(winner.at.data.task.directory, name), "utf8")).join("\n");
+    assert.match(logs, /stale|dead|take.?over|reclaim/iu, "Stale takeover leaves an explanatory log line");
+    assert.ok(logs.includes(String(held.owner.pid)), "The takeover log identifies the dead PID");
+    winner.run.release("commit:after:1"); deliveredTurn(winner.run, await winner.run.result());
+    const acquired = await loser.point("commit:after:1"); ownsTurn(f, loser, acquired);
+    loser.release("commit:after:1"); deliveredTurn(loser, await loser.result());
+    assert.deepEqual(repositoryTurns(f), []); untouched(f);
+  } finally { await Promise.all([owner.stop(), ...waiters.map(run => run.stop())]); }
+});
+
+test("repository turn: conflict repair releases the turn and reacquires it before replaying onto a newer base", async context => {
+  const f = fixture(context); let reviews = 0; let moved = ""; let current = ""; const prompts: string[] = [];
+  const result = await execute(input(f), {
+    implementer: request => {
+      if (prompts.length === 1) {
+        assert.deepEqual(repositoryTurns(f), [], "The implementer repairs without holding a repository turn");
+        assert.equal(git(request.cwd, "rev-parse", "HEAD"), moved);
+        current = advance(f, "later.txt", "The base can advance during conflict repair\n");
+      }
+      return settles(prompts)(request);
+    },
+    reviewer: () => { if (++reviews === 1) moved = advance(f, "greeting.txt", "hi\n"); return review(); },
+  }, person(), assertRepositoryTurn(f));
+  assert.equal(result.state, "delivered"); assert.equal(prompts.length, 2); assert.equal(reviews, 2);
+  assert.equal(git(f.repo, "rev-parse", `${branch}^`), current);
+  assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello\nhi");
+  assert.deepEqual(phases(evidence(f)), ["red", "verify", "verify", "reverify"]);
+  assert.deepEqual(repositoryTurns(f), []); untouched(f);
+});
+
+test("repository turn: the workflow documentation describes the commit-through-delivery turn in one paragraph", () => {
+  const paragraphs = readFileSync(resolve("docs/workflows/ticket-task.md"), "utf8").split(/\n\s*\n/u);
+  assert.ok(paragraphs.some(paragraph => /repository/iu.test(paragraph) && /turn|lock/iu.test(paragraph)
+    && /commit/iu.test(paragraph) && /rebase|replay/iu.test(paragraph) && /deliver/iu.test(paragraph)
+    && /wait/iu.test(paragraph) && /stale|dead|pid/iu.test(paragraph)),
+  "One paragraph must describe the repository turn, waiting, and stale-owner recovery across commit, rebase, and delivery");
+});
+
+test("repository turn: different repositories sharing the worktree directory deliver independently", { timeout: 25_000 }, async context => {
+  const firstRepo = turnFixture(context); const otherRepo = turnFixture(context);
+  const first = scriptedTurn(context, firstRepo, 51, ["commit:after:1"], "first");
+  let other: ReturnType<typeof scriptedTurn> | undefined;
+  try {
+    const held = ownsTurn(firstRepo, first, await first.point("commit:after:1"));
+    other = scriptedTurn(context, firstRepo, 52, [], "second", otherRepo.repo);
+    deliveredTurn(other, await other.result());
+    assert.deepEqual(repositoryTurns(firstRepo), [held], "The other repository does not release this owner's turn");
+    first.release("commit:after:1"); deliveredTurn(first, await first.result());
+    assert.deepEqual(repositoryTurns(firstRepo), []);
+    untouched(firstRepo); untouched(otherRepo);
+  } finally { await Promise.all([first.stop(), other?.stop()]); }
+});
+
+test("repository turn: a commit failure releases before the person and retry reacquires", async context => {
+  const f = fixture(context); const hook = join(f.repo, ".git/hooks/pre-commit");
+  writeFileSync(hook, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  const human = person(() => {
+    assert.deepEqual(repositoryTurns(f), []);
+    rmSync(hook); return "retry";
+  });
+  const result = await execute(input(f), {}, human, assertRepositoryTurn(f));
+  assert.equal(result.state, "delivered"); assert.equal(human.requests.length, 1);
+  assert.equal(result.states.filter(state => state === "commit").length, 2);
+  assert.deepEqual(repositoryTurns(f), []);
+});
+
+for (const ending of ["stop", "error"] as const) test(`repository turn: actor ${ending} releases ownership while its PID remains alive`, async context => {
+  const f = fixture(context); let state = ""; let actor: { stop: () => void };
+  const primitives = {
+    ...runtime,
+    machine: ((config: any) => runtime.machine({ ...config, entry: [(args: any) => { actor = args.self; }, config.entry] })) as typeof runtime.machine,
+    operation: ((run: (...args: any[]) => any, on: any, options: any) => runtime.operation(async (...args: any[]) => {
+      await Promise.resolve();
+      const entered = state; const event = await run(...args);
+      if (entered === "commit" && event.type === "committed") {
+        assert.equal(repositoryTurns(f).length, 1);
+        if (ending === "error") throw new Error("Injected Operation failure after commit");
+        actor.stop();
+      }
+      return event;
+    }, on, options)) as typeof runtime.operation,
+  };
+  const result = execute(input(f), {}, person(), { primitives, onEnter: entry => { state = String(entry.value); } });
+  if (ending === "error") await assert.rejects(result, /Injected Operation failure after commit/u);
+  else await result;
+  assert.deepEqual(repositoryTurns(f), []);
+  assert.doesNotThrow(() => process.kill(process.pid, 0));
+});
+
+test("repository turn: cancelling a waiter aborts polling and never acquires after release", async context => {
+  const f = fixture(context);
+  const { repositoryTurn } = await import("../defaults/_machine-shop/task.ts");
+  const directory = join(f.root, ".machine-runs", "repository-turns");
+  const owner = repositoryTurn(f.repo, directory, "owner");
+  const waiter = repositoryTurn(f.repo, directory, "waiter");
+  const controller = new AbortController();
+  await owner.acquire(new AbortController().signal, () => {}, () => {});
+  let waiting = false;
+  const pending = waiter.acquire(controller.signal, note => { waiting ||= !!note; }, () => {});
+  assert.equal(waiting, true);
+  controller.abort();
+  await assert.rejects(pending, { name: "AbortError" });
+  waiter.release(); assert.equal(repositoryTurns(f).length, 1, "A cancelled waiter must not release someone else's lock");
+  owner.release(); await delay(150);
+  assert.deepEqual(repositoryTurns(f), []);
+});
+
+test("repository turn: a sleeping delivery retry reacquires against the current base and reruns gates", async context => {
+  const f = fixture(context); remote(f); fakeGh(context, f); failingPushes(f, 1);
+  const assignment = input(f, { output: "pr" }); const saves = checkpointed();
+  const first = await execute(assignment, {}, person(), { ...saves.options, onSleep: () => {} });
+  assert.equal(first.state, "deliver"); assert.deepEqual(repositoryTurns(f), []);
+  const checkpoint = saves.saved.deliver!;
+  const tip = advance(f, "later.txt", "A new published base while the retry sleeps\n");
+  git(f.repo, "push", "-q", "origin", "main");
+  const resumed = checkpointed(checkpoint);
+  const second = await execute(assignment, { implementer: () => assert.fail("Retry must keep the approved candidate"), reviewer: () => assert.fail("An unchanged replay does not need another review") }, person(), {
+    ...resumed.options, continueAt: { value: checkpoint.value, context: checkpoint.context, due: new Date(0).toISOString(), retry: { attempt: 2, of: 4 } },
+  });
+  const run = merged(f, second);
+  assert.equal(run.delivery.baseCommit, tip);
+  assert.equal(git(f.repo, "rev-parse", `${run.delivery.commit}^`), tip);
+  assert.deepEqual(phases(run), ["red", "verify", "reverify"]);
+  assert.deepEqual(repositoryTurns(f), []);
 });

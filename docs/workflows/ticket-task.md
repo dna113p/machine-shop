@@ -65,6 +65,18 @@ The call ceiling includes these send-backs; repair and review budgets are unchan
 | `stuck` | no | `"park"` | `stuck` no longer changes anything: both `"park"` and `"ask"` sleep on the same Human question. |
 | `resume` | no | `false` | Pick up the worktree a hand-off or block left, or a delivered commit whose worktree is gone. |
 
+Each repository has one turn from commit through rebase, repeated gates and delivery.
+A lock beside the worktrees directory, under `.machine-runs/repository-turns/`,
+records the run ID and PID using the canonical Git repository identity. Other
+runs poll and publish their wait in the run status’s `now` field, clearing it
+when they acquire the turn or stop; a stale lock whose PID is gone is reclaimed
+with a log line. A waiting run replays onto the current base and runs
+the gates again when it moved. The turn is released before repair, review,
+a person’s decision, completion or a stopped run. A replay conflict uses the
+existing once-per-run repair allowance, reacquiring the turn before commit and
+replay; a second conflict keeps the existing stop. Delivery never advances the
+base itself or stacks onto unmerged ticket branches.
+
 In `pr` mode, resume also moves an uncommitted candidate onto the published tip
 when the local base is behind. Before delivery, a run whose local base remains
 behind its starting commit reads the recorded remote base again: it keeps the

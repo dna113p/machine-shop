@@ -1,8 +1,87 @@
 import { spawnSync, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readlinkSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmdirSync, unlinkSync, readlinkSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import type { Event, MachinePrimitives } from "@dna113p/machines";
+
+/** Mechanical coordination only; the definition chooses which steps hold a turn. */
+export function repositoryTurn(repository: string, directory: string, runId: string) {
+  // The common Git directory identifies aliases and linked worktrees of one repository.
+  const identity = realpathSync(git(repository, "rev-parse", "--path-format=absolute", "--git-common-dir").trim());
+  const key = createHash("sha256").update(identity).digest("hex");
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const lock = join(realpathSync(directory), key);
+  const token = `${randomUUID()}.json`;
+  let owned = false;
+  const missing = (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT";
+  const removeEmpty = () => {
+    try { rmdirSync(lock); } catch (error) {
+      // A competing acquirer may already have installed a nonempty replacement.
+      if (!missing(error) && (error as NodeJS.ErrnoException).code !== "ENOTEMPTY" && (error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  };
+  const release = () => {
+    if (!owned) return;
+    // Unique owner filenames prevent an old release/reclaimer from unlinking a new owner.
+    try { unlinkSync(join(lock, token)); } catch (error) { if (!missing(error)) throw error; }
+    owned = false;
+    removeEmpty();
+  };
+  const removeCandidate = (candidate: string) => {
+    try { unlinkSync(join(candidate, token)); } catch (error) { if (!missing(error)) throw error; }
+    try { rmdirSync(candidate); } catch (error) { if (!missing(error)) throw error; }
+  };
+  const dead = (pid: number) => {
+    try { process.kill(pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+  };
+  const acquire = async (signal: AbortSignal, note: (value: string) => void, log: (value: string) => void) => {
+    signal.throwIfAborted();
+    if (owned) return;
+    let previous: { pid: number; runId: string } | undefined;
+    let reclaimed = false;
+    for (;;) {
+      signal.throwIfAborted();
+      const candidate = mkdtempSync(join(directory, ".candidate-"));
+      try {
+        writeFileSync(join(candidate, token), JSON.stringify({ runId, pid: process.pid }) + "\n", { flag: "wx", mode: 0o600 });
+        try {
+          // Atomic publication of a complete record. rename cannot replace a nonempty directory.
+          renameSync(candidate, lock);
+          owned = true;
+          // Another waiter can remove the dead record just before this run wins the turn.
+          if (!reclaimed && previous && dead(previous.pid)) log(`Acquired repository turn after run ${previous.runId}, dead PID ${previous.pid}.`);
+          note("");
+          return;
+        } catch (error) {
+          if (!["ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+        }
+      } finally {
+        removeCandidate(candidate);
+      }
+      let records: string[];
+      try { records = readdirSync(lock); } catch (error) { if (missing(error)) continue; throw error; }
+      for (const record of records) {
+        const file = join(lock, record);
+        let owner: { pid: number; runId: string };
+        try { owner = JSON.parse(readFileSync(file, "utf8")); } catch (error) { if (missing(error)) continue; throw error; }
+        if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0) throw new Error(`Invalid repository turn owner: ${file}`);
+        previous = owner;
+        if (dead(owner.pid)) {
+          try {
+            unlinkSync(file);
+            log(`Reclaimed stale repository turn from run ${owner.runId}, dead PID ${owner.pid}.`);
+            reclaimed = true;
+          } catch (error) { if (!missing(error)) throw error; }
+          removeEmpty();
+        }
+      }
+      note("Waiting for the repository turn before commit, rebase and delivery.");
+      await delay(100, undefined, { signal });
+    }
+  };
+  return { acquire, release };
+}
 
 export interface Check {
   name: string;

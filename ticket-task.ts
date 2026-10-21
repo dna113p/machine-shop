@@ -1,8 +1,8 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { closeSync, existsSync, lstatSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, lstatSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { defineEndings, type Event, type MachinePrimitives } from "@dna113p/machines";
-import { taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
+import { repositoryTurn, taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
 import { brief, opening } from "./defaults/_machine-shop/brief.ts";
 import { outsideScope } from "./defaults/_machine-shop/scope.ts";
 
@@ -38,6 +38,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const { machine, operation, agent, human, wait, final } = p;
   type PlanningStage = "falsify" | "plan" | "planReview";
   const saved = p.data({
+    pushed: false,
     branch: "",
     baseCommit: "",
     commitHash: "",
@@ -101,6 +102,33 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     task: taskData(),
   });
   const { ticket, repository, prefix, worktree, evidenceRoot, resume, redGreen, assume, work, branch: named } = parseTicket(input, saved.task);
+  let turn: ReturnType<typeof repositoryTurn> | undefined;
+  const lifetime = new AbortController();
+  let turnHeld = false;
+  const releaseTurn = () => { turn?.release(); turnHeld = false; p.status({ now: null }); };
+  const stopTurn = () => { lifetime.abort(); releaseTurn(); };
+  const takeTurn = async () => {
+    turn ??= repositoryTurn(repository.path, join(dirname(dirname(worktree)), ".machine-runs", "repository-turns"), basename(work.open()));
+    await turn.acquire(lifetime.signal, note => { p.status({ now: note || null }); }, message => {
+      appendFileSync(join(work.open(), "repository-turn.log"), message + "\n", { mode: 0o600 });
+      console.log(message);
+    });
+    turnHeld = true;
+  };
+  // Keep the turn only on transitions that remain in the delivery stretch.
+  const inTurn = (run: () => Event, keep: readonly string[], replayOnAcquire = false) => async () => {
+    try {
+      const replay = replayOnAcquire && !turnHeld && !saved.pushed;
+      await takeTurn();
+      lifetime.signal.throwIfAborted();
+      // A sleeping delivery retry lost its turn. Recheck the base before any unpublished delivery.
+      // Once pushed, preserve that exact commit so a partial PR delivery remains idempotent.
+      const rebased = replay ? stopped("rebase", rebase)() : undefined;
+      const result = rebased && !["current", "rebased"].includes(rebased.type) ? rebased : run();
+      if (!keep.includes(result.type)) releaseTurn();
+      return result;
+    } catch (error) { releaseTurn(); throw error; }
+  };
   // A continued run keeps its saved branch; resume may adopt the worktree's branch.
   saved.branch ||= named;
   const assumptionsPrompt = () => saved.assumptionsJson ? ["Assumptions:", saved.assumptionsJson] : [];
@@ -808,6 +836,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       // The only ref ever pushed is this run's own branch at the approved commit, without force and whatever push.followTags says.
       // It goes to the URL prepare checked, read once: a remote reconfigured since then, as an Agent can do, is not asked again.
       if (!attempt("git", ["push", "--no-follow-tags", saved.checked, `${saved.commitHash}:refs/heads/${saved.branch}`], worktree, publishTimeoutMs, undefined, true).ok) return stepFailure("deliver", true, undefined, "unreachable");
+      saved.pushed = true;
       if (!saved.prUrl) {
         const body = join(directory, "pull-request.md");
         writeFileSync(body, [
@@ -1376,6 +1405,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }[name] })),
   });
   function stepFailed(): Event {
+    releaseTurn();
     writeFileSync(join(work.open(), `question-${++saved.questions}.txt`), stepPrompt() + "\n", { mode: 0o600 });
     return { type: saved.failedStep === "deliver" ? "delivery" : saved.retryable ? "retryable" : "keep" };
   }
@@ -1395,6 +1425,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   };
   const mergeDecide = ({ event }: { event: Event }) => { saved.mergeDecision = work.choice("mergeDecide", event, mergeDecisions); };
   return machine({
+    entry: ({ self }) => { self.subscribe({ error: stopTurn }); },
+    // An invoked lifecycle actor also starts on checkpoint continuation, when entry actions do not.
+    invoke: { src: {
+      getInitialSnapshot: () => ({ status: "active" as const, output: undefined, error: undefined }),
+      transition: snapshot => snapshot,
+      getPersistedSnapshot: snapshot => snapshot,
+      restoreSnapshot: () => ({ status: "active" as const, output: undefined, error: undefined }),
+      start: (_snapshot, { self }) => { self.subscribe({ complete: stopTurn, error: stopTurn }); },
+    } },
     initial: "shape", output: () => saved.held ?? undefined,
     states: {
       shape: operation(shape, { prepared: "prepare", blocked: "refuse" }),
@@ -1534,9 +1573,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }, { present: "presenter", presentWith: () => runFacts("stuck"), choices: confirmations }),
       archive: operation(archive, { archived: "remove" }),
       remove: operation(remove, { removed: "abandon" }),
-      commit: operation(commit, { committed: "rebase", failed: "stepFailed" }),
-      rebase: operation(stopped("rebase", rebase), { current: "deliver", rebased: "deliver", conflicted: "change", resumed: "scopeAfterChange", review: "verify", failed: "repairBudget", stuck: "stuck", blocked: "refuse", handBack: "stepFailed" }),
-      deliver: operation(deliver, { delivered: "success", unreachable: "stepFailed", failed: "stepFailed" }, { retry: { on: "unreachable", times: 3, wait: "1m" } }),
+      commit: operation(inTurn(commit, ["committed"]), { committed: "rebase", failed: "stepFailed" }),
+      rebase: operation(inTurn(stopped("rebase", rebase), ["current", "rebased"]), { current: "deliver", rebased: "deliver", conflicted: "change", resumed: "scopeAfterChange", review: "verify", failed: "repairBudget", stuck: "stuck", blocked: "refuse", handBack: "stepFailed" }),
+      deliver: operation(inTurn(() => {
+        const result = deliver();
+        return result.type === "failed" ? { type: "deliveryFailed" } : result;
+      }, [], true), {
+        delivered: "success", unreachable: "stepFailed", deliveryFailed: "stepFailed",
+        conflicted: "change", resumed: "scopeAfterChange", review: "verify", failed: "repairBudget", stuck: "stuck", blocked: "refuse", handBack: "stepFailed",
+      }, { retry: { on: "unreachable", times: 3, wait: "1m" } }),
       success: operation(() => conclude("completed"), { delivered: repository.output === "pr" ? "checkMerge" : "delivered", kept: "delivered", refused: "refused" }),
       checkMerge: operation(checkMerge, { merged: "cleanUp", waiting: "awaitMerge", decide: "mergeDecide" }),
       awaitMerge: wait({ every: "10m" }, { due: "checkMerge" }),
