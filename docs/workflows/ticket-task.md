@@ -73,14 +73,36 @@ round, or plan revision.
 Each repository has one turn from commit through rebase, repeated gates and delivery.
 A lock beside the worktrees directory, under `.machine-runs/repository-turns/`,
 records the run ID and PID using the canonical Git repository identity. Other
-runs poll and publish their wait in the run status’s `now` field, clearing it
-when they acquire the turn or stop; a stale lock whose PID is gone is reclaimed
+runs poll and publish `<title>: waiting for the repository's turn` in the run
+status, restoring the active sentence when they acquire the turn or stop;
+a stale lock whose PID is gone is reclaimed
 with a log line. A waiting run replays onto the current base and runs
 the gates again when it moved. The turn is released before repair, review,
 a person’s decision, completion or a stopped run. A replay conflict uses the
 existing once-per-run repair allowance, reacquiring the turn before commit and
 replay; a second conflict keeps the existing stop. Delivery never advances the
 base itself or stacks onto unmerged ticket branches.
+
+Every state publishes one sentence about the ticket in both `now` and `note`,
+including after checkpoint continuation. For example, falsification says
+`<title>: checking whether the ticket is sound`, planning says
+`<title>: planning; the plan review is next`, tests say
+`<title>: writing the failing tests`, and implementation says
+`<title>: implementing; gates not yet run`. Gates name the configured checks,
+such as `<title>: running lint, types, tests`. Review names the current attempt
+and its budget, counting the initial review plus permitted revisions:
+`<title>: under review, round 1 of 2`. An extra review budget is identified explicitly.
+A stop says `<title>: stuck at <stage>, needs you`; pull request delivery says
+`<title>: delivered as pull request #N`. Merge waiting, cleanup, and every ending
+have their own sentences. Releasing the repository turn never clears the status.
+
+Whitespace is collapsed to keep each sentence on one line. Sentences are limited
+to 200 Unicode characters; long titles are shortened with an ellipsis without
+splitting a Unicode character, preserving the stage meaning. An unusually long
+stage description (such as a list of check names) is capped at 160 characters
+to leave room for the title. The identical `note` supports runtimes that silently
+ignore `now`. Explicit unknown-`now` validation errors retry with only `note`;
+unrelated status errors still fail visibly.
 
 In `pr` mode, resume also moves an uncommitted candidate onto the published tip
 when the local base is behind. Before delivery, a run whose local base remains

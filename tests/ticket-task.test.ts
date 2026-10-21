@@ -7888,7 +7888,12 @@ function ownsTurn(f: Fixture, run: ReturnType<typeof scriptedTurn>, at: TurnMess
 const deliveredTurn = (run: ReturnType<typeof scriptedTurn>, result: TurnMessage) => {
   assert.equal(result.state, "delivered");
   assert.equal(result.published?.length, 1, "The runtime publishes this run's status");
-  assert.deepEqual(statusNotes(result.published), [], "Delivery must clear the published waiting message");
+  const sentences = statusNotes(result.published);
+  assert.ok(sentences.length > 0, "Delivery preserves a title-bearing status sentence");
+  for (const sentence of sentences) {
+    assert.match(sentence, /^Add a greeting: delivered\b/u);
+    assert.doesNotMatch(sentence, /waiting for the repository|queued/iu);
+  }
   assert.equal(result.data.task.result.checksPassed, true);
   const receipt = JSON.parse(readFileSync(join(result.data.task.directory, "delivery.json"), "utf8"));
   assert.equal(receipt.branch, run.name);
@@ -7926,13 +7931,18 @@ test("repository turn: a live owner's file records run and PID, reports waiting,
     const held = ownsTurn(f, owner, committed);
     // A second spelling of the same checkout and a separate evidence root must still share this turn.
     waiter = scriptedTurn(context, f, 32, ["commit:after:1"], "second", alias);
-    await waitingForTurn(waiter);
+    assert.equal(await waitingForTurn(waiter), "Add a greeting: waiting for the repository's turn");
     assert.deepEqual(repositoryTurns(f), [held], "A live owner's lock cannot be stolen or replaced by a waiter");
     owner.release("commit:after:1"); deliveredTurn(owner, await owner.result());
     const acquired = await waiter.point("commit:after:1"); ownsTurn(f, waiter, acquired);
     const status = await waiter.inspect();
     assert.equal(status.published?.length, 1);
-    assert.deepEqual(statusNotes(status.published), [], "Acquiring the turn must clear the published waiting message before replay and delivery");
+    const sentences = statusNotes(status.published);
+    assert.ok(sentences.length > 0, "Acquiring the turn restores the active sentence before replay and delivery");
+    for (const sentence of sentences) {
+      assert.match(sentence, /^Add a greeting: .+\S/u);
+      assert.doesNotMatch(sentence, /waiting|queued/iu);
+    }
     waiter.release("commit:after:1"); deliveredTurn(waiter, await waiter.result());
     assert.deepEqual(repositoryTurns(f), []); untouched(f);
   } finally { await owner.stop(); await waiter?.stop(); }
@@ -8077,3 +8087,235 @@ test("repository turn: a sleeping delivery retry reacquires against the current 
   assert.deepEqual(phases(run), ["red", "verify", "reverify"]);
   assert.deepEqual(repositoryTurns(f), []);
 });
+
+/** Observe only the public status channel, including what a note-only runtime actually retains. */
+function ticketStatus(mode: "now" | "note-only" | "reject-now" = "now", base = runtime) {
+  type Status = Parameters<typeof runtime.status>[0];
+  let current: Status = {};
+  let state = "";
+  let rejected = 0;
+  const updates: Status[] = [];
+  const observations: { stage: string; status: Status }[] = [];
+  const observe = (stage: string) => observations.push({ stage, status: { ...current } });
+  const primitives = {
+    ...base,
+    status: (update: Status) => {
+      if (mode === "reject-now" && typeof update.now === "string") {
+        rejected++;
+        throw new TypeError("Unknown status field: now");
+      }
+      // Old runtimes can silently ignore unknown fields. No error can trigger fallback here.
+      const accepted = mode === "now" ? update : update.note !== undefined ? { note: update.note } : {};
+      runtime.status(accepted);
+      updates.push(structuredClone(update));
+      current = { ...current, ...accepted };
+    },
+    operation: ((run: (...args: any[]) => any, on: any, options: any) => base.operation(async (...args: any[]) => {
+      await Promise.resolve();
+      const entered = state;
+      const event = await run(...args);
+      observe(entered);
+      return event;
+    }, on, options)) as typeof runtime.operation,
+  };
+  return {
+    primitives, observe, observations, updates, current: () => current, rejected: () => rejected,
+    onEnter: (entry: Parameters<NonNullable<RunHooks["onEnter"]>>[0]) => { state = String(entry.value); },
+  };
+}
+
+function statusSentence(status: Parameters<typeof runtime.status>[0], expected: string, mode: "now" | "note-only" | "reject-now" = "now") {
+  assert.equal(status.note, expected, "The note carries the complete ticket sentence, even without now support");
+  if (mode === "now") assert.equal(status.now, expected, "now and note carry the identical ticket sentence");
+  else assert.equal(status.now, undefined, "The legacy runtime has no now setter");
+}
+
+for (const mode of ["now", "note-only", "reject-now"] as const) {
+  test(`ticket now: scripted lifecycle publishes title-based sentences with ${mode} status`, async context => {
+    const f = fixture(context); remote(f); fakeGh(context, f);
+    const status = ticketStatus(mode);
+    let tests = 0; let reviews = 0;
+    const capture = (stage: string, answer: Runner): Runner => request => { status.observe(stage); return answer(request); };
+    const human = person(() => { status.observe("needs-owner"); return "more rounds"; });
+    // One permitted revision gives this script two review attempts.
+    const result = await execute(input(f, {
+      output: "pr", checks: [command(undefined, { name: "lint" }), command(undefined, { name: "types" }), command()],
+    }, { maxReviewRounds: 1 }), {
+      falsify: capture("falsify-agent", planning.falsify!.answer),
+      plan: capture("plan-agent", planning.plan!.answer),
+      tester: capture("test-agent", request => ++tests === 1 ? ok("blocked", "The test needs the owner's answer") : tester(request)),
+      implementer: capture("change-agent", implement),
+      reviewer: capture("review-agent", () => ++reviews === 1 ? review("revise", "Handle the empty greeting") : review()),
+    }, human, status);
+    merged(f, result);
+    assert.equal(tests, 2); assert.equal(reviews, 2); assert.equal(human.requests.length, 1);
+    const expected: [string, string[]][] = [
+      ["falsify-agent", ["Add a greeting: checking whether the ticket is sound"]],
+      ["plan-agent", ["Add a greeting: planning; the plan review is next"]],
+      ["test-agent", Array(2).fill("Add a greeting: writing the failing tests")],
+      ["change-agent", Array(2).fill("Add a greeting: implementing; gates not yet run")],
+      ["verify", Array(2).fill("Add a greeting: running lint, types, tests")],
+      ["review-agent", ["Add a greeting: under review, round 1 of 2", "Add a greeting: under review, round 2 of 2"]],
+      ["stuck", ["Add a greeting: stuck at test, needs you"]],
+      ["needs-owner", ["Add a greeting: stuck at test, needs you"]],
+      ["success", ["Add a greeting: delivered as pull request #7"]],
+    ];
+    for (const [stage, sentences] of expected) {
+      const actual = status.observations.filter(item => item.stage === stage);
+      assert.equal(actual.length, sentences.length, `${stage} was observed on every scripted visit`);
+      actual.forEach((item, index) => statusSentence(item.status, sentences[index]!, mode));
+    }
+    // Observe completion after the lifecycle actor releases its repository turn.
+    const final = status.current();
+    assert.match(final.note ?? "", /^Add a greeting: .*merged/iu);
+    if (mode === "now") assert.equal(final.now, final.note);
+    assert.doesNotMatch(final.note!, /waiting for the repository/iu);
+    assert.deepEqual(repositoryTurns(f), []); untouched(f);
+    if (mode === "reject-now") assert.ok(status.rejected() > 0, "The adapter really rejected the unsupported field");
+    if (mode === "note-only") assert.ok(status.updates.some(update => typeof update.now === "string"), "The legacy runtime silently ignored now");
+  });
+}
+
+for (const continuedAt of ["stuck", "decide"] as const) {
+  test(`ticket now: checkpoint continuation at ${continuedAt} restores the stopped sentence and then the active sentence`, async context => {
+    const f = fixture(context); const saves = checkpointed();
+    const first = await execute(input(f), { tester: () => ok("blocked", "Which greeting should the test expect?") }, person(), {
+      ...saves.options, onHumanSleep: () => {},
+    });
+    assert.equal(first.state, "decide");
+    const checkpoint = saves.saved[continuedAt]!; assert.ok(checkpoint);
+    const restored = checkpointed(checkpoint);
+    const status = ticketStatus("now", restored.options.primitives);
+    const human = person(() => { status.observe("continued-question"); return "more rounds"; });
+    const result = await execute(input(f), {
+      investigator: () => assert.fail("Continuation must not restart planning"),
+      tester: request => { status.observe("continued-test"); return tester(request); },
+    }, human, {
+      ...restored.options, primitives: status.primitives,
+      onEnter: entry => { restored.options.onEnter!(entry); status.onEnter(entry); },
+      continueAt: { value: checkpoint.value, context: checkpoint.context },
+    });
+    assert.equal(result.state, "delivered");
+    assert.deepEqual(result.states.slice(0, continuedAt === "stuck" ? 2 : 1), continuedAt === "stuck" ? ["stuck", "decide"] : ["decide"]);
+    for (const [stage, expected] of [
+      ["continued-question", "Add a greeting: stuck at test, needs you"],
+      ["continued-test", "Add a greeting: writing the failing tests"],
+    ]) {
+      const observations = status.observations.filter(item => item.stage === stage);
+      assert.equal(observations.length, 1); statusSentence(observations[0]!.status, expected!);
+    }
+    assert.match(status.current().now ?? "", /^Add a greeting: delivered\b/u);
+    assert.equal(status.current().note, status.current().now);
+    assert.deepEqual(repositoryTurns(f), []); untouched(f);
+  });
+}
+
+for (const long of [false, true]) {
+  test(`ticket now: ${long ? "long Unicode" : "multiline"} titles keep the stage meaning in one line within 200 characters`, async context => {
+    const f = fixture(context); const status = ticketStatus();
+    const assignment = input(f);
+    assignment.ticket.title = long ? `Build Track B ${"🚀".repeat(240)} heads` : "  Build\n Track\tB\u2028per-stat\u2029heads  ";
+    const result = await execute(assignment, {
+      implementer: request => { status.observe("title-change"); return implement(request); },
+    }, person(), status);
+    assert.equal(result.state, "delivered");
+    const snapshot = status.observations.find(item => item.stage === "title-change"); assert.ok(snapshot);
+    const sentence = snapshot.status.now;
+    assert.equal(typeof sentence, "string");
+    assert.ok(sentence!.startsWith("Build Track B "), "The sentence retains the ticket's title");
+    assert.ok(sentence!.endsWith(": implementing; gates not yet run"), "Truncation preserves the entire stage meaning");
+    assert.equal(snapshot.status.note, sentence);
+    if (!long) assert.equal(sentence, "Build Track B per-stat heads: implementing; gates not yet run");
+    else {
+      assert.ok(sentence!.includes("🚀"), "Unicode title content survives truncation");
+      assert.ok(sentence!.isWellFormed(), "Truncation does not split a Unicode character");
+    }
+    const sentences = status.updates.filter(update => typeof update.now === "string");
+    assert.ok(sentences.length > 0);
+    for (const update of sentences) {
+      assert.equal(update.note, update.now);
+      assert.ok([...update.now!].length <= 200, "The public now limit is 200 Unicode characters");
+      assert.doesNotMatch(update.now!, /[\r\n\u0085\u2028\u2029]|\s{2}/u);
+    }
+    assert.match(status.current().now ?? "", /^Build Track B .+: delivered\b/u);
+    assert.equal(status.current().note, status.current().now); untouched(f);
+  });
+}
+
+test("ticket now: an unrelated status failure propagates instead of retrying note-only", async context => {
+  const f = fixture(context);
+  const failure = new Error("Status storage is unavailable");
+  const attempts: Parameters<typeof runtime.status>[0][] = [];
+  let failed = false;
+  const primitives = { ...runtime, status: (update: Parameters<typeof runtime.status>[0]) => {
+    if (typeof update.now === "string" || update.note?.startsWith("Add a greeting:")) {
+      attempts.push(structuredClone(update));
+      if (!failed) { failed = true; throw failure; }
+    }
+    runtime.status(update);
+  } };
+  await assert.rejects(execute(input(f), {}, person(), { primitives }), error => error === failure);
+  assert.ok(failed, "The Machine tried to publish a ticket sentence");
+  assert.ok(attempts.every(update => typeof update.now === "string"), "Unrelated failures must not trigger note-only fallback");
+  assert.deepEqual(repositoryTurns(f), []); untouched(f);
+});
+
+test("ticket now: the gates sentence names the repository's configured checks", async context => {
+  const f = fixture(context); const status = ticketStatus();
+  const result = await execute(input(f, {
+    checks: [command(undefined, { name: "formatting" }), command(undefined, { name: "contracts" })], redCheck: "contracts",
+  }), {}, person(), status);
+  assert.equal(result.state, "delivered");
+  const gates = status.observations.filter(item => item.stage === "verify");
+  assert.equal(gates.length, 1);
+  statusSentence(gates[0]!.status, "Add a greeting: running formatting, contracts");
+  assert.deepEqual(repositoryTurns(f), []); untouched(f);
+});
+
+test("ticket now: merge waiting survives sleep and continuation before cleanup and the merged ending", async context => {
+  const f = fixture(context); remote(f); fakeGh(context, f, 0, ["OPEN", "MERGED"]);
+  const assignment = input(f, { output: "pr" }); const saves = checkpointed();
+  const firstStatus = ticketStatus("now", saves.options.primitives);
+  const first = await execute(assignment, {}, person(), {
+    ...saves.options, primitives: firstStatus.primitives,
+    onEnter: entry => { saves.options.onEnter!(entry); firstStatus.onEnter(entry); },
+    onSleep: () => {},
+  });
+  assert.equal(first.state, "awaitMerge");
+  statusSentence(firstStatus.current(), "Add a greeting: waiting for the pull request to merge");
+  assert.deepEqual(repositoryTurns(f), []);
+  const checkpoint = saves.saved.awaitMerge!; assert.ok(checkpoint);
+  const resumed = checkpointed(checkpoint); const status = ticketStatus("now", resumed.options.primitives);
+  const second = await execute(assignment, {}, person(), {
+    ...resumed.options, primitives: status.primitives,
+    continueAt: { value: checkpoint.value, context: checkpoint.context, due: new Date(0).toISOString() },
+    onEnter: entry => {
+      resumed.options.onEnter!(entry); status.onEnter(entry);
+      if (entry.value === "awaitMerge") status.observe("continued-wait");
+    },
+  });
+  assert.equal(second.state, "merged");
+  for (const [stage, sentence] of [
+    ["continued-wait", "Add a greeting: waiting for the pull request to merge"],
+    ["cleanUp", "Add a greeting: removing the merged ticket's branches"],
+  ]) {
+    const observations = status.observations.filter(item => item.stage === stage);
+    assert.equal(observations.length, 1); statusSentence(observations[0]!.status, sentence!);
+  }
+  statusSentence(status.current(), "Add a greeting: merged; ticket complete");
+  assert.deepEqual(repositoryTurns(f), []); untouched(f);
+});
+
+for (const ending of ["refused", "handedOff", "abandoned"] as const) {
+  test(`ticket now: ${ending} keeps its sentence without changing the declared ending`, async context => {
+    const f = fixture(context); const status = ticketStatus(); const assignment = input(f);
+    if (ending === "refused") assignment.ticket.body = "## Goal\nA ticket missing its required sections";
+    const human = ending === "handedOff" ? person("hand off") : person("discard", "confirm discard");
+    const result = await execute(assignment, { tester: () => ok("blocked", "The owner must choose the greeting") }, human, status);
+    assert.equal(result.state, ending);
+    statusSentence(status.current(), `Add a greeting: ${{
+      refused: "refused; see the recorded reason", handedOff: "handed off; work kept", abandoned: "abandoned",
+    }[ending]}`);
+    assert.deepEqual(repositoryTurns(f), []); untouched(f);
+  });
+}

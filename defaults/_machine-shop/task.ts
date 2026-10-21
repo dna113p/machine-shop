@@ -5,6 +5,24 @@ import { isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Event, MachinePrimitives } from "@dna113p/machines";
 
+/** Publish one bounded sentence; the definition supplies its stage meaning. */
+export function taskNow(status: MachinePrimitives["status"], title: string, meaning: string): void {
+  const line = (value: string) => value.replace(/[\s\u0085]+/gu, " ").trim();
+  const shorten = (value: string, limit: number) => {
+    const characters = [...value];
+    return characters.length <= limit ? value : characters.slice(0, limit - 1).join("").trimEnd() + "…";
+  };
+  // Reserve room for the title, even for unusually long configured check names.
+  const stage = shorten(line(meaning), 160);
+  const sentence = `${shorten(line(title), 200 - [...stage].length - 2)}: ${stage}`;
+  try { status({ now: sentence, note: sentence }); }
+  catch (error) {
+    // Some old runtimes ignore now; others explicitly reject it. Never hide a storage failure.
+    if (!(error instanceof Error) || !/^Unknown status fields?: now$/u.test(error.message)) throw error;
+    status({ note: sentence });
+  }
+}
+
 /** Read only the selected log tail; leave the complete log in place. Missing logs are evidence too. */
 export function evidenceLog(log: string): string {
   try {
