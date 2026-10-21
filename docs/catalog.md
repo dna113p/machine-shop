@@ -45,6 +45,24 @@ Production migrations and publishing are deliberately not generic defaults.
 Ticket operations use [recovery by step](workflows/ticket-task.md#recovery-by-step),
 including bounded Operation retries and questions specific to each failed step.
 
+Ticket delivery, stops and endings also leave a deterministic run-note page and
+`handoff.html` in the evidence directory. The page includes the ticket title,
+repository/ticket/branch/PR-or-patch breadcrumb, outcome, now/done/decided/needs
+recap, changed-file counts, gate chips and failing-log tails, and review criteria
+and findings by severity. Stops reuse the question evidence described below.
+Only passed stages and accepted falsify assumptions populate the recap.
+Required gate chips use verification results and show skipped before verification.
+Setup and red-proof evidence keeps separate phase labels; passing a red proof
+means the tests failed as expected, not that verification passed.
+
+The complete escaped page is below 200,000 UTF-8 bytes, with explicit omission
+markers and diagnostic tails retained for displayed failures. Full logs and
+reports stay intact. File counts survive cleanup and checkpoints; subsequent note
+updates retain the page, and merge or another stop refreshes its outcome. Every
+note with a page names `handoff.html`, including on runtimes that ignore `page`.
+Explicit rejection of `page` or `now` retries without only those fields; other
+errors propagate. No model call, transition or ending is added.
+
 ### Explaining a stop
 
 Every ticket stop and discard confirmation carries a deterministic evidence page,
