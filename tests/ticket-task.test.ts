@@ -39,6 +39,11 @@ function fixture(context: TestContext) {
   git(repo, "init", "-q", "-b", "main");
   git(repo, "config", "user.email", "fixture@example.invalid");
   git(repo, "config", "user.name", "Fixture");
+  // Only fixture-owned ignore rules apply, including in linked worktrees. A
+  // developer's global .machine-runs ignore must not hide untracked evidence
+  // in tests that exercise Git refusing to remove a dirty worktree.
+  const excludes = join(repo, ".git", "test-excludes"); writeFileSync(excludes, "");
+  git(repo, "config", "core.excludesFile", excludes);
   writeFileSync(join(repo, "code.txt"), "old");
   git(repo, "add", "."); git(repo, "commit", "-qm", "baseline");
   return { root, repo, head: git(repo, "rev-parse", "HEAD"), evidence: join(root, "evidence"), worktree: join(root, "worktrees", "widgets--proj-12") };
@@ -6330,11 +6335,11 @@ for (const path of ["README.md", "docs/catalog.md"]) {
   });
 }
 
-test("one stuck state: the documented default count matches the selectable workflows", () => {
+test("one stuck state: the documented default count matches the source workflows", () => {
   const defaults = readdirSync(resolve("defaults")).filter(name => name.endsWith(".ts"));
-  assert.equal(defaults.length, 11);
+  assert.equal(defaults.length, 12);
   for (const path of ["README.md", "docs/catalog.md"]) {
-    assert.match(readFileSync(resolve(path), "utf8"), /\beleven\b|\b11\b/iu, path);
+    assert.match(readFileSync(resolve(path), "utf8"), /\btwelve\b|\b12\b/iu, path);
   }
 });
 

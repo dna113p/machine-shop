@@ -43,7 +43,8 @@ the [input](docs/catalog.md#common-input).
 
 ## The workflows
 
-Eleven defaults that the installer copies into a project on request:
+Twelve defaults live in `defaults/`. The installer copies these eleven into a
+project on request:
 
 | Default | Purpose |
 | --- | --- |
@@ -59,10 +60,11 @@ Eleven defaults that the installer copies into a project on request:
 | [`upgrade-dependency`](docs/workflows/upgrade-dependency.md) | Assess compatibility, get approval, upgrade, and verify |
 | [`prepare-release`](docs/workflows/prepare-release.md) | Check a candidate and obtain sign-off; never publish |
 
-Three more run from source and are never installed:
+The audit and three root workflows run from source and are never installed:
 
 | Workflow | Purpose |
 | --- | --- |
+| [`audit-project`](docs/workflows/audit-project.md) | Propose Machines, gates and role bindings for a project, then apply on acceptance |
 | [`ticket-task`](docs/workflows/ticket-task.md) | Carry a local ticket from its own worktree to a branch, patch, or pull request |
 | [`chatgpt-thread`](docs/workflows/chatgpt-thread.md) | Keep one ChatGPT web chat going, with a person writing each reply |
 | [`smoke`](docs/workflows/smoke.md) | One no-model step that proves the runtime can load a definition |
@@ -74,17 +76,36 @@ A project orchestrator chooses among them with the runtime's
 Malformed Agent reports get [one send-back with the exact fault](docs/catalog.md#recovery),
 kept in the stage evidence, before the existing stop applies.
 
+## Project setup and audit
+
+Run from this checkout with input `{ "project": "/absolute/project" }`:
+
+```sh
+machine run defaults/audit-project.ts --input-file /absolute/audit-input.json
+```
+
+The [audit](docs/workflows/audit-project.md) inventories the project, proposes
+routes, gates and role bindings, and waits for accept or skip. `apply: true`
+authorizes applying immediately. It is also setup for a project with no catalog.
+It stays in Machine Shop so it can use the current defaults and installer; it is
+absent from the installer’s selections. Evidence and the decision page live under
+the audited project's `.machine-runs/`. It never accesses Drip.
+
 ## Installing
 
-- Each workflow lands as `.machines/dev-<name>.ts`, beside the helper
-  `.machines/_machine-shop/task.ts`. The `dev-` prefix leaves names such as
+- Each selected workflow lands as `.machines/dev-<name>.ts`, beside its required
+  helpers in `.machines/_machine-shop/`. The `dev-` prefix leaves names such as
   `verify` free for the project.
 - **Safe to repeat.** An identical file is a no-op. A customized or conflicting
   one is refused, never overwritten. There is no force option, automatic
-  update, or install-all.
+  update, or install-all. The accepted audit can refresh copies whose bytes still
+  match their recorded installer hashes.
 - **No shadowing by accident.** A new `.machines/` directory hides the catalogs
   of parent directories, so the installer refuses to create one unless you pass
   `--allow-shadowing`. It also refuses symlinked destinations.
+- **Provenance.** `.machines/_machine-shop/manifest.json` records each copied
+  file’s hash and Machine Shop version. Modified and unknown-provenance files
+  are preserved by the audit.
 - **Nothing else.** It installs no Agents, presets, dependencies, or global
   configuration.
 - **Upgrading a customized helper:** compare by hand or install into a fresh

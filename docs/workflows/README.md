@@ -6,7 +6,7 @@ full.
 
 ## Defaults
 
-The installer copies these into a project on request.
+The installer copies these eleven into a project on request.
 
 | Workflow | What it does |
 | --- | --- |
@@ -24,8 +24,11 @@ The installer copies these into a project on request.
 
 ## Run from source
 
+`audit-project` lives in `defaults/` but is never copied into projects.
+
 | Workflow | What it does |
 | --- | --- |
+| [audit-project](audit-project.md) | Inventory project workflow coverage, propose routes and bindings, then apply on acceptance |
 | [ticket-task](ticket-task.md) | Carry a local ticket from its own worktree to a branch, patch, or pull request |
 | [chatgpt-thread](chatgpt-thread.md) | Keep one ChatGPT web chat going, with a person writing each reply |
 | [smoke](smoke.md) | Prove the runtime can load a definition from here |

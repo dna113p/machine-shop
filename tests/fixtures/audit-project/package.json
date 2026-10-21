@@ -1,0 +1,13 @@
+{
+  "name": "audit-fixture",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "node -e \"throw new Error('inventory must not run lint')\"",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@dna113p/machines": "0.7.0"
+  }
+}

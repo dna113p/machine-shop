@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -20,9 +21,30 @@ const checkInput = workspace => ({ task: "Check the installed workflow", workspa
 
 test("installer lists exactly eleven opt-in defaults", () => {
   assert.equal(available.length, 11);
+  assert.equal(available.includes("audit-project"), false, "audit runs only from the checkout");
   const listed = spawnSync(process.execPath, ["scripts/install.mjs", "--list"], { encoding: "utf8" });
   assert.equal(listed.status, 0, listed.stderr);
   assert.deepEqual(listed.stdout.trim().split("\n"), available);
+});
+
+test("audit cannot be installed and creates no target files", context => {
+  const { project } = fixture(context);
+  assert.throws(() => install({ target: project, workflows: ["audit-project"] }), /Unknown workflow/u);
+  assert.deepEqual(readdirSync(project), []);
+});
+
+test("selective installation records each copied file's hash and version in the manifest", context => {
+  const { project } = fixture(context);
+  const result = install({ target: project, workflows: ["retrospective"] });
+  const support = join(project, ".machines/_machine-shop");
+  assert.deepEqual(readdirSync(support).sort(), ["evidence.ts", "manifest.json", "task.ts"]);
+  const manifest = JSON.parse(readFileSync(join(support, "manifest.json"), "utf8"));
+  assert.deepEqual(Object.keys(manifest.files).sort(), ["_machine-shop/evidence.ts", "_machine-shop/task.ts", "dev-retrospective.ts"]);
+  const version = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+  for (const file of result.files) {
+    const key = file.destination.slice(join(project, ".machines").length + 1);
+    assert.deepEqual(manifest.files[key], { hash: createHash("sha256").update(readFileSync(file.destination)).digest("hex"), version });
+  }
 });
 
 test("dry-run creates no catalog or files", context => {
@@ -141,4 +163,17 @@ test("real CLI executes an installed Machine and exits unsuccessfully on failed 
   const passed = call(); assert.equal(passed.status, 0, passed.stderr); assert.match(passed.stdout, /--> done/u);
   data.checks[0].command = [process.execPath, "-e", "process.exit(1)"];
   const failed = call(); assert.notEqual(failed.status, 0); assert.match(failed.stderr, /Required checks failed/u);
+});
+
+test("an identical legacy helper remains unknown when another default is installed", context => {
+  const { project } = fixture(context);
+  install({ target: project, workflows: ["verify-checks"] });
+  const path = join(project, ".machines/_machine-shop/manifest.json");
+  const manifest = JSON.parse(readFileSync(path, "utf8"));
+  delete manifest.files["_machine-shop/task.ts"];
+  writeFileSync(path, JSON.stringify(manifest));
+  install({ target: project, workflows: ["review-code"] });
+  const after = JSON.parse(readFileSync(path, "utf8"));
+  assert.equal(after.files["_machine-shop/task.ts"], undefined);
+  assert.ok(after.files["dev-review-code.ts"]);
 });

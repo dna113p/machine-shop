@@ -2,15 +2,16 @@
 
 These are selectable starting points, not a mandatory process for every project.
 The project orchestrator chooses and adapts the useful subset, supplies actual
-acceptance criteria and commands, and validates the results. Do not run all eleven
+acceptance criteria and commands, and validates the results. Do not run all twelve
 for one task. Small direct changes can remain direct.
 
 ## Defaults
 
 Each workflow also has [its own page](workflows/README.md) with its input and a
 diagram of its states.
-Names below are source names in `defaults/`. Installation adds the `dev-` prefix
-so these do not replace project-specific names such as `verify`.
+Names below are source names in `defaults/`. Installation adds the `dev-` prefix to the eleven selectable defaults
+so these do not replace project-specific names such as `verify`. The twelfth,
+`audit-project`, runs only from this checkout and is absent from `available`.
 
 | Machine | State sequence | Required Agent roles | Maximum Agent calls, default repair budget |
 | --- | --- | --- | --- |
@@ -20,6 +21,7 @@ so these do not replace project-specific names such as `verify`.
 | [refactor](../defaults/refactor.ts) | green baseline -> behavior-preserving change -> checks -> review; bounded repair | implementer, reviewer | 8 |
 | [add-tests](../defaults/add-tests.ts) | green baseline -> focused tests -> checks -> review; bounded repair | tester, reviewer | 8 |
 | [review-code](../defaults/review-code.ts) | read-only review -> unchanged-checkout guard -> findings receipt | reviewer | 2 |
+| [audit-project](../defaults/audit-project.ts) | inventory -> judge -> report -> Human decision -> apply -> discovery | analyst | 2 |
 | [retrospective](../defaults/retrospective.ts) | read evidence -> classify stops -> validate and report; one malformed-report retry | analyst | 2 |
 | [investigate](../defaults/investigate.ts) | investigate -> unchanged guard -> challenge evidence; bounded research revision | investigator, reviewer | 8 |
 | [update-docs](../defaults/update-docs.ts) | docs/examples change -> explicit validation -> source-consistency review; bounded repair | writer, reviewer | 8 |
@@ -149,9 +151,29 @@ the decision to stop. Unknown metadata stays unknown. The Machine changes
 nothing outside its own evidence folder, writes no tickets, changes no Machine,
 and never starts, resumes or answers another run.
 
+## Project audit
+
+[audit-project](workflows/audit-project.md) accepts `{ project, apply?, since? }`.
+It inventories instructions, scripts/CI, definitions and their provenance, preset
+capabilities, runtime versions and recent run outcomes/stops. One analyst proposes
+selective installs, safe refreshes, routing and gate findings. A schema fault gets
+one send-back; a second ends refused. Without `apply: true`, Human acceptance gates
+all setup writes. Skip retains the page without changing the checkout.
+
+The audit reads the catalog and installer relative to its own checkout. The installer
+copies selected defaults and their transitive helpers, records each file’s hash and
+version in `.machines/_machine-shop/manifest.json`, and refuses modified or
+unknown-provenance refreshes. Apply changes only selected
+`.machines/` files, the marked README routes and absent bindings; other findings
+stay on the page. Only the audit's own run-evidence directory is written before
+acceptance. Discovery gates completion. This is also setup for an empty project;
+it neither reads Drip nor installs runtime dependencies. The checkout supplies the current catalog;
+there is no network release check. See the workflow page for input, schema,
+preservation rules and refusal/partial-effect receipts.
+
 ## Common input
 
-Except for retrospective’s separate input above, the defaults accept a JSON object through MCP/Pi, `--input-file`, or a JSON
+Except for retrospective and audit-project’s separate inputs above, the defaults accept a JSON object through MCP/Pi, `--input-file`, or a JSON
 string as CLI positional input. They do not accept an unstructured task string.
 
 ```json
@@ -264,7 +286,7 @@ the saved origin; the workflow page documents inputs, budgets, resume and ending
 ## ChatGPT thread
 
 [chatgpt-thread](../chatgpt-thread.ts) is a separate root workflow, not one of
-the eleven defaults: it is not in `defaults/`, the installer does not copy it, and
+the twelve defaults: it is not in `defaults/`, the installer does not copy it, and
 it does not use the shared helper, so it runs no checks and writes no
 `.machine-runs` receipt. It keeps one ChatGPT web chat going by sending each
 Human reply back to the same conversation.
@@ -318,7 +340,7 @@ editing. Separate roles do not inherently mean separate providers/models.
 
 `npm run check` type-checks the new definitions and runs real-runtime tests with
 fake Agent runners, real commands, and temporary Git repositories. Tests exercise
-all eleven success paths, failure and rejection paths, red/green requirements,
+all twelve success paths, failure and rejection paths, red/green requirements,
 repair budgets, stale verification, source-integrity guards, malformed inputs,
 command errors, and result retrieval. `npm run smoke:install` covers selective
 installation, conflicts, relocation, discovery, and the real CLI. Ticket delivery
