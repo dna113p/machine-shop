@@ -10,7 +10,7 @@ import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { launcher, runtime } from "./runtime.ts";
 import "./fixtures/runtime-imports.ts";
-import { evidenceFacts, evidencePage as renderEvidencePage } from "../defaults/_machine-shop/brief.ts";
+import { evidenceFacts, evidencePage as renderEvidencePage, handoffPage as renderHandoffPage } from "../defaults/_machine-shop/brief.ts";
 import { evidenceLog, writeStuckEvidence } from "../defaults/_machine-shop/task.ts";
 
 const mod = await import(pathToFileURL(resolve("ticket-task.ts")).href);
@@ -1963,8 +1963,11 @@ test("the presenter of a stuck run is given the stage, the reason, the last chec
     { path: "greeting.test.txt", added: 1, removed: 0 },
     { path: "greeting.txt", added: 1, removed: 0 },
   ]);
+  const red = run.result.checks.find((check: { phase: string }) => check.phase === "red");
+  assert.ok(red, "the red proof is kept separately from verification");
   assert.deepEqual(details.checks.map(({ name, phase, exitCode, passed, log }: any) => ({ name, phase, exitCode, passed, log })),
-    [{ name: verify.name, phase: "verify", exitCode: 0, passed: true, log: verify.log }]);
+    [{ name: red.name, phase: "red", exitCode: 1, passed: true, log: red.log },
+      { name: verify.name, phase: "verify", exitCode: 0, passed: true, log: verify.log }]);
   assert.equal(details.reports.sentBack, true);
   assert.deepEqual(details.reports.malformedReviews, [0, 1]);
   assert.equal(details.rounds.extraRound, "unused");
@@ -3228,10 +3231,13 @@ test("a tester blocker waits for a decision with what is missing, before any imp
 });
 
 test("an implementer blocker waits for a decision without green checks, review, or a commit", async context => {
-  const f = fixture(context); const human = person("hand off");
-  const result = await execute(input(f), { implementer: () => ok("blocked", "Required API specification unavailable"), reviewer: () => assert.fail() }, human);
+  const f = fixture(context); const human = person("hand off"); const status = ticketStatus();
+  const result = await execute(input(f), { implementer: () => ok("blocked", "Required API specification unavailable"), reviewer: () => assert.fail() }, human, status);
   const run = handedOff(f, result, /specification unavailable/u, human);
   assert.deepEqual(run.result.checks.map(check => check.phase), ["red"]);
+  const page = handoffPage(status.current());
+  handoffGate(page, "tests", "skipped");
+  handoffGate(page, "red proof: tests", "passed");
 });
 
 test("checks failing until the repair budget is exhausted wait for a decision, and commit and push nothing", async context => {
@@ -7728,10 +7734,11 @@ test("setup configuration can fail twice and ask twice before retry continues th
 
 test("a completion receipt that cannot confirm passing verification ends refused instead of claiming delivery", async context => {
   const f = fixture(context); const saved = checkpointed();
+  const status = ticketStatus("now", saved.options.primitives);
   const result = await execute(input(f), {}, person(), {
-    ...saved.options,
+    ...saved.options, primitives: status.primitives,
     onEnter: entry => {
-      saved.options.onEnter!(entry);
+      saved.options.onEnter!(entry); status.onEnter(entry);
       // Exercise finish's downgrade without changing the candidate or its review rules.
       if (String(entry.value) === "success") saved.data()!.task.lastChecksPassed = false;
     },
@@ -7741,6 +7748,10 @@ test("a completion receipt that cannot confirm passing verification ends refused
   assert.deepEqual([run.result.outcome, run.delivery.outcome], ["blocked", "refused"]);
   assert.match(run.delivery.reason, /final checkout no longer matches passing verification/u);
   assert.match(result.output.summary, /^Refused: /u);
+  const page = handoffPage(status.current());
+  assert.match(page, /<p class="lede">Refused the ticket\.<\/p>/u);
+  assert.ok(pageText(page).includes(run.delivery.reason));
+  assert.equal(handoffArtifact(f).page, page);
 });
 
 /** Discover ownership records without prescribing the helper's filename or repository-key hash. */
@@ -8109,6 +8120,8 @@ function ticketStatus(mode: "now" | "note-only" | "reject-now" = "now", base = r
       runtime.status(accepted);
       updates.push(structuredClone(update));
       current = { ...current, ...accepted };
+      // run-status clears the old page whenever a note is replaced without one.
+      if ("note" in accepted) current.page = "page" in accepted ? accepted.page : undefined;
     },
     operation: ((run: (...args: any[]) => any, on: any, options: any) => base.operation(async (...args: any[]) => {
       await Promise.resolve();
@@ -8124,9 +8137,22 @@ function ticketStatus(mode: "now" | "note-only" | "reject-now" = "now", base = r
   };
 }
 
+/** The original bounded sentence remains exact; a published page adds one artifact pointer. */
+function statusNote(status: Parameters<typeof runtime.status>[0], expected: string) {
+  const lines = status.note?.split("\n") ?? [];
+  const artifact = lines.length === 2 ? lines[1]!.slice("Handoff: ".length) : undefined;
+  if (artifact !== undefined) {
+    assert.match(lines[1]!, /^Handoff: \/.*\/\.machine-runs\/machine-shop\/[^/]+\/handoff\.html$/u);
+    assert.ok(existsSync(artifact), "The note's artifact pointer resolves to a saved page");
+  }
+  assert.equal(status.note, expected + (artifact === undefined ? "" : `\nHandoff: ${artifact}`),
+    "The note carries the exact ticket sentence plus only the saved handoff pointer");
+  if (status.page !== undefined) assert.ok(artifact, "A page is always accompanied by its artifact pointer");
+}
+
 function statusSentence(status: Parameters<typeof runtime.status>[0], expected: string, mode: "now" | "note-only" | "reject-now" = "now") {
-  assert.equal(status.note, expected, "The note carries the complete ticket sentence, even without now support");
-  if (mode === "now") assert.equal(status.now, expected, "now and note carry the identical ticket sentence");
+  statusNote(status, expected);
+  if (mode === "now") assert.equal(status.now, expected, "now carries the identical ticket sentence");
   else assert.equal(status.now, undefined, "The legacy runtime has no now setter");
 }
 
@@ -8168,7 +8194,7 @@ for (const mode of ["now", "note-only", "reject-now"] as const) {
     // Observe completion after the lifecycle actor releases its repository turn.
     const final = status.current();
     assert.match(final.note ?? "", /^Add a greeting: .*merged/iu);
-    if (mode === "now") assert.equal(final.now, final.note);
+    if (mode === "now") statusNote(final, final.now!);
     assert.doesNotMatch(final.note!, /waiting for the repository/iu);
     assert.deepEqual(repositoryTurns(f), []); untouched(f);
     if (mode === "reject-now") assert.ok(status.rejected() > 0, "The adapter really rejected the unsupported field");
@@ -8205,7 +8231,7 @@ for (const continuedAt of ["stuck", "decide"] as const) {
       assert.equal(observations.length, 1); statusSentence(observations[0]!.status, expected!);
     }
     assert.match(status.current().now ?? "", /^Add a greeting: delivered\b/u);
-    assert.equal(status.current().note, status.current().now);
+    statusNote(status.current(), status.current().now!);
     assert.deepEqual(repositoryTurns(f), []); untouched(f);
   });
 }
@@ -8233,12 +8259,12 @@ for (const long of [false, true]) {
     const sentences = status.updates.filter(update => typeof update.now === "string");
     assert.ok(sentences.length > 0);
     for (const update of sentences) {
-      assert.equal(update.note, update.now);
+      statusNote(update, update.now!);
       assert.ok([...update.now!].length <= 200, "The public now limit is 200 Unicode characters");
       assert.doesNotMatch(update.now!, /[\r\n\u0085\u2028\u2029]|\s{2}/u);
     }
     assert.match(status.current().now ?? "", /^Build Track B .+: delivered\b/u);
-    assert.equal(status.current().note, status.current().now); untouched(f);
+    statusNote(status.current(), status.current().now!); untouched(f);
   });
 }
 
@@ -8319,3 +8345,337 @@ for (const ending of ["refused", "handedOff", "abandoned"] as const) {
     assert.deepEqual(repositoryTurns(f), []); untouched(f);
   });
 }
+
+/** Inspect the public run note, rather than a Human question's separate page. */
+function handoffPage(status: Parameters<typeof runtime.status>[0], title = "Add a greeting") {
+  assert.equal(typeof status.page, "string", "the run note carries a handoff page");
+  const page = status.page!;
+  assert.ok(Buffer.byteLength(page, "utf8") < 200_000, "the complete escaped page stays strictly below 200 kB");
+  const headings = [...page.matchAll(/<h1\b[^>]*>([\s\S]*?)<\/h1>/gu)];
+  assert.equal(headings.length, 1);
+  assert.equal(pageText(headings[0]![1]!), oneLine(title));
+  assert.match(page, /<p\b[^>]*class=["']lede["'][^>]*>\s*\S/u);
+  const recap = /<section\b[^>]*class=["']recap["'][^>]*>([\s\S]*?)<\/section>/u.exec(page);
+  assert.ok(recap, "the page uses the Drip recap element");
+  const labels = [...recap[1]!.matchAll(/<dt\b[^>]*>([\s\S]*?)<\/dt>/gu)].map(match => pageText(match[1]!).toLowerCase());
+  for (const label of ["now", "done", "decided", "needs"]) assert.ok(labels.includes(label), `recap includes ${label}`);
+  assert.doesNotMatch(page, /<\/?(?:html|head|body|script|style|link|a|iframe)\b|<[a-z][^>]*\s(?:style|on\w+|src|href)\s*=/iu,
+    "the handoff uses only inert Drip kit markup");
+  return page;
+}
+
+function handoffFiles(page: string, files: { path: string; added: number; removed: number }[]) {
+  const tables = [...page.matchAll(/<table\b[^>]*>([\s\S]*?)<\/table>/gu)].map(match => match[1]!);
+  const table = tables.find(table => /<thead\b/u.test(table) && /file/iu.test(pageText(table))
+    && /added/iu.test(pageText(table)) && /removed/iu.test(pageText(table)));
+  assert.ok(table, "changed files have a labelled table with added and removed columns");
+  const rows = [...table.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gu)]
+    .map(row => [...row[1]!.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gu)].map(cell => pageText(cell[1]!)));
+  for (const { path, added, removed } of files) {
+    assert.ok(rows.some(row => isDeepStrictEqual(row, [path, String(added), String(removed)])), `${path} retains its line counts`);
+  }
+}
+
+function handoffGate(page: string, name: string, outcome: "passed" | "failed" | "skipped") {
+  const tone = { passed: "ok", failed: "bad", skipped: "muted" }[outcome];
+  const chips = [...page.matchAll(/<span\b[^>]*class=["']([^"']*)["'][^>]*>([\s\S]*?)<\/span>/gu)];
+  assert.ok(chips.some(([, classes, content]) => classes!.split(/\s/u).includes("chip")
+    && classes!.split(/\s/u).includes(tone) && pageText(content!).includes(name)
+    && pageText(content!).toLowerCase().includes(outcome)), `${name} has a ${outcome} gate chip`);
+}
+
+function handoffArtifact(f: Fixture) {
+  const runs = join(f.evidence, ".machine-runs/machine-shop");
+  const ids = readdirSync(runs); assert.equal(ids.length, 1);
+  const path = join(runs, ids[0]!, "handoff.html");
+  assert.ok(existsSync(path), "handoff.html is saved in the run's evidence directory");
+  return { path, page: readFileSync(path, "utf8") };
+}
+
+test("handoff page: a delivered PR carries its breadcrumb, files, all gates and approved review through merge cleanup", async context => {
+  const f = fixture(context); remote(f); fakeGh(context, f);
+  const status = ticketStatus();
+  const result = await execute(input(f, {
+    output: "pr", checks: [command(undefined, { name: "lint" }), command(undefined, { name: "types" }), command()],
+  }, { redGreen: false, assume: true }), { falsify: () => gaps([beside]) }, person(), status);
+  const run = merged(f, result);
+  assert.equal(run.result.agentInvocations, 5, "the page adds no Agent invocation to falsify, plan, plan review, implementation and review");
+  const delivered = status.observations.find(item => item.stage === "success"); assert.ok(delivered);
+  for (const snapshot of [delivered.status, status.current()]) {
+    const page = handoffPage(snapshot); const text = pageText(page);
+    assert.ok([...(page.matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/gu))]
+      .some(([, paragraph]) => ["widgets", f.repo, "PROJ-12", branch, url].every(part => pageText(paragraph!).includes(part))),
+    "one breadcrumb line carries the repository, ticket, branch and pull request address");
+    handoffFiles(page, [{ path: "greeting.txt", added: 1, removed: 0 }]);
+    for (const gate of ["lint", "types", "tests"]) handoffGate(page, gate, "passed");
+    for (const detail of [criterion, "greeting.txt:1", "Greeting matches the ticket", beside.text, beside.recommended, beside.why]) {
+      assert.ok(text.includes(oneLine(detail)), `handoff carries ${detail}`);
+    }
+    assert.match(text, /approved/iu); assert.match(text, /\bmet\b/iu);
+    const recap = /<section\b[^>]*class=["']recap["'][^>]*>([\s\S]*?)<\/section>/u.exec(page)![1]!;
+    for (const stage of ["falsify", "plan", "review"]) assert.match(pageText(recap), new RegExp(stage, "iu"));
+  }
+  assert.match(pageText(handoffPage(delivered.status)), /delivered/iu);
+  assert.match(pageText(handoffPage(status.current())), /merged/iu);
+  assert.equal(handoffArtifact(f).page, status.current().page);
+  untouched(f);
+});
+
+for (const output of ["branch", "patch"] as const) {
+  test(`handoff page: ${output} delivery retains its breadcrumb and diff after the worktree is removed`, async context => {
+    const f = fixture(context); const status = ticketStatus();
+    const result = await execute(scoped(input(f, { output }, { redGreen: false }), "code.txt"), {
+      implementer: request => { implement(request); writeFileSync(join(request.cwd, "code.txt"), "new\nreplacement\n"); return ok(); },
+    }, person(), status);
+    const run = ended(f, result, output);
+    assert.equal(existsSync(f.worktree), false);
+    const page = handoffPage(status.current()); const text = pageText(page);
+    for (const detail of ["widgets", f.repo, "PROJ-12", branch]) assert.ok(text.includes(detail));
+    if (output === "patch") {
+      assert.equal(run.delivery.patches.length, 1);
+      assert.ok(text.includes(run.delivery.patches[0]), "the breadcrumb names the delivered patch path");
+    }
+    handoffFiles(page, [{ path: "greeting.txt", added: 1, removed: 0 }, { path: "code.txt", added: 2, removed: 1 }]);
+    assert.equal(handoffArtifact(f).page, page);
+    untouched(f);
+  });
+}
+
+test("handoff page: a stuck run publishes the open questions and skipped gates before waiting", async context => {
+  const f = fixture(context); const status = ticketStatus();
+  const answer = (request: Ask) => {
+    const page = handoffPage(status.current());
+    assert.equal(typeof request.page, "string", "the original stop presentation is preserved");
+    for (const detail of [f.repo, "PROJ-12", branch, f.worktree, "falsifyResult", language.text, ...language.options, language.why]) {
+      assert.ok(pageText(page).includes(oneLine(detail)), `the run note retains the stop's evidence: ${detail}`);
+    }
+    handoffGate(page, "tests", "skipped");
+    assert.match(pageText(page), /question/iu);
+    assert.equal(handoffArtifact(f).page, page, "the artifact exists before the Human waits");
+    return "hand off";
+  };
+  const result = await execute(input(f), { falsify: () => gaps([language]) }, answer, status);
+  assert.equal(result.state, "handedOff");
+  assert.ok(pageText(handoffPage(status.current())).includes(language.text));
+  untouched(f);
+});
+
+for (const redGreen of [false, true]) {
+  test(`handoff page: same-named setup and red proof cannot pass unrun verification (redGreen=${redGreen})`, async context => {
+    const f = fixture(context); const status = ticketStatus();
+    const assertPage = () => {
+      const page = handoffPage(status.current());
+      handoffGate(page, "tests", "skipped");
+      handoffGate(page, "setup: tests", "passed");
+      if (redGreen) handoffGate(page, "red proof: tests", "passed");
+      assert.doesNotMatch(page, />tests: passed<|>tests: failed</u);
+    };
+    const result = await execute(input(f, { setup: [command("")] }, { redGreen }), {
+      implementer: () => ok("blocked", "Required API specification unavailable"), reviewer: () => assert.fail(),
+    }, () => { assertPage(); return "hand off"; }, status);
+    assert.equal(result.state, "handedOff");
+    assert.deepEqual(evidence(f).result.checks.map((check: any) => [check.phase, check.passed]),
+      redGreen ? [["setup", true], ["red", true]] : [["setup", true]]);
+    assertPage();
+    untouched(f);
+  });
+}
+
+test("handoff page: verification retains same-named setup and red proof evidence", async context => {
+  const f = fixture(context); const status = ticketStatus();
+  const result = await execute(input(f, { setup: [command("")] }), {}, person(), status);
+  assert.equal(result.state, "delivered");
+  const page = handoffPage(status.current());
+  handoffGate(page, "setup: tests", "passed");
+  handoffGate(page, "red proof: tests", "passed");
+  // Match the verification chip exactly: the phase-labelled chips also contain "tests".
+  assert.match(page, /<span class="chip ok">tests: passed<\/span>/u);
+  untouched(f);
+});
+
+test("handoff page: exhausted gates retain passed and failed chips and the failing diagnostic tail", async context => {
+  const f = fixture(context); const status = ticketStatus();
+  const lines = Array.from({ length: 90 }, (_, index) => `HANDOFF-GATE-${index}`);
+  const result = await execute(input(f, {
+    checks: [command("", { name: "lint" }), command(`console.log(${JSON.stringify(lines.join("\n"))}); process.exitCode = 1`, { name: "contracts" })],
+    rerunFailedChecks: false,
+  }, { redGreen: false, maxRepairs: 0 }), {}, person("hand off"), status);
+  assert.equal(result.state, "handedOff");
+  const page = handoffPage(status.current());
+  handoffGate(page, "lint", "passed"); handoffGate(page, "contracts", "failed");
+  const tails = [...page.matchAll(/<pre\b[^>]*>([\s\S]*?)<\/pre>/gu)].map(match => pageText(match[1]!));
+  assert.ok(tails.some(tail => lines.slice(-30).every(line => tail.includes(line))), "the failing gate's last lines are in a pre element");
+  assert.equal(page.includes("HANDOFF-GATE-0"), false);
+  assert.match(pageText(page), /repairBudget/iu);
+  untouched(f);
+});
+
+for (const decision of ["hand off", "archive", "discard"] as const) {
+  test(`handoff page: ${decision} retains review evidence and file counts through its ending and cleanup`, async context => {
+    const f = fixture(context); const status = ticketStatus();
+    const human = person(decision, ...(decision === "discard" ? ["confirm discard"] : []));
+    const result = await execute(input(f, {}, { redGreen: false, maxReviewRounds: 0 }), {
+      reviewer: () => review("revise", "The owner must settle the locale", {
+        criteria: [{ text: criterion, met: false, evidence: "greeting.txt:1 needs a locale" }],
+        findings: [{ severity: "blocker", text: "Locale decision remains open", where: "outside-scope.txt:17" },
+          { severity: "discussion", text: "Clarify the fallback locale", where: "greeting.txt:1" }],
+      }),
+    }, human, status);
+    if (decision === "hand off") assert.equal(result.state, "handedOff");
+    else abandoned(f, result, decision);
+    const page = handoffPage(status.current()); const text = pageText(page);
+    for (const detail of ["reviewBudget", criterion, "greeting.txt:1 needs a locale", "blocker", "Locale decision remains open", "outside-scope.txt:17", "discussion", "Clarify the fallback locale"]) {
+      assert.ok(text.includes(detail), `the final page keeps ${detail}`);
+    }
+    assert.match(text, /revise/iu); assert.match(text, /unmet|not met|false/iu);
+    assert.match(text, decision === "hand off" ? /handed off|handed-off/iu : /abandoned/iu);
+    handoffFiles(page, [{ path: "greeting.txt", added: 1, removed: 0 }]);
+    assert.equal(handoffArtifact(f).page, page);
+    untouched(f);
+  });
+}
+
+test("handoff page: a refused ticket records its verified outcome and reason with skipped gates", async context => {
+  const f = fixture(context); const status = ticketStatus(); const assignment = input(f);
+  assignment.ticket.body = "## Goal\nMissing required sections";
+  const result = await execute(assignment, nobody, person(), status);
+  const run = refused(f, result, /Scope|Acceptance|Forbidden/u);
+  const page = handoffPage(status.current());
+  assert.match(pageText(page), /refused/iu);
+  assert.ok(pageText(page).includes(oneLine(run.delivery.reason)));
+  handoffGate(page, "tests", "skipped");
+  assert.equal(run.result.agentInvocations, 0);
+  assert.equal(handoffArtifact(f).page, page);
+  untouched(f);
+});
+
+test("handoff page: long Unicode logs and a large diff are explicitly truncated below 200 kB with diagnostic tails retained", async context => {
+  const f = fixture(context); const status = ticketStatus();
+  const payload = '🧪<&"é'.repeat(2_000);
+  const logs = ["first-contract", "second-contract"].map(name => {
+    const text = ["OLDER-LINES", ...Array.from({ length: 30 }, () => payload), `DIAGNOSTIC-${name}: expected hello`].join("\n");
+    const path = join(f.root, `${name}.log`); writeFileSync(path, text);
+    return { name, text, check: command(`process.stdout.write(require("node:fs").readFileSync(${JSON.stringify(path)}, "utf8")); process.exitCode = 1`, { name }) };
+  });
+  const title = 'Add <script>bad()</script> & café 🧪';
+  const assignment = scoped(input(f, { checks: logs.map(log => log.check), rerunFailedChecks: false }, { redGreen: false, maxRepairs: 0 }), "bulk/**");
+  assignment.ticket.title = title;
+  const result = await execute(assignment, { implementer: request => {
+    implement(request); mkdirSync(join(request.cwd, "bulk"));
+    for (let index = 0; index < 800; index++) {
+      writeFileSync(join(request.cwd, "bulk", `${String(index).padStart(4, "0")}-${"é&".repeat(40)}.txt`), `${payload}\n`);
+    }
+    return ok();
+  } }, person("hand off"), status);
+  assert.equal(result.state, "handedOff");
+  const page = handoffPage(status.current(), title);
+  assert.ok(Buffer.byteLength(page, "utf8") < 200_000);
+  assert.match(page, /&lt;script&gt;/u); assert.doesNotMatch(page, /�/u);
+  assert.match(pageText(page), /\d+\s+(?:bytes?|characters?|lines?|files?|rows?)\s+(?:(?:were|are)\s+)?(?:omitted|left out)/iu,
+    "truncation states how much evidence was omitted");
+  assert.equal(page.includes(payload), false, "oversized log lines are excerpted");
+  const fileRows = [...page.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gu)].filter(row => pageText(row[1]!).includes("bulk/"));
+  assert.ok(fileRows.length > 0 && fileRows.length < 800, "the large file table retains rows and truncates the rest");
+  for (const { name, text } of logs) {
+    handoffGate(page, name, "failed");
+    assert.ok(pageText(page).includes(`DIAGNOSTIC-${name}: expected hello`));
+    const check = evidence(f).result.checks.find((check: any) => check.name === name);
+    assert.equal(readFileSync(check.log, "utf8"), text, "truncation leaves the original log whole");
+  }
+  assert.equal(handoffArtifact(f).page, page);
+  untouched(f);
+});
+
+for (const mode of ["reject-page", "ignore-page", "reject-page-and-now"] as const) {
+  test(`handoff page: ${mode} runtime keeps handoff.html and names it in the note`, async context => {
+    const f = fixture(context); const status = ticketStatus(); const rejected: string[] = [];
+    const primitives = { ...status.primitives, status: (update: Parameters<typeof runtime.status>[0]) => {
+      if (mode !== "ignore-page" && "page" in update) {
+        rejected.push("page"); throw new TypeError("Unknown status field: page");
+      }
+      if (mode === "reject-page-and-now" && "now" in update) {
+        rejected.push("now"); throw new TypeError("Unknown status field: now");
+      }
+      const { page: _page, ...accepted } = update;
+      status.primitives.status(accepted);
+    } };
+    const result = await execute(input(f, {}, { redGreen: false }), {}, person(), { ...status, primitives });
+    assert.equal(result.state, "delivered");
+    const artifact = handoffArtifact(f);
+    handoffPage({ note: status.current().note, page: artifact.page });
+    assert.ok(status.current().note?.includes(artifact.path), "the final note points to handoff.html, including when unsupported fields are silently ignored");
+    assert.equal(status.current().page, undefined);
+    if (mode !== "ignore-page") assert.ok(rejected.includes("page"), "explicit page rejection exercises the fallback");
+    if (mode === "reject-page-and-now") assert.ok(rejected.includes("now"));
+    untouched(f);
+  });
+}
+
+test("handoff page: publication propagates unrelated status errors without a legacy retry", async context => {
+  const f = fixture(context); const failure = new Error("Run note storage is unavailable");
+  let attempted = false; let retried = false;
+  const primitives = { ...runtime, status: (update: Parameters<typeof runtime.status>[0]) => {
+    if (attempted) retried = true;
+    if (typeof update.page === "string") { attempted = true; throw failure; }
+    runtime.status(update);
+  } };
+  await assert.rejects(execute(input(f, {}, { redGreen: false }), {}, person(), { primitives }), error => error === failure);
+  assert.equal(attempted, true, "the failure occurred while publishing a handoff page");
+  assert.equal(retried, false, "a storage failure is not an unsupported-field fallback");
+  untouched(f);
+});
+
+test("handoff page: merge waiting and checkpoint continuation retain the note's page after candidate cleanup", async context => {
+  const f = fixture(context); remote(f); fakeGh(context, f, 0, ["OPEN", "MERGED"]);
+  const assignment = input(f, { output: "pr" }, { redGreen: false }); const saves = checkpointed();
+  const firstStatus = ticketStatus("now", saves.options.primitives);
+  const first = await execute(assignment, {}, person(), {
+    ...saves.options, primitives: firstStatus.primitives,
+    onEnter: entry => { saves.options.onEnter!(entry); firstStatus.onEnter(entry); }, onSleep: () => {},
+  });
+  assert.equal(first.state, "awaitMerge"); assert.equal(existsSync(f.worktree), false);
+  const waiting = handoffPage(firstStatus.current());
+  handoffFiles(waiting, [{ path: "greeting.txt", added: 1, removed: 0 }]);
+  assert.ok(pageText(waiting).includes(url));
+  const checkpoint = saves.saved.awaitMerge!; assert.ok(checkpoint);
+  const restored = checkpointed(checkpoint); const status = ticketStatus("now", restored.options.primitives);
+  const second = await execute(assignment, nobody, person(), {
+    ...restored.options, primitives: status.primitives,
+    continueAt: { value: checkpoint.value, context: checkpoint.context, due: new Date(0).toISOString() },
+    onEnter: entry => {
+      restored.options.onEnter!(entry); status.onEnter(entry);
+      if (entry.value === "awaitMerge") status.observe("continued-handoff");
+    },
+  });
+  merged(f, second);
+  const continued = status.observations.find(item => item.stage === "continued-handoff"); assert.ok(continued);
+  for (const snapshot of [continued.status, status.current()]) {
+    const page = handoffPage(snapshot);
+    handoffFiles(page, [{ path: "greeting.txt", added: 1, removed: 0 }]);
+    handoffGate(page, "tests", "passed");
+    for (const detail of [url, criterion, "Greeting matches the ticket"]) assert.ok(pageText(page).includes(detail));
+  }
+  assert.equal(handoffArtifact(f).page, status.current().page);
+  assert.deepEqual(saves.unsaveable, []); assert.deepEqual(restored.unsaveable, []);
+  untouched(f);
+});
+
+
+test("handoff renderer: saturated sections stay below 200 kB and retain each selected diagnostic tail", () => {
+  const huge = '🧪<&"é'.repeat(40_000);
+  const names = Array.from({ length: 100 }, (_, i) => `contract-${i}`);
+  const page = renderHandoffPage({
+    title: huge, breadcrumb: huge, outcome: huge, done: [huge], decided: huge, needs: huge,
+    files: Array.from({ length: 800 }, (_, i) => ({ path: `${i}-${huge}`, added: 12, removed: 3 })),
+    gates: names.map(name => ({ name: `${name}-${huge}`, outcome: "failed", tail: `${huge}\nDIAGNOSTIC-${name}` })),
+    review: Array.from({ length: 50 }, () => ({ title: huge, text: huge })),
+    evidence: Array.from({ length: 50 }, () => ({ title: huge, text: huge, tail: huge })),
+  });
+  assert.ok(Buffer.byteLength(page) < 200_000);
+  assert.ok(page.isWellFormed()); assert.doesNotMatch(page, /�|<script|<html/u);
+  assert.match(page, /&lt;/u); assert.match(page, /740 files omitted/u); assert.match(page, /10 blocks omitted/u);
+  for (const name of names) {
+    handoffGate(page, name, "failed");
+    assert.ok(pageText(page).includes(`DIAGNOSTIC-${name}`));
+  }
+});

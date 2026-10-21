@@ -83,7 +83,7 @@ existing once-per-run repair allowance, reacquiring the turn before commit and
 replay; a second conflict keeps the existing stop. Delivery never advances the
 base itself or stacks onto unmerged ticket branches.
 
-Every state publishes one sentence about the ticket in both `now` and `note`,
+Every state publishes one sentence about the ticket in `now` and at the start of `note`,
 including after checkpoint continuation. For example, falsification says
 `<title>: checking whether the ticket is sound`, planning says
 `<title>: planning; the plan review is next`, tests say
@@ -100,9 +100,37 @@ Whitespace is collapsed to keep each sentence on one line. Sentences are limited
 to 200 Unicode characters; long titles are shortened with an ellipsis without
 splitting a Unicode character, preserving the stage meaning. An unusually long
 stage description (such as a list of check names) is capped at 160 characters
-to leave room for the title. The identical `note` supports runtimes that silently
-ignore `now`. Explicit unknown-`now` validation errors retry with only `note`;
-unrelated status errors still fail visibly.
+to leave room for the title. The note's opening sentence supports runtimes that
+silently ignore `now`. Once a handoff page exists, the note also names its saved
+`handoff.html` path. Explicit unknown-`now` or unknown-`page` validation errors retry
+without just those fields; unrelated status errors still fail visibly.
+
+At delivery, each stop and discard confirmation, and every ending, the run composes
+an escaped Drip kit page without a model call. Its title is the ticket title. The
+breadcrumb names the repository and path, ticket id, branch, and pull request or
+patch path when available. A one-sentence outcome and a now/done/decided/needs recap
+precede the changed-file line counts, passed/failed/skipped gate chips, failing
+log tails, and the review verdict, criteria and findings by severity. Done lists
+stages that passed; decided records accepted falsify assumptions. Stops reuse the
+question's evidence, including open questions, plans, conflicts and report faults.
+Required gate chips use the latest verification or reverification result, and
+show skipped until verification runs. Setup and red-proof chips are labelled
+separately; a passed red proof means the tests failed as expected.
+
+The complete escaped UTF-8 page stays below 200,000 bytes. Bounded sections and
+lists mark omitted bytes, files, gates or blocks; each displayed failed gate keeps
+its diagnostic tail. Full logs and reports remain in the evidence directory.
+File counts are captured before destructive cleanup and saved in checkpoints.
+Delivery can also read its diff from the saved base and commit after cleanup.
+The verified completion result determines the ending page, including a completion
+that the helper refuses. Merge waiting retains the delivered page; merge or a
+later stop replaces it with that outcome.
+
+The page is always saved as `handoff.html` in the run evidence directory, and every
+later note includes both the page and its artifact pointer, including after
+checkpoint continuation. This also supports runtimes that silently ignore `page`.
+An older runtime that explicitly rejects it receives the note with the file path.
+Publication adds no Agent invocation and changes no transitions or declared endings.
 
 In `pr` mode, resume also moves an uncommitted candidate onto the published tip
 when the local base is behind. Before delivery, a run whose local base remains

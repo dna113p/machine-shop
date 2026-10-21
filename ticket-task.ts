@@ -2,8 +2,8 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { appendFileSync, closeSync, existsSync, lstatSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { defineEndings, type Event, type MachinePrimitives } from "@dna113p/machines";
-import { evidenceHuman, evidenceLog, writeStuckEvidence, repositoryTurn, taskNow, taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
-import { brief, opening, excerpt, evidenceFacts, evidencePage, type EvidenceBlock } from "./defaults/_machine-shop/brief.ts";
+import { evidenceHuman, evidenceLog, writeStuckEvidence, repositoryTurn, taskNow, taskStatus, writeHandoff, taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
+import { brief, opening, excerpt, evidenceFacts, evidencePage, handoffPage, type EvidenceBlock } from "./defaults/_machine-shop/brief.ts";
 import { outsideScope } from "./defaults/_machine-shop/scope.ts";
 
 export const description = "Carry one local ticket for one Git repository from an isolated worktree through falsification, planning, plan review, implementation, checks, and review to a delivered branch, patch, or pull request; a pull request is then watched until it merges, when its branch is deleted and the ticket completes; a stuck run sleeps on a Human question.";
@@ -99,6 +99,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     answers: [] as string[],
     assumptions: [] as Assumption[],
     assumptionsJson: "",
+    passedStages: [] as string[],
+    handoff: null as { page: string; path: string } | null,
+    handoffFiles: null as { path: string; added: number | null; removed: number | null }[] | null,
+    stopKind: "stuck" as "stuck" | "step" | "merge",
     task: taskData(),
   });
   const { ticket, repository, prefix, worktree, evidenceRoot, resume, redGreen, assume, work, branch: named } = parseTicket(input, saved.task);
@@ -107,7 +111,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   let turnHeld = false;
   let waitingForTurn = false;
   let activeMeaning = "checking the ticket's required sections";
-  const publishNow = (meaning: string) => taskNow(p.status, ticket.title, meaning);
+  const publishNow = (meaning: string) => taskNow(p.status, ticket.title, meaning, saved.handoff);
   const setNow = (meaning: string) => { activeMeaning = meaning; publishNow(meaning); };
   const releaseTurn = () => {
     turn?.release(); turnHeld = false;
@@ -606,6 +610,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }
     saved.commitHash = head;
     saved.firstApproved ??= { baseCommit: saved.baseCommit, commit: head };
+    passed("commit");
     return { type: "committed" };
   }
 
@@ -870,6 +875,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }
     }
     if (!attempt("git", ["config", "--local", `branch.${saved.branch}.ticketDelivered`, saved.commitHash], repository.path, undefined, undefined, true).ok) return stepFailure("deliver", true);
+    passed("deliver");
+    // The next state's status lifecycle publishes this pair, as it does on continuation.
+    composeHandoff("Delivered the checked changes.", "", "stuck");
     return { type: "delivered" };
   }
 
@@ -903,7 +911,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   function runFacts(kind: "stuck" | "step" | "merge") {
     const { reason, ...rounds } = work.status();
     const review = saved.reviews.slice(saved.reviewsFrom).at(-1);
-    const checks = [...new Map(saved.task.evidence.map(check => [check.name, check])).values()]
+    // Keep the latest attempt per phase and name, in execution order. A red
+    // proof's expected failure and setup success are not green verification.
+    const latest = new Map<string, (typeof saved.task.evidence)[number]>();
+    for (const check of saved.task.evidence) {
+      const key = JSON.stringify([check.phase, check.name]);
+      latest.delete(key);
+      latest.set(key, check);
+    }
+    const checks = [...latest.values()]
       .map(({ name, phase, exitCode, passed, log, flaky }) => ({ name, phase, exitCode, passed, log, flaky,
         ...(!passed ? { tail: evidenceLog(log) } : {}),
       }));
@@ -924,7 +940,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         reviewSummaryFault: saved.reviewSummaryFault, planningReports: saved.planningReports,
         questionsReturned: saved.questionsReturned, questionsFault: saved.questionsFault,
       },
-      files: diffFiles(), evidenceDirectory: saved.task.directory, worktree, branch: saved.branch, prUrl: saved.prUrl,
+      files: snapshotFiles() ?? undefined, evidenceDirectory: saved.task.directory, worktree, branch: saved.branch, prUrl: saved.prUrl,
       questionFile: saved.questions ? join(saved.task.directory, `question-${saved.questions}.txt`) : undefined,
     };
   }
@@ -936,27 +952,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return Object.entries(value).filter(([, item]) => item !== undefined)
       .map(([key, item]) => `${key}: ${evidenceText(item)}`).join("\n");
   }
-  function questionEvidence(kind: "stuck" | "step" | "merge", choices: readonly string[], confirm: boolean) {
-    const facts = runFacts(kind);
-    const options = kind === "stuck" ? confirm ? discardOptions() : stuckOptions()
-      : kind === "step" ? stepOptions(confirm) : mergeOptions(confirm);
-    const short = (value: string) => excerpt(value.replace(/\s+/gu, " ").trim(), 160).replace(/\s+/gu, " ");
-    const effects = Object.fromEntries(choices.map(name => {
-      // Long branch/worktree names belong in the breadcrumb, not in the 160-character effect.
-      const does = name === "archive" ? "commit and save the candidate on its archive branch, then remove the worktree and ticket branch; ignored files are not kept."
-        : name === "confirm discard" ? kind === "merge" ? saved.remoteDeleted
-          ? "delete only the local branch; the remote branch is already deleted; leave the ticket open."
-          : "delete only the local branch; keep the pushed branch and leave the ticket open."
-          : "remove the worktree and delete the ticket branch without saving its committed or uncommitted work."
-        : options.find(option => option.name === name)!.does;
-      return [name, short(does)];
-    }));
-    const recommended = confirm ? "go back" : "hand off";
-    const headline = short(`${ticket.id}: ${confirm ? "Confirm discarding work" : `Decision needed at ${facts.stage}`}`);
-    const reason = confirm ? "Keep the candidate until you choose how to proceed."
-      : "Keep the work available while a person or another workflow resolves this stop.";
-    const breadcrumb = `${repository.name}: ${repository.path}\nTicket: ${ticket.id} — ${ticket.title}\nBranch: ${saved.branch}\nWorktree: ${worktree}`;
-    const stopped = `Stopped in ${facts.stage}: ${facts.reason}`;
+  function snapshotFiles() {
+    // Keep the last readable candidate before archive/discard or delivery removes it.
+    // After removal the saved base and commit can still refresh a delivered diff.
+    if (saved.removed && saved.handoffFiles !== null) return saved.handoffFiles;
+    const files = diffFiles();
+    if (files !== undefined) saved.handoffFiles = files;
+    return saved.handoffFiles;
+  }
+  function evidenceBlocks(facts: ReturnType<typeof runFacts>, kind: "stuck" | "step" | "merge") {
     const files = facts.files;
     const diffStat = files === undefined ? "Diff unavailable."
       : `${files.length} files changed, ${files.reduce((sum, file) => sum + (file.added ?? 0), 0)} insertions, ${files.reduce((sum, file) => sum + (file.removed ?? 0), 0)} deletions; binary counts are shown as binary.`;
@@ -983,9 +987,74 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       { title: "Candidate", text: evidenceText(facts.candidate) },
       { title: "Reports and evidence", text: evidenceText(facts.reports) + `\nEvidence: ${facts.evidenceDirectory}\n${facts.prUrl ? `Pull request: ${facts.prUrl}\n` : ""}${facts.questionFile ?? ""}` },
     ];
+    return { blocks, diffStat };
+  }
+
+  function composeHandoff(outcome: string, needs: string, kind = saved.stopKind, facts = runFacts(kind)) {
+    const { blocks } = evidenceBlocks(facts, kind);
+    const review = facts.review;
+    const reviewBlocks: EvidenceBlock[] = review ? [
+      { title: `Verdict: ${review.verdict}`, text: evidenceText(review.summary) },
+      { title: "Acceptance criteria", text: Array.isArray(review.criteria) ? review.criteria.map(item =>
+        `${item?.met === true ? "Met" : "Not met"}: ${evidenceText(item?.text)}\n${evidenceText(item?.evidence)}`).join("\n\n") : evidenceText(review.criteria) },
+      ...["blocker", "discussion", "minor"].map(severity => ({ title: `${severity} findings`,
+        text: Array.isArray(review.findings) ? evidenceText(review.findings.filter(item => item?.severity === severity)) || "None." : evidenceText(review.findings) })),
+      { title: "Changes since previous review", text: evidenceText(review.newSinceLastRound) },
+    ] : [{ title: "Review", text: "No review recorded." }];
+    const verification = (check: (typeof facts.checks)[number]) => check.phase === "verify" || check.phase === "reverify";
+    const checks = new Map(facts.checks.filter(verification).map(check => [check.name, check]));
+    const gate = (name: string, check?: (typeof facts.checks)[number]) => ({
+      name, outcome: !check ? "skipped" as const : check.passed ? "passed" as const : "failed" as const, tail: check?.tail,
+    });
+    const gates = [
+      ...[...new Set([...repository.checks, ...checks.keys()])].map(name => gate(name, checks.get(name))),
+      ...facts.checks.filter(check => !verification(check))
+        .map(check => gate(`${check.phase === "red" ? "red proof" : check.phase}: ${check.name}`, check)),
+    ];
+    const page = handoffPage({
+      title: ticket.title, breadcrumb: `${repository.name}: ${repository.path} · Ticket: ${ticket.id} · Branch: ${saved.branch}${saved.prUrl ? ` · Pull request: ${saved.prUrl}` : saved.patches.length ? ` · Patch: ${saved.patches.join(", ")}` : ""}`,
+      outcome, done: saved.passedStages, decided: saved.assumptions.length ? evidenceText(saved.assumptions) : "No assumptions taken.",
+      needs: needs || "Nothing needed.", files: facts.files ?? null, gates, review: reviewBlocks,
+      evidence: [{ title: "Stage and candidate location", text: `${facts.stage}\nWorktree: ${worktree}\n${needs}` },
+        ...(saved.held ? [{ title: "Ending", text: saved.held.summary }] : []),
+        // Keep the question's gate metadata as well as its other evidence. The table,
+        // diagnostic tails and structured review already have dedicated sections above.
+        ...blocks.filter(block => !["Changed files", "Review", "Unmet criteria and open findings"].includes(block.title))
+          .map(({ tail: _tail, ...block }) => block)],
+    });
+    saved.handoff = writeHandoff(work.open(), page);
+  }
+  function publishHandoff(outcome: string, needs: string, kind = saved.stopKind, facts = runFacts(kind)) {
+    composeHandoff(outcome, needs, kind, facts);
+    publishNow(activeMeaning);
+  }
+  function questionEvidence(kind: "stuck" | "step" | "merge", choices: readonly string[], confirm: boolean) {
+    saved.stopKind = kind;
+    const facts = runFacts(kind);
+    const options = kind === "stuck" ? confirm ? discardOptions() : stuckOptions()
+      : kind === "step" ? stepOptions(confirm) : mergeOptions(confirm);
+    const short = (value: string) => excerpt(value.replace(/\s+/gu, " ").trim(), 160).replace(/\s+/gu, " ");
+    const effects = Object.fromEntries(choices.map(name => {
+      // Long branch/worktree names belong in the breadcrumb, not in the 160-character effect.
+      const does = name === "archive" ? "commit and save the candidate on its archive branch, then remove the worktree and ticket branch; ignored files are not kept."
+        : name === "confirm discard" ? kind === "merge" ? saved.remoteDeleted
+          ? "delete only the local branch; the remote branch is already deleted; leave the ticket open."
+          : "delete only the local branch; keep the pushed branch and leave the ticket open."
+          : "remove the worktree and delete the ticket branch without saving its committed or uncommitted work."
+        : options.find(option => option.name === name)!.does;
+      return [name, short(does)];
+    }));
+    const recommended = confirm ? "go back" : "hand off";
+    const headline = short(`${ticket.id}: ${confirm ? "Confirm discarding work" : `Decision needed at ${facts.stage}`}`);
+    const reason = confirm ? "Keep the candidate until you choose how to proceed."
+      : "Keep the work available while a person or another workflow resolves this stop.";
+    const breadcrumb = `${repository.name}: ${repository.path}\nTicket: ${ticket.id} — ${ticket.title}\nBranch: ${saved.branch}\nWorktree: ${worktree}`;
+    const stopped = `Stopped in ${facts.stage}: ${facts.reason}`;
+    const { blocks, diffStat } = evidenceBlocks(facts, kind);
     const page = evidencePage({ headline, stopped, breadcrumb, blocks, effects, recommended });
     const selected = { ...facts, diffStat, effects, recommended };
     writeStuckEvidence(work.open(), `# ${headline}\n\n${breadcrumb}\n\n${stopped}\n\n${evidenceText(selected)}`, page);
+    publishHandoff(`Stopped in ${facts.stage}; a decision is needed.`, facts.reason, kind, facts);
     return { presentation: { headline, page, effects, recommended, reason,
       discards: choices.filter(choice => choice === "discard" || choice === "confirm discard"),
     }, facts: evidenceFacts(selected) };
@@ -1066,10 +1135,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   function summaryReason(reason: string, split = opening(flat(reason))): string {
     return [split.first, capped(split.rest, 600)].filter(Boolean).map(part => part.replace(/[^.!?…]$/u, "$&.")).join(" ");
   }
-  const stopped = (state: string, run: () => Event) => () => { saved.stoppedIn = state; return run(); };
+  const passed = (stage: string) => { if (!saved.passedStages.includes(stage)) saved.passedStages.push(stage); };
+  const stopped = (state: string, run: () => Event) => () => {
+    saved.stoppedIn = state;
+    const result = run();
+    if (["sound", "assumed", "planned", "approved"].includes(result.type)) passed(state.replace(/Result$/u, ""));
+    return result;
+  };
 
   /** Saves what delivery would have committed as a commit on a branch of its own, which outlives the worktree and the ticket branch. */
   function archive(): Event {
+    snapshotFiles();
     const name = archiveBranch();
     const failure = "The candidate could not be archived, so nothing was removed";
     if (run("git", ["show-ref", "--verify", "--quiet", `refs/heads/${name}`], repository.path).ok) {
@@ -1108,6 +1184,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   /** Removes this run's own worktree and branch, and nothing else, once the candidate is archived or a Human confirmed losing it. */
   function remove(): Event {
     if (!saved.archived && !saved.discardConfirmed) throw new Error("The worktree and branch are removed only after an archive or a confirmed discard");
+    snapshotFiles();
     work.retire();
     if (!attempt("git", ["worktree", "remove", "--force", worktree], repository.path).ok) throw new Error(work.status().reason);
     saved.removed = true;
@@ -1116,6 +1193,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   }
 
   function conclude(wanted: "completed" | "refused" | "handed-off" | "abandoned"): Event {
+    snapshotFiles();
     const result = `${saved.branch} at ${saved.commitHash}${saved.prUrl ? `, pull request ${saved.prUrl}` : ""}${saved.patches.length ? `, patch ${saved.patches.join(", ")}` : ""}`;
     // Delivery succeeds even when its worktree must be kept for manual cleanup.
     if (wanted === "completed") {
@@ -1151,6 +1229,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ...((saved.created || saved.adopted) && !saved.removed ? [`Worktree kept at ${worktree}${finished ? `; it could not be removed: inspect ${directory}/git-worktree.log.` : "."}`] : []),
       `Evidence: ${directory}`,
     ].join(" ") };
+    publishHandoff({ delivered: "Delivered the checked changes.", refused: "Refused the ticket.", "handed-off": "Handed off the ticket.", abandoned: "Abandoned the ticket." }[outcome], reason);
     return { type: outcome === "handed-off" ? "handedOff" : outcome === "delivered" && !saved.removed ? "kept" : outcome };
   }
 
@@ -1212,6 +1291,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   // Delivery and result receipts were already written before waiting; this receipt records the later ending, and a continued run may write it again.
   function settle(outcome: "merged" | "handedOff" | "abandoned"): Event {
     const directory = work.open();
+    if (outcome === "merged") passed("merge");
     const reason = saved.mergeReason;
     const remoteKept = saved.remoteDeleted ? `The pushed branch was already deleted on ${repository.remote}.` : `The pushed branch is kept on ${repository.remote}.`;
     writeFileSync(join(directory, "merge.json"), JSON.stringify({
@@ -1225,6 +1305,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       abandoned: `${reason ? `Abandoned: ${summaryReason(reason)}` : "Abandoned."} Pull request: ${saved.prUrl}. Branch: ${saved.branch}, deleted locally${saved.remoteDeleted ? `. ${remoteKept}` : `; the pushed branch is kept on ${repository.remote}.`}`,
     }[outcome];
     saved.held = { action: outcome === "merged" ? "complete" : "hold", summary: `${ending} Evidence: ${directory}` };
+    publishHandoff({ merged: "Merged the pull request and removed the ticket branches.", handedOff: "Handed off the delivered ticket.", abandoned: "Abandoned the delivered ticket." }[outcome], outcome === "merged" ? "" : reason, "merge");
     return { type: outcome };
   }
 
@@ -1253,11 +1334,12 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     saved.stoppedIn = stage;
     work.receive(event);
     work.reported(stage);
+    if (event.type === "completed") passed(stage);
   };
   const rememberPlanning = ({ event }: { event: Event }) => { saved.planningReport = event; };
   function reportFault(stage: string, result: { type: "sendBack" | "invalid"; fault: string; path: string }): Event {
     if (result.type === "sendBack") {
-      p.status({ note: `The ${stage} report was sent back with its validation fault.` });
+      taskStatus(p.status, { note: `The ${stage} report was sent back with its validation fault.` }, saved.handoff);
       return { type: "reask" };
     }
     return work.block(`The ${stage} report was malformed twice: ${result.fault}. The report is kept in ${result.path}.`);
@@ -1591,6 +1673,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         saved.repairing = "test";
         const result = work.redCheck(repository.redCheck);
         saved.provedRed = result.type === "passed";
+        if (saved.provedRed) passed("red");
         return result;
       }, { passed: "change", failed: "repairBudget" }),
       change: agent(() => {
@@ -1624,7 +1707,12 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }, { using: "implementer", cwd: worktree }),
       changeReport: operation(() => work.reported("change", result => reportFault("change", result)), { reask: "change", completed: "scopeAfterChange", blocked: "stuck" }),
       scopeAfterChange: operation(() => unsettled() ?? scope("change"), { passed: "verify", failed: "repairBudget" }),
-      verify: operation(() => { saved.repairing = "change"; return work.checks(); }, { passed: "sealReview", failed: "repairBudget" }),
+      verify: operation(() => {
+        saved.repairing = "change";
+        const result = work.checks();
+        if (result.type === "passed") passed("verify");
+        return result;
+      }, { passed: "sealReview", failed: "repairBudget" }),
       sealReview: operation(work.seal, { sealed: "review" }),
       review: agent(() => prompt([
         "Review the current diff and verification evidence. Do not edit any file. Check acceptance criteria, regressions, scope, and whether tests actually establish the intended behavior.",
