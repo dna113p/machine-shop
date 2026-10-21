@@ -80,11 +80,21 @@ export function catalogSnapshot(project: string) {
 }
 export async function inventoryProject(project: string, catalog: Catalog, own: string, since: number, until: number): Promise<Inventory> {
   if (!lstatSync(project).isDirectory()) throw new Error("project must be an existing directory");
-  const instructions = Object.fromEntries(["AGENTS.md", "CLAUDE.md", ".machines/README.md"].map(key => [key, readOptional(project, join(project, key))]));
+  // The project's own gate list (.machines/gates.json, which the task helper runs) is read as an instruction file and as gates.
+  const instructions = Object.fromEntries(["AGENTS.md", "CLAUDE.md", ".machines/README.md", ".machines/gates.json"].map(key => [key, readOptional(project, join(project, key))]));
   const pkg = JSON.parse(readOptional(project, join(project, "package.json")) ?? "{}");
   const scripts: Record<string, string> = Object.fromEntries(Object.entries(pkg.scripts ?? {}).filter(([, value]) => typeof value === "string")) as Record<string, string>;
   const matchers: Record<GateClass, RegExp> = { lint: /(?:^|:)lint(?:$|:)/u, types: /(?:typecheck|type-check|types|tsc)/u, tests: /(?:^|:)tests?(?:$|:)/u, build: /(?:^|:)build(?:$|:)/u, live: /(?:live|e2e|integration)/u };
   const found = Object.keys(scripts).sort().flatMap(name => gateClasses.filter(kind => matchers[kind].test(name)).map(kind => ({ class: kind, name, command: ["npm", "run", name] })));
+  // A gate list names its checks; a name is classed as a script name is, and its command is kept as written (placeholders included).
+  let gateList: unknown = null;
+  try { gateList = instructions[".machines/gates.json"] === null ? null : JSON.parse(instructions[".machines/gates.json"]!); } catch { gateList = null; }
+  if (object(gateList) && Array.isArray(gateList.checks)) for (const check of gateList.checks) {
+    if (!object(check) || !text(check.name) || !Array.isArray(check.command) || !check.command.length || check.command.some(part => !text(part))) continue;
+    const named = `${check.name}`.toLowerCase();
+    const kind = gateClasses.find(kind => matchers[kind].test(named)) ?? (/(?:smoke|package|install)/u.test(named) ? "live" : undefined);
+    if (kind) found.push({ class: kind, name: `.machines/gates.json:${check.name}`, command: check.command as string[] });
+  }
   const ci: Record<string, string> = {};
   const workflows = join(project, ".github/workflows");
   safePath(project, workflows);
@@ -188,10 +198,13 @@ export function validateProposal(summary: unknown, inventory: Inventory): Propos
     || JSON.stringify((gates.found as Gate[]).map(gateKey).sort()) !== JSON.stringify(inventory.gates.found.map(gateKey).sort())
     || JSON.stringify([...gates.missing].sort()) !== JSON.stringify([...inventory.gates.missing].sort())) throw new Error("gates must retain the found commands and missing classes from inventory");
   if (!Array.isArray(body.findings) || body.findings.length > 200) throw new Error("findings must be an array of at most 200 items");
-  const evidence = new Set(inventory.runs.stops.flatMap(stop => [stop.id, ...stop.locations]));
+  // A finding may cite a run stop, or an inventoried file: an instruction file that was read, a CI file, or a gate's name.
+  const evidence = new Set([...inventory.runs.stops.flatMap(stop => [stop.id, ...stop.locations]),
+    ...Object.entries(inventory.instructions).filter(([, content]) => content !== null).map(([key]) => key),
+    ...Object.keys(inventory.ci), ...inventory.gates.found.map(gate => gate.name)]);
   for (const finding of body.findings) {
     if (!object(finding) || !text(finding.reason) || !text(finding.route) || !Array.isArray(finding.evidence) || !finding.evidence.length
-      || finding.evidence.some(item => !evidence.has(item)) || (!routes.has(finding.route) && !gateClasses.includes(finding.route as GateClass))) throw new Error("Each finding needs a known route or gate class and supplied run evidence");
+      || finding.evidence.some(item => !evidence.has(item)) || (!routes.has(finding.route) && !gateClasses.includes(finding.route as GateClass))) throw new Error("Each finding needs a known route or gate class, and evidence from the inventory: a stop id or location, an instruction or CI file key, or a gate name");
   }
   return body as unknown as Proposal;
 }
