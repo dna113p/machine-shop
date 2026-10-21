@@ -311,21 +311,36 @@ interface. Choices are restricted to the actions available at that step.
 All nine stop questions use the optional `presenter` role: `decide`,
 `confirmDiscard`, `stepDecide`, `keepDecide`, `deliverDecide`,
 `confirmStepDiscard`, `mergeDecide`, `mergeRetryDecide` and `confirmMergeDiscard`.
-The presenter receives the run's map and history from Machines. `presentWith`
-adds the stopped stage (the failed step for step or merge recovery), reason,
-repair and review budgets, extra-round state, last check results with exit codes
-and logs, latest review verdict and criteria, report send-back history, diff
-files with line counts, and the evidence directory. It also names the worktree,
-branch, pull request and latest question file when available. After worktree
-removal, diff facts compare the saved base with the delivered commit. Binary
-line counts are `null`; a failed diff read is omitted without preventing the question.
+Each question gets a deterministic page, headline, effects for every offered
+choice and a recommendation, without a model call. The page carries the repository,
+ticket id and title, branch and worktree, followed by a sentence naming the stopped
+stage and reason. Saved evidence includes questions with options and recommendations,
+the plan and plan-review objection, a changed-files table with diff stat, failing
+gate log tails, unmet review criteria and open findings, and replay conflict paths
+with the saved candidate reference. Missing logs or diffs are identified explicitly.
+After worktree removal, the diff compares the saved base and delivered commit.
 
-The presenter may supply a headline, recommendation, option explanations and an
-HTML page showing where the run stopped and what passed. Only it marks `discard`
-or `confirm discard` as discarding. Its recommendation is advice on top of the
-unchanged prompt's `hand off (recommended)` text. The choices, suggestions and
-answer matching stay the same. Without a bound presenter, or if it fails, the
-question goes out exactly as before.
+The page uses escaped Drip kit HTML: recap sections, status chips, tables with
+headers and preformatted logs. It contains no scripts, styles or links. Gate logs
+contribute their last 30 lines. Each failing gate gets its own budget for its
+identity and diagnostic tail in both the page and presenter facts, before passing
+check metadata. Oversized tails retain their end. Every variable block is byte-budgeted after HTML
+escaping, keeping the whole page below 200,000 UTF-8 bytes. Each cut says how much
+was omitted and points to `stuck.md`. The same evidence goes to the optional
+presenter through `presentWith`, with an independent serialized-facts byte budget.
+The presenter also receives the run's map and history from Machines.
+
+Before the Human waits, `stuck.md` in the run's evidence directory receives the full
+selected evidence and generated page. It is refreshed on re-entry and confirmations;
+numbered `question-<n>.txt` files and original logs remain intact. This also works
+after sleep and after the worktree is removed. An older runtime rejecting the
+presentation fields receives the original request, while the generated page stays
+in `stuck.md` only. Other validation errors propagate.
+
+The Machine's presentation fields take precedence over optional presenter output
+and remain available without a presenter or if it fails. `hand off` is recommended,
+or `go back` for discard confirmations. Destructive choices are marked. The choices,
+suggestions, answer matching and endings stay the same.
 
 | Step | Recovery |
 | --- | --- |

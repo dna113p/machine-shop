@@ -47,25 +47,34 @@ including bounded Operation retries and questions specific to each failed step.
 
 ### Explaining a stop
 
-Ticket-task offers an optional `presenter` role on every stop question, including
-discard confirmations. With Machines `^0.7.1`, bind it to a small, read-only model
-preset from `machine agents` by adding `--agent presenter=small` to the launch
-command (replace `small` with your preset's name). No binding is required.
+Every ticket stop and discard confirmation carries a deterministic evidence page,
+a headline, an explanation of every offered choice, and a recommendation. No model
+is needed. The breadcrumb names the repository, ticket id/title, branch and worktree.
+The page says where the run stopped and why, then shows saved questions/options,
+the plan and objection, a changed-files table and diff stat, failing gate log tails,
+review criteria/findings, or replay conflicts as applicable. Binary counts are
+`null` in facts; an unavailable diff is reported without preventing the question.
+After delivery, the diff uses the saved base and delivered commit.
 
-The runtime supplies the run's map, current Human state, trail and recent Agent
-summaries. Ticket-task adds the stopped stage and reason, rounds used and limits,
-last check results and logs, latest review verdict and criteria, report send-back
-history, diff files with added and removed line counts, and the evidence directory
-where the presenter can read the reports. Binary line counts are `null`; an
-unavailable diff is omitted. After delivery, the diff uses the saved base and
-delivered commit even though the worktree is gone.
+Gate excerpts select the last 30 lines. Each failing gate has its own budget for
+its identity and log tail in both the page and presenter facts; oversized tails
+keep their end. Passing-check metadata cannot consume a failing gate's share.
+Every variable evidence block has a byte
+budget; the escaped HTML page stays below 200,000 UTF-8 bytes, and serialized
+presenter facts are independently bounded. Cuts name the omitted amount and
+`stuck.md`. Before waiting, that file receives the full selected evidence and the
+page in the run's evidence directory. Original logs remain intact. The page is
+always generated, including on older runtimes that reject presentation fields;
+those runtimes receive the original request and keep the page in `stuck.md` only.
+Unrelated validation errors still fail visibly.
 
-The presenter can add a headline, recommendation, explanation of each option and
-an HTML page with the run's map and what passed. Only the presenter marks
-`discard` or `confirm discard` as discarding. Prompts, options and answer matching
-stay unchanged. Its recommendation is advice layered over the existing prompt,
-which still labels `hand off` recommended. With no presenter, or if presentation
-fails, the original question goes out unchanged.
+An optional `presenter` role can read the same evidence through `presentWith`,
+along with the runtime's map and history. Bind a small, read-only preset with
+`--agent presenter=small` (replace `small` with a name from `machine agents`).
+The Machine's presentation fields take precedence over presenter output and
+survive presenter failure. `hand off` is recommended, or `go back` on a discard
+confirmation. Discard choices are marked as destructive. Prompts, option names,
+answer matching, question numbering and endings stay unchanged.
 
 ### Replay conflicts at delivery
 

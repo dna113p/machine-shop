@@ -10,6 +10,8 @@ import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { launcher, runtime } from "./runtime.ts";
 import "./fixtures/runtime-imports.ts";
+import { evidenceFacts, evidencePage as renderEvidencePage } from "../defaults/_machine-shop/brief.ts";
+import { evidenceLog, writeStuckEvidence } from "../defaults/_machine-shop/task.ts";
 
 const mod = await import(pathToFileURL(resolve("ticket-task.ts")).href);
 const branch = "ticket/proj-12-add-a-greeting";
@@ -1325,6 +1327,7 @@ test("a failing setup command asked about is discarded only after confirmation, 
   stepAsked(f, first, "setup", /setup: tests did not meet/u, stepChoices); assert.deepEqual([second!.prompt, second!.choices], [first!.prompt, first!.choices]);
   for (const request of [confirm!, again!]) {
     assert.deepEqual(request.choices, ["confirm discard", "go back"]); assert.equal(request.suggestions, undefined);
+    evidencePage(f, request, "setup", /tests did not meet/u, ["tests"], ["confirm discard", "go back"], "go back");
     for (const part of [f.worktree, branch, "will not be saved"]) assert.ok(request.prompt.includes(part), part);
     assert.doesNotMatch(request.prompt, /\bstuck\b/iu);
   }
@@ -1806,17 +1809,134 @@ function presenter(pick: (asked: Ask) => string) {
 // The reviewer approves and every check passes, but the report is malformed: it goes back once, comes back malformed again, and the run stops.
 const approvedButMalformed = () => review("approved", "Approves the greeting", { newSinceLastRound: false });
 
-test("a stuck run with a presenter bound publishes its question with the presenter's headline, recommendation and page, the options unchanged, and more rounds matched as before", async context => {
+/** Inspect the deterministic presentation, without prescribing its prose or serialized facts schema. */
+const pageText = (page: string) => oneLine(page.replace(/<[^>]*>/gu, " ")
+  .replace(/&lt;/gu, "<").replace(/&gt;/gu, ">").replace(/&quot;/gu, '"')
+  .replace(/&#(?:39|x27);/gu, "'").replace(/&amp;/gu, "&"));
+function evidencePage(f: Fixture, request: Ask | undefined, stage: string, reason: RegExp,
+  selected: readonly string[], options: readonly string[] = stuckDecisions, recommended = "hand off") {
+  assert.ok(request, "the stopped run asked a Human");
+  assert.equal(typeof request.page, "string", "the Machine supplies a page without a presenter");
+  const page = request.page!;
+  assert.ok(Buffer.byteLength(page, "utf8") < 200_000, "the escaped page is below 200 kB");
+  assert.doesNotMatch(page, /<\/?(?:html|head|body|script|style|link|a|iframe)\b|<[a-z][^>]*\s(?:style|on\w+|src|href)\s*=/iu);
+  assert.match(page, /<section\b[^>]*class=["']recap["']/u);
+  assert.match(page, /<span\b[^>]*class=["']chip\s/u);
+  const text = pageText(page);
+  for (const part of ["widgets", f.repo, "PROJ-12", "Add a greeting", branch, f.worktree, ...selected]) {
+    assert.ok(text.includes(oneLine(part)), `the page carries ${part.slice(0, 150)}`);
+  }
+  // A single recap paragraph or definition describes the stage and why it stopped.
+  const sentences = [...page.matchAll(/<(p|dd)\b[^>]*>([\s\S]*?)<\/\1>/gu)].map(match => pageText(match[2]!));
+  assert.ok(sentences.some(sentence => sentence.includes(stage) && reason.test(sentence)),
+    `one stage sentence names ${stage} and ${reason}`);
+  assert.match(request.headline ?? "", /\S/u);
+  assert.ok(request.headline!.length <= 160);
+  assert.equal(request.recommended, recommended);
+  assert.match(page, /recommended/iu, "the page marks its recommendation");
+  assert.deepEqual(Object.keys(request.effects ?? {}).sort(), [...options].sort(), "every offered option has an effect");
+  for (const option of options) {
+    const effect = request.effects![option]!;
+    assert.match(effect, /\S/u); assert.ok(effect.length <= 160); assert.doesNotMatch(effect, /[\r\n]/u);
+    assert.ok(text.includes(option), `the page explains ${option}`);
+  }
+  if (options.includes("more rounds")) assert.match(request.effects!["more rounds"]!, /budget|round|restart|return/iu);
+  if (options.includes("hand off")) assert.match(request.effects!["hand off"]!, /keep|retain/iu);
+  if (options.includes("archive")) assert.match(request.effects!.archive!, /commit|sav/iu);
+  if (options.includes("discard")) assert.match(request.effects!.discard!, /confirm/iu);
+  return page;
+}
+/** The note must already exist while the Human is waiting, before any answer or final receipt. */
+function stuckNote(f: Fixture) {
+  const root = join(f.evidence, ".machine-runs/machine-shop");
+  const ids = readdirSync(root); assert.equal(ids.length, 1);
+  return readFileSync(join(root, ids[0]!, "stuck.md"), "utf8");
+}
+/** Read the presenter's facts at Human entry without binding or calling a model. */
+function observeHumanFacts(facts: string[]) {
+  return { ...runtime, human: ((prompt, on, options = {}) => {
+    const state = runtime.human(prompt, on, options);
+    return { ...state, invoke: { ...state.invoke, input: () => {
+      const request = state.invoke.input();
+      if (options.presentWith) facts.push(options.presentWith());
+      return request;
+    } } };
+  }) as typeof runtime.human };
+}
+const textFacts = (facts: string) => {
+  const strings: string[] = [];
+  JSON.parse(facts, (_key, value) => { if (typeof value === "string") strings.push(value); return value; });
+  return oneLine(strings.join("\n"));
+};
+
+test("evidence helpers preserve full selected log tails and cap escaped blocks, tables and facts", context => {
+  const directory = mkdtempSync(join(tmpdir(), "ticket-evidence-"));
+  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  const log = join(directory, "gate.log");
+  const lines = Array.from({ length: 90 }, (_, index) => `line ${index + 1}`);
+  writeFileSync(log, lines.join("\n") + "\n");
+  const tail = evidenceLog(log);
+  assert.deepEqual(tail.split("\n").slice(1), lines.slice(-30));
+  assert.match(tail, /60 lines omitted; see stuck\.md/u);
+  assert.match(evidenceLog(join(directory, "missing.log")), /Log unavailable:.*ENOENT/u);
+  const payload = '🧪<&"é'.repeat(40_000);
+  for (const selected of [payload, Array.from({ length: 30 }, (_, index) => `${index}: ${payload}`).join("\n")]) {
+    writeFileSync(log, selected);
+    assert.equal(evidenceLog(log), selected);
+    const page = renderEvidencePage({
+      headline: "Decide what happens next", stopped: `verify: ${payload}`, breadcrumb: payload,
+      blocks: [
+        { title: "Failed gate", text: evidenceLog(log) },
+        { title: "Diff", text: "1000 files changed", table: {
+          headings: ["File", "Added", "Removed"], rows: Array.from({ length: 1000 }, () => [payload, "1", "0"]),
+        } },
+        ...Array.from({ length: 8 }, () => ({ title: "Evidence", text: payload })),
+      ], effects: { "hand off": "Keep the worktree and branch." }, recommended: "hand off",
+    });
+    const facts = evidenceFacts({ stage: "verify", reason: payload, checks: [{ name: "gate", tail: selected }], files: [payload] });
+    for (const bounded of [page, facts]) {
+      assert.ok(Buffer.byteLength(bounded) < 200_000);
+      assert.match(bounded, /\d+ bytes omitted; see stuck\.md/u);
+      assert.doesNotMatch(bounded, /�/u);
+    }
+    assert.match(page, /\d+ rows omitted; see stuck\.md/u);
+    assert.match(page, /&lt;&amp;&quot;/u);
+    assert.doesNotMatch(page, /<script|<style|<a\b/u);
+    assert.equal(JSON.parse(facts).stage, "verify");
+    writeStuckEvidence(directory, selected, page);
+    const note = readFileSync(join(directory, "stuck.md"), "utf8");
+    assert.ok(note.includes(selected)); assert.ok(note.includes(page));
+    assert.equal(readFileSync(log, "utf8"), selected);
+  }
+});
+
+test("stuck evidence: legacy rejection at invocation retains the note and retries only unsupported fields", async context => {
+  const f = fixture(context); const human = person("hand off"); let rejected = 0;
+  const legacy = { ...runtime, human: ((prompt, on, options = {}) => {
+    const state = runtime.human(prompt, on, options);
+    return { ...state, invoke: { ...state.invoke, input: () => {
+      const request = state.invoke.input();
+      if (request.page !== undefined) { rejected++; throw new Error("Unknown Human request fields: page"); }
+      return request;
+    } } };
+  }) as typeof runtime.human };
+  const result = await execute(input(f), { falsify: () => gaps([language]) }, human, { primitives: legacy });
+  assert.equal(result.state, "handedOff"); assert.equal(rejected, 1);
+  assert.equal(human.requests[0]!.page, undefined);
+  assert.match(stuckNote(f), /<section class="recap">/u);
+});
+
+test("a stuck run keeps its deterministic evidence when a presenter proposes other fields, and more rounds is matched as before", async context => {
   const f = fixture(context); const human = person("more rounds"); const explain = presenter(() => "more rounds"); let reviews = 0;
   const result = await execute(input(f), { presenter: explain, reviewer: () => ++reviews <= 2 ? approvedButMalformed() : review() }, human);
   assert.equal(result.state, "delivered"); assert.deepEqual([human.requests.length, explain.prompts.length, reviews], [1, 1, 3]);
   const [request] = human.requests; stuckQuestion(f, request, "reviewResult");
   const run = held(f, result, /^Delivered/u); asksWritten(run.directory, [request!]);
-  // The presenter was given the question the state built, and the person sees that question with only the presenter's fields added.
-  assert.deepEqual(explain.asked, [{ prompt: request!.prompt, suggestions: stuckDecisions }]);
-  assert.deepEqual(request, { prompt: request!.prompt, suggestions: stuckDecisions, ...explanation(explain.asked[0]!, "more rounds") });
-  assert.deepEqual([request!.recommended, request!.discards], ["more rounds", ["discard"]]);
-  assert.match(request!.page!, /<pre class="mermaid">/u);
+  // State-owned fields win over optional presenter output in the runtime.
+  assert.deepEqual(explain.asked, [request]);
+  evidencePage(f, request, "reviewResult", /newSinceLastRound/u, [criterion, "greeting.txt"]);
+  assert.deepEqual(request!.suggestions, stuckDecisions);
+  assert.deepEqual(request!.discards, ["discard"]);
   // more rounds is the decision it was: back to the stage that stopped, with fresh budgets.
   assert.equal(result.states[result.states.indexOf("decide") + 1], "repairTarget");
   assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }]);
@@ -1879,31 +1999,34 @@ test("a failed presenter diff read omits the diff while the question still carri
   assert.ok(calls().some(call => call.startsWith("diff --numstat")));
   const facts = JSON.parse(factsOf(explain.prompts[0]!));
   assert.equal(Object.hasOwn(facts, "files"), false); assert.equal(facts.stage, "reviewResult");
-  assert.equal(human.requests[0]!.recommended, "more rounds");
+  assert.equal(human.requests[0]!.recommended, "hand off");
+  evidencePage(f, human.requests[0], "reviewResult", /newSinceLastRound/u, [criterion]);
 });
 
-test("with no presenter bound, a stuck question goes out exactly as before: its prompt and suggestions, nothing more", async context => {
+test("with no presenter bound, a stuck question includes deterministic evidence and preserves its prompt and suggestions", async context => {
   const f = fixture(context); const human = person("hand off");
   // The Machine offers a presenter; this run binds none.
   assert.deepEqual(runtime.optionalAgentNames(mod.default(runtime, input(f))), ["presenter"]);
   const result = await execute(input(f), { reviewer: approvedButMalformed }, human);
   const run = handedOff(f, result, /review report was malformed twice/u, human);
   const [request, ...others] = human.requests; assert.deepEqual(others, []);
-  assert.deepEqual(request, { prompt: request!.prompt, suggestions: stuckDecisions });
+  evidencePage(f, request, "reviewResult", /newSinceLastRound/u, [criterion, "greeting.txt"]);
+  assert.deepEqual(request!.suggestions, stuckDecisions); assert.equal(request!.choices, undefined);
   stuckQuestion(f, request, "reviewResult"); asksWritten(run.directory, [request!]);
   assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "hand off" }]);
 });
 
-test("with no presenter bound, a step question goes out exactly as before: its prompt and choices, nothing more", async context => {
+test("with no presenter bound, a step question includes deterministic evidence and preserves its choices", async context => {
   const f = fixture(context); const human = person("hand off");
   assert.deepEqual(runtime.optionalAgentNames(mod.default(runtime, input(f))), ["presenter"]);
   const result = await execute(input(f, { setup: [command("process.exit(3)")] }), { investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() }, human);
   steppedOff(f, result, "setup", "stepDecide", /setup: tests did not meet/u, human, 0);
-  assert.deepEqual(human.requests[0], { prompt: human.requests[0]!.prompt, choices: stepChoices });
+  evidencePage(f, human.requests[0], "setup", /tests did not meet/u, ["tests"], stepChoices);
+  assert.deepEqual(human.requests[0]!.choices, stepChoices); assert.equal(human.requests[0]!.suggestions, undefined);
 });
 
 for (const failure of ["throws", "returns no presented event"]) {
-  test(`a presenter that ${failure} leaves the stuck question exactly as it is without one, and more rounds is matched as before`, async context => {
+  test(`a presenter that ${failure} leaves the deterministic evidence intact, and more rounds is matched as before`, async context => {
     const f = fixture(context); const human = person("more rounds"); let presented = 0; let reviews = 0;
     const result = await execute(input(f), {
       presenter: () => { presented++; if (failure === "throws") throw new Error("The presenter's model is unavailable"); return ok("completed", "Nothing to present"); },
@@ -1911,11 +2034,288 @@ for (const failure of ["throws", "returns no presented event"]) {
     }, human);
     assert.equal(result.state, "delivered"); assert.deepEqual([presented, human.requests.length], [1, 1]);
     const [request] = human.requests;
-    assert.deepEqual(request, { prompt: request!.prompt, suggestions: stuckDecisions }); stuckQuestion(f, request, "reviewResult");
+    evidencePage(f, request, "reviewResult", /newSinceLastRound/u, [criterion, "greeting.txt"]);
+    stuckQuestion(f, request, "reviewResult");
     const run = held(f, result, /^Delivered/u); asksWritten(run.directory, [request!]);
     assert.deepEqual(run.result.decisions, [{ stage: "decide", response: "more rounds" }]);
   });
 }
+
+for (const stop of ["falsify questions", "plan too broad", "gates exhausted", "review exhausted", "rebase conflict"] as const) {
+  test(`stuck evidence: ${stop} carries the breadcrumb, stage, evidence and every choice without a presenter`, async context => {
+    const f = fixture(context); const facts: string[] = [];
+    const data = input(f, { rerunFailedChecks: false }, { redGreen: false, maxRepairs: 0, maxReviewRounds: 0 });
+    const agents: Record<string, Runner> = {};
+    let stage: string; let reason: RegExp; let selected: string[];
+    if (stop === "falsify questions") {
+      agents.falsify = () => gaps([language, beside], "Two owner decisions prevent implementation");
+      agents.plan = () => assert.fail("falsify questions must stop before planning");
+      stage = "falsifyResult"; reason = /question/iu;
+      selected = [language.text, ...language.options, language.why, beside.text, ...beside.options, beside.why];
+    } else if (stop === "plan too broad") {
+      agents.planReview = () => ok("tooBroad", split);
+      agents.implementer = () => assert.fail("a broad plan must stop before editing");
+      stage = "planReviewResult"; reason = /too broad/iu; selected = [plan, ...splitLines];
+    } else if (stop === "gates exhausted") {
+      data.repository.checks = [command('console.log("evidence gate: expected hello, received goodbye"); process.exit(1)', { name: "greeting-contract" })];
+      stage = "repairBudget"; reason = /(?:repair|budget)/iu;
+      selected = ["greeting-contract", "evidence gate: expected hello, received goodbye"];
+    } else if (stop === "review exhausted") {
+      agents.reviewer = () => review("revise", "The empty case remains broken", {
+        criteria: [{ text: criterion, met: false, evidence: "greeting.txt:1 returns goodbye" }],
+        // Outside Scope makes this an owner stop rather than the automatic extra round.
+        findings: [{ severity: "blocker", text: "The default locale loses the greeting", where: "outside-scope.txt:17" }],
+      });
+      stage = "reviewBudget"; reason = /(?:review|budget)/iu;
+      selected = [criterion, "greeting.txt:1 returns goodbye", "The default locale loses the greeting", "outside-scope.txt:17"];
+    } else {
+      let edits = 0;
+      agents.implementer = request => ++edits === 1 ? implement(request) : ok("completed", "Conflict needs the owner's decision");
+      agents.reviewer = () => { advance(f, "greeting.txt", "hi\n"); return review(); };
+      stage = "repairBudget"; reason = /conflict/iu;
+      selected = ["greeting.txt", "refs/machine-shop/saved/", "saved-candidate.patch"];
+    }
+    const human = person();
+    const answer = (request: Ask) => {
+      const page = evidencePage(f, request, stage, reason, selected);
+      if (stop === "review exhausted") {
+        assert.match(pageText(page), /unmet|not met/iu, "unmet criteria are identified as such");
+        assert.match(pageText(page), /blocker/iu, "open findings retain their severity");
+      }
+      const note = stuckNote(f);
+      assert.ok(note.includes(page), "stuck.md preserves the generated page before waiting");
+      assert.equal(facts.length, 1, "facts are available at Human entry without a presenter");
+      const factText = textFacts(facts[0]!);
+      for (const part of [f.repo, "PROJ-12", "Add a greeting", branch, f.worktree, stage, ...selected]) {
+        assert.ok(note.includes(part), `stuck.md keeps the full text of ${part.slice(0, 100)}`);
+        assert.ok(factText.includes(oneLine(part)), `presenter facts carry the same evidence: ${part.slice(0, 100)}`);
+      }
+      human.requests.push(request);
+      return "hand off";
+    };
+    const result = await execute(data, agents, answer, { primitives: observeHumanFacts(facts) });
+    questioned(f, result, reason, human);
+    assert.deepEqual(human.requests[0]!.suggestions, stuckDecisions);
+  });
+}
+
+test("stuck evidence: the page renders the staged and untracked diff as a table with counts and a diff stat", async context => {
+  const f = fixture(context); const human = person("hand off");
+  const result = await execute(input(f, {}, { redGreen: false, maxReviewRounds: 0 }), {
+    implementer: request => {
+      implement(request); git(request.cwd, "add", "greeting.txt");
+      // The default gate evaluates this file; keep the two counted lines valid JavaScript.
+      writeFileSync(join(request.cwd, "greeting.test.txt"), "// first\n// second\n");
+      return ok();
+    }, reviewer: () => ownerReview("The owner must settle the locale"),
+  }, human);
+  questioned(f, result, /Review budget exhausted \(0\)/u, human);
+  const page = evidencePage(f, human.requests[0], "reviewBudget", /review|budget/iu, ["greeting.txt", "greeting.test.txt"]);
+  assert.match(page, /<table\b[^>]*>[\s\S]*?<thead\b[^>]*>[\s\S]*?<th\b/u);
+  const rows = [...page.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gu)].map(match => pageText(match[1]!));
+  assert.ok(rows.some(row => /greeting\.txt/u.test(row) && /\b1\b/u.test(row) && /\b0\b/u.test(row)), "staged addition has counts");
+  assert.ok(rows.some(row => /greeting\.test\.txt/u.test(row) && /\b2\b/u.test(row) && /\b0\b/u.test(row)), "untracked addition has counts");
+  assert.match(pageText(page), /2 files? changed/u);
+  assert.match(pageText(page), /3 insertions?/u);
+});
+
+test("stuck evidence: a long failing gate log contributes only its last 30 lines, preserving the selected tail in stuck.md and the original log", async context => {
+  const f = fixture(context); const human = person("hand off");
+  const lines = Array.from({ length: 90 }, (_, index) => `GATE-LINE-${String(index + 1).padStart(3, "0")}`);
+  const result = await execute(input(f, {
+    checks: [command(`console.log(${JSON.stringify(lines.join("\n"))}); process.exit(1)`, { name: "long-contract" })], rerunFailedChecks: false,
+  }, { redGreen: false, maxRepairs: 0 }), {}, human);
+  const run = questioned(f, result, /Repair budget exhausted \(0\)/u, human);
+  const page = evidencePage(f, human.requests[0], "repairBudget", /repair|budget/iu, ["long-contract", ...lines.slice(-30)]);
+  assert.match(page, /<pre\b/u);
+  for (const line of lines.slice(0, -30)) assert.equal(page.includes(line), false, `${line} is outside the last 30 lines`);
+  assert.match(pageText(page), /(?:60[^.]*?(?:lines?[^.]*?)?(?:omitted|left out)|(?:omitted|left out)[^.]*?60)/iu);
+  assert.ok(page.includes("stuck.md"), "the excerpt points to the complete evidence");
+  const note = stuckNote(f);
+  for (const line of lines.slice(-30)) assert.ok(note.includes(line), `${line} stays in stuck.md`);
+  const check = run.result.checks.find((check: any) => check.phase === "verify" && !check.passed);
+  assert.ok(check); const log = readFileSync(check.log, "utf8");
+  for (const line of lines) assert.ok(log.includes(line), `${line} stays in the original log`);
+});
+
+for (const failed of [2, 20]) {
+  test(`evidence rendering budgets ${failed} failing gates separately before passing metadata`, () => {
+    const payload = '🧪<&"é'.repeat(10_000);
+    const failures = Array.from({ length: failed }, (_, index) => ({
+      name: `failed-gate-${index}`, phase: "verify", passed: false, exitCode: 1,
+      log: `/evidence/${index}.log`, tail: `${payload}\nDIAGNOSTIC-${index}: expected hello`,
+    }));
+    const passes = Array.from({ length: 20 - failed }, () => ({
+      name: `passing-${payload}`, phase: "verify", passed: true, exitCode: 0, log: `/evidence/${payload}.log`,
+    }));
+    const page = renderEvidencePage({
+      headline: "Decide what happens next", stopped: "Stopped in repairBudget: gates failed", breadcrumb: "widgets / PROJ-12 / ticket/proj-12 / worktree",
+      blocks: [
+        ...failures.map(({ name, tail, exitCode }) => ({ title: `Failing gate: ${name}`, text: `name: ${name}\nexitCode: ${exitCode}`, tail })),
+        { title: "Passing checks", text: JSON.stringify(passes) },
+      ], effects: { "hand off": "Keep the worktree and branch." }, recommended: "hand off",
+    });
+    const facts = evidenceFacts({ stage: "repairBudget", checks: [...passes, ...failures], reason: payload });
+    for (const bounded of [page, facts]) {
+      assert.ok(Buffer.byteLength(bounded) < 200_000);
+      assert.match(bounded, /\d+ bytes omitted; see stuck\.md/u);
+      assert.doesNotMatch(bounded, /�/u);
+      for (const { name } of failures) assert.ok(bounded.includes(name), `retains ${name}`);
+      for (let index = 0; index < failed; index++) assert.ok(bounded.includes(`DIAGNOSTIC-${index}: expected hello`), `retains gate ${index}'s diagnostic tail`);
+    }
+    const checks = JSON.parse(facts).checks;
+    assert.equal(checks.length, 20);
+    for (const { name, exitCode, log, tail } of failures) {
+      const check = checks.find((entry: any) => entry.name === name);
+      assert.equal(check.exitCode, exitCode); assert.equal(check.passed, false); assert.equal(check.log, log);
+      assert.ok(check.tail.endsWith(tail.split("\n").at(-1)));
+    }
+  });
+}
+
+test("stuck evidence: multiple failing gates retain their own identities and diagnostic tails despite noisy logs and passing metadata", async context => {
+  const f = fixture(context); const human = person("hand off"); const facts: string[] = [];
+  const failures = ["first-contract", "second-contract"].map(name => {
+    const full = [`OLD-${name}`, ...Array.from({ length: 29 }, () => '🧪<&"é'.repeat(2_000)), `DIAGNOSTIC-${name}: expected hello`].join("\n");
+    const file = join(f.root, `${name}.txt`); writeFileSync(file, full);
+    return { name, full, check: command(`process.stdout.write(require("node:fs").readFileSync(${JSON.stringify(file)}, "utf8")); process.exitCode = 1`, { name }) };
+  });
+  const result = await execute(input(f, {
+    checks: [command("", { name: `passing-${"metadata".repeat(2_000)}` }), ...failures.map(failure => failure.check)],
+    rerunFailedChecks: false,
+  }, { redGreen: false, maxRepairs: 0 }), {}, human, { primitives: observeHumanFacts(facts) });
+  const run = questioned(f, result, /Repair budget exhausted \(0\)/u, human);
+  const page = evidencePage(f, human.requests[0], "repairBudget", /repair|budget/iu,
+    failures.flatMap(({ name }) => [name, `DIAGNOSTIC-${name}: expected hello`]));
+  assert.equal(facts.length, 1);
+  assert.ok(Buffer.byteLength(facts[0]!) < 200_000);
+  for (const bounded of [pageText(page), textFacts(facts[0]!)]) {
+    assert.match(bounded, /\d+ bytes omitted; see stuck\.md/u);
+    assert.doesNotMatch(bounded, /�/u);
+    for (const { name } of failures) {
+      assert.ok(bounded.includes(name));
+      assert.ok(bounded.includes(`DIAGNOSTIC-${name}: expected hello`), `${name} keeps its diagnostic tail`);
+      assert.equal(bounded.includes(`OLD-${name}`), false, "only the last 30 lines are selected");
+    }
+  }
+  for (const { name, full } of failures) {
+    const checkFacts = JSON.parse(facts[0]!).checks.find((check: any) => check.name === name);
+    assert.equal(checkFacts.passed, false);
+    assert.equal(checkFacts.exitCode, 1);
+    assert.ok(checkFacts.tail.endsWith(`DIAGNOSTIC-${name}: expected hello`));
+    assert.ok(stuckNote(f).includes(full.split("\n").slice(-30).join("\n")));
+    const check = run.result.checks.find((check: any) => check.name === name);
+    assert.equal(readFileSync(check.log, "utf8"), full);
+  }
+});
+
+for (const overflow of ["one oversized line", "thirty oversized escaped Unicode lines", "oversized questions and options"]) {
+  test(`stuck evidence: ${overflow} is byte-capped in the page and facts, with full selected evidence in stuck.md`, async context => {
+    const f = fixture(context); const human = person("hand off"); const facts: string[] = [];
+    const payload = '🧪<&"é'.repeat(overflow === "thirty oversized escaped Unicode lines" ? 2_000 : 6_000);
+    const full = overflow === "one oversized line" ? `START-LONG ${payload.repeat(3)} END-LONG`
+      : overflow === "thirty oversized escaped Unicode lines" ? Array.from({ length: 30 }, (_, index) => `TAIL-${index + 1} ${payload}`).join("\n")
+        : `QUESTION-START ${payload.repeat(3)} QUESTION-END`;
+    // Keep large data out of argv: the gate reads an evidence fixture outside the checkout.
+    const file = join(f.root, "oversized-evidence.txt"); writeFileSync(file, full);
+    const data = input(f, { rerunFailedChecks: false }, { redGreen: false, maxRepairs: 0 });
+    const agents: Record<string, Runner> = {
+      presenter: request => { facts.push(factsOf(request.prompt)); return ok("completed", "No presentation override"); },
+    };
+    if (overflow === "oversized questions and options") {
+      const option = `OPTION-START ${payload.repeat(3)} OPTION-END`;
+      agents.falsify = () => gaps([gap(full, { options: [option, "Keep existing behavior"], recommended: option, why: full })]);
+    } else {
+      // Let stdout drain before the failing exit so the gate log contains the entire fixture.
+      data.repository.checks = [command(`process.stdout.write(require("node:fs").readFileSync(${JSON.stringify(file)}, "utf8")); process.exitCode = 1`, { name: "overflow-contract" })];
+    }
+    const result = await execute(data, agents, human);
+    assert.equal(result.state, "handedOff"); assert.equal(human.requests.length, 1); assert.equal(facts.length, 1);
+    const request = human.requests[0]!;
+    assert.equal(typeof request.page, "string", "overflow must never omit the page");
+    assert.ok(Buffer.byteLength(request.page!, "utf8") < 200_000, "budget includes escaping and UTF-8 bytes");
+    assert.ok(Buffer.byteLength(facts[0]!, "utf8") < 200_000, "serialized presenter facts are independently bounded");
+    for (const excerpt of [pageText(request.page!), facts[0]!]) {
+      assert.match(excerpt, /(?:\b\d+\s+(?:bytes?|characters?|lines?)\s+(?:(?:were|are)\s+)?(?:omitted|left out)|(?:omitted|left out)\s*:?\s*\d+\s+(?:bytes?|characters?|lines?))/iu,
+        "a cut states the omitted amount");
+      assert.ok(excerpt.includes("stuck.md"));
+      assert.equal(excerpt.includes(full), false, "large evidence is actually excerpted");
+      assert.equal(excerpt.includes("�"), false, "UTF-8 truncation does not split a code point");
+    }
+    const note = stuckNote(f);
+    assert.ok(note.includes(full), "stuck.md keeps complete selected evidence, beyond the excerpt");
+    if (overflow === "oversized questions and options") assert.ok(note.includes(`OPTION-START ${payload.repeat(3)} OPTION-END`));
+    assert.ok(note.includes(request.page!), "the bounded page is also saved");
+    if (overflow !== "oversized questions and options") {
+      const check = evidence(f).result.checks.find((check: any) => !check.passed);
+      assert.ok(readFileSync(check.log, "utf8").includes(full), "the original log is retained");
+    }
+  });
+}
+
+test("stuck evidence: HTML-like questions, options and Unicode are escaped in the page and kept literally in text facts", async context => {
+  const f = fixture(context); const human = person("hand off"); const facts: string[] = [];
+  const unsafe = gap('Keep <script>alert("x")</script> & café 🧪?', {
+    options: ['<a href="https://example.invalid">Keep</a>', '<img src="x" onerror="alert(1)">'],
+    recommended: '<a href="https://example.invalid">Keep</a>', why: "<style>body{display:none}</style> is evidence, not markup.",
+  });
+  const result = await execute(input(f), {
+    falsify: () => gaps([unsafe]),
+    presenter: request => { facts.push(factsOf(request.prompt)); return ok(); },
+  }, human);
+  assert.equal(result.state, "handedOff");
+  const page = evidencePage(f, human.requests[0], "falsifyResult", /question/iu, [unsafe.text, ...unsafe.options, unsafe.why]);
+  assert.ok(page.includes("&lt;script&gt;")); assert.ok(page.includes("&amp;"));
+  const textFacts = JSON.stringify(JSON.parse(facts[0]!));
+  for (const part of [f.repo, "PROJ-12", "Add a greeting", unsafe.text, ...unsafe.options, unsafe.why]) {
+    assert.ok(textFacts.includes(JSON.stringify(part).slice(1, -1)), `presenter facts include ${part}`);
+    assert.ok(stuckNote(f).includes(part), `stuck.md includes ${part}`);
+  }
+});
+
+test("stuck evidence: a strict legacy runtime rejects presentation fields, then receives the original request with the page saved only in stuck.md", async context => {
+  const f = fixture(context); const human = person("hand off"); const rejected: string[][] = [];
+  // This runtime has the optional presenter API, but no presentation fields on Human requests.
+  // Reject keys rather than silently dropping them, so an accidental dependency fails visibly.
+  const legacy = { ...runtime, human: ((prompt, on, options = {}) => {
+    const known = new Set(["choices", "suggestions", "present", "presentWith", "presentIn"]);
+    const unknown = Object.keys(options).filter(key => !known.has(key));
+    if (unknown.length) {
+      rejected.push(unknown);
+      throw new Error(`Unknown Human request fields: ${unknown.join(", ")}`);
+    }
+    const state = runtime.human(prompt, on, options);
+    return { ...state, invoke: { ...state.invoke, input: () => {
+      const request = state.invoke.input();
+      const unknown = Object.keys(request).filter(key => !["prompt", "choices", "suggestions"].includes(key));
+      if (unknown.length) {
+        rejected.push(unknown);
+        throw new Error(`Unknown Human request fields: ${unknown.join(", ")}`);
+      }
+      return request;
+    } } };
+  }) as typeof runtime.human };
+  const result = await execute(input(f), { falsify: () => gaps([language]) }, human, { primitives: legacy });
+  assert.equal(result.state, "handedOff"); assert.equal(human.requests.length, 1);
+  assert.ok(rejected.some(fields => fields.includes("page")), "the fallback was exercised after an actual unsupported-field rejection");
+  const request = human.requests[0]!;
+  assert.deepEqual(request, { prompt: request.prompt, suggestions: stuckDecisions });
+  stuckQuestion(f, request, "falsifyResult");
+  const note = stuckNote(f);
+  for (const part of [f.repo, "PROJ-12", "Add a greeting", branch, f.worktree, "falsifyResult", language.text, ...language.options, language.why]) {
+    assert.ok(pageText(note).includes(part), `legacy stuck.md keeps ${part}`);
+  }
+  assert.match(note, /<section\b[^>]*class=["']recap["']/u);
+  assert.match(note, /<span\b[^>]*class=["']chip\s/u);
+  const run = questioned(f, result, /question/iu, human); asksWritten(run.directory, [request]);
+});
+
+test("stuck evidence: legacy compatibility propagates unrelated Human validation errors", async context => {
+  const f = fixture(context); const failure = new Error("Human choices must include at least one value");
+  const rejecting = { ...runtime, human: (() => { throw failure; }) as typeof runtime.human };
+  await assert.rejects(execute(input(f), {}, person(), { primitives: rejecting }), error => error === failure);
+  assert.deepEqual(readdirSync(f.root), ["widgets"], "an unrelated construction error performs no work");
+});
 
 test("with a presenter bound, Discard. still asks for confirmation, whose choices are unchanged, and go back returns to the stuck question", async context => {
   const f = fixture(context); const human = person("Discard.", "go back", "hand off"); const explain = presenter(asked => asked.choices ? "go back" : "more rounds");
@@ -1924,10 +2324,12 @@ test("with a presenter bound, Discard. still asks for confirmation, whose choice
   assert.deepEqual(result.states.filter(state => ["decide", "confirmDiscard"].includes(state)), ["decide", "confirmDiscard", "decide"]);
   const [decide, confirm, again] = human.requests; assert.equal(human.requests.length, 3); assert.equal(explain.prompts.length, 3);
   for (const asked of [decide!, again!]) {
-    assert.deepEqual(asked, { prompt: asked.prompt, suggestions: stuckDecisions, ...explanation({ prompt: asked.prompt, suggestions: stuckDecisions }, "more rounds") });
+    evidencePage(f, asked, "reviewResult", /newSinceLastRound/u, [criterion, "greeting.txt"]);
+    assert.deepEqual(asked.suggestions, stuckDecisions);
   }
-  assert.deepEqual(explain.asked[1], { prompt: confirm!.prompt, choices: ["confirm discard", "go back"] });
-  assert.deepEqual(confirm, { prompt: confirm!.prompt, choices: ["confirm discard", "go back"], ...explanation(explain.asked[1]!, "go back") });
+  assert.deepEqual(explain.asked, human.requests);
+  evidencePage(f, confirm, "reviewResult", /newSinceLastRound/u, [criterion, "greeting.txt"], ["confirm discard", "go back"], "go back");
+  assert.deepEqual(confirm!.choices, ["confirm discard", "go back"]);
   assert.deepEqual(confirm!.discards, ["confirm discard"]);
   const run = evidence(f); asksWritten(run.directory, [decide!, again!]);
   assert.deepEqual(run.result.decisions.map((made: any) => `${made.stage}: ${made.response}`), ["decide: Discard.", "confirmDiscard: go back", "decide: hand off"]);
@@ -1945,9 +2347,9 @@ test("a step question with a presenter bound is explained with the step's facts,
   const result = await execute(input(f, { setup: [command("process.exit(3)")] }), { presenter: explain, investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail() }, human);
   const run = steppedOff(f, result, "setup", "stepDecide", /setup: tests did not meet/u, human, 0);
   const [request] = human.requests;
-  assert.deepEqual(explain.asked, [{ prompt: request!.prompt, choices: stepChoices }]);
-  assert.deepEqual(request, { prompt: request!.prompt, choices: stepChoices, ...explanation(explain.asked[0]!, "retry") });
-  assert.deepEqual([request!.recommended, request!.discards], ["retry", ["discard"]]);
+  assert.deepEqual(explain.asked, [request]);
+  evidencePage(f, request, "setup", /tests did not meet/u, ["tests"], stepChoices);
+  assert.deepEqual([request!.recommended, request!.discards], ["hand off", ["discard"]]);
   const facts = factsOf(explain.prompts[0]!);
   assert.match(facts, /\bsetup\b/u); assert.match(facts, /tests did not meet/u);
   assert.ok(facts.includes(run.result.checks[0].name)); assert.ok(facts.includes(run.directory), run.directory);
@@ -2355,6 +2757,8 @@ test("a run continued from the checkpoint saved on entering stuck, after its que
   const saves = checkpointed();
   const first = await execute(input(f), agents, person(), { ...saves.options, onHumanSleep: request => { slept.push(request); } });
   assert.equal(String(first.state), "decide"); assert.equal(slept.length, 1);
+  evidencePage(f, slept[0], "planReviewResult", /plan still names no test/iu, [plan, "The plan still names no test"]);
+  assert.ok(stuckNote(f).includes(slept[0]!.page!), "the page is saved before the run sleeps");
   const runs = join(f.evidence, ".machine-runs/machine-shop"); const [id] = readdirSync(runs);
   asksWritten(join(runs, id!), slept);
   // The process ends after question-1.txt was written and before the question was put, so the run continues where stuck was entered.
@@ -2365,6 +2769,8 @@ test("a run continued from the checkpoint saved on entering stuck, after its que
     .catch(error => assert.fail(`continuing at stuck failed: ${error.message}`));
   assert.deepEqual(continued.states.slice(0, 2), ["stuck", "decide"]);
   assert.equal(human.requests.length, 1); stuckQuestion(f, human.requests[0], "planReviewResult");
+  evidencePage(f, human.requests[0], "planReviewResult", /plan still names no test/iu, [plan, "The plan still names no test"]);
+  assert.equal(human.requests[0]!.page, slept[0]!.page, "restarting stuck rebuilds the same saved-state evidence");
   const run = handedOff(f, continued, /The plan still names no test/u, human); assert.equal(planReviews, 2);
   // The question is numbered as it was and rewritten as it is now put; there is no second one.
   asksWritten(run.directory, [human.requests[0]!]);
@@ -2468,7 +2874,9 @@ test("under the sleep option a stuck run sleeps on its question with nothing end
   const first = await execute(input(f), agents, person(), { ...saves.options, onHumanSleep: request => { slept.push(request); } });
   assert.equal(String(first.state), "decide"); assert.equal(first.states.at(-1), "decide"); assert.deepEqual(saves.unsaveable, []);
   assert.equal(slept.length, 1); stuckQuestion(f, slept[0], "planReviewResult"); assert.match(slept[0]!.prompt, splitSaid);
-  // Nothing has ended: no receipt and no note, and the worktree is kept on its branch.
+  evidencePage(f, slept[0], "planReviewResult", /too broad/iu, [plan, ...splitLines]);
+  assert.ok(stuckNote(f).includes(slept[0]!.page!), "sleep preserves the deterministic page");
+  // Nothing has ended: no final receipt or park note, and the worktree is kept on its branch.
   const runs = join(f.evidence, ".machine-runs/machine-shop"); const [id, ...others] = readdirSync(runs); assert.deepEqual(others, []);
   for (const name of ["delivery.json", "result.json", "park.txt"]) assert.equal(existsSync(join(runs, id!, name)), false, name);
   // The question it sleeps on is already in the evidence.
@@ -4997,9 +5405,10 @@ test("a merge question with a presenter bound is explained with the merge step's
   const result = await untilEnd(input(f, { output: "pr" }), { presenter: explain }, human);
   assert.equal(result.state, "handedOff"); assert.deepEqual(result.states.slice(-3), ["mergeRetryDecide", "mergeHandOff", "handedOff"]);
   assert.equal(human.requests.length, 1); const [request] = human.requests; mergeRetryAsked(request, /git push failed deleting/u);
-  assert.deepEqual(explain.asked, [{ prompt: request!.prompt, choices: mergeRetryChoices }]);
-  assert.deepEqual(request, { prompt: request!.prompt, choices: mergeRetryChoices, ...explanation(explain.asked[0]!, "retry") });
-  assert.deepEqual([request!.recommended, request!.discards], ["retry", ["discard"]]);
+  assert.deepEqual(explain.asked, [request]);
+  evidencePage(f, request, "cleanUp", /git push failed deleting/u, [url, "greeting.txt"], mergeRetryChoices);
+  assert.deepEqual([request!.recommended, request!.discards], ["hand off", ["discard"]]);
+  assert.ok(stuckNote(f).includes(request!.page!), "merge recovery persists its page after the worktree is gone");
   const run = held(f, result, /^Handed off: /u); asksWritten(run.directory, human.requests);
   const facts = factsOf(explain.prompts[0]!);
   assert.match(facts, /\bcleanUp\b/u); assert.match(facts, /git push failed deleting/u); assert.ok(facts.includes(url), url);
@@ -5069,6 +5478,7 @@ for (const choice of ["hand off", "discard"] as const) {
     viewed(gh, 1); assert.deepEqual(result.sleeps, []); assert.equal(result.states.includes("parked"), false);
     const [asked, confirmation, ...others] = human.requests; assert.deepEqual(others, []);
     assert.deepEqual(asked!.choices, ["hand off", "discard"]);
+    evidencePage(f, asked, "checkMerge", /closed without merging/iu, [url], ["hand off", "discard"]);
     assert.match(asked!.prompt, /closed without merging/iu); for (const part of [url, branch]) assert.ok(asked!.prompt.includes(part), part);
     const commit = evidence(f).delivery.commit; untouched(f); assert.equal(existsSync(f.worktree), false);
     // Only a merge deletes the pushed branch.
@@ -5080,6 +5490,7 @@ for (const choice of ["hand off", "discard"] as const) {
       return;
     }
     assert.deepEqual(confirmation!.choices, ["confirm discard", "go back"]);
+    evidencePage(f, confirmation, "checkMerge", /closed without merging/iu, [url], ["confirm discard", "go back"], "go back");
     assert.equal(result.state, "abandoned"); held(f, result, /^Abandoned: /u);
     settled(result.output.summary, `Pull request: ${url}. Branch: ${branch}, deleted locally; the pushed branch is kept on origin. Evidence: `);
     assert.equal(git(f.repo, "branch", "--list", branch), ""); assert.equal(git(f.repo, "cat-file", "-t", commit), "commit");
