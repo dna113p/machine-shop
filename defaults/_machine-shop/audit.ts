@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { catalogNames, hash, maybeStat, provenance, readOptional, safePath, workflowFiles, type Catalog } from "./install.ts";
 import { readEvidence } from "./evidence.ts";
 import { declaredRoles } from "./roles.ts";
+import { displayArgv, inspectProjectAgent, parseProjectAgentInput, type ProjectAgentAudit, type ProjectAgentInput } from "./project-agent.ts";
 
 export const gateClasses = ["lint", "types", "tests", "build", "live"] as const;
 export type GateClass = typeof gateClasses[number];
@@ -20,6 +21,7 @@ export interface Inventory {
   defaults: Default[]; custom: string[]; snapshot: string;
   helpers: { name: string; status: string }[]; provenanceVersion: string;
   runs: ReturnType<typeof readEvidence>;
+  projectAgent?: ProjectAgentAudit;
 }
 export interface Proposal {
   defaults: { name: string; action: "install" | "refresh" | "keep" | "leave"; reason: string }[];
@@ -32,7 +34,7 @@ const text = (value: unknown): value is string => typeof value === "string" && v
 export const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 export function parseAuditInput(input: unknown) {
   const value: unknown = typeof input === "string" ? JSON.parse(input) : input;
-  if (!object(value) || Object.keys(value).some(key => !["project", "apply", "since"].includes(key))) throw new Error("Expected project, optional apply and since");
+  if (!object(value) || Object.keys(value).some(key => !["project", "apply", "since", "projectAgent"].includes(key))) throw new Error("Expected project, optional apply, since and projectAgent");
   if (!text(value.project) || !isAbsolute(value.project) || value.project.includes("\0")) throw new Error("project must be an absolute directory path");
   if (value.apply !== undefined && typeof value.apply !== "boolean") throw new Error("apply must be a boolean");
   const until = Date.now();
@@ -42,7 +44,8 @@ export function parseAuditInput(input: unknown) {
     since = Date.parse(value.since);
     if (!Number.isFinite(since) || new Date(since).toISOString().slice(0, 10) !== value.since) throw new Error("since must be a valid calendar date");
   }
-  return { project: resolve(value.project), apply: value.apply === true, since, until };
+  const projectAgent = value.projectAgent === undefined ? undefined : parseProjectAgentInput(value.projectAgent);
+  return { project: resolve(value.project), apply: value.apply === true, since, until, ...(projectAgent ? { projectAgent } : {}) };
 }
 interface Launcher {
   listAgentPresets(location: { cwd: string }): Promise<Preset[]>;
@@ -78,7 +81,7 @@ export function catalogSnapshot(project: string) {
   visit(root);
   return hash(JSON.stringify(values));
 }
-export async function inventoryProject(project: string, catalog: Catalog, own: string, since: number, until: number): Promise<Inventory> {
+export async function inventoryProject(project: string, catalog: Catalog, own: string, since: number, until: number, projectAgent?: ProjectAgentInput): Promise<Inventory> {
   if (!lstatSync(project).isDirectory()) throw new Error("project must be an existing directory");
   // The project's own gate list (.machines/gates.json, which the task helper runs) is read as an instruction file and as gates.
   const instructions = Object.fromEntries(["AGENTS.md", "CLAUDE.md", ".machines/README.md", ".machines/gates.json"].map(key => [key, readOptional(project, join(project, key))]));
@@ -161,7 +164,8 @@ export async function inventoryProject(project: string, catalog: Catalog, own: s
     gates: { found, missing: gateClasses.filter(kind => !found.some(gate => gate.class === kind)) }, presets,
     bindings: { source: readOptional(project, join(directory, "agents.ts")), roles: Object.fromEntries([...new Set(defaults.flatMap(item => item.roles))].map(role => [role, presets.find(preset => preset.name === role)?.source ?? null])) },
     runtime: { pinned: pkg.dependencies?.["@dna113p/machines"] ?? pkg.devDependencies?.["@dna113p/machines"] ?? null, installed: version },
-    catalogVersion: catalog.version, provenanceVersion: baseline.version, helpers, defaults, custom, snapshot: catalogSnapshot(project), runs: readEvidence([project], own, since, until, true) };
+    catalogVersion: catalog.version, provenanceVersion: baseline.version, helpers, defaults, custom, snapshot: catalogSnapshot(project), runs: readEvidence([project], own, since, until, true),
+    ...(projectAgent ? { projectAgent: await inspectProjectAgent(project, projectAgent) } : {}) };
 }
 export function validateProposal(summary: unknown, inventory: Inventory): Proposal {
   const body: unknown = typeof summary === "string" ? JSON.parse(summary) : summary;
@@ -216,26 +220,58 @@ export function validateProposal(summary: unknown, inventory: Inventory): Propos
       throw new Error(`${named} names a route that is neither a proposed Machine (${[...routes].join(", ") || "none proposed"}) nor a gate class (${gateClasses.join(", ")})`);
     }
   }
-  return body as unknown as Proposal;
+  // Discard extra analyst fields: project-agent assessment and commands belong to deterministic code.
+  return { defaults: body.defaults, routes: body.routes, gates, findings: body.findings } as unknown as Proposal;
 }
 const escape = (value: string) => value.replace(/[&<>"']/gu, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]!);
-const cell = (value: unknown) => escape([...String(value)].slice(0, 500).join(""));
-function table(headers: string[], rows: unknown[][]) {
+const cell = (value: unknown, byteBudget = Infinity) => {
+  const characters = [...String(value)].slice(0, 500);
+  const escaped = escape(characters.join(""));
+  if (Buffer.byteLength(escaped) <= byteBudget) return escaped;
+  let result = "", bytes = 0;
+  for (const character of characters) {
+    const encoded = escape(character), size = Buffer.byteLength(encoded);
+    if (bytes + size + 3 > byteBudget) break;
+    result += encoded;
+    bytes += size;
+  }
+  return result + "…";
+};
+function table(headers: string[], rows: unknown[][], preserveRows = false) {
   const start = `<table><thead><tr>${headers.map(header => `<th>${cell(header)}</th>`).join("")}</tr></thead><tbody>`;
+  const end = "</tbody></table>", selected = rows.slice(0, 60);
+  // Observation fields all matter. Share their budget before rendering so earlier
+  // escaped values cannot consume the space reserved for limitations or explanation.
+  const rowBudget = preserveRows ? Math.floor((16_000 - Buffer.byteLength(start + end)) / Math.max(1, selected.length)) : Infinity;
   let body = "";
-  for (const row of rows.slice(0, 60)) {
-    const rendered = `<tr>${row.map(value => `<td>${cell(value)}</td>`).join("")}</tr>`;
+  for (const row of selected) {
+    // Each row wrapper and each cell wrapper occupy nine bytes.
+    const cellBudget = Math.floor((rowBudget - 9 - 9 * row.length) / Math.max(1, row.length));
+    const rendered = `<tr>${row.map(value => `<td>${cell(value, cellBudget)}</td>`).join("")}</tr>`;
     if (Buffer.byteLength(start + body + rendered) > 16_000) break;
     body += rendered;
   }
-  return start + body + "</tbody></table>";
+  return start + body + end;
 }
 export function auditPage(inventory: Inventory, proposal: Proposal, decision: string) {
+  const agent = inventory.projectAgent;
+  const observed = agent?.observation;
+  const projectAgent = !agent ? "" : `<h2>Shared project agent</h2><p>${cell(agent.status)}. Read-only observation; no enforcement or subsequent repair is established.</p>
+${observed ? table(["Observation", "Provider-reported value"], [
+    ["Project", observed.project], ["Observed at", observed.observedAt], ["State", observed.state],
+    ["Provider", `${observed.provider.id}: ${observed.provider.name}`], ["Agent", observed.agent ? `${observed.agent.id}: ${observed.agent.name}` : "missing"],
+    ["Binding reference", observed.binding?.reference ?? "missing"], ["Binding revision", observed.binding?.revision ?? "missing"],
+    ["Capabilities", observed.capabilities.join("; ")], ["Limits", observed.limits.join("; ")], ["Explanation", observed.explanation],
+  ], true) : "<p>No valid observation is available.</p>"}
+${table(["Project-agent finding"], agent.findings.map(finding => [finding.reason]))}
+${agent.nextActions.map(action => `<h3>Separate next action: setup or repair</h3><pre>${escape(action.display)}</pre><p>${escape(action.effects)}</p><p>Display only (POSIX shell quoting). Invoke separately under the provider's permission contract. Audit acceptance and apply never execute this command.</p>`).join("")}
+${agent.findings.length && !agent.nextActions.length ? "<p>No setup route supplied. Discover the installed provider's supported setup interface and supply its command and effects explicitly.</p>" : ""}`;
   const page = `<h1>${cell(basename(inventory.project))}: ${cell(decision)}</h1>
 <p class="breadcrumb">${cell(inventory.project)} · Machines ${cell(inventory.runtime.installed)} (pinned ${cell(inventory.runtime.pinned ?? "none")}) · Catalog ${cell(inventory.catalogVersion)}: ${inventory.defaults.length} defaults, ${inventory.custom.length} project Machines</p>
 <h2>Drift</h2>${table(["Machine", "Status", "Action", "Reason"], [...proposal.defaults.map(item => [item.name, inventory.defaults.find(entry => entry.name === item.name)!.status, item.action, item.reason]), ...inventory.custom.map(name => [name, "project-specific", "leave", "Owner policy"])])}
 <h2>Proposed routing map</h2>${table(["Task", "Machine", "Role bindings and evidence"], proposal.routes.map(route => [route.task, route.machine, Object.entries(route.roles).map(([role, binding]) => `${role} = ${binding.preset}: ${binding.reason} (${binding.evidence.join(", ")})`).join("; ")]))}
 <h2>Gates</h2>${table(["Class", "Commands", "Status"], gateClasses.map(kind => [kind, proposal.gates.found.filter(gate => gate.class === kind).map(gate => gate.command.join(" ")).join("; ") || "No command", proposal.gates.missing.includes(kind) ? "missing" : "found; not executed"]))}
+${projectAgent}
 <h2>Run evidence</h2><p>${cell(inventory.since)} through ${cell(inventory.until)}</p>
 ${table(["Helper", "Provenance"], inventory.helpers.map(helper => [helper.name, helper.status]))}
 ${table(["Outcome", "Count"], Object.entries(inventory.runs.outcomes))}${table(["Stopped stage", "Count"], Object.entries(inventory.runs.stopsByStage))}
@@ -247,11 +283,13 @@ ${table(["Finding", "Route or gate", "Evidence"], proposal.findings.map(item => 
   if (Buffer.byteLength(page) >= 200_000) throw new Error("Audit page exceeds 200 kB");
   return page;
 }
-export function routingReadme(previous: string | null, proposal: Proposal) {
+export function routingReadme(previous: string | null, proposal: Proposal, projectAgent?: ProjectAgentAudit, integration?: ProjectAgentInput) {
   const open = "<!-- machine-shop:routes -->", close = "<!-- /machine-shop:routes -->";
   const old = previous ?? "";
   const md = (value: string) => escape(value.replace(/[\r\n]/gu, " ")).replace(/[\\`*_{}[\]#|]/gu, "\\$&");
-  const section = `${open}\n## Machine routes\n\n${proposal.routes.map(route => `- ${md(route.task)}: \`${route.machine}\`${Object.entries(route.roles).map(([role, binding]) => ` --agent ${md(role)}=${md(binding.preset)}`).join("")}`).join("\n")}\n${close}`;
+  // Reference and supported route only; runtime binding facts stay in the provider and audit evidence.
+  const agentRoute = !projectAgent ? "" : `\n\n### Shared project agent\n\nBinding reference: ${md(projectAgent.observation?.binding?.reference ?? "not observed")}.\n${integration?.setup ? `Setup/repair command (display only, POSIX shell quoting): ${md(displayArgv(integration.setup.command))}\n\nEffects: ${md(integration.setup.effects)}\n\nInvoke separately under the provider's permission contract; audit acceptance does not execute setup.\n` : "No setup route supplied; discover the installed provider's supported interface.\n"}`;
+  const section = `${open}\n## Machine routes\n\n${proposal.routes.map(route => `- ${md(route.task)}: \`${route.machine}\`${Object.entries(route.roles).map(([role, binding]) => ` --agent ${md(role)}=${md(binding.preset)}`).join("")}`).join("\n")}${agentRoute}\n${close}`;
   const openings = old.split(open).length - 1, closings = old.split(close).length - 1;
   if (!openings && !closings) return old + (old.endsWith("\n") || !old ? "" : "\n") + "\n" + section + "\n";
   if (openings !== 1 || closings !== 1 || old.indexOf(open) > old.indexOf(close)) throw new Error("Broken or duplicate machine-shop:routes markers");

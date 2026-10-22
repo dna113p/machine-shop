@@ -3,7 +3,7 @@
 `audit-project` runs from the Machine Shop checkout and inventories a project to propose
 Machines, gates and role bindings. With no `.machines/`, it is the setup workflow.
 It uses one read-only `analyst` Agent, with one retry for a malformed proposal.
-It never accesses Drip or starts another Machine. It is not copied into projects
+By default it makes no project-agent inspection or external service call. It never starts another Machine. It is not copied into projects
 and is absent from the installer's `available` list. Run it from this checkout:
 
 ```sh
@@ -24,6 +24,119 @@ true only when the input itself authorizes applying the proposal without a Human
 step. The runtime must expose the public launcher export. It is resolved from the
 project, the Machine Shop checkout or the running Machines CLI, in that order.
 The audit neither installs nor upgrades that dependency.
+
+## Optional shared project-agent inspection
+
+Project setup can teach one reusable project-agent binding. Audit can inspect that
+same binding through a caller-selected adapter. Drip feedback is the first consumer;
+Overlord is one possible provider. Neither is required. Omit `projectAgent` to retain
+the existing behavior: no inspection command, new external calls or readiness claim.
+This is an integration with the provider's binding, not a second registry or scheduler.
+
+Discover the installed provider's **supported interface** using its documentation
+or supported help before configuring an adapter. The caller supplies trusted argv;
+the analyst never discovers or generates commands from project prose. The adapter
+uses that interface without reading private databases/configuration or probing
+readiness through a model or manager request. Use a generic adapter until the
+installed Drip inspection/setup contract can be verified; the following example
+does not assert any Drip CLI flags. Replace these illustrative adapter paths with
+your trusted local adapter and its supported arguments:
+
+```json
+{
+  "project": "/absolute/project",
+  "projectAgent": {
+    "inspect": ["node", "/absolute/trusted-provider-adapter.mjs", "inspect", "/absolute/project"],
+    "setup": {
+      "command": ["node", "/absolute/trusted-provider-adapter.mjs", "setup", "/absolute/project"],
+      "effects": "Creates or repairs the shared project binding; may start a service, provision a manager, grant writes or incur model charges. Invoke separately under the provider's permission contract."
+    }
+  }
+}
+```
+
+`inspect` is required when `projectAgent` is supplied. `setup` is optional, but when
+present needs both `command` and a plain-language `effects` description. Both commands
+are nonempty argv arrays, with a nonblank executable and no NUL characters. Empty
+argument strings are allowed. Each array has at most 100 words and 8,000 UTF-8 bytes
+when JSON encoded; effects have at most 4,000 characters. The quoted setup command
+and effects also share a 16,000-byte escaped display budget (conservatively counting
+each HTML special character as six bytes), so the complete route fits the page.
+No shell, environment or
+permission fields are accepted. Keep credentials out of argv, effects and JSON;
+authentication belongs to the supported provider interface.
+
+The inventory Operation executes inspection once, from the audited project, with
+no shell or stdin, a **10-second** timeout and a **64 KiB** combined stdout/stderr
+limit. Stdout must contain one JSON object. Stderr counts toward the bound but is
+never persisted; unsuccessful exits and raw error output are not treated as evidence
+of readiness. No command is run when this integration is absent.
+
+The version-one adapter contract is:
+
+```json
+{
+  "version": 1,
+  "project": "/canonical/absolute/project",
+  "observedAt": "2026-10-22T16:00:00.000Z",
+  "binding": { "reference": "example://project-agent/binding-17", "revision": "revision-42" },
+  "provider": { "id": "example-provider", "name": "Example provider" },
+  "agent": { "id": "shared-agent-17", "name": "Shared project agent" },
+  "capabilities": ["feedback", "read-project"],
+  "limits": ["Snapshot only; no write-access or enforcement guarantee"],
+  "state": "ready",
+  "explanation": "Provider observed this project's binding ready at observedAt."
+}
+```
+
+All fields are required. `project` must exactly match the audited directory's
+canonical path (`realpath`); a different or relative identity cannot establish readiness.
+`observedAt` is a UTC ISO timestamp: future observations and observations older than
+the **five-minute** freshness limit are findings. Audit reassesses this limit at
+publication, acceptance and resume using the saved observation, without another probe.
+The example timestamp is illustrative; a real adapter supplies the inspection time.
+
+`state` is `missing`, `ready`, `offline`, `wrong-project` or `unsupported`.
+`provider` always identifies the actual provider; `agent` and `binding` may be explicit
+`null` when unavailable (for example, missing). `ready` requires both agent identity
+and binding `reference` and `revision`. A reference is opaque data, never a URL to
+fetch or command to execute. Capabilities and limits are arrays of at most 100
+nonblank strings, including provider-specific restrictions. Strings are at most
+4,000 characters, without NULs. Unknown fields, including credentials, environment,
+permissions or setup commands, invalidate the schema and are discarded. The adapter
+must return credential-free explanations and identifiers; audit cannot infer secrets
+hidden inside otherwise valid prose. Malformed JSON/schema, launch failure, timeout,
+oversized output, unsuccessful exit, stale evidence or mismatched identity produce
+actionable findings without hiding the ordinary workflow audit.
+
+`projectAgent` in `inventory.json`, `audit.json` and `result.json` contains the same
+`observation`, local `inspectedAt` time, deterministic `findings` and `nextActions`. Its status distinguishes
+`inspected` (a recent ready observation), `setup-needed` (a provider-reported gap),
+and `unverifiable` (inspection cannot establish readiness). A timestamp that was
+future-dated at inspection stays invalid on resume, even if the clock catches up.
+The HTML shows the same
+assessment, provider/agent identities, binding reference/revision and reported limits.
+All content is escaped data. Long evidence cells are shortened; JSON retains full facts.
+These are observations, not enforcement guarantees. Applying workflows cannot mark a
+binding repaired, and analyst claims cannot replace an observation or its assessment.
+Project-agent findings are separate from the analyst's Machine-route/gate findings;
+the existing route and gate validation still applies.
+
+For a finding, a supplied setup route appears as a **separate next action** containing
+the exact argv `command`, its effects, and a POSIX shell-quoted `display`. Display is
+data, not an execution instruction to audit. Without a supplied route, audit explains
+the gap and asks the caller to discover the provider's supported setup interface.
+After reviewing the audit, invoke setup separately under that interface's permission
+contract, then run a fresh audit to inspect the resulting binding. Setup skills should
+use the documented caller-supplied route and effects rather than invent provider commands.
+The coordinating project owns the Machines setup-skill follow-up to this contract.
+
+**Neither audit acceptance nor `apply: true` executes setup.** Those decisions authorize
+workflow installation only, not service starts, manager provisioning, write grants or
+paid requests. The generated map records only the binding reference and caller-supplied
+supported setup route/effects; it does not copy the runtime binding, identity, capabilities
+or revision into `.machines/README.md`. Customized map sections and existing bindings
+retain the preservation rules below.
 
 ```mermaid
 flowchart TD

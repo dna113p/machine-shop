@@ -153,7 +153,7 @@ and never starts, resumes or answers another run.
 
 ## Project audit
 
-[audit-project](workflows/audit-project.md) accepts `{ project, apply?, since? }`.
+[audit-project](workflows/audit-project.md) accepts `{ project, apply?, since?, projectAgent? }`.
 It inventories instructions, scripts/CI, definitions and their provenance, preset
 capabilities, runtime versions and recent run outcomes/stops. One analyst proposes
 selective installs, safe refreshes, routing and gate findings. A schema fault gets
@@ -167,7 +167,13 @@ unknown-provenance refreshes. Apply changes only selected
 `.machines/` files, the marked README routes and absent bindings; other findings
 stay on the page. Only the audit's own run-evidence directory is written before
 acceptance. Discovery gates completion. This is also setup for an empty project;
-it neither reads Drip nor installs runtime dependencies. The checkout supplies the current catalog;
+it installs no runtime dependencies. Optional `projectAgent: { inspect: argv, setup?: { command: argv, effects: string } }`
+uses a caller-supplied supported adapter to inspect the shared binding once. Deterministic
+findings and a separate setup action appear in inventory, reports and HTML. Audit never
+executes setup, even after acceptance or with apply; it records only the binding reference
+and supported route in the map. Omission makes no new external calls and needs neither
+Drip nor Overlord. See the [adapter contract and setup boundary](workflows/audit-project.md#optional-shared-project-agent-inspection).
+The checkout supplies the current catalog;
 there is no network release check. See the workflow page for input, schema,
 preservation rules and refusal/partial-effect receipts.
 
