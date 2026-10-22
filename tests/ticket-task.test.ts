@@ -90,6 +90,14 @@ function fakeGh(context: TestContext, f: Fixture, exitCode = 0) {
     `  printf '%s\\n' "$*" >> "${bin}/views.log"`,
     '  echo "Unexpected merge polling" >&2; exit 1',
     "fi",
+    // Finding a delivered pull request is a read: it answers what the test listed and is never taken for `pr create`.
+    'if [ "$1" = pr ] && [ "$2" = list ]; then',
+    `  printf '%s\\n' "$*" >> "${bin}/list.log"`,
+    `  if [ -f "${bin}/list-fails" ]; then echo "error connecting to example.invalid" >&2; exit 1; fi`,
+    `  cat "${bin}/prs.json" 2>/dev/null || echo '[]'`,
+    // A bare exit: tests that make `pr create` fail rewrite the script's first `exit 0`.
+    "  exit",
+    "fi",
     `printf '%s\\n' "$@" > "${bin}/args"`,
     `echo "Creating pull request for ${branch}"`,
     `echo ${url}`,
@@ -101,6 +109,13 @@ function fakeGh(context: TestContext, f: Fixture, exitCode = 0) {
   return Object.assign(() => existsSync(join(bin, "args")) ? readFileSync(join(bin, "args"), "utf8").trimEnd().split("\n") : undefined, {
     /** The arguments of every `gh pr view`, in order. */
     views: () => existsSync(join(bin, "views.log")) ? readFileSync(join(bin, "views.log"), "utf8").trimEnd().split("\n") : [],
+    /** What `gh pr list` answers from now on: these pull requests as JSON, or a host that cannot be reached. */
+    listing: (prs: readonly object[] | "unreachable") => {
+      if (prs === "unreachable") writeFileSync(join(bin, "list-fails"), "");
+      else writeFileSync(join(bin, "prs.json"), JSON.stringify(prs) + "\n");
+    },
+    /** The arguments of every `gh pr list`, in order. */
+    lists: () => existsSync(join(bin, "list.log")) ? readFileSync(join(bin, "list.log"), "utf8").trimEnd().split("\n") : [],
   });
 }
 const tester = (request: { cwd: string }) => {
@@ -7304,24 +7319,187 @@ test("with resume, gates that fail on a redelivered commit when the base has not
   assert.equal(deliveredAs(f), commit);
 });
 
-test("with resume in pr mode, a delivered ticket is not taken up: the run is refused, saying the pull request is brought up to date at its host, and nothing is changed or asked of the remote", async context => {
-  const path = process.env.PATH; const f = fixture(context); const pushed = remote(f); const gh = fakeGh(context, f); const calls = recordGit(context, f);
-  context.after(() => { process.env.PATH = path; });
-  // The pull request delivery retains its branch and delivery record.
-  const first = await execute(input(f, { output: "pr" }), {}, person("hand off"));
-  assert.equal(first.state, "delivered"); assert.equal(existsSync(f.worktree), false);
-  assert.equal(git(f.repo, "rev-list", "--count", `${f.head}..${branch}`), "1");
-  const delivered = git(f.repo, "rev-parse", branch); assert.equal(deliveredAs(f), delivered);
-  // The base moves on and is published, as its owner leaves it: only the output mode stands in the way.
-  advance(f); git(f.repo, "push", "-q", "origin", "main");
-  rmSync(join(f.root, "bin/args")); const before = [everything(f), pushed(), gh.views()]; const since = calls().length; const again = next(f, 2);
-  const result = await execute(input(again, { output: "pr", setup: [command("process.exit(1)", { name: "install" })] }, { resume: true }), nobody);
-  assert.equal(result.state, "refused"); assert.deepEqual(result.states, ["prepare","refused"]); untouched(f);
-  const run = held(again, result, /^Refused: .*\bpull request\b.*\bhost\b/iu); assert.doesNotMatch(result.output.summary, /Worktree kept/u);
-  assert.deepEqual([run.delivery.outcome, run.delivery.commit, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.result.checks.length, run.result.agentInvocations],
-    ["refused", null, false, false, 0, 0]);
-  assert.deepEqual([everything(f), pushed(), gh.views()], before); assert.equal(git(f.repo, "rev-parse", branch), delivered); assert.equal(gh(), undefined);
-  assert.deepEqual(calls().slice(since).filter(call => /^(?:ls-remote|fetch|push|worktree add)(?:\s|$)/u.test(call)), []);
+// A delivered pull request whose base moved under it: resume finds that pull request at its host and updates it in place.
+/** A pull request as `gh pr list --json` describes it: unless a test says otherwise, open on main from this repository, with the delivered commit at its head. */
+const pullRequest = (head: string, extra: object = {}) => ({
+  number: 7, url, state: "OPEN", baseRefName: "main", headRefName: branch, headRefOid: head, isCrossRepository: false, ...extra,
+});
+/**
+ * A ticket delivered in pr mode as pull request 7: the remote's ticket branch holds the delivered commit, and the host lists that one
+ * pull request for the branch. The first run's `gh pr create` is forgotten, so `gh()` shows only a later one.
+ */
+async function deliveredPr(context: TestContext, f: Fixture, repository: object = {}) {
+  remote(f); const gh = fakeGh(context, f); const bare = join(f.root, "remote.git");
+  const delivered = await deliverFirst(f, input(f, { output: "pr", ...repository }));
+  assert.equal(deliveredAs(f), delivered);
+  rmSync(join(f.root, "bin/args")); gh.listing([pullRequest(delivered)]);
+  /** The commit the remote's ticket branch holds. */
+  const hostHolds = () => git(bare, "rev-parse", `refs/heads/${branch}`);
+  /** Every ref the remote holds. */
+  const remoteRefs = () => git(bare, "for-each-ref", "--format=%(refname) %(objectname)");
+  assert.equal(hostHolds(), delivered);
+  return { gh, bare, delivered, hostHolds, remoteRefs };
+}
+/** The base moves on in the source checkout and is published, as its owner leaves it once a sibling's pull request merges. */
+const publish = (f: Fixture) => git(f.repo, "push", "-q", "origin", "main");
+/** The one force this road may use: on the run's own branch, and only while the remote still holds the delivered commit. */
+const leaseOn = (delivered: string) => `--force-with-lease=refs/heads/${branch}:${delivered}`;
+/** One push of the run forced, to its own branch, with the lease on the delivered commit and nothing else that forces; every other push and replay is unforced. */
+function leased(calls: string[], delivered: string) {
+  const pushes = calls.filter(call => /^push(?:\s|$)/u.test(call));
+  const forced = pushes.filter(call => call.split(" ").includes(leaseOn(delivered)));
+  assert.equal(forced.length, 1, `exactly one push carries ${leaseOn(delivered)}: ${pushes.join("; ")}`);
+  unforced(calls.filter(call => call !== forced[0]));
+  const rest = forced[0]!.split(" ").filter(word => word !== leaseOn(delivered)).join(" ");
+  assert.doesNotMatch(rest, /(?:^|\s)(?:-f|--force\S*|\+\S+)(?:\s|$)/u, forced[0]);
+  assert.match(rest, new RegExp(`(?:^|\\s|:)refs/heads/${branch}(?:\\s|$)`, "u"), forced[0]);
+  return forced[0]!;
+}
+/** The host was asked once, with `gh pr list`, for the pull requests of the branch in the repository prepare checked; nothing polled for a merge. */
+function askedHost(gh: ReturnType<typeof fakeGh>) {
+  const lists = gh.lists(); assert.equal(lists.length, 1, `gh pr list: ${lists.join("; ")}`);
+  const words = lists[0]!.split(" "); const names = (value: string) => words.some(word => word === value || word.endsWith(`=${value}`));
+  assert.ok(names(slug), `gh pr list names the repository ${slug}: ${lists[0]}`);
+  assert.ok(names(branch), `gh pr list names the branch ${branch}: ${lists[0]}`);
+  assert.deepEqual(gh.views(), []);
+}
+
+test("with resume in pr mode, a delivered pull request whose base moved is rebased onto the published tip, verified, and updated in place with a lease on the delivered commit", async context => {
+  const f = fixture(context); const started = f.head;
+  const repository = { output: "pr", setup: [command(sees, { name: "install" })], checks: [testedOn] };
+  const { gh, delivered, hostHolds } = await deliveredPr(context, f, repository);
+  // A sibling's pull request merges first: the base moves on and is published, and this one no longer fast-forwards.
+  const tip = advance(f); publish(f); const refs = others(f);
+  const calls = recordGit(context, f); const again = next(f, 2);
+  const result = await execute(input(again, repository, { resume: true }), nobody);
+  assert.equal(result.state, "delivered"); assert.deepEqual(result.states, ["prepare","rebase","deliver","delivered"]);
+  askedHost(gh);
+  const commit = onTip(f, tip); assert.notEqual(commit, delivered); untouched(f); assert.equal(others(f), refs);
+  const run = held(again, result, new RegExp(`^Delivered ${branch} at ${commit}, pull request ${url}`, "u"));
+  recreated(calls(), f);
+  assert.ok(calls().some(call => /(?:^|\s)rebase\s/u.test(call) && call.includes(`--onto ${tip} ${started}`)), "git rebase --onto <tip> <the delivered commit's parent>");
+  // The same pull request is updated: the branch is pushed with a lease on the commit delivered before, and no second pull request is opened.
+  leased(calls(), delivered); assert.equal(gh(), undefined, "no gh pr create");
+  assert.deepEqual([hostHolds(), deliveredAs(f)], [commit, commit]);
+  assert.deepEqual([run.delivery.outcome, run.delivery.prUrl, run.delivery.pullRequest, run.delivery.baseCommit, run.delivery.commit, run.delivery.resumed, run.delivery.worktreeRemoved],
+    ["delivered", url, "updated", tip, commit, true, true]);
+  assert.equal(rebasedFrom(f, run, started), delivered); assert.notEqual(run.delivery.redelivered, true);
+  // Setup where the worktree was recreated and on the replayed tree, then every gate on the commit that was pushed.
+  assert.deepEqual(ran(run), [["setup", "install", true], ["setup", "install", true], ["verify", "tests", true]]);
+  assert.ok(readFileSync(run.result.checks[2].log, "utf8").includes(`tested ${commit}`), "the gates ran on the commit that was delivered");
+  assert.deepEqual([run.result.outcome, run.result.checksPassed, run.result.agentInvocations], ["completed", true, 0]);
+  // The hold says the pull request was updated, not opened.
+  const said = between(result, run); assert.match(said, /\bupdated\b/iu); assert.doesNotMatch(said, /\bopened\b/iu);
+});
+
+test("with resume in pr mode, a delivered pull request whose replay conflicts is settled as a repair round, reviewed afresh, and only then updated in place", async context => {
+  const f = fixture(context); const started = f.head; const human = person();
+  const { gh, delivered, hostHolds } = await deliveredPr(context, f);
+  // The base gains a greeting of its own before this pull request merges.
+  const tip = advance(f, "greeting.txt", "hi\n"); publish(f); const refs = others(f);
+  const calls = recordGit(context, f); const again = next(f, 2); const prompts: string[] = []; const reviews: string[] = [];
+  const result = await execute(input(again, { output: "pr" }, { resume: true, stuck: "park" }), {
+    ...nobody,
+    implementer: request => {
+      prompts.push(request.prompt);
+      assert.equal(git(request.cwd, "rev-parse", "HEAD"), tip);
+      assert.match(git(request.cwd, "ls-files", "-u"), /\tgreeting\.txt$/mu);
+      writeFileSync(join(request.cwd, "greeting.txt"), "hello\nhi\n");
+      return ok("completed", "Kept both greetings");
+    },
+    reviewer: request => {
+      reviews.push(request.prompt);
+      // The review reads the settled candidate before anything is pushed: the pull request still holds the delivered commit.
+      assert.equal(git(request.cwd, "rev-parse", "HEAD"), tip); assert.equal(git(request.cwd, "ls-files", "-u"), "");
+      assert.equal(readFileSync(join(request.cwd, "greeting.txt"), "utf8"), "hello\nhi\n");
+      assert.equal(hostHolds(), delivered, "nothing is pushed before the fresh review");
+      return review();
+    },
+  }, human);
+  assert.deepEqual(result.states, ["prepare", "rebase", "implement", "gate", "review", "judge", "commit", "rebase", "deliver", "delivered"]);
+  assert.deepEqual([prompts.length, reviews.length, human.requests.length], [1, 1, 0]);
+  const feedback = prompts[0]!.split("Current failure/feedback: ")[1] ?? ""; assert.ok(movedAtDelivery.exec(feedback), feedback);
+  askedHost(gh);
+  const commit = onTip(f, tip); assert.notEqual(commit, delivered); untouched(f); assert.equal(others(f), refs);
+  assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello\nhi");
+  const run = held(again, result, new RegExp(`^Delivered ${branch} at ${commit}, pull request ${url}`, "u"));
+  leased(calls(), delivered); assert.equal(gh(), undefined, "no gh pr create");
+  assert.deepEqual([hostHolds(), deliveredAs(f)], [commit, commit]);
+  assert.deepEqual([run.delivery.prUrl, run.delivery.pullRequest, run.delivery.resumed, run.delivery.baseCommit, run.delivery.commit], [url, "updated", true, tip, commit]);
+  assert.equal(rebasedFrom(f, run, started), delivered);
+  assert.deepEqual([phases(run), run.result.checksPassed, run.result.repairs, run.result.agents.map((agent: any) => agent.stage)], [["verify"], true, 1, ["change", "review"]]);
+});
+
+test("with resume in pr mode, a delivered pull request whose base has not moved is verified on the same commit, records redelivered, and pushes nothing", async context => {
+  const f = fixture(context); const started = f.head;
+  const repository = { output: "pr", checks: [testedOn] };
+  const { gh, delivered, hostHolds, remoteRefs } = await deliveredPr(context, f, repository);
+  const before = [everything(f), remoteRefs()]; const calls = recordGit(context, f); const again = next(f, 2);
+  const result = await execute(input(again, repository, { resume: true }), nobody);
+  assert.equal(result.state, "delivered"); assert.deepEqual(result.states, ["prepare","rebase","deliver","delivered"]);
+  askedHost(gh);
+  const run = held(again, result, new RegExp(`^Delivered ${branch} at ${delivered}, pull request ${url}`, "u")); untouched(f);
+  assert.deepEqual([run.delivery.outcome, run.delivery.redelivered, run.delivery.prUrl, run.delivery.baseCommit, run.delivery.commit, run.delivery.rebasedFrom, run.delivery.resumed],
+    ["delivered", true, url, started, delivered, undefined, true]);
+  assert.deepEqual(ran(run), [["verify", "tests", true]]);
+  assert.ok(readFileSync(run.result.checks[0].log, "utf8").includes(`tested ${delivered}`), "the gates ran on the commit that was delivered");
+  // Nothing was pushed and no pull request opened: every ref, record, and remote branch is as it was.
+  assert.deepEqual(calls().filter(call => /^push(?:\s|$)/u.test(call)), []); assert.equal(gh(), undefined, "no gh pr create");
+  assert.deepEqual([everything(f), remoteRefs()], before); assert.deepEqual([hostHolds(), deliveredAs(f)], [delivered, delivered]);
+  assert.notEqual(run.delivery.pullRequest, "updated");
+  const said = between(result, run); assert.match(said, /\bunchanged\b|\bagain\b/iu); assert.doesNotMatch(said, /\bupdated\b|\breplayed\b/iu);
+});
+
+type HostArrange = (f: Fixture, gh: ReturnType<typeof fakeGh>, delivered: string, bare: string) => void;
+const hostRefusals: [label: string, arrange: HostArrange, reasons: RegExp[]][] = [
+  ["its pull request was merged", (_f, gh, delivered) => gh.listing([pullRequest(delivered, { state: "MERGED" })]), [/\bmerged\b/iu, /\bnothing to rebase\b/iu]],
+  ["its pull request was closed", (_f, gh, delivered) => gh.listing([pullRequest(delivered, { state: "CLOSED" })]), [/\bclosed\b/iu]],
+  ["the host lists no pull request for its branch", (_f, gh) => gh.listing([]), [/\bno pull request\b/iu]],
+  // Every pull request listed for the branch counts, whatever its state.
+  ["the host lists more than one pull request for its branch", (_f, gh, delivered) => gh.listing([
+    pullRequest(delivered), pullRequest(delivered, { number: 6, url: url.replace(/\/7$/u, "/6"), state: "CLOSED" }),
+  ]), [/\bmore than one\b/iu]],
+  ["someone pushed to its pull request, so the head on the host is not the recorded commit", (f, gh, delivered, bare) => {
+    const theirs = byHand(f, delivered); git(f.repo, "push", "-q", bare, `${theirs}:refs/heads/${branch}`);
+    gh.listing([pullRequest(theirs)]);
+  }, [/\bhead\b|\bpushed\b/iu]],
+  ["its pull request is based on another branch", (_f, gh, delivered) => gh.listing([pullRequest(delivered, { baseRefName: "release" })]), [/\bbase\b/iu, /\brelease\b/u]],
+  ["the host cannot be reached", (_f, gh) => gh.listing("unreachable"), [/\bcould not be reached\b/iu]],
+];
+for (const [label, arrange, reasons] of hostRefusals) {
+  test(`with resume in pr mode, a delivered ticket is refused when ${label}, and nothing changes locally or on the remote`, async context => {
+    const f = fixture(context); const { gh, delivered, bare, remoteRefs } = await deliveredPr(context, f);
+    advance(f); publish(f); arrange(f, gh, delivered, bare);
+    const before = [everything(f), remoteRefs()]; const calls = recordGit(context, f); const again = next(f, 2);
+    const result = await execute(input(again, { output: "pr", setup: [command("process.exit(1)", { name: "install" })] }, { resume: true }), nobody);
+    assert.deepEqual(result.states, ["prepare","refused"]); untouched(f);
+    const run = refused(again, result, /^Cannot resume: /u);
+    for (const reason of reasons) assert.match(run.delivery.reason, reason);
+    assert.equal(gh.lists().length, 1, "the host was asked for the branch's pull requests");
+    assert.deepEqual([everything(f), remoteRefs()], before); assert.deepEqual([git(f.repo, "rev-parse", branch), deliveredAs(f)], [delivered, delivered]);
+    assert.deepEqual(calls().filter(call => /^(?:push|worktree add)(?:\s|$)/u.test(call)), []); assert.equal(gh(), undefined); assert.deepEqual(gh.views(), []);
+    assert.doesNotMatch(result.output.summary, /Worktree kept/u);
+    assert.deepEqual([run.delivery.commit, run.delivery.worktreeCreated, run.delivery.worktreeRemoved, run.result.checks.length, run.result.agentInvocations], [null, false, false, 0, 0]);
+  });
+}
+
+test("with resume in pr mode, the lease keeps a push that reached the pull request after the host was asked: the update fails, nothing is overwritten, and the run stops at deliver saying so", async context => {
+  const f = fixture(context); const human = person("hand off");
+  const { gh, delivered, bare, hostHolds } = await deliveredPr(context, f);
+  const tip = advance(f); publish(f); const theirs = byHand(f, delivered); const marker = join(f.root, "pushed-by-someone");
+  // Someone pushes to the pull request's branch while the gates run: after the host check found the delivered commit, before the run's push.
+  const someone = command(`const fs = require("fs"); if (!fs.existsSync(${JSON.stringify(marker)})) { fs.writeFileSync(${JSON.stringify(marker)}, "");
+    require("child_process").execFileSync("git", ["-C", ${JSON.stringify(f.repo)}, "push", "-q", ${JSON.stringify(bare)}, ${JSON.stringify(`${theirs}:refs/heads/${branch}`)}]); }
+    console.log("check passed")`);
+  const calls = recordGit(context, f); const again = next(f, 2);
+  const result = await execute(input(again, { output: "pr", checks: [someone] }, { resume: true }), nobody, human);
+  assert.ok(existsSync(marker), "the remote branch moved during the run");
+  askedHost(gh);
+  const run = steppedOff(again, result, "deliver", "stuck", /\bmoved\b|\blease\b/iu, human, 1); untouched(f);
+  // The run's push carried the lease on the delivered commit and was refused: their commit stays, and the record still names the delivered one.
+  leased(calls(), delivered);
+  assert.deepEqual([hostHolds(), deliveredAs(f)], [theirs, delivered]); assert.equal(gh(), undefined, "no gh pr create");
+  assert.equal(onTip(f, tip), run.delivery.commit); assert.notEqual(run.delivery.commit, delivered);
 });
 
 /** The branch an earlier run of the ticket made and recorded, with no worktree left for it. */
@@ -7382,8 +7560,20 @@ test("the ticket page says which delivered commits resume refuses, what pr mode 
   const said = statements(readFileSync(resolve("docs/workflows/ticket-task.md"), "utf8"));
   assert.ok(said.some(one => /\brecord/iu.test(one) && /\bdeliver/iu.test(one) && /\brefus|\bnot adopted\b|Cannot resume/iu.test(one)),
     "docs/workflows/ticket-task.md must say in one sentence or table row that a commit with no delivery record, or one whose record names another commit, is refused");
-  assert.ok(said.some(one => /\bpull request\b/iu.test(one) && /\bhost\b/iu.test(one) && /\bresum|\bdelivered\b/iu.test(one)),
-    "docs/workflows/ticket-task.md must say in one sentence or table row that in pr mode the pull request is brought up to date at its host");
+  // In pr mode resume takes up the delivered pull request and updates it in place; the page no longer sends it to its host.
+  assert.equal(said.some(one => /brought up to date at its host/iu.test(one)), false,
+    "docs/workflows/ticket-task.md still says that in pr mode a delivered pull request is brought up to date at its host");
+  assert.ok(said.some(one => /`pr`/u.test(one) && /\bresum/iu.test(one) && /\bdelivered pull request\b/iu.test(one) && /\bsame pull request\b|\bin place\b|\bupdate/iu.test(one)),
+    "docs/workflows/ticket-task.md must say in one sentence or table row that in pr mode resume takes up the delivered pull request and updates it");
+  assert.ok(said.some(one => /\brefus/iu.test(one) && /\bmerged\b/iu.test(one) && /\bclosed\b/iu.test(one) && /\bmore than one\b/iu.test(one) && /\bbase\b/iu.test(one) && /\bhead\b/iu.test(one)),
+    "docs/workflows/ticket-task.md must say in one sentence or table row when resume refuses a delivered pull request: none, merged, closed, more than one, another base, or a head moved on the host");
+  assert.ok(said.some(one => /--force-with-lease/u.test(one) && /\bdelivered commit\b/iu.test(one)),
+    "docs/workflows/ticket-task.md must say in one sentence or table row that the push uses --force-with-lease naming the delivered commit");
+  assert.ok(said.some(one => /\bpatch\b/iu.test(one) && /\bchang/iu.test(one) && /\breview/iu.test(one)),
+    "docs/workflows/ticket-task.md must say that a changed patch is reviewed again");
+  // The page may no longer say without exception that nothing is force-pushed: the lease on this road is the one exception it names.
+  assert.equal(said.some(one => /\bforce/iu.test(one) && /\bnever\b|\bwithout\b/iu.test(one) && !/\blease\b/iu.test(one)), false,
+    "docs/workflows/ticket-task.md still says without the lease exception that delivery never force-pushes");
   // Setup does run again on this road, the run does create its worktree, and a branch that holds a delivered commit is continued:
   // a sentence that still says otherwise must say where the delivered commit is the exception.
   const excepted = (one: string) => /\bdelivered\b|\brecreat/iu.test(one);
