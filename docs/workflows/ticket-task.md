@@ -34,6 +34,7 @@ The optional `presenter` can explain the sole Human question at `stuck`.
 | `ticket.body` | yes | — | Markdown with `## Goal`, `## Scope` (paths or globs the change may touch), `## Acceptance` (testable criteria), and `## Forbidden`. A missing section blocks before any Agent runs. |
 | `repository.name` | yes | — | One path segment, used in the worktree name. |
 | `repository.path` | yes | — | Absolute path to the source checkout root. |
+| `repository.companions` | no | `[]` | Array of non-empty strings using the same paths and glob syntax as Scope, for example `["tests/**", "README.md"]`. These paths are in scope for every ticket, in addition to its own Scope. Both scope gates allow them, and all six Agent prompts list them after Scope. |
 | `repository.base` | no | its HEAD | Branch or ref to start from and rebase onto. In `pr` mode, if this local base is behind the remote base branch, use that branch's published tip instead. No local base or remote-tracking ref moves; `base.json` in the prepare evidence records the local ref and commit, remote, remote branch, and tip used. |
 | `repository.setup` | no | none | Commands run in the new worktree before any Agent, such as `npm ci`. Same shape as `checks`. |
 | `repository.checks` | yes, 1–20 | — | The gates, as `{ name, command, timeoutMs }` with `command` an argv array. |
@@ -47,7 +48,7 @@ The optional `presenter` can explain the sole Human question at `stuck`.
 | `maxRepairs` | no | `3` | Rounds for a failed implementation scope or green gate, 0–3. |
 | `maxReviewRounds` | no | `2` | Rounds for a `revise` review, 0–5. |
 | `redGreen` | no | `true` | Write failing tests first. `false` skips the tester and the red check. |
-| `assume` | no | `false` | Let `falsify` answer questions whose cautious answer loses nothing, and record them, instead of stopping. |
+| `assume` | no | `false` | Record recommended answers to maintainer-level questions whose wrong guess costs at most a review comment, instead of stopping. Non-assumable questions still need the owner. |
 | `stuck` | no | `"park"` | `stuck` no longer changes anything: both `"park"` and `"ask"` sleep on the same Human question. |
 | `resume` | no | `false` | Pick up the worktree a hand-off or block left, or a delivered commit whose worktree is gone. |
 
@@ -92,18 +93,29 @@ flowchart TD
 ```
 
 `falsify` asks whether the ticket is wrong, already done, impossible, or
-underspecified. With `assume: true`, conservative answers that lose nothing
-are recorded as assumptions; scope, product, and irreversible decisions still
-need the owner. `plan` names files and tests, and `planReview` permits one revision.
+underspecified. A path covered by a companion is already in scope and never
+needs a question. An answer is assumable when it is what a careful maintainer
+of this repository would do without asking, and a wrong guess costs at most a
+review comment. Examples include naming, placement within Scope, the shape of
+a test, which existing helper to reuse, the wording of documentation, and where
+in Scope a new file goes. A product decision, a change to behaviour a user sees,
+a path outside the Scope and companions, or anything irreversible such as
+deleting, publishing, migrating data, or changing a protocol is never assumable.
+The Agent marks the flag; the workflow decides whether to use the answer.
+With `assume: true`, assumable answers are recorded in
+`ticket-task-assumptions.json` and `## Assumptions`; non-assumable questions
+still stop the run. Without it, all questions still stop the run.
+`plan` names files and tests, and `planReview` permits one revision.
 By default, `test` writes acceptance tests before `red` proves they fail.
-`implement` must preserve those tests and stay within Scope. `gate` checks Scope
-and runs every configured check, retaining all failures for the next repair.
+`implement` must preserve those tests and stay within Scope and companions.
+`gate` checks these paths and runs every configured check, retaining all failures
+for the next repair.
 
 Repair counters default to 3 (range 0–3); review counters default to 2
 (range 0–5). They are updated on transitions and do not consume each other's
 budget. Malformed-report send-backs and the one plan revision consume neither.
 A spent review budget grants one extra review budget only for a `revise` report
-with a blocker, all finding paths in Scope, and no discussion. Repairs already
+with a blocker, all finding paths in Scope or companions, and no discussion. Repairs already
 used still count. The extra allowance is available once per run, including
 after owner answers. Its triggering blockers remain in later implementer
 prompts, and every later question states that it was used and includes the

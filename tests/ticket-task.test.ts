@@ -2692,8 +2692,17 @@ test("the falsify prompt asks for each question's text, options, recommended ans
     for (const field of ["text", "options", "recommended", "assumable", "why"]) assert.match(prompt, new RegExp(`\\b${field}\\b`, "u"), field);
     // The questions go in the report's questions field, not in its summary or message.
     for (const rule of questionsGo) assert.match(prompt, rule);
-    // Assumable is for a gap whose conservative answer loses nothing if wrong; a product decision, a change of scope, or anything irreversible never is.
-    for (const rule of [/\bconservative\b/iu, /\bloses? nothing\b|\bnothing (?:is )?lost\b/iu, /\bproduct decision\b/iu, /\bchange of scope\b|\bscope change\b|\bchang\w+ (?:the |its )?scope\b/iu, /\birreversibl/iu]) {
+    // The Agent marks maintainer-level gaps; the workflow still decides whether to assume their answers.
+    for (const rule of [
+      /\bcareful maintainer\b/iu, /\bthis repository\b/iu, /\bwithout asking\b/iu,
+      /\bwrong (?:guess|answer)\b[^.]*\bat most a review comment\b/iu,
+      /\bnaming\b/iu, /\bplacement\b[^.]*\bScope\b/u, /\bshape of a test\b/iu,
+      /\bexisting helper\b/iu, /\bwording of documentation\b/iu, /\bnew file\b/iu,
+      /\bnever assumable\b/iu, /\bproduct decision\b/iu,
+      /\bbehaviou?r\b[^.]*\buser sees\b/iu, /outside the Scope and companions/u,
+      /\birreversibl/iu, /\bdelet\w+\b/iu, /\bpublish\w*\b/iu,
+      /\bmigrat\w+ data\b/iu, /\bchang\w+ a protocol\b/iu,
+    ]) {
       assert.match(prompt, rule);
     }
   }
@@ -6161,6 +6170,123 @@ for (const evidenceOnly of [false, true]) {
     }, human);
     questioned(f, result, /the tester changed nothing/u, human);
     assert.ok(result.states.includes("red"));
+  });
+}
+
+/** These new inputs narrow only their own ticket Scope; the shared greeting fixture stays unchanged. */
+function companionInput(f: Fixture) {
+  const data = input(f, {
+    companions: ["tests/**", "README.md"],
+    checks: [command('eval(require("node:fs").readFileSync("tests/a.test.txt", "utf8"))')],
+  }, { maxRepairs: 0 });
+  data.ticket.body = "## Goal\nWrite hello to src/a.txt.\n\n## Scope\n- src/**\n\n## Acceptance\n- src/a.txt contains hello\n\n## Forbidden\n- nothing beyond the scope above";
+  return data;
+}
+const companionTester: Runner = request => {
+  mkdirSync(join(request.cwd, "tests"), { recursive: true });
+  writeFileSync(join(request.cwd, "tests/a.test.txt"), 'require("node:assert/strict").equal(require("node:fs").readFileSync("src/a.txt", "utf8"), "hello\\n");\n');
+  return ok("completed", "tests/a.test.txt requires src/a.txt to contain hello");
+};
+const companionImplementer: Runner = request => {
+  mkdirSync(join(request.cwd, "src"), { recursive: true });
+  writeFileSync(join(request.cwd, "src/a.txt"), "hello\n");
+  writeFileSync(join(request.cwd, "README.md"), "The greeting in src/a.txt is hello.\n");
+  return ok("completed", "Implemented src/a.txt and documented the greeting in README.md");
+};
+const companionAgents: Record<string, Runner> = {
+  plan: () => ok("planned", "Test src/a.txt in tests/a.test.txt, then implement it and document it in README.md."),
+  tester: companionTester, implementer: companionImplementer,
+  reviewer: () => review("approved", "The source, test, and README match the ticket", {
+    criteria: [{ text: "src/a.txt contains hello", met: true, evidence: "src/a.txt:1" }],
+  }),
+};
+
+test("repository companions pass both scope gates and all three paths reach the delivered commit", async context => {
+  const f = fixture(context);
+  const result = await execute(companionInput(f), companionAgents);
+  const run = ended(f, result, "branch", /^Delivered/u);
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-1.json"), "utf8")), {
+    stage: "test", changed: ["tests/a.test.txt"], outside: [],
+  });
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-2.json"), "utf8")), {
+    stage: "change", changed: ["README.md", "src/a.txt", "tests/a.test.txt"], outside: [],
+  });
+  assert.deepEqual(run.result.checks.map(check => [check.phase, check.passed]), [["red", true], ["verify", true]]);
+  const commit = git(f.repo, "rev-parse", branch);
+  assert.equal(run.delivery.commit, commit);
+  assert.equal(git(f.repo, "show", "--name-only", "--format=", commit), "README.md\nsrc/a.txt\ntests/a.test.txt");
+  assert.equal(git(f.repo, "show", `${commit}:src/a.txt`), "hello");
+  assert.equal(git(f.repo, "show", `${commit}:README.md`), "The greeting in src/a.txt is hello.");
+  assert.match(git(f.repo, "show", `${commit}:tests/a.test.txt`), /node:assert\/strict/u);
+  untouched(f);
+});
+
+for (const stage of ["test", "change"] as const) {
+  test(`repository companions still reject docs/other.md at the ${stage} scope gate`, async context => {
+    const f = fixture(context); const human = person("hand off");
+    const outside: Runner = request => {
+      mkdirSync(join(request.cwd, "docs"), { recursive: true });
+      writeFileSync(join(request.cwd, "docs/other.md"), "Outside Scope and companions\n");
+      return (stage === "test" ? companionTester : companionImplementer)(request);
+    };
+    const result = await execute(companionInput(f), {
+      ...companionAgents,
+      ...(stage === "test" ? { tester: outside, implementer: () => assert.fail("tester scope must pass first") } : { implementer: outside }),
+      reviewer: () => assert.fail("an outside path must prevent review"),
+    }, human);
+    const run = questioned(f, result, /Paths outside the ticket Scope[^\n]*docs\/other\.md/u, human);
+    const index = stage === "test" ? 1 : 2;
+    assert.deepEqual(JSON.parse(readFileSync(join(run.directory, `scope-${index}.json`), "utf8")), {
+      stage, changed: stage === "test" ? ["docs/other.md", "tests/a.test.txt"] : ["README.md", "docs/other.md", "src/a.txt", "tests/a.test.txt"],
+      outside: ["docs/other.md"],
+    });
+    if (stage === "change") assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-1.json"), "utf8")).outside, []);
+    assert.ok(run.delivery.reason.includes("docs/other.md"));
+    assert.equal(run.delivery.commit, null);
+  });
+}
+
+for (const companions of ["tests/**", [""], [1], ["   "], null, {}]) {
+  test(`repository.companions rejects ${JSON.stringify(companions)} at parse before effects`, context => {
+    const f = fixture(context);
+    assert.throws(() => mod.default(runtime, input(f, { companions })), /repository\.companions/u);
+    assert.deepEqual(readdirSync(f.root), ["widgets"]);
+    untouched(f);
+  });
+}
+
+test("all six stage prompts list repository companions immediately after the ticket Scope", async context => {
+  const f = fixture(context); const prompts: Record<string, string> = {};
+  const agents = Object.fromEntries(["falsify", "plan", "planReview", "tester", "implementer", "reviewer"].map(stage => [stage, (request: Request) => {
+    prompts[stage] = request.prompt;
+    return (companionAgents[stage] ?? planning[stage]!.answer)(request);
+  }]));
+  const result = await execute(companionInput(f), agents);
+  assert.equal(result.state, "delivered");
+  assert.deepEqual(Object.keys(prompts), ["falsify", "plan", "planReview", "tester", "implementer", "reviewer"]);
+  for (const [stage, prompt] of Object.entries(prompts)) {
+    const section = prompt.match(/(?:^|\n)(?:#{1,6} )?Scope[^\n]*\n- src\/\*\*\n\s*([^\n]+)\n- tests\/\*\*\n- README\.md(?:\n|$)/u);
+    assert.ok(section, `${stage} lists companions under a heading immediately after Scope`);
+    assert.match(section[1]!, /in scope|companions/iu, `${stage} names the additional scope`);
+  }
+  assert.match(prompts.falsify!, /(?:companion[^.\n]*(?:never[^.\n]*question|no[^.\n]*question|do not[^.\n]*ask)|(?:never|do not)[^.\n]*(?:ask|question)[^.\n]*companion)/iu);
+});
+
+for (const repository of [{}, { companions: [] }]) {
+  test(`all six stage prompts omit the companions heading when companions are ${"companions" in repository ? "empty" : "omitted"}`, async context => {
+    const f = fixture(context); const prompts: Record<string, string> = {};
+    const work: Record<string, Runner> = { tester, implementer: implement, reviewer: () => review() };
+    const agents = Object.fromEntries(["falsify", "plan", "planReview", "tester", "implementer", "reviewer"].map(stage => [stage, (request: Request) => {
+      prompts[stage] = request.prompt;
+      return (work[stage] ?? planning[stage]!.answer)(request);
+    }]));
+    const result = await execute(input(f, repository), agents);
+    assert.equal(result.state, "delivered");
+    assert.deepEqual(Object.keys(prompts), ["falsify", "plan", "planReview", "tester", "implementer", "reviewer"]);
+    for (const [stage, prompt] of Object.entries(prompts)) {
+      assert.doesNotMatch(prompt, /^(?:#{1,6}\s+)?(?:Also in scope|(?:Repository )?[Cc]ompanions)[^:\n]*:\s*$/mu, stage);
+      assert.doesNotMatch(prompt, /^- (?:tests\/\*\*|README\.md)$/mu, stage);
+    }
   });
 }
 

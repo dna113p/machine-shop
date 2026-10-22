@@ -26,3 +26,14 @@ test("outsideScope preserves paths outside all patterns in input order", () => {
   assert.deepEqual(outsideScope(["a"], []), ["a"]);
   assert.equal(matchesScope("anything", [""]), false);
 });
+
+test("ticket Scope and repository companions allow their combined patterns only", () => {
+  const scope = ["src/**"];
+  const companions = ["tests/**", "README.md"];
+  const paths = ["src/a.txt", "tests/a.test.txt", "README.md", "docs/other.md"];
+  const patterns = [...scope, ...companions];
+  for (const path of paths.slice(0, 3)) assert.equal(matchesScope(path, patterns), true, path);
+  assert.equal(matchesScope("docs/other.md", patterns), false);
+  assert.deepEqual(outsideScope(paths, patterns), ["docs/other.md"]);
+  assert.deepEqual(outsideScope(paths, scope), ["tests/a.test.txt", "README.md", "docs/other.md"]);
+});

@@ -96,6 +96,11 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     task: taskData(),
   });
   const { ticket, repository, prefix, worktree, evidenceRoot, resume, redGreen, assume, work, branch: named } = parseTicket(input, saved.task);
+  const allowedScope = [...ticket.sections.scope, ...repository.companions];
+  const scopePrompt = (heading = "Scope:") => [
+    heading, ...ticket.sections.scope.map(text => `- ${text}`),
+    ...(repository.companions.length ? ["Also in scope for every ticket here:", ...repository.companions.map(text => `- ${text}`)] : []),
+  ];
   let turn: ReturnType<typeof repositoryTurn> | undefined;
   let turnHeld = false;
   const lifetime = new AbortController();
@@ -153,10 +158,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       if (/[RC]/u.test(entry.slice(0, 2))) paths.push(entries[++index]!);
     }
     const changed = [...new Set(paths)].filter(path => path !== ".machine-runs" && !path.startsWith(".machine-runs/")).sort();
-    const outside = outsideScope(changed, ticket.sections.scope);
+    const outside = outsideScope(changed, allowedScope);
     writeFileSync(join(work.open(), `scope-${++saved.scopeChecks}.json`), JSON.stringify({ stage, changed, outside }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     if (outside.length) {
-      work.block(`Paths outside the ticket Scope after ${stage}: ${outside.map(path => JSON.stringify(path)).join(", ")}. Scope: ${ticket.sections.scope.join(", ")}.`);
+      work.block(`Paths outside the ticket Scope after ${stage}: ${outside.map(path => JSON.stringify(path)).join(", ")}. Scope: ${allowedScope.join(", ")}.`);
       return { type: "failed" };
     }
     return { type: "passed" };
@@ -1362,7 +1367,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       && !findings.some(finding => finding.severity === "discussion")
       && findings.every(finding => {
         const path = finding.where.replace(/^\.\//u, "").replace(/:\d+(-\d+)?$/u, "");
-        return !!path.trim() && outsideScope([path], ticket.sections.scope).length === 0;
+        return !!path.trim() && outsideScope([path], allowedScope).length === 0;
       });
   }
   function reviewBudget(): Event {
@@ -1563,16 +1568,19 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     states: {
       prepare: operation(prepareRun, { falsify: "falsify", plan: "plan", planReview: "planReview", test: "test", implement: "implement", gate: "gate", rebase: "rebase", stuck: "stuck", refused: "refused" }),
       falsify: checkedAgent(() => prompt([
-        "Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 entries shaped as { text, options: string[], recommended: string, assumable: boolean, why }, giving the exact questions a person could answer. text and why must be non-empty strings; options must be a non-empty array of non-empty strings; recommended must copy one of those options exactly. Mark assumable true only for a gap whose conservative answer loses nothing if wrong: it stops, refuses, or keeps more. A product decision, a change of scope, or anything irreversible is never assumable.",
+        "Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 entries shaped as { text, options: string[], recommended: string, assumable: boolean, why }, giving the exact questions a person could answer. text and why must be non-empty strings; options must be a non-empty array of non-empty strings; recommended must copy one of those options exactly. Mark assumable true only when the recommended answer is what a careful maintainer of this repository would do without asking, and a wrong guess costs at most a review comment: for example naming, placement within the Scope, the shape of a test, which existing helper to reuse, the wording of documentation, or where in the Scope a new file goes. A product decision, a change to behaviour a user sees, a path outside the Scope and companions, or anything irreversible such as deleting, publishing, migrating data, or changing a protocol is never assumable. You mark the assumable flag; the workflow decides what to do with it. A path covered by a companion is already in scope and is never a question.",
+        ...scopePrompt(),
         ...(saved.questionsFault ? [saved.questionsFault] : []),
         "Put the questions in the report's questions field, not in the summary or message.",
       ].join("\n")), ["sound", "questions"], "investigator", event => planning("falsify", event, falsifyResult), { sound: "plan", assumed: "plan", reask: "falsify", stuck: "stuck" }),
       plan: checkedAgent(() => prompt([
         "Plan the implementation of this sound ticket. Do not edit any file. Cover the acceptance criteria, tests, permitted paths, and required checks. Address any plan review feedback in the stage reports. Return planned with the complete plan as the summary. Keep it concise: name the files and the tests, and do not restate the ticket.",
+        ...scopePrompt(),
         ...assumptionsPrompt(),
       ].join("\n"), "plan"), ["planned"], "investigator", event => planning("plan", event, planResult), { planned: "planReview", reask: "plan", stuck: "stuck" }),
       planReview: checkedAgent(() => prompt([
         "Review the plan against the ticket, relevant code, scope, acceptance criteria, and tests. Do not edit any file. Return approved with a summary if it is ready to implement, or revise with a summary of what must change. Prefer concise plans: send back as revise a plan that restates the ticket or carries detail the implementer does not need. Return tooBroad if the ticket is too broad for one run, with a summary suggesting a split into smaller tickets, one per line. Only one revision of the plan is allowed.",
+        ...scopePrompt(),
         ...assumptionsPrompt(),
         "Plan:", saved.plan,
       ].join("\n"), "planReview"), ["approved", "revise", "tooBroad"], "reviewer", event => planning("planReview", event, planReviewResult), { approved: redGreen ? "test" : "implement", revise: "plan", reask: "planReview", stuck: "stuck" }),
@@ -1583,7 +1591,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           ...assumptionsPrompt(),
           ...(saved.plan ? ["Plan:", saved.plan] : []),
           "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
-          "Scope:", ...ticket.sections.scope.map(text => `- ${text}`),
+          ...scopePrompt(),
           cannotRun,
         ].join("\n"), "test");
       }, ["completed", "blocked"], "tester", event => editing("test", event), { completed: "red", reask: "test", stuck: "stuck" }),
@@ -1601,7 +1609,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           ...(saved.plan ? ["Plan:", saved.plan] : []),
           ...(redGreen ? ["The tester's tests in the stage reports are the contract; make them pass without weakening or deleting them. If a test is wrong, say so in the summary rather than changing its intent."] : []),
           "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
-          "Scope (the only paths you may change; the workflow checks them):", ...ticket.sections.scope.map(text => `- ${text}`),
+          ...scopePrompt("Scope (the only paths you may change; the workflow checks them):"),
           "Forbidden:", ...ticket.sections.forbidden.map(text => `- ${text}`),
           "Resolve discussion findings or explain why they need the ticket owner in your summary.",
           cannotRun,
@@ -1609,6 +1617,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }, ["completed", "blocked"], "implementer", event => editing("change", event), { completed: "gate", reask: "implement", stuck: "stuck" }),
       review: checkedAgent(() => prompt([
         "Review the current diff and verification evidence. Do not edit any file. Check acceptance criteria, regressions, scope, and whether tests actually establish the intended behavior.",
+        ...scopePrompt(),
         ...movedPrompt(),
         ...assumptionsPrompt(),
         ...(saved.assumptions.length ? ["An assumption you disagree with is a discussion finding for the ticket owner."] : []),
@@ -1834,7 +1843,9 @@ function parseTicket(input: unknown, saved: TaskData) {
   const stuck = data.stuck === undefined ? "park" : data.stuck;
   if (stuck !== "ask" && stuck !== "park") throw new Error('stuck must be "ask" or "park"');
 
-  const repo = object(data.repository, "repository", ["name", "path", "base", "setup", "checks", "rerunFailedChecks", "output", "remote", "draft", "redCheck"]);
+  const repo = object(data.repository, "repository", ["name", "path", "base", "setup", "checks", "rerunFailedChecks", "output", "remote", "draft", "redCheck", "companions"]);
+  if (repo.companions !== undefined && !Array.isArray(repo.companions)) throw new Error("repository.companions must be an array of non-empty strings");
+  const companions = ((repo.companions ?? []) as unknown[]).map((entry, i) => text(entry, `repository.companions[${i}]`));
   if (repo.rerunFailedChecks !== undefined && typeof repo.rerunFailedChecks !== "boolean") throw new Error("repository.rerunFailedChecks must be a boolean");
   const redCheck = repo.redCheck === undefined ? "tests" : text(repo.redCheck, "repository.redCheck");
   const name = text(repo.name, "repository.name");
@@ -1865,7 +1876,7 @@ function parseTicket(input: unknown, saved: TaskData) {
   return {
     ticket: { id, slug, title, summary: firstParagraph(ticket.body ?? ""), sections: ticketSections(ticket.body ?? "") }, prefix, branch: titled ? `${prefix}-${titled}` : prefix,
     worktree, evidenceRoot, work, resume: data.resume === true, redGreen, assume: data.assume === true, stuck,
-    repository: { name, path, base, setup, output, remote, draft: repo.draft !== false, redCheck, checks },
+    repository: { name, path, base, setup, output, remote, draft: repo.draft !== false, redCheck, checks, companions },
   };
 }
 /** A ticket id as branch and worktree names carry it. */
