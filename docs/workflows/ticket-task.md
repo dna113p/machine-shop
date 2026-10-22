@@ -7,7 +7,8 @@ the source checkout's working tree. This root workflow runs from source; the
 installer does not copy it.
 
 Required roles are `investigator`, `tester`, `implementer`, and `reviewer`.
-The optional `presenter` can explain the sole Human question at `stuck`.
+The optional `presenter` can explain the sole Human question at `stuck`. Scope
+decisions use the deterministic question alone so no presenter recommends an answer.
 
 ## Input
 
@@ -45,7 +46,7 @@ The optional `presenter` can explain the sole Human question at `stuck`.
 | `repository.draft` | no | `true` | Whether `pr` mode opens a draft. |
 | `worktreeRoot` | yes | — | Absolute directory for the worktree, outside the repository. |
 | `evidenceRoot` | yes | — | Absolute directory for run evidence, outside the repository and worktree. |
-| `maxRepairs` | no | `3` | Rounds for a failed implementation scope, green gate or delivery replay conflict, 0–3. |
+| `maxRepairs` | no | `3` | Rounds for a failed green gate or delivery replay conflict, 0–3. Scope misses ask the owner immediately and consume no automatic repair rounds. |
 | `maxReviewRounds` | no | `2` | Rounds for a `revise` review, 0–5. |
 | `redGreen` | no | `true` | Write failing tests first. `false` skips the tester and the red check. |
 | `assume` | no | `false` | Record recommended answers to maintainer-level questions whose wrong guess costs at most a review comment, instead of stopping. Non-assumable questions still need the owner. |
@@ -75,9 +76,10 @@ flowchart TD
   planReview -->|too broad| stuck
   planReview -->|redGreen off| implement([implement])
   red -->|passed| implement --> gate["gate: scope and every check"]
-  red -->|not red| stuck
+  red -->|not red or scope miss| stuck
   gate -->|passed| review(["review: sealed checkout"]) --> judge[judge]
-  gate -->|failed with budget| implement
+  gate -->|check failed with budget| implement
+  gate -->|scope miss| stuck
   gate -->|budget spent| stuck
   judge -->|approved| commit[commit] --> rebase["rebase: turn, replay, gates"]
   judge -->|revise with budget| implement
@@ -89,6 +91,8 @@ flowchart TD
   commit -->|failure| stuck
   deliver -->|failure| stuck
   stuck -->|continue by saved origin| prepare & falsify & plan & test & implement & gate & rebase
+  stuck -->|include scope paths| red & gate
+  stuck -->|revert scope paths| test & implement
   stuck -->|hand off| handedOff((handedOff))
   stuck -->|discard| abandoned((abandoned))
 ```
@@ -110,7 +114,21 @@ still stop the run. Without it, all questions still stop the run.
 By default, `test` writes acceptance tests before `red` proves they fail.
 `implement` must preserve those tests and stay within Scope and companions.
 `gate` checks these paths and runs every configured check, retaining all failures
-for the next repair.
+for the next repair. A path outside Scope and companions stops at `stuck`
+immediately, from `red` or `gate`, before checks or another editing Agent call.
+The question asks “May this ticket's scope include <paths>?” and shows the stage,
+each path's added and removed lines from Git numstat (including untracked files),
+and the existing evidence. Binary counts or unavailable diffs are labelled.
+It suggests `include`, `revert`, `hand off`, and `discard`, with no recommendation.
+A scope miss is never assumed, even with `assume: true`.
+
+`include` adds only those literal paths to the run's effective scope, without
+changing the ticket or using a repair round. It returns directly to the stopped
+stage: `red` repeats scope and proves red; `gate` repeats scope and every check.
+`revert` sends the tester (from `red`) or implementer (from `gate`) back once,
+with the paths and the owner's refusal to widen scope as feedback. This
+owner-authorized pass counts as one repair, even when the automatic budget is
+zero or spent. Other text retains the usual destination and standing feedback.
 
 Repair counters default to 3 (range 0–3); review counters default to 2
 (range 0–5). They are updated on transitions and do not consume each other's
@@ -125,13 +143,14 @@ A `blocked` review stops immediately. Unchanged blockers with nothing new and
 repeated discussion questions also need the owner. Minor notes are retained
 without forcing a revision. With a stable base the ceiling is 42 Agent calls
 at default budgets, 20 with both budgets zero, or 18 with `redGreen: false`,
-including report send-backs; an owner continuation grants fresh budgets.
+including report send-backs; an ordinary owner continuation grants fresh budgets.
+Scope `include` and `revert` preserve the counters already used.
 
 ## Continuing a stop
 
 `stuck` saves the origin, reason, original reports and log references before
-sleeping. Its suggestions are `continue`, `hand off`, and `discard`; free text
-also continues and stays verbatim in every later Agent prompt. Decision names
+sleeping. Except for scope misses, its suggestions are `continue`, `hand off`,
+and `discard`; free text also continues and stays verbatim in every later Agent prompt. Decision names
 ignore case, surrounding whitespace, and trailing punctuation. Empty text
 asks again. There is no route straight from `stuck` to `deliver`.
 
@@ -140,6 +159,7 @@ asks again. There is no route straight from `stuck` to `deliver`.
 | `prepare`: setup failed | `prepare` | Retry preparation after the owner resolves the fault. |
 | `falsify`: questions | `plan` | Treat the owner's text as assumptions; an explicit scope change returns to `falsify`. |
 | `planReview`: too broad | `plan` | Revise the plan using the narrowed scope. |
+| `red` or `gate`: scope miss | `include`: same stage; `revert`: `test` or `implement` | Include the exact paths, or authorize one counted repair to revert them. Free text returns to `test` or `implement`. |
 | `red`: not red | `test` | Repair the acceptance tests. |
 | `gate`: repair budget spent | `implement` | Repair with a fresh budget and the owner's answer. |
 | `judge`: review budget spent | `implement` | Address findings with the owner's answer and fresh budgets. |
@@ -180,10 +200,12 @@ and budget conventions.
 
 A kept worktree resumes through `prepare`, which validates repository identity,
 branch ownership, and ancestry before adopting it. Worktree-local
-`ticket-task-resume.json` preserves the saved origin, unanswered falsify questions,
-owner answers, plan, and evidence location across separate runs. Unanswered
-falsify questions return to `stuck`, with their options and evidence, until the
-owner answers; handing off does not authorize planning. Otherwise preparation returns to the saved origin;
+`ticket-task-resume.json` preserves the saved origin, unanswered scope and falsify
+questions, owner answers, plan, and evidence location across separate runs. Unanswered
+scope decisions return to `stuck` with their original stage and paths; handing off
+never includes them. Unanswered falsify questions return to `stuck`, with their
+options and evidence, until the owner answers; handing off does not authorize
+planning. Otherwise preparation returns to the saved origin;
 a candidate without saved-origin metadata goes through `gate` and review,
 while a clean worktree without metadata starts at `falsify`.
 
@@ -216,6 +238,13 @@ Saved `ticket-task-assumptions.json` belongs to the worktree's Git directory,
 outside the candidate. Candidate resume validates it before proceeding, records
 `assumptions.json` in the new evidence, and includes it in prompts, the PR body,
 and `delivery.json`. A clean run's falsification replaces its old assumptions.
+Owner-approved scope additions are validated and saved beside assumptions in
+`ticket-task-scope.json`, outside the candidate. A separate `resume` keeps them.
+Every later Agent sees them after Scope. The PR body and `branch-summary.md`
+list them under `## Scope additions` as
+`<path>: included by the ticket owner after <stage>`, and `delivery.json` records
+their literal paths and stages.
+Branch delivery's one-line summary links the Markdown summary.
 
 With no worktree, resume can adopt a recorded delivered commit and continue
 at `rebase`. Exactly one owned branch must hold exactly one ticket commit above
