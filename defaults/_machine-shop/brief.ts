@@ -166,6 +166,7 @@ export function handoffPage(parts: {
   const omitted = (count: number, unit: string) => count > 0
     ? `<p>${count} ${unit} omitted; see the run evidence.</p>` : "";
   const blocks = (items: EvidenceBlock[], budget: number) => {
+    items = items.filter(block => block.text.trim() || block.tail?.trim());
     const shown = items.slice(0, 40);
     const share = Math.floor((budget - 1_000) / Math.max(1, shown.length));
     return shown.map(block => {
@@ -175,15 +176,16 @@ export function handoffPage(parts: {
     }).join("\n") + omitted(items.length - shown.length, "blocks");
   };
   const files = parts.files?.slice(0, 60);
-  const table = files ? '<table><thead><tr><th>File</th><th>Added</th><th>Removed</th></tr></thead><tbody>'
+  const table = files?.length ? '<table><thead><tr><th>File</th><th>Added</th><th>Removed</th></tr></thead><tbody>'
     + files.map(file => `<tr><td>${html(file.path, 300)}</td><td>${html(String(file.added ?? "binary"), 64)}</td><td>${html(String(file.removed ?? "binary"), 64)}</td></tr>`).join("")
-    + "</tbody></table>" + omitted(parts.files!.length - files.length, "files") : "<p>Diff unavailable.</p>";
+    + "</tbody></table>" + omitted(parts.files!.length - files.length, "files") : files ? "<p>No code written yet.</p>" : "<p>Diff unavailable.</p>";
   const gates = parts.gates.slice(0, 100);
   const failures = gates.filter(gate => gate.outcome === "failed").length;
   const tailBudget = Math.floor(35_000 / Math.max(1, failures));
   const gateHtml = gates.map(gate => `<section><span class="chip ${{ passed: "ok", failed: "bad", skipped: "muted" }[gate.outcome]}">${html(gate.name, 160)}: ${gate.outcome}</span>`
     + (gate.outcome === "failed" ? `<pre>${html(gate.tail ?? "No log recorded.", tailBudget, true)}</pre>` : "") + "</section>").join("\n")
     + omitted(parts.gates.length - gates.length, "gates");
+  const reviewHtml = blocks(parts.review, 25_000);
   return [
     `<h1>${html(parts.title, 4_000)}</h1>`,
     `<p>${html(parts.breadcrumb, 8_000)}</p>`,
@@ -192,9 +194,9 @@ export function handoffPage(parts: {
     `<dt>Done</dt><dd>${html(parts.done.join(", ") || "No stages passed.", 4_000)}</dd>`,
     `<dt>Decided</dt><dd>${html(parts.decided, 8_000)}</dd>`,
     `<dt>Needs</dt><dd>${html(parts.needs, 4_000)}</dd></dl></section>`,
-    `<h2>Files changed</h2>${table}`,
-    `<h2>Gates</h2>${gateHtml}`,
-    `<h2>Review verdict</h2>${blocks(parts.review, 25_000)}`,
+    `${files?.length ? "<h2>Files changed</h2>" : ""}${table}`,
+    ...(gates.length ? [`<h2>Gates</h2>${gateHtml}`] : []),
+    ...(reviewHtml ? [`<h2>Review verdict</h2>${reviewHtml}`] : []),
     blocks(parts.evidence, 40_000),
   ].join("\n");
 }
