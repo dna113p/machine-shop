@@ -2905,6 +2905,70 @@ test("a plan the reviewer sends back twice is asked about with the reviewer's su
   assert.equal(candidate(f.worktree).status, ""); assert.deepEqual(run.result.checks, []);
 });
 
+test("a run stopped in plan review before any code shows only what it has, and its question opens with the decision rather than the reviewer's report", async context => {
+  const f = fixture(context); const status = ticketStatus(); let planReviews = 0; let waiting: string | undefined;
+  const report = "Both recovery corrections are present and match src/requests.ts:52-56. The plan is still too long to review; shorten it.";
+  const human = person(() => { waiting = status.current().page; return "hand off"; });
+  const result = await execute(input(f, {}, { stuck: "park" }), {
+    planReview: () => ok("revise", ++planReviews === 1 ? "Name the test that proves the greeting" : report),
+    tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+  }, human, status);
+  const run = questioned(f, result, /Both recovery corrections are present/u, human);
+  // No diff, no checks run and no review: the precondition the page is judged under.
+  assert.equal(candidate(f.worktree).status, ""); assert.deepEqual(run.result.checks, []); assert.equal(planReviews, 2);
+  assert.equal(typeof waiting, "string", "the run note carried a page while the question waited");
+  for (const page of [handoffPage({ page: waiting }), handoffPage(status.current())]) {
+    const text = pageText(page);
+    // Only what the run has: no empty Files changed, Gates or Review sections, and one line saying no code is written yet.
+    for (const heading of ["Files changed", "Gates", "Review verdict"]) {
+      assert.equal(sectionHeadings(page).some(shown => shown.toLowerCase() === heading.toLowerCase()), false, `no ${heading} section`);
+    }
+    assert.doesNotMatch(page, /<span\b[^>]*class=["'][^"']*\bchip\b[^"']*["'][^>]*>[^<]*: skipped<\/span>/u, "no gate is shown as skipped before any check ran");
+    assert.equal(text.includes("No review recorded."), false);
+    assert.equal(occurrences(text, "No code written yet."), 1, text);
+    // Words, not dumps: Rounds is one sentence and Done names the stages as a person reads them.
+    assert.ok(text.includes("Repair rounds: 0 of 3. Review rounds: 0 of 2."), text);
+    assert.doesNotMatch(text, /\b(?:repairs|totalRepairs|maxRepairs|reviewRounds|totalReviewRounds|maxReviewRounds): /u);
+    assert.equal(recapField(page, "Done"), "checked the ticket, planned");
+    // Each thing once: the stage block gives the stage and the worktree, not the needs again.
+    const stage = sectionBlock(page, "Stage and candidate location");
+    assert.ok(stage !== undefined, "the page keeps the stage and candidate location");
+    assert.equal(stage.includes("Both recovery corrections"), false, stage);
+  }
+  assert.equal(sectionBlock(handoffPage({ page: waiting }), "Stage and candidate location"), `planReview\nWorktree: ${f.worktree}`);
+  // The decision first: the question's first line names the stop and the decision; the report stays below it.
+  const [first] = run.prompt.split("\n");
+  assert.doesNotMatch(first!, /^Both recovery/u);
+  assert.match(first!, /^PROJ-12\b/u); assert.match(first!, /\bplan ?review\b/iu); assert.match(first!, /\bback to plan/iu); assert.match(first!, /\?$/u);
+  assert.ok(oneLine(needsIn(run.prompt, f.worktree)).includes(oneLine(report)), "the reviewer's report stays in the prompt below the first line");
+  // The choices and how the answer is taken are unchanged.
+  assert.deepEqual(human.requests[0]!.suggestions, stuckDecisions);
+  assert.deepEqual(run.result.decisions, [{ stage: "stuck", response: "hand off" }]);
+});
+
+for (const rejectedBefore of [0, 2]) for (const fault of ["checkout changed", "malformed report"]) {
+  test(`plan review ${fault} keeps its real stop reason first after ${rejectedBefore} rejected plans`, async context => {
+    const f = fixture(context); let planReviews = 0;
+    const human = rejectedBefore ? person("continue", "hand off") : person("hand off");
+    const result = await execute(input(f), {
+      planReview: request => {
+        if (++planReviews <= rejectedBefore) return ok("revise", "The plan still names no test");
+        if (fault === "malformed report") return ok("revise", "");
+        writeFileSync(join(request.cwd, "greeting.txt"), "Unexpected plan reviewer edit");
+        return ok("revise", "Name the test that proves the greeting");
+      },
+      tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+    }, human);
+    const reason = fault === "checkout changed" ? /read-only stage/u : /planReview report was malformed twice/u;
+    handedOff(f, result, reason, human);
+    const question = human.requests.at(-1)!;
+    assert.match(question.prompt.split("\n")[0]!, reason);
+    assert.doesNotMatch(question.prompt.split("\n")[0]!, /plan was rejected again/u);
+    assert.deepEqual(question.suggestions, stuckDecisions);
+    assert.equal(planReviews, rejectedBefore + (fault === "malformed report" ? 2 : 1));
+  });
+}
+
 test("a second plan revision whose summary runs over several lines and 600 characters is asked about with needs capped on one line, as any other blocker", async context => {
   const f = fixture(context); const human = person("hand off"); let planReviews = 0;
   const feedback = `The plan still names no test.\n${"Say which file proves the greeting.\n".repeat(30)}`.trim();
@@ -2913,9 +2977,10 @@ test("a second plan revision whose summary runs over several lines and 600 chara
     tester: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
   }, human);
   const run = questioned(f, result, /The plan still names no test/u, human);
-  // The first sentence is what is needed; the rest of the summary follows under Needs, on one line cut at 600 characters.
-  const needs = `${oneLine(feedback.slice("The plan still names no test.".length))}`.slice(0, 600) + "…";
-  assert.equal(run.needs, `The plan still names no test.\n${needs}`);
+  // The first line is the decision; the reviewer's whole summary follows under Needs, on one line cut at 600 characters.
+  const needs = oneLine(feedback).slice(0, 600) + "…";
+  assert.equal(run.needs, `${run.prompt.split("\n")[0]}\n${needs}`);
+  assert.doesNotMatch(run.prompt.split("\n")[0]!, /^The plan still names no test/u);
   // The full reason stays in the receipt.
   assert.equal(run.delivery.reason, feedback);
   assert.equal(run.prompt.split("\n").find(line => line.startsWith("Needs: ")), `Needs: ${needs}`);
@@ -3484,7 +3549,8 @@ test("an implementer blocker waits for a decision without green checks, review, 
   const run = handedOff(f, result, /specification unavailable/u, human);
   assert.deepEqual(run.result.checks.map(check => check.phase), ["red"]);
   const page = handoffPage(status.current());
-  handoffGate(page, "tests", "skipped");
+  // Verification never ran, so it has no chip; the red proof that did run keeps its own.
+  assert.doesNotMatch(page, />tests: skipped</u);
   handoffGate(page, "red proof: tests", "passed");
 });
 
@@ -3593,6 +3659,7 @@ test("continue can be chosen again each time the budget runs out", async context
   assert.equal(edits, 6); assert.equal(result.states.filter(state => state === "stuck").length, 3);
   assert.deepEqual(human.requests.map(request => /Repair rounds used: .+/u.exec(request.prompt)![0]),
     ["Repair rounds used: 1 of 1.", "Repair rounds used: 1 of 1 in this budget, 2 in all.", "Repair rounds used: 1 of 1 in this budget, 3 in all."]);
+  assert.equal(sectionBlock(handoffArtifact(f).page, "Rounds"), "Repair rounds: 1 of 1 (3 in all). Review rounds: 0 of 1.");
   assert.deepEqual([run.result.repairs, run.result.checks.length], [3, 13]);
   assert.deepEqual(run.result.decisions.map((made: any) => made.response), ["continue", "continue", "hand off"]);
 });
@@ -3705,6 +3772,8 @@ test("a run that stops after its extra review round says the round was used and 
   // Said above what is needed, with the reviewer's own account of what was new in the round.
   assert.ok(extraRoundLine(standingOf(request!.prompt)), request!.prompt);
   assert.ok(standingOf(request!.prompt).includes("New in round 2"), request!.prompt);
+  assert.equal(sectionBlock(handoffArtifact(f).page, "Rounds"),
+    "Repair rounds: 0 of 3. Review rounds: 0 of 0. The one extra review round was used and is still in progress; review retries: 0 of 0.");
   asksWritten(run.directory, human.requests);
 });
 
@@ -8005,6 +8074,31 @@ function handoffFiles(page: string, files: { path: string; added: number; remove
   }
 }
 
+/** A page's section headings as a person reads them. */
+const sectionHeadings = (page: string) => [...page.matchAll(/<h2\b[^>]*>([\s\S]*?)<\/h2>/gu)].map(match => pageText(match[1]!));
+/** Markup text with its entities read back, keeping its line breaks. */
+const unescaped = (text: string) => text.replace(/&lt;/gu, "<").replace(/&gt;/gu, ">").replace(/&quot;/gu, '"')
+  .replace(/&#(?:39|x27);/gu, "'").replace(/&amp;/gu, "&");
+/** What one recap field says, such as Done. */
+function recapField(page: string, label: string) {
+  const recap = /<section\b[^>]*class=["']recap["'][^>]*>([\s\S]*?)<\/section>/u.exec(page)![1]!;
+  const field = new RegExp(`<dt\\b[^>]*>\\s*${label}\\s*</dt>\\s*<dd\\b[^>]*>([\\s\\S]*?)</dd>`, "iu").exec(recap);
+  assert.ok(field, `the recap has ${label}`);
+  return pageText(field[1]!);
+}
+/** The text of the evidence block a heading titles, line breaks kept, or undefined when the page has none. */
+function sectionBlock(page: string, title: string) {
+  const sections = [...page.matchAll(/<section>\s*<h2\b[^>]*>([\s\S]*?)<\/h2>\s*<pre\b[^>]*>([\s\S]*?)<\/pre>/gu)];
+  const found = sections.find(match => pageText(match[1]!) === title);
+  return found ? unescaped(found[2]!) : undefined;
+}
+
+/** A run that ran no check has no Gates section and no gate chip. */
+function noGates(page: string) {
+  assert.equal(sectionHeadings(page).includes("Gates"), false, "no Gates section before any check ran");
+  assert.doesNotMatch(page, /<span\b[^>]*class=["'][^"']*\bchip\b[^"']*["'][^>]*>[^<]*: (?:skipped|passed|failed)<\/span>/u);
+}
+
 function handoffGate(page: string, name: string, outcome: "passed" | "failed" | "skipped") {
   const tone = { passed: "ok", failed: "bad", skipped: "muted" }[outcome];
   const chips = [...page.matchAll(/<span\b[^>]*class=["']([^"']*)["'][^>]*>([\s\S]*?)<\/span>/gu)];
@@ -8041,8 +8135,11 @@ test("handoff page: a delivered PR carries its breadcrumb, files, all gates and 
       assert.ok(text.includes(oneLine(detail)), `handoff carries ${detail}`);
     }
     assert.match(text, /approved/iu); assert.match(text, /\bmet\b/iu);
-    const recap = /<section\b[^>]*class=["']recap["'][^>]*>([\s\S]*?)<\/section>/u.exec(page)![1]!;
-    for (const stage of ["falsify", "plan", "review"]) assert.match(pageText(recap), new RegExp(stage, "iu"));
+    // Done names the stages as a person reads them, not by their state ids.
+    const done = recapField(page, "Done");
+    for (const stage of ["checked the ticket", "planned", "passed review"]) assert.ok(done.includes(stage), `Done says ${stage}: ${done}`);
+    assert.doesNotMatch(done, /\b(?:falsify|planReview)\b/u);
+    for (const heading of ["Files changed", "Gates", "Review verdict"]) assert.ok(sectionHeadings(page).includes(heading), `a delivered run keeps ${heading}`);
   }
   assert.match(pageText(handoffPage(delivered.status)), /delivered/iu);
   assert.match(pageText(handoffPage(status.current())), /delivered/iu);
@@ -8070,7 +8167,7 @@ for (const output of ["branch", "patch"] as const) {
   });
 }
 
-test("handoff page: a stuck run publishes the open questions and skipped gates before waiting", async context => {
+test("handoff page: a stuck run publishes the open questions before waiting, with no gates before any check ran", async context => {
   const f = fixture(context); const status = ticketStatus();
   const answer = (request: Ask) => {
     const page = handoffPage(status.current());
@@ -8078,7 +8175,7 @@ test("handoff page: a stuck run publishes the open questions and skipped gates b
     for (const detail of [f.repo, "PROJ-12", branch, f.worktree, "falsify", language.text, ...language.options, language.why]) {
       assert.ok(pageText(page).includes(oneLine(detail)), `the run note retains the stop's evidence: ${detail}`);
     }
-    handoffGate(page, "tests", "skipped");
+    noGates(page);
     assert.match(pageText(page), /question/iu);
     assert.equal(handoffArtifact(f).page, page, "the artifact exists before the Human waits");
     return "hand off";
@@ -8094,7 +8191,8 @@ for (const redGreen of [false, true]) {
     const f = fixture(context); const status = ticketStatus();
     const assertPage = () => {
       const page = handoffPage(status.current());
-      handoffGate(page, "tests", "skipped");
+      // Verification never ran, so it has no chip; the setup and red proof that did run keep theirs.
+      assert.doesNotMatch(page, />tests: skipped</u);
       handoffGate(page, "setup: tests", "passed");
       if (redGreen) handoffGate(page, "red proof: tests", "passed");
       assert.doesNotMatch(page, />tests: passed<|>tests: failed</u);
@@ -8139,6 +8237,57 @@ test("handoff page: exhausted gates retain passed and failed chips and the faili
   untouched(f);
 });
 
+test("handoff page: a run stuck after implementation with changed files, a failing gate and a review keeps every one of those sections", async context => {
+  const f = fixture(context); const status = ticketStatus(); let edits = 0;
+  const failing = command('console.log("BROKEN-DIAGNOSTIC"); process.exitCode = require("fs").existsSync("broken.txt") ? 1 : 0', { name: "contracts" });
+  const result = await execute(scoped(input(f, { checks: [command(), failing], rerunFailedChecks: false }, { redGreen: false, maxRepairs: 0 }), "broken.txt"), {
+    implementer: request => { implement(request); if (++edits === 2) writeFileSync(join(request.cwd, "broken.txt"), "broken\n"); return ok(); },
+    reviewer: () => review("revise", "Say which locale the greeting uses"),
+  }, person("hand off"), status);
+  assert.equal(result.state, "handedOff"); assert.equal(edits, 2);
+  const page = handoffPage(status.current()); const text = pageText(page);
+  for (const heading of ["Files changed", "Gates", "Review verdict"]) assert.ok(sectionHeadings(page).includes(heading), `the page keeps ${heading}`);
+  handoffFiles(page, [{ path: "greeting.txt", added: 1, removed: 0 }, { path: "broken.txt", added: 1, removed: 0 }]);
+  handoffGate(page, "tests", "passed"); handoffGate(page, "contracts", "failed");
+  assert.ok([...page.matchAll(/<pre\b[^>]*>([\s\S]*?)<\/pre>/gu)].some(match => pageText(match[1]!).includes("BROKEN-DIAGNOSTIC")), "the failing gate keeps its tail");
+  assert.match(text, /revise/iu); assert.ok(text.includes("Say which locale the greeting uses"));
+  assert.equal(text.includes("No code written yet."), false);
+  untouched(f);
+});
+
+test("handoff renderer: empty sections are left out and full ones are kept", () => {
+  const base = { title: "Add a greeting", breadcrumb: "widgets · PROJ-12", outcome: "Stopped in planReview; a decision is needed.",
+    done: ["checked the ticket", "planned"], decided: "No assumptions taken.", needs: "Shorten the plan." };
+  const empty = renderHandoffPage({ ...base, files: [], gates: [], review: [],
+    evidence: [{ title: "Rounds", text: "Repair rounds: 0 of 3. Review rounds: 0 of 2." }, { title: "Passing checks", text: "" }] });
+  for (const heading of ["Files changed", "Gates", "Review verdict"]) assert.equal(sectionHeadings(empty).includes(heading), false, `no empty ${heading}`);
+  assert.equal(occurrences(pageText(empty), "No code written yet."), 1);
+  assert.equal(sectionHeadings(empty).includes("Passing checks"), false, "a block with nothing in it is left out");
+  assert.ok(sectionHeadings(empty).includes("Rounds"));
+  assert.equal(recapField(empty, "Done"), "checked the ticket, planned");
+  const unreadable = renderHandoffPage({ ...base, files: null, gates: [], review: [], evidence: [] });
+  assert.ok(pageText(unreadable).includes("Diff unavailable."), "an unreadable diff is said, not hidden");
+  assert.equal(pageText(unreadable).includes("No code written yet."), false);
+  const full = renderHandoffPage({ ...base, files: [{ path: "greeting.txt", added: 1, removed: 0 }],
+    gates: [{ name: "tests", outcome: "failed", tail: "FULL-DIAGNOSTIC" }, { name: "lint", outcome: "passed" }],
+    review: [{ title: "Verdict: revise", text: "Say which locale" }], evidence: [] });
+  for (const heading of ["Files changed", "Gates", "Review verdict"]) assert.ok(sectionHeadings(full).includes(heading), `keeps ${heading}`);
+  handoffFiles(full, [{ path: "greeting.txt", added: 1, removed: 0 }]);
+  handoffGate(full, "tests", "failed"); handoffGate(full, "lint", "passed");
+  for (const detail of ["FULL-DIAGNOSTIC", "Verdict: revise", "Say which locale"]) assert.ok(pageText(full).includes(detail), detail);
+  assert.equal(pageText(full).includes("No code written yet."), false);
+});
+
+test("handoff renderer keeps tail-only evidence and drops whitespace-only blocks", () => {
+  const page = renderHandoffPage({ title: "Stopped", breadcrumb: "PROJ-12", outcome: "A decision is needed.",
+    done: [], decided: "None", needs: "Continue?", files: [], gates: [],
+    review: [{ title: "Empty review", text: " \n", tail: "\t" }],
+    evidence: [{ title: "Empty evidence", text: "\t" }, { title: "Diagnostic", text: "", tail: "Keep this log." }],
+  });
+  assert.deepEqual(sectionHeadings(page), ["Diagnostic"]);
+  assert.ok(pageText(page).includes("Keep this log."));
+});
+
 for (const decision of ["hand off", "discard"] as const) {
   test(`handoff page: ${decision} retains review evidence and file counts through its ending and cleanup`, async context => {
     const f = fixture(context); const status = ticketStatus();
@@ -8164,7 +8313,7 @@ for (const decision of ["hand off", "discard"] as const) {
   });
 }
 
-test("handoff page: a refused ticket records its verified outcome and reason with skipped gates", async context => {
+test("handoff page: a refused ticket records its verified outcome and reason, with no gates since none ran", async context => {
   const f = fixture(context); const status = ticketStatus(); const assignment = input(f);
   assignment.ticket.body = "## Goal\nMissing required sections";
   const result = await execute(assignment, nobody, person(), status);
@@ -8172,7 +8321,7 @@ test("handoff page: a refused ticket records its verified outcome and reason wit
   const page = handoffPage(status.current());
   assert.match(pageText(page), /refused/iu);
   assert.ok(pageText(page).includes(oneLine(run.delivery.reason)));
-  handoffGate(page, "tests", "skipped");
+  noGates(page);
   assert.equal(run.result.agentInvocations, 0);
   assert.equal(handoffArtifact(f).page, page);
   untouched(f);

@@ -82,6 +82,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     planningReports: { falsify: 0, plan: 0, planReview: 0 } as Record<PlanningStage, number>,
     plan: "",
     planRevisions: 0,
+    planRejectedAgain: false,
     questionsReturned: false,
     questionsFault: "",
     ownerQuestions: null as { text: string; where: string; options?: string[]; recommended?: string; why?: string }[] | null,
@@ -945,12 +946,20 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (files !== undefined) saved.handoffFiles = files;
     return saved.handoffFiles;
   }
+  function roundsText(rounds: ReturnType<typeof runFacts>["rounds"]): string {
+    const { repairs, totalRepairs, maxRepairs, reviewRounds, totalReviewRounds, maxReviewRounds, extraRound, extraReviewRounds } = rounds;
+    return [
+      `Repair rounds: ${repairs} of ${maxRepairs}${totalRepairs !== repairs ? ` (${totalRepairs} in all)` : ""}.`,
+      `Review rounds: ${reviewRounds} of ${maxReviewRounds}${totalReviewRounds !== reviewRounds ? ` (${totalReviewRounds} in all)` : ""}.`,
+      ...(extraRound !== "unused" ? [`The one extra review round was used and ${extraRound === "running" ? "is still in progress" : "has ended"}; review retries: ${extraReviewRounds} of ${maxReviewRounds}.`] : []),
+    ].join(" ");
+  }
   function evidenceBlocks(facts: ReturnType<typeof runFacts>) {
     const files = facts.files;
     const diffStat = files === undefined ? "Diff unavailable."
       : `${files.length} files changed, ${files.reduce((sum, file) => sum + (file.added ?? 0), 0)} insertions, ${files.reduce((sum, file) => sum + (file.removed ?? 0), 0)} deletions; binary counts are shown as binary.`;
     const blocks: EvidenceBlock[] = [
-      { title: "Rounds", text: evidenceText(facts.rounds) },
+      { title: "Rounds", text: roundsText(facts.rounds) },
       ...(saved.ownerQuestions ? [{ title: "Open questions and options", text: questionLines() + wouldAssumeLines() }] : []),
       ...(saved.plan ? [{ title: "Plan", text: saved.plan }] : []),
       ...(["falsify", "plan", "planReview"].includes(saved.repairing)
@@ -986,22 +995,27 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ...["blocker", "discussion", "minor"].map(severity => ({ title: `${severity} findings`,
         text: Array.isArray(review.findings) ? evidenceText(review.findings.filter(item => item?.severity === severity)) || "None." : evidenceText(review.findings) })),
       { title: "Changes since previous review", text: evidenceText(review.newSinceLastRound) },
-    ] : [{ title: "Review", text: "No review recorded." }];
+    ] : [];
     const verification = (check: (typeof facts.checks)[number]) => check.phase === "verify" || check.phase === "reverify";
     const checks = new Map(facts.checks.filter(verification).map(check => [check.name, check]));
     const gate = (name: string, check?: (typeof facts.checks)[number]) => ({
       name, outcome: !check ? "skipped" as const : check.passed ? "passed" as const : "failed" as const, tail: check?.tail,
     });
     const gates = [
-      ...[...new Set([...repository.checks, ...checks.keys()])].map(name => gate(name, checks.get(name))),
+      ...(checks.size ? [...new Set([...repository.checks, ...checks.keys()])].map(name => gate(name, checks.get(name))) : []),
       ...facts.checks.filter(check => !verification(check))
         .map(check => gate(`${check.phase === "red" ? "red proof" : check.phase}: ${check.name}`, check)),
     ];
+    const stageWords: Record<string, string> = {
+      falsify: "checked the ticket", plan: "planned", planReview: "had the plan reviewed",
+      red: "proved the tests fail first", change: "implemented the change", verify: "passed the gates",
+      review: "passed review", commit: "committed", deliver: "delivered",
+    };
     const page = handoffPage({
       title: ticket.title, breadcrumb: `${repository.name}: ${repository.path} · Ticket: ${ticket.id} · Branch: ${saved.branch}${saved.prUrl ? ` · Pull request: ${saved.prUrl}` : saved.patches.length ? ` · Patch: ${saved.patches.join(", ")}` : ""}`,
-      outcome, done: saved.passedStages, decided: saved.assumptions.length ? evidenceText(saved.assumptions) : "No assumptions taken.",
+      outcome, done: saved.passedStages.map(stage => stageWords[stage] ?? stage), decided: saved.assumptions.length ? evidenceText(saved.assumptions) : "No assumptions taken.",
       needs: needs || "Nothing needed.", files: facts.files ?? null, gates, review: reviewBlocks,
-      evidence: [{ title: "Stage and candidate location", text: `${facts.stage}\nWorktree: ${worktree}\n${needs}` },
+      evidence: [{ title: "Stage and candidate location", text: `${facts.stage}\nWorktree: ${worktree}` },
         ...(saved.held ? [{ title: "Ending", text: saved.held.summary }] : []),
         // Keep the question's gate metadata as well as its other evidence. The table,
         // diagnostic tails and structured review already have dedicated sections above.
@@ -1058,11 +1072,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     { name: "discard", does: "remove the worktree and delete the branch without saving the candidate; Drip confirms this choice." },
     { name: "any other reply", does: "answer the question and continue with this answer as standing feedback." },
   ];
-  const stuckPrompt = () => brief({
-    decision: asking().first, standing: standing(),
-    needs: asking().rest || undefined, evidence: locations(),
-    options: stuckOptions(),
-  });
+  const stuckPrompt = () => {
+    const rejectedPlan = saved.stoppedIn === "planReview" && saved.planRejectedAgain;
+    return brief({
+      decision: rejectedPlan ? `${ticket.id}'s plan was rejected again in plan review: send it back to planning?` : asking().first,
+      standing: standing(),
+      needs: rejectedPlan ? capped(flat(work.status().reason), 600) : asking().rest || undefined,
+      evidence: locations(), options: stuckOptions(),
+    });
+  };
   const questionCount = () => `${saved.ownerQuestions!.length} open question${saved.ownerQuestions!.length === 1 ? "" : "s"}`;
   const questionText = (question: { text: string; where: string }, cap = Infinity) => {
     const where = flat(question.where);
@@ -1236,6 +1254,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: "planned" };
   }
   function planReviewResult(): Event {
+    saved.planRejectedAgain = false;
     const kept = keep("planReview");
     if (work.unchanged().type === "changed") return { type: "blocked" };
     const result = planningShape("planReview", kept);
@@ -1251,6 +1270,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }
     if (saved.planRevisions++ === 0) return { type: "revise" };
     saved.repairing = "plan";
+    saved.planRejectedAgain = true;
     return work.block(result.report);
   }
   const recordReview = ({ event }: { event: Event }) => {

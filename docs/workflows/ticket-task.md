@@ -247,8 +247,10 @@ does not wait for a merge or delete the pushed branch.
 
 Every state publishes a one-line `now` and note. Stops, delivery and endings
 also save `handoff.html` with a recap, changed-file counts, gate chips, log tails,
-and review findings. Required gate chips stay skipped before verification;
-setup and red-proof evidence have separate labels. Notes keep the artifact path
+and review findings. Empty sections are left out; an empty diff says "No code
+written yet." Required gate chips appear once verification has run, with any
+unrun gates marked skipped. Setup and red-proof checks keep their own labelled
+chips whenever they ran. Notes keep the artifact path
 after checkpoint continuation, including on runtimes that ignore pages.
 
 ## Wrapping it
