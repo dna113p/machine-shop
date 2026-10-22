@@ -4081,16 +4081,14 @@ for (const [label, move] of [
 
 /** What the run tells the implementer it moved, ahead of the conflicts: the replay that conflicted, its files, and the tip it moved onto. */
 const movedAtDelivery = /^Replay onto (\S+) conflicted in "?greeting\.txt"?; the run moved the approved candidate onto (\S+)/u;
-/** Today's stop after a replay conflict, which a run that already moved its candidate says again, word for word, before saying so. */
-const replayStop = /^Replay onto \S+ failed with conflicts in greeting\.txt\. The approved candidate is uncommitted on \S+; a resumed run moves it onto the current base and sends conflicts to the implementer to settle\. Inspect rebase logs in \S+\./u;
 /** The first implementation, then the settling of the conflict the move left, keeping both greetings. */
 const settles = (prompts: string[], settled = "hello\nhi\n") => (request: Request) => {
   if (prompts.push(request.prompt) === 1) return implement(request);
   writeFileSync(join(request.cwd, "greeting.txt"), settled); return ok("completed", "Kept both greetings");
 };
 
-test("a delivery replay conflict moves the approved candidate onto the tip in the same run: the implementer settles it, it is reviewed again, and it is delivered after the owner continues", async context => {
-  const f = fixture(context); const started = f.head; const human = person("continue"); let tip = ""; let files: Record<string, string> = {};
+test("a delivery replay conflict moves the approved candidate onto the tip in the same run: the implementer settles it as a repair round, it is reviewed again, and it is delivered without asking the owner", async context => {
+  const f = fixture(context); const started = f.head; const human = person(); let tip = ""; let files: Record<string, string> = {};
   const prompts: string[] = []; const reviews: string[] = [];
   const result = await execute(input(f), {
     implementer: request => {
@@ -4112,10 +4110,9 @@ test("a delivery replay conflict moves the approved candidate onto the tip in th
       return review();
     },
   }, human, assertRepositoryTurn(f));
-  assert.equal(result.state, "delivered"); assert.equal(human.requests.length, 1);
-  // The states show the move: from rebase back to the implementer, then scope, checks, a fresh review, commit, and a clean rebase.
-  assert.deepEqual(result.states.slice(result.states.indexOf("rebase")), ["rebase", "stuck", "rebase", "implement", "gate", "review", "judge", "commit", "rebase", "deliver", "delivered"]);
-  assert.deepEqual(human.requests[0]!.suggestions, stuckDecisions);
+  assert.equal(result.state, "delivered"); assert.equal(human.requests.length, 0, "a conflict within the repair budget asks nobody");
+  // The states show the move: from rebase straight back to the implementer, then scope, checks, a fresh review, commit, and a clean rebase.
+  assert.deepEqual(result.states.slice(result.states.indexOf("rebase")), ["rebase", "implement", "gate", "review", "judge", "commit", "rebase", "deliver", "delivered"]);
   // The implementer was told the replay conflicted, in which file, and that the run moved the candidate onto the tip.
   assert.equal(prompts.length, 2); assert.doesNotMatch(prompts[1]!, /git add/u);
   const feedback = prompts[1]!.split("Current failure/feedback: ")[1] ?? "";
@@ -4125,57 +4122,87 @@ test("a delivery replay conflict moves the approved candidate onto the tip in th
   assert.equal(reviews.length, 2); assert.ok(names(reviews[1]!, tip), "the second review is told the candidate was moved onto the tip");
   const commit = onTip(f, tip); const run = held(f, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
   assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello\nhi");
-  assert.deepEqual(phases(run), ["red", "verify", "verify", "reverify"]);
-  assert.deepEqual([run.result.outcome, run.result.checksPassed, run.result.repairs, run.result.reviewRounds], ["completed", true, 0, 0]);
+  // Settling it ran the gates again, and the clean replay found the base unchanged, so nothing was verified a third time.
+  assert.deepEqual(phases(run), ["red", "verify", "verify"]);
+  // Settling the conflict was one repair round.
+  assert.deepEqual([run.result.outcome, run.result.checksPassed, run.result.repairs, run.result.reviewRounds], ["completed", true, 1, 0]);
   assert.deepEqual(run.result.agents.filter((agent: any) => agent.stage === "review").length, 2);
   assert.deepEqual([run.delivery.baseCommit, run.delivery.commit], [tip, commit]); rebasedFrom(f, run, started);
   // The candidate was saved as it was approved, on the base it was approved on, once.
   savedAsItStood(f, run.directory, started, files);
 });
 
-test("a second replay conflict in the same run stops with today's text, says the run already moved once, and hand off then leaves the candidate uncommitted, as that choice says", async context => {
-  const f = fixture(context); const human = person("continue", "hand off");
-  let before: Candidate | undefined; let moved = ""; let tip = ""; const prompts: string[] = []; let reviews = 0;
-  const result = await execute(input(f), {
-    implementer: settles(prompts),
+test("a second replay conflict in the same run is moved and settled again within the repair budget, each move saving its own candidate, and the ticket is delivered", async context => {
+  const f = fixture(context); const human = person(); let moved = ""; let tip = ""; const prompts: string[] = []; let reviews = 0;
+  const result = await execute(input(f, {}, { maxRepairs: 2 }), {
+    implementer: request => {
+      if (prompts.push(request.prompt) === 1) return implement(request);
+      writeFileSync(join(request.cwd, "greeting.txt"), prompts.length === 2 ? "hello\nhi\n" : "hello\nhi\nhey\n"); return ok("completed", "Kept every greeting");
+    },
     reviewer: request => {
-      before = candidate(request.cwd);
-      // Each review sees the base change the greeting again, so each replay conflicts.
-      if (++reviews === 1) moved = advance(f, "greeting.txt", "hi\n"); else tip = advance(f, "greeting.txt", "hey\n");
+      // The first two reviews each see the base change the greeting again, so each replay conflicts; the third sees a settled candidate.
+      if (++reviews === 1) moved = advance(f, "greeting.txt", "hi\n"); else if (reviews === 2) tip = advance(f, "greeting.txt", "hey\n");
+      else assert.equal(readFileSync(join(request.cwd, "greeting.txt"), "utf8"), "hello\nhi\nhey\n");
       return review();
     },
   }, human, assertRepositoryTurn(f));
-  assert.equal(result.state, "handedOff"); assert.deepEqual(result.states.slice(-3), ["rebase","stuck","handedOff"]);
-  assert.deepEqual(result.states.filter(state => ["commit", "rebase", "stuck", "implement", "failure"].includes(state)), ["implement","commit","rebase","stuck","rebase","implement","commit","rebase","stuck"]);
-  assert.equal(reviews, 2); assert.equal(prompts.length, 2); assert.match(prompts[1]!.split("Current failure/feedback: ")[1] ?? "", movedAtDelivery);
-  // The question is the one every stop asks, once, with today's text and its decisions unchanged.
-  assert.equal(human.requests.length, 2);
-  const run = questionedIn("rebase", f, result, replayStop, human); untouched(f);
-  assert.ok(names(run.delivery.reason, tip), "the reason names the tip"); assert.ok(names(run.delivery.reason, moved), "the reason names the tip the run moved onto");
-  for (const text of [run.delivery.reason, run.prompt]) assert.match(oneLine(text), /already moved its candidate once, after a replay conflict/u);
-  assert.match(run.prompt, /Stopped in rebase\./u);
-  assert.deepEqual([run.result.outcome, run.delivery.outcome, run.delivery.decision, run.delivery.archive], ["blocked", "handed-off", "hand off", undefined]);
-  // The candidate is uncommitted on the tip it was moved onto, and only the one move saved a candidate.
-  uncommitted(f, run, moved, before!); assert.equal(savedRefs(f).length, 1);
+  assert.equal(result.state, "delivered"); assert.equal(human.requests.length, 0);
+  assert.deepEqual(result.states.filter(state => ["commit", "rebase", "stuck", "implement", "failure"].includes(state)),
+    ["implement", "commit", "rebase", "implement", "commit", "rebase", "implement", "commit", "rebase"]);
+  assert.deepEqual([reviews, prompts.length], [3, 3]);
+  for (const prompt of prompts.slice(1)) assert.match(prompt.split("Current failure/feedback: ")[1] ?? "", movedAtDelivery);
+  assert.ok(names(prompts[1]!.split("Current failure/feedback: ")[1] ?? "", moved)); assert.ok(names(prompts[2]!.split("Current failure/feedback: ")[1] ?? "", tip));
+  assert.match(prompts[2]!, /its move 2 of this run/u, "the second move says it is the second");
+  const commit = onTip(f, tip); const run = held(f, result, new RegExp(`^Delivered ${branch} at ${commit}`, "u")); untouched(f);
+  assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello\nhi\nhey");
+  // Each conflict spent one repair, and each move saved the candidate as it stood, under its own name.
+  assert.deepEqual([run.result.outcome, run.result.repairs, run.result.reviewRounds], ["completed", 2, 0]);
+  assert.equal(savedRefs(f).length, 2, "two saved candidates");
+  for (const name of ["saved-candidate.patch", "saved-candidate-2.patch"]) assert.ok(existsSync(join(run.directory, name)), name);
+  const second = readFileSync(join(run.directory, "saved-candidate-2.patch"), "utf8");
+  assert.match(second, /^\+hello$/mu); assert.match(second, /^ hi$/mu, "the second saved candidate is the settled one, on the base it was moved onto");
 });
 
-test("a resumed run that moved in prepare and then meets a replay conflict stops, saying it already moved its candidate once, when it resumed", async context => {
-  const f = fixture(context); const again = await handOff(f); let before: Candidate | undefined; let tip = ""; const human = person("hand off");
-  // The base moves while the ticket waits, touching nothing the candidate touches, so prepare moves it cleanly.
-  const moved = advance(again);
-  const result = await execute(input(again, {}, { resume: true }), {
-    investigator: () => assert.fail(), implementer: () => assert.fail(),
-    reviewer: request => { before = candidate(request.cwd); tip = advance(f, "greeting.txt", "hi\n"); return review(); },
-  }, human);
-  assert.deepEqual(result.states, ["prepare", "gate", "review", "judge", "commit", "rebase", "stuck", "handedOff"]);
-  const run = questionedIn("rebase", again, result, replayStop, human); untouched(f);
+test("a replay conflict with no repair budget left stops at rebase, saying the budget is used up with the unsettled conflict, and hand off leaves the moved candidate uncommitted on the tip", async context => {
+  const f = fixture(context); const human = person("hand off"); let tip = ""; const prompts: string[] = []; let reviews = 0;
+  const result = await execute(input(f, {}, { maxRepairs: 0 }), {
+    implementer: request => { prompts.push(request.prompt); return implement(request); },
+    reviewer: () => { if (++reviews === 1) tip = advance(f, "greeting.txt", "hi\n"); return review(); },
+  }, human, assertRepositoryTurn(f));
+  assert.deepEqual([prompts.length, reviews], [1, 1], "no repair round runs without budget");
+  const run = questionedIn("rebase", f, result, /Replay onto \S+ conflicted in "?greeting\.txt"?; the run moved the approved candidate onto \S+ itself\./u, human); untouched(f);
+  assert.match(run.delivery.reason, /^Repair budget exhausted \(0\)\. Replay onto/u);
+  assert.match(run.prompt.split("\n")[0]!, /^Repair budget used up \(0 of 0\) with 1 unsettled conflict in "?greeting\.txt"?\.$/u);
   assert.ok(names(run.delivery.reason, tip), "the reason names the tip");
-  for (const text of [run.delivery.reason, run.prompt]) assert.match(oneLine(text), /already moved its candidate once, when it resumed/u);
-  assert.doesNotMatch(run.delivery.reason, /after a replay conflict/u);
-  uncommitted(f, run, moved, before!); assert.equal(savedRefs(f).length, 1); assert.equal(human.requests.length, 1);
+  for (const text of [run.delivery.reason, run.prompt]) assert.match(text, /refs\/machine-shop\/saved\//u);
+  // The candidate waits on the tip with its conflict markers, uncommitted, for a resumed run or a person.
+  assert.match(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), /^<<<<<<< /mu);
+  assert.deepEqual([git(f.worktree, "rev-parse", "HEAD"), git(f.repo, "rev-parse", branch)], [tip, tip]); assert.equal(savedRefs(f).length, 1);
+  assert.deepEqual([run.result.outcome, run.delivery.outcome, run.delivery.decision, run.delivery.commit, run.delivery.baseCommit, run.delivery.archive], ["blocked", "handed-off", "hand off", null, tip, undefined]);
 });
 
-test("a move after a replay conflict whose settling leaves markers spends the repair budget as a resumed run's does, then delivers once they are settled", async context => {
+test("a resumed run that moved in prepare and then meets a replay conflict moves its candidate again as a repair round, and delivers once it is settled", async context => {
+  const f = fixture(context); const again = await handOff(f); let tip = ""; const prompts: string[] = []; let reviews = 0;
+  // The base moves while the ticket waits, touching nothing the candidate touches, so prepare moves it cleanly.
+  advance(again);
+  const result = await execute(input(again, {}, { resume: true }), {
+    investigator: () => assert.fail(),
+    implementer: request => { prompts.push(request.prompt); writeFileSync(join(request.cwd, "greeting.txt"), "hello\nhi\n"); return ok("completed", "Kept both greetings"); },
+    reviewer: () => { if (++reviews === 1) tip = advance(f, "greeting.txt", "hi\n"); return review(); },
+  }, person());
+  assert.equal(result.state, "delivered");
+  assert.deepEqual(result.states, ["prepare", "gate", "review", "judge", "commit", "rebase", "implement", "gate", "review", "judge", "commit", "rebase", "deliver", "delivered"]);
+  assert.equal(prompts.length, 1);
+  const feedback = prompts[0]!.split("Current failure/feedback: ")[1] ?? "";
+  assert.match(feedback, movedAtDelivery); assert.match(feedback, /its move 2 of this run/u); assert.ok(names(feedback, tip));
+  onTip(f, tip); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello\nhi"); untouched(f);
+  const run = evidence(again);
+  assert.deepEqual([run.result.outcome, run.result.repairs, run.delivery.resumed], ["completed", 1, true]);
+  assert.equal(savedRefs(f).length, 2, "the resume move and the delivery move each saved a candidate");
+  for (const name of ["saved-candidate.patch", "saved-candidate-2.patch"]) assert.ok(existsSync(join(run.directory, name)), name);
+});
+
+test("a move after a replay conflict whose settling leaves markers spends another repair, as a resumed run's does, then delivers once they are settled", async context => {
   const f = fixture(context); let tip = ""; let reviews = 0; const prompts: string[] = [];
   const result = await execute(input(f), {
     implementer: request => {
@@ -4184,25 +4211,25 @@ test("a move after a replay conflict whose settling leaves markers spends the re
       return settles(prompts)(request);
     },
     reviewer: () => { if (++reviews === 1) tip = advance(f, "greeting.txt", "hi\n"); return review(); },
-  }, person("continue"));
+  }, person());
   assert.equal(result.state, "delivered");
   const from = result.states.indexOf("rebase");
   assert.deepEqual(result.states.slice(from).filter(state => ["implement", "gate", "gate", "gate", "review", "rebase", "deliver", "stuck"].includes(state)),
-    ["rebase", "stuck", "rebase", "implement", "gate", "implement", "gate", "review", "rebase", "deliver"]);
+    ["rebase", "implement", "gate", "implement", "gate", "review", "rebase", "deliver"]);
   assert.equal(prompts.length, 3); assert.match(prompts[2]!, /Unsettled conflicts: "greeting\.txt"\./u);
   onTip(f, tip); assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello\nhi");
-  assert.deepEqual([evidence(f).result.repairs, reviews], [1, 2]);
+  assert.deepEqual([evidence(f).result.repairs, reviews], [2, 2]);
 });
 
 test("a move after a replay conflict with no repair budget left for its markers asks the owner from repairBudget, naming the file, as a resumed run does", async context => {
-  const f = fixture(context); let tip = ""; let reviews = 0; const prompts: string[] = []; const human = person("continue", "hand off");
-  const result = await execute(input(f, {}, { maxRepairs: 0 }), {
+  const f = fixture(context); let tip = ""; let reviews = 0; const prompts: string[] = []; const human = person("hand off");
+  const result = await execute(input(f, {}, { maxRepairs: 1 }), {
     implementer: request => prompts.push(request.prompt) === 1 ? implement(request) : ok("completed", "Could not settle the greeting"),
     reviewer: () => { if (++reviews === 1) tip = advance(f, "greeting.txt", "hi\n"); return review(); },
   }, human);
   assert.deepEqual([prompts.length, reviews], [2, 1]);
   const run = questionedIn("gate", f, result, /Unsettled conflicts: "greeting\.txt"\./u, human); untouched(f);
-  assert.match(run.prompt.split("\n")[0]!, /^Repair budget used up \(0 of 0\) with 1 unsettled conflict in "?greeting\.txt"?\.$/u);
+  assert.match(run.prompt.split("\n")[0]!, /^Repair budget used up \(1 of 1\) with 1 unsettled conflict in "?greeting\.txt"?\.$/u);
   assert.match(readFileSync(join(f.worktree, "greeting.txt"), "utf8"), /^<<<<<<< /mu);
   assert.equal(git(f.repo, "rev-parse", branch), tip); assert.equal(savedRefs(f).length, 1);
 });
@@ -7109,8 +7136,8 @@ for (const output of ["branch", "patch"] as const) {
   });
 }
 
-test("with resume, a delivered ticket whose replay conflicts moves onto the tip, is settled and reviewed in the same run after the owner continues, and the next resume is accepted", async context => {
-  const f = fixture(context); const started = f.head; const human = person("continue");
+test("with resume, a delivered ticket whose replay conflicts moves onto the tip, is settled and reviewed in the same run without asking the owner, and the next resume is accepted", async context => {
+  const f = fixture(context); const started = f.head; const human = person();
   const delivered = await deliverFirst(f);
   const files = Object.fromEntries(["greeting.test.txt", "greeting.txt"].map(name => [name, git(f.repo, "show", `${delivered}:${name}`)]));
   // The base gains a greeting of its own before this one is merged.
@@ -7135,8 +7162,8 @@ test("with resume, a delivered ticket whose replay conflicts moves onto the tip,
       return review();
     },
   }, human);
-  assert.deepEqual(result.states, ["prepare", "rebase", "stuck", "rebase", "implement", "gate", "review", "judge", "commit", "rebase", "deliver", "delivered"]);
-  assert.deepEqual([prompts.length, reviews.length, human.requests.length], [1, 1, 1]);
+  assert.deepEqual(result.states, ["prepare", "rebase", "implement", "gate", "review", "judge", "commit", "rebase", "deliver", "delivered"]);
+  assert.deepEqual([prompts.length, reviews.length, human.requests.length], [1, 1, 0]);
   const feedback = prompts[0]!.split("Current failure/feedback: ")[1] ?? "";
   const said = movedAtDelivery.exec(feedback); assert.ok(said, feedback);
   assert.ok(names(said[1]!, tip) && names(said[2]!, tip));
@@ -7148,14 +7175,14 @@ test("with resume, a delivered ticket whose replay conflicts moves onto the tip,
   assert.deepEqual([run.delivery.resumed, run.delivery.baseCommit, run.delivery.commit, deliveredAs(f)], [true, tip, commit, commit]);
   assert.equal(rebasedFrom(f, run, started), delivered);
   assert.deepEqual([phases(run), run.result.checksPassed, run.result.repairs, run.result.agents.map((agent: any) => agent.stage)],
-    [["verify", "reverify"], true, 0, ["change", "review"]]);
+    [["verify"], true, 1, ["change", "review"]]);
   savedAsItStood(f, run.directory, started, files);
   // The new delivery record remains resumable without another move or any Agent work.
   const later = next(f, 3);
   const resumed = await execute(input(later, {}, { resume: true }), nobody, human);
   assert.deepEqual(resumed.states, ["prepare","rebase","deliver","delivered"]);
   assert.deepEqual([phases(evidence(later)), evidence(later).delivery.commit, deliveredAs(f)], [["verify"], commit, commit]);
-  assert.equal(human.requests.length, 1, "The next resume adds no question"); assert.equal(savedRefs(f).length, 1);
+  assert.equal(human.requests.length, 0, "The next resume adds no question"); assert.equal(savedRefs(f).length, 1);
 });
 
 test("with resume, a delivered ticket whose replayed patch is not the one that was reviewed is undone on the new tip, verified, and reviewed again before it is delivered there", async context => {

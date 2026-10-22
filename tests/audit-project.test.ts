@@ -909,3 +909,50 @@ test("the project's own gates.json supplies gates, and a finding may cite an inv
   assert.equal(typeof run.inventory.instructions[".machines/gates.json"], "string", "the gate list is read as an instruction file");
   assert.match(run.page, /gates\.json:lint/u, "the finding is on the page");
 });
+
+test("an instruction file the inventory records as null is evidence that it is missing, and a rejected finding is named with each item the inventory does not hold", async context => {
+  const f = fixture(context);
+  assert.equal(existsSync(join(f.project, ".machines/gates.json")), false, "the fixture declares no gate list");
+  const reason = "No gate list is declared; installed routes have no inventoried checks";
+  const prompts: string[] = [];
+  const judge: Analyst = request => {
+    prompts.push(request.prompt);
+    const body = proposal(f, inventoryIn(request.prompt));
+    body.findings = prompts.length === 1
+      ? [{ reason, evidence: [".machines/gates.json", "nope.md", ".woodpecker/quality.yaml:15"], route: "tests" }]
+      : [{ reason, evidence: [".machines/gates.json"], route: "tests" }];
+    return proposed(body);
+  };
+  const run = await execute(f, judge);
+  completed(run);
+  assert.equal(run.calls, 2, "the unknown items are sent back once");
+  assert.equal(run.inventory.instructions[".machines/gates.json"], null, "the inventory lists the missing gate list with null content");
+  const feedback = prompts[1]!;
+  assert.ok(feedback.includes(`Finding 1 of 1 (route "tests", reason ${JSON.stringify(reason)}) cites evidence the inventory does not hold: "nope.md", ".woodpecker/quality.yaml:15".`), feedback);
+  assert.match(feedback, /an instruction file key \(also one the inventory records as null, which is evidence that the file is missing\)/u, "the feedback says a null key is evidence of a missing file");
+  const fault = JSON.parse(readFileSync(join(run.folder, "report-fault-1.json"), "utf8"));
+  assert.match(fault.fault, /^Finding 1 of 1 \(route "tests", reason .*\) cites evidence the inventory does not hold: "nope\.md", "\.woodpecker\/quality\.yaml:15"\./u);
+  assert.match(run.page, /gates\.json/u, "the accepted finding is on the page");
+  assert.deepEqual(run.report.proposal.findings, [{ reason, evidence: [".machines/gates.json"], route: "tests" }]);
+});
+
+test("a finding whose route is neither a proposed Machine nor a gate class is named with its index and route, and a second fault refuses", async context => {
+  const f = fixture(context); const before = tree(f.project);
+  const prompts: string[] = [];
+  const judge: Analyst = request => {
+    prompts.push(request.prompt);
+    const inventory = inventoryIn(request.prompt);
+    const body = proposal(f, inventory);
+    body.findings = [
+      { reason: "A build check would catch packaging faults", evidence: [inventory.gates.found[0]!.name], route: "build" },
+      { reason: "Documentation drift needs its own route", evidence: ["AGENTS.md"], route: prompts.length === 1 ? "dev-update-docs" : "dev-nope" },
+    ];
+    return proposed(body);
+  };
+  const run = await execute(f, judge);
+  assert.equal(run.result.value, "refused"); assert.equal(run.calls, 2);
+  const expected = (route: string) => `Finding 2 of 2 (route ${JSON.stringify(route)}, reason "Documentation drift needs its own route") names a route that is neither a proposed Machine (dev-fix-bug, dev-review-code) nor a gate class (lint, types, tests, build, live)`;
+  assert.ok(prompts[1]!.includes(expected("dev-update-docs")), prompts[1]);
+  assert.ok((run.result.output as { reason: string }).reason.includes(expected("dev-nope")), JSON.stringify(run.result.output));
+  assert.deepEqual(tree(f.project), before);
+});

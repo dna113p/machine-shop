@@ -92,8 +92,12 @@ missing classes. A project's own `.machines/gates.json` is read as an instructio
 each check whose name reads as a class (lint, types, tests, build; smoke, package or install as live)
 is a found gate with its command as written. Findings cite a stop id or location, an
 instruction or CI file key, or a found gate name, and name a
-proposed route or gate class. Validation sends the precise fault back once; a
-second malformed report ends `refused`, without applying anything.
+proposed route or gate class. An instruction key the inventory records as `null`
+(the project has no such file) is valid evidence that the file is missing, so a
+finding such as "no gate list declared" may cite `.machines/gates.json`.
+Validation sends the precise fault back once, naming the finding by index, route
+and reason together with each evidence item the inventory does not hold, or the
+unknown route; a second malformed report ends `refused`, without applying anything.
 
 ## Applying and preservation
 
