@@ -89,7 +89,10 @@ routes, gates and role bindings, and waits for accept or skip. `apply: true`
 authorizes applying immediately. It is also setup for a project with no catalog.
 It stays in Machine Shop so it can use the current defaults and installer; it is
 absent from the installer’s selections. Evidence and the decision page live under
-the audited project's `.machine-runs/`. It never accesses Drip.
+the audited project's `.machine-runs/`. Optional caller-supplied `projectAgent`
+argv inspects a shared binding and offers a separate setup route; audit never
+executes setup. Without it there are no new external calls or Drip/Overlord
+dependencies. See the [adapter contract](docs/workflows/audit-project.md#optional-shared-project-agent-inspection).
 
 ## Installing
 
