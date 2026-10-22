@@ -24,6 +24,8 @@ const publishTimeoutMs = 120_000;
 // A sandboxed harness may be unable to start the project's checks at all. That is not a blocker: the checks are the workflow's to run.
 const cannotRun = "Run the checks you can. If your environment cannot run them, as when a sandbox refuses to start processes, say which and why in your summary and still return completed: the workflow runs every required check itself after you return. Return blocked only for something a person must decide or supply.";
 const decisions = ["continue", "hand off", "discard"] as const;
+const scopeDecisions = ["include", "revert", "hand off", "discard"] as const;
+const scopeDecisionOf = (value: string) => scopeDecisions.find(decision => decision === value.trim().replace(/[.,;:!?…]+$/u, "").trim().toLowerCase());
 const decisionOf = (value: unknown) => {
   if (typeof value !== "string") return undefined;
   const normalized = value.trim().replace(/[.,;:!?…]+$/u, "").trim().toLowerCase();
@@ -78,6 +80,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     held: null as { action: "hold" | "complete"; summary: string } | null,
     repairing: "change" as PlanningStage | "test" | "change",
     scopeChecks: 0,
+    scopeAdditions: [] as ScopeAddition[],
+    pendingScope: null as ScopeMiss | null,
     provedRed: false,
     planningReport: { type: "sound" } as Event,
     planningReports: { falsify: 0, plan: 0, planReview: 0 } as Record<PlanningStage, number>,
@@ -98,8 +102,13 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   });
   const { ticket, repository, prefix, worktree, evidenceRoot, resume, redGreen, assume, work, branch: named } = parseTicket(input, saved.task);
   const allowedScope = [...ticket.sections.scope, ...repository.companions];
+  const scopeAdditionLines = () => saved.scopeAdditions.map(({ path, stage }) => `${path}: included by the ticket owner after ${stage}`);
+  const scopeAdditionSection = () => saved.scopeAdditions.length ? ["## Scope additions", scopeAdditionLines().map(line => `- ${line}`).join("\n")] : [];
+  // Owner additions are literal filenames, never patterns or directory prefixes.
+  const outsideEffectiveScope = (paths: string[]) => outsideScope(paths.filter(path => !saved.scopeAdditions.some(addition => addition.path === path)), allowedScope);
   const scopePrompt = (heading = "Scope:") => [
     heading, ...ticket.sections.scope.map(text => `- ${text}`),
+    ...scopeAdditionSection(),
     ...(repository.companions.length ? ["Also in scope for every ticket here:", ...repository.companions.map(text => `- ${text}`)] : []),
   ];
   let turn: ReturnType<typeof repositoryTurn> | undefined;
@@ -159,13 +168,23 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       if (/[RC]/u.test(entry.slice(0, 2))) paths.push(entries[++index]!);
     }
     const changed = [...new Set(paths)].filter(path => path !== ".machine-runs" && !path.startsWith(".machine-runs/")).sort();
-    const outside = outsideScope(changed, allowedScope);
+    const outside = outsideEffectiveScope(changed);
     writeFileSync(join(work.open(), `scope-${++saved.scopeChecks}.json`), JSON.stringify({ stage, changed, outside }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     if (outside.length) {
+      const files = diffFiles();
+      saved.pendingScope = { stage: stage === "test" ? "red" : "gate", files: outside.map(path =>
+        files?.find(file => file.path === path) ?? { path, added: null, removed: null }) };
+      writeFileSync(join(work.open(), `scope-miss-${saved.scopeChecks}.json`), JSON.stringify(saved.pendingScope, null, 2) + "\n", { flag: "wx", mode: 0o600 });
       work.block(`Paths outside the ticket Scope after ${stage}: ${outside.map(path => JSON.stringify(path)).join(", ")}. Scope: ${allowedScope.join(", ")}.`);
-      return { type: "failed" };
+      return { type: "scopeMiss" };
     }
+    saved.pendingScope = null;
     return { type: "passed" };
+  }
+
+  const scopeFile = () => join(git(worktree, "rev-parse", "--absolute-git-dir"), "ticket-task-scope.json");
+  function saveScope() {
+    writeFileSync(scopeFile(), JSON.stringify({ ticket: ticket.id, branch: saved.branch, additions: saved.scopeAdditions }, null, 2) + "\n", { mode: 0o600 });
   }
 
   /** A failed Git or gh step blocks with its output saved as evidence rather than copied into the ticket summary. */
@@ -368,6 +387,16 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       }
     }
     saved.baseCommit = tip;
+    try {
+      if (lstatSync(scopeFile(), { throwIfNoEntry: false })) {
+        const record = JSON.parse(readFileSync(scopeFile(), "utf8"));
+        if (record.ticket !== ticket.id || record.branch !== saved.branch || !Array.isArray(record.additions)
+          || !record.additions.every(scopeAddition) || new Set(record.additions.map((item: ScopeAddition) => item.path)).size !== record.additions.length) {
+          return work.block(`Cannot resume: invalid scope additions in ${scopeFile()}; nothing was changed.`);
+        }
+        saved.scopeAdditions = record.additions;
+      }
+    } catch (error) { return work.block(`Cannot resume: ${scopeFile()}: ${String(error)}; nothing was changed.`); }
     // Legacy clean worktrees start afresh. A saved origin also carries the assumptions its plan used.
     if (pending() !== "" || existsSync(join(git(worktree, "rev-parse", "--absolute-git-dir"), "ticket-task-resume.json"))) {
       const directory = run("git", ["rev-parse", "--path-format=absolute", "--git-dir"], worktree);
@@ -854,6 +883,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           ticket.title,
           ...(ticket.summary ? ["## Summary", ticket.summary] : []),
           ...(saved.assumptions.length ? ["## Assumptions", saved.assumptions.map(({ question, answer, why }) => `- ${flat(question)} Assumed: ${flat(answer)} (${flat(why)})`).join("\n")] : []),
+          ...scopeAdditionSection(),
           "## Checks", repository.checks.map(name => `- ${name}: passed${(saved.task.flaky ?? []).includes(name) ? " (flaky: failed once, passed when run again alone)" : ""}`).join("\n"),
           // The helper has already taken the summary out of a JSON report; one that is still an object is evidence, not text for a reader.
           "## Review", jsonObject(saved.reviewSummary) ? "The reviewer approved this change without a written summary; its report is kept with the run evidence." : saved.reviewSummary,
@@ -919,7 +949,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return {
       repository: { name: repository.name, path: repository.path }, ticket: { id: ticket.id, title: ticket.title },
       plan: saved.plan, planningReport: saved.planningReport, questions: saved.ownerQuestions, wouldAssume: saved.wouldAssume,
-      moved: saved.moved,
+      moved: saved.moved, scopeMiss: saved.pendingScope, scopeAdditions: saved.scopeAdditions,
       candidate: { worktreeRemoved: saved.removed, pushed: saved.pushed, baseCommit: saved.baseCommit, commit: saved.commitHash },
       stage: saved.stoppedIn,
       reason,
@@ -967,6 +997,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       : `${files.length} files changed, ${files.reduce((sum, file) => sum + (file.added ?? 0), 0)} insertions, ${files.reduce((sum, file) => sum + (file.removed ?? 0), 0)} deletions; binary counts are shown as binary.`;
     const blocks: EvidenceBlock[] = [
       { title: "Rounds", text: roundsText(facts.rounds) },
+      ...(saved.pendingScope ? [{ title: "Scope decision", text: scopeQuestion() + "\n" + scopeChanges() }] : []),
+      ...(saved.scopeAdditions.length ? [{ title: "Scope additions", text: scopeAdditionLines().join("\n") }] : []),
       ...(saved.ownerQuestions ? [{ title: "Open questions and options", text: questionLines() + wouldAssumeLines() }] : []),
       ...(saved.plan ? [{ title: "Plan", text: saved.plan }] : []),
       ...(["falsify", "plan", "planReview"].includes(saved.repairing)
@@ -1036,7 +1068,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     publishNow(activeMeaning);
   }
   function questionEvidence() {
-    const choices = decisions;
+    const choices = saved.pendingScope ? scopeDecisions : decisions;
     const facts = runFacts();
     const options = stuckOptions();
     const short = (value: string) => excerpt(value.replace(/\s+/gu, " ").trim(), 160).replace(/\s+/gu, " ");
@@ -1045,14 +1077,14 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       const does = options.find(option => option.name === name)!.does;
       return [name, short(does)];
     }));
-    const recommended = "hand off";
+    const recommended = saved.pendingScope ? "" : "hand off";
     const headline = short(`${ticket.id}: Decision needed at ${facts.stage}`);
-    const reason = "Keep the work available while a person or another workflow resolves this stop.";
+    const reason = saved.pendingScope ? "" : "Keep the work available while a person or another workflow resolves this stop.";
     const breadcrumb = `${repository.name}: ${repository.path}\nTicket: ${ticket.id} — ${ticket.title}\nBranch: ${saved.branch}\nWorktree: ${worktree}`;
     const stopped = `Stopped in ${facts.stage}: ${facts.reason}`;
     const { blocks, diffStat } = evidenceBlocks(facts);
     const page = evidencePage({ headline, stopped, breadcrumb, blocks, effects, recommended });
-    const selected = { ...facts, diffStat, effects, recommended };
+    const selected = { ...facts, diffStat, effects, ...(recommended ? { recommended } : {}) };
     writeStuckEvidence(work.open(), `# ${headline}\n\n${breadcrumb}\n\n${stopped}\n\n${evidenceText(selected)}`, page);
     publishHandoff(`Stopped in ${facts.stage}; a decision is needed.`, facts.reason, facts);
     return { presentation: { headline, page, effects, recommended, reason,
@@ -1073,18 +1105,28 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     ...(saved.previousEvidence ? [`Earlier run's evidence: ${saved.previousEvidence}`] : []),
     ...(saved.moved ? [`Saved candidate: ${saved.moved.ref} (${saved.moved.patch})`] : []),
     ...(saved.moved?.conflicts.length ? [`Unsettled conflicts: ${saved.moved.conflicts.map(path => JSON.stringify(path)).join(", ")}`] : [])];
+  const scopeQuestion = () => `May this ticket's scope include ${saved.pendingScope!.files.map(file => JSON.stringify(file.path)).join(", ")}?`;
+  const scopeChanges = () => `Stage: ${saved.pendingScope!.stage}.\n` + saved.pendingScope!.files.map(file =>
+    `${JSON.stringify(file.path)}: added ${file.added ?? "binary/unavailable"} lines, removed ${file.removed ?? "binary/unavailable"} lines.`).join("\n");
   const stuckOptions = () => [
-    { name: "continue", does: `return to ${destination()} with the owner's answer and fresh budgets.` },
-    { name: "hand off", does: "stop here and keep the worktree and branch exactly as they are for another workflow or a person.", recommended: true },
+    ...(saved.pendingScope ? [
+      { name: "include", does: `include these exact paths for this run and return to ${saved.pendingScope.stage} without another editing Agent call.` },
+      { name: "revert", does: `return to ${destination()} once to revert these paths; count one repair round.` },
+    ] : [{ name: "continue", does: `return to ${destination()} with the owner's answer and fresh budgets.` }]),
+    { name: "hand off", does: "stop here and keep the worktree and branch exactly as they are for another workflow or a person.", ...(!saved.pendingScope ? { recommended: true } : {}) },
     { name: "discard", does: "remove the worktree and delete the branch without saving the candidate; Drip confirms this choice." },
     { name: "any other reply", does: "answer the question and continue with this answer as standing feedback." },
   ];
   const stuckPrompt = () => {
     const rejectedPlan = saved.stoppedIn === "planReview" && saved.planRejectedAgain;
     return brief({
-      decision: rejectedPlan ? `${ticket.id}'s plan was rejected again in plan review: send it back to planning?` : asking().first,
+      decision: saved.pendingScope ? scopeQuestion() : rejectedPlan ? `${ticket.id}'s plan was rejected again in plan review: send it back to planning?` : asking().first,
       standing: standing(),
-      needs: rejectedPlan ? capped(flat(work.status().reason), 600) : asking().rest || undefined,
+      needs: saved.pendingScope ? [
+        // The shared brief caps and flattens its headline. Keep the exact question when that would cut or alter a filename.
+        ...(scopeQuestion().length > 100 || /\s{2,}/u.test(scopeQuestion()) ? [scopeQuestion()] : []),
+        scopeChanges(), work.status().reason,
+      ].join("\n") : rejectedPlan ? capped(flat(work.status().reason), 600) : asking().rest || undefined,
       evidence: locations(), options: stuckOptions(),
     });
   };
@@ -1164,6 +1206,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ...(saved.rebasedFrom ? { rebasedFrom: saved.rebasedFrom } : {}),
       ...(finished && saved.redelivered ? { redelivered: true } : {}),
       ...(saved.assumptions.length ? { assumptions: saved.assumptions } : {}),
+      ...(saved.scopeAdditions.length ? { scopeAdditions: saved.scopeAdditions } : {}),
       ...(saved.prUrl ? { prUrl: saved.prUrl } : {}), ...(saved.patches.length ? { patches: saved.patches } : {}),
       worktree, ...(saved.adopted ? { resumed: true } : {}), worktreeCreated: saved.created, worktreeRemoved: saved.removed, reviewNotes: saved.reviewNotes,
     }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
@@ -1178,6 +1221,11 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ...((saved.created || saved.adopted) && !saved.removed ? [`Worktree kept at ${worktree}${finished ? `; it could not be removed: inspect ${directory}/git-worktree.log.` : "."}`] : []),
       `Evidence: ${directory}`,
     ].join(" ") };
+    if (finished && repository.output === "branch" && saved.scopeAdditions.length) {
+      const summary = join(directory, "branch-summary.md");
+      writeFileSync(summary, [ticket.title, saved.held.summary, ...scopeAdditionSection()].join("\n\n") + "\n", { mode: 0o600 });
+      saved.held.summary = saved.held.summary.replace(`Evidence: ${directory}`, `Summary: ${summary}. Evidence: ${directory}`);
+    }
     publishHandoff({ delivered: "Delivered the checked changes.", refused: "Refused the ticket.", "handed-off": "Handed off the ticket.", abandoned: "Abandoned the ticket." }[outcome], reason);
     return { type: outcome === "handed-off" ? "handedOff" : outcome === "delivered" && !saved.removed ? "kept" : outcome };
   }
@@ -1369,7 +1417,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       && !findings.some(finding => finding.severity === "discussion")
       && findings.every(finding => {
         const path = finding.where.replace(/^\.\//u, "").replace(/:\d+(-\d+)?$/u, "");
-        return !!path.trim() && outsideScope([path], allowedScope).length === 0;
+        return !!path.trim() && outsideEffectiveScope([path]).length === 0;
       });
   }
   function reviewBudget(): Event {
@@ -1400,6 +1448,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
 
   const resumeFile = () => join(git(worktree, "rev-parse", "--absolute-git-dir"), "ticket-task-resume.json");
   const destination = (answer = ""): Origin => {
+    if (saved.pendingScope && scopeDecisionOf(answer) === "include") return saved.pendingScope.stage;
     switch (saved.origin) {
       case "falsify": return /scope\s+(?:has\s+)?chang(?:e|ed|es|ing)/iu.test(answer) ? "falsify" : saved.ownerQuestions ? "plan" : "falsify";
       case "planReview": return "plan";
@@ -1410,7 +1459,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       default: return saved.origin;
     }
   };
-  function rememberStop(origin = saved.origin === "falsify" && saved.ownerQuestions ? "falsify" : destination()) {
+  function rememberStop(origin = saved.pendingScope?.stage ?? (saved.origin === "falsify" && saved.ownerQuestions ? "falsify" : destination())) {
     if (!(saved.created || saved.adopted) || saved.removed || !existsSync(worktree)) return;
     // A destination is only valid after the owner answers. A separate run must
     // recover unanswered questions, not mistake a hand-off for that answer.
@@ -1419,7 +1468,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ...saved.wouldAssume,
     ] : undefined;
     writeFileSync(resumeFile(), JSON.stringify({ ticket: ticket.id, branch: saved.branch, origin,
-      pendingFalsify, answers: saved.answers, plan: saved.plan, reason: work.status().reason, evidence: work.open() }) + "\n", { mode: 0o600 });
+      pendingScope: saved.pendingScope, pendingFalsify, answers: saved.answers, plan: saved.plan, reason: work.status().reason, evidence: work.open() }) + "\n", { mode: 0o600 });
   }
   function stopAt(origin: Origin): Event {
     releaseTurn();
@@ -1431,8 +1480,30 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   function continueWork({ event }: { event: Event }) {
     const reply = work.choice("stuck", event);
     const next = destination(reply);
-    saved.decision = decisionOf(reply) ?? reply;
+    saved.decision = (saved.pendingScope ? scopeDecisionOf(reply) : decisionOf(reply)) ?? reply;
     saved.answers.push(reply);
+    if (saved.pendingScope) {
+      const miss = saved.pendingScope;
+      if (scopeDecisionOf(reply) === "include") {
+        for (const { path } of miss.files) if (!saved.scopeAdditions.some(item => item.path === path)) saved.scopeAdditions.push({ path, stage: miss.stage });
+        saveScope();
+        saved.pendingScope = null;
+        work.block("");
+        rememberStop(next);
+        return;
+      }
+      if (scopeDecisionOf(reply) === "revert") {
+        // The owner authorizes this one pass even when the automatic repair budget is zero or spent.
+        saved.task.repairs++;
+        work.block(`Revert ${miss.files.map(file => JSON.stringify(file.path)).join(", ")}: the ticket owner declined to include these paths in scope after ${miss.stage}.`);
+      }
+      saved.pendingScope = null;
+      if (scopeDecisionOf(reply) === "revert") {
+        work.resetReport(next === "test" ? "test" : "change");
+        rememberStop(next);
+        return;
+      }
+    }
     if (saved.origin === "falsify" && saved.ownerQuestions && destination(reply) === "plan") {
       saved.assumptions = saved.ownerQuestions.map(question => ({ question: question.text, answer: reply,
         options: [...new Set([...(question.options ?? []), reply])], why: "The ticket owner supplied this answer." }));
@@ -1487,9 +1558,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (result.type === "created" && setup().type !== "prepared") return stopAt("prepare");
     if (resume && saved.adopted && existsSync(resumeFile())) {
       const record = JSON.parse(readFileSync(resumeFile(), "utf8"));
-      const origins: Origin[] = ["prepare", "falsify", "plan", "planReview", "test", "implement", "gate", "rebase"];
+      const origins: Origin[] = ["prepare", "falsify", "plan", "planReview", "test", "red", "implement", "gate", "rebase"];
       if (record.ticket !== ticket.id || record.branch !== saved.branch || !origins.includes(record.origin)
         || !Array.isArray(record.answers) || record.answers.some((answer: unknown) => typeof answer !== "string")
+        || (record.pendingScope != null && (!scopeMiss(record.pendingScope) || record.pendingScope.stage !== record.origin))
         || typeof record.plan !== "string" || typeof record.reason !== "string" || typeof record.evidence !== "string"
         || (record.pendingFalsify !== undefined && (record.origin !== "falsify" || questionField(record.pendingFalsify)
           || !record.pendingFalsify.some((question: FalsifyQuestion) => !question.assumable)))) {
@@ -1497,6 +1569,11 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         return conclude("refused");
       }
       saved.answers = record.answers; saved.plan = record.plan; saved.previousEvidence = record.evidence; work.block(record.reason);
+      if (record.pendingScope) {
+        saved.pendingScope = record.pendingScope;
+        work.seal();
+        return stopAt(record.pendingScope.stage);
+      }
       if (record.pendingFalsify) {
         const questions = record.pendingFalsify as FalsifyQuestion[];
         saved.ownerQuestions = questions.filter(question => !question.assumable)
@@ -1518,6 +1595,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   function gate(): Event {
     saved.repairing = "change";
     const scopeResult = unsettled() ?? scope("change");
+    if (scopeResult.type === "scopeMiss") return stopAt("gate");
     const result = scopeResult.type === "passed" ? work.checks() : scopeResult;
     if (result.type === "passed") { passed("verify"); work.seal(); return { type: "passed" }; }
     return work.repair().type === "retry" ? { type: "retry" } : stopAt("gate");
@@ -1570,7 +1648,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       return saved.held ?? undefined;
     },
     states: {
-      prepare: operation(prepareRun, { falsify: "falsify", plan: "plan", planReview: "planReview", test: "test", implement: "implement", gate: "gate", rebase: "rebase", stuck: "stuck", refused: "refused" }),
+      prepare: operation(prepareRun, { falsify: "falsify", plan: "plan", planReview: "planReview", test: "test", red: "red", implement: "implement", gate: "gate", rebase: "rebase", stuck: "stuck", refused: "refused" }),
       falsify: checkedAgent(() => prompt([
         "Try to falsify this ticket before anyone implements it: look for evidence that it is wrong, already done, impossible in this repository, or underspecified. Do not edit any file. Read the relevant code and check the request, scope, and acceptance criteria. Return sound with a one-paragraph summary if the ticket survives, or questions with a questions array of 1–10 entries shaped as { text, options: string[], recommended: string, assumable: boolean, why }, giving the exact questions a person could answer. text and why must be non-empty strings; options must be a non-empty array of non-empty strings; recommended must copy one of those options exactly. Mark assumable true only when the recommended answer is what a careful maintainer of this repository would do without asking, and a wrong guess costs at most a review comment: for example naming, placement within the Scope, the shape of a test, which existing helper to reuse, the wording of documentation, or where in the Scope a new file goes. A product decision, a change to behaviour a user sees, a path outside the Scope and companions, or anything irreversible such as deleting, publishing, migrating data, or changing a protocol is never assumable. You mark the assumable flag; the workflow decides what to do with it. A path covered by a companion is already in scope and is never a question.",
         ...scopePrompt(),
@@ -1663,12 +1741,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           return result.type === "delivered" ? conclude("completed") : stopAt("deliver");
         }, [])();
       }, { delivered: "delivered", kept: "delivered", refused: "refused", stuck: "stuck" }),
-      stuck: evidenceHuman(human, stuckPrompt, {
+      stuck: evidenceHuman((prompt, on, options) => {
+        if (!saved.pendingScope) return human(prompt, on, options);
+        // Adapt only this workflow's request; the shared helper retains its existing contract.
+        const { recommended: _recommended, reason: _reason, present: _present, presentWith: _presentWith, presentIn: _presentIn, choices: _choices, discussion: _discussion, ...rest } = options ?? {};
+        return human(prompt, on, { ...rest, suggestions: scopeDecisions });
+      }, stuckPrompt, {
         submitted: [
           { guard: ({ event }: { event: Event }) => typeof event.value === "string" && !event.value.trim(), target: "stuck", reenter: true, actions: () => { stopAt(saved.origin); } },
           { guard: ({ event }: { event: Event }) => decisionOf(event.value) === "hand off", target: "handedOff", actions: endDecision },
           { guard: ({ event }: { event: Event }) => decisionOf(event.value) === "discard", target: "abandoned", actions: endDecision },
-          ...(["prepare", "falsify", "plan", "planReview", "test", "implement", "gate", "rebase"] as const).map(target => ({
+          ...(["prepare", "falsify", "plan", "planReview", "test", "red", "implement", "gate", "rebase"] as const).map(target => ({
             guard: ({ event }: { event: Event }) => destination(String(event.value)) === target, target, actions: continueWork,
           })),
         ],
@@ -1713,6 +1796,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   })) as typeof states;
   return machine({ ...definition, states: reportingStates });
 }
+
+type ScopeAddition = { path: string; stage: "red" | "gate" };
+type ScopeMiss = { stage: "red" | "gate"; files: { path: string; added: number | null; removed: number | null }[] };
+const literalPath = (value: unknown): value is string => typeof value === "string" && value.length > 0
+  && !value.includes("\0") && !isAbsolute(value) && value.split("/").every(part => part !== "" && part !== "." && part !== "..");
+const scopeStage = (value: unknown) => value === "red" || value === "gate";
+const recordValue = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
+const scopeAddition = (value: unknown): value is ScopeAddition => recordValue(value) && literalPath(value.path) && scopeStage(value.stage);
+const scopeMiss = (value: unknown): value is ScopeMiss => recordValue(value) && scopeStage(value.stage)
+  && Array.isArray(value.files) && value.files.length > 0 && value.files.every(file => recordValue(file) && literalPath(file.path)
+    && [file.added, file.removed].every(count => count === null || (typeof count === "number" && Number.isSafeInteger(count) && count >= 0)));
 
 type Assumption = { question: string; answer: string; options: string[]; why: string };
 /** Refuse damaged saved answers before adopting or changing the candidate. */

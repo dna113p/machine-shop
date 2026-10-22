@@ -361,6 +361,7 @@ function optionsFirst(line: string, number: number, asked: Gap, shown = oneLine(
 }
 /** The decisions a stuck run offers. They are suggestions: any other reply is the owner's answer. */
 const stuckDecisions = ["continue", "hand off", "discard"];
+const scopeChoices = ["include", "revert", "hand off", "discard"];
 /** What a stuck run's question says is needed: everything after its `Needs: ` up to the worktree line, which may run over several lines. */
 function needsIn(prompt: string, worktree: string) {
   const start = prompt.indexOf("\nNeeds: "); const end = prompt.indexOf(`\nWorktree: ${worktree}\n`);
@@ -377,7 +378,7 @@ const standsAt = (stoppedIn: string) => `Ticket PROJ-12. Stopped in ${stoppedIn}
  * than the only replies. It never repeats the ticket's title, and never sends anyone to run the ticket again.
  * Returns the need: the first sentence, followed by what its `Needs: ` line says when it has one.
  */
-function stuckQuestion(f: Fixture, request: Ask | undefined, stoppedIn: string): string {
+function stuckQuestion(f: Fixture, request: Ask | undefined, stoppedIn: string, suggestions = stuckDecisions): string {
   assert.ok(request, "the stuck run asked its question");
   const [first, blank, stands] = request.prompt.split("\n");
   // A first sentence too long for that is cut after a whole word, with an ellipsis that counts toward the 100.
@@ -387,7 +388,7 @@ function stuckQuestion(f: Fixture, request: Ask | undefined, stoppedIn: string):
   // The run's label already carries the title, and the reason is said once, not under a standing line of its own.
   assert.equal(request.prompt.includes("Add a greeting"), false, "the question does not repeat the ticket's title");
   assert.doesNotMatch(request.prompt, /This run is stuck and needs a decision|is stuck: answer what is needed/u);
-  assert.deepEqual(request.suggestions, stuckDecisions); assert.equal(request.choices, undefined);
+  assert.deepEqual(request.suggestions, suggestions); assert.equal(request.choices, undefined);
   assert.ok(request.prompt.includes(`\nWorktree: ${f.worktree}\nBranch: ${branch}\nEvidence: `));
   // Any reply that is not one of the decisions is taken as the answer.
   assert.ok(request.prompt.split("\n").some(line => line.startsWith("any other reply: ")), "the question says what any other reply does");
@@ -398,13 +399,13 @@ function stuckQuestion(f: Fixture, request: Ask | undefined, stoppedIn: string):
  * A stopped run asks its question and keeps the evidence. Answered with hand off, it ends as any hand-off does:
  * the candidate is kept and nothing is committed. Returns the run's evidence with the question's prompt and what it says is needed.
  */
-function questioned(f: Fixture, result: { state: unknown; output: any; states: string[] }, reason: RegExp, human: { requests: Ask[] }) {
+function questioned(f: Fixture, result: { state: unknown; output: any; states: string[] }, reason: RegExp, human: { requests: Ask[] }, suggestions = stuckDecisions) {
   assert.deepEqual(result.states.slice(-2), ["stuck","handedOff"]);
   for (const state of ["park"]) assert.equal(result.states.includes(state), false, state);
   assert.equal(human.requests.length, 1);
   const run = handedOff(f, result, reason, human);
   const [request] = human.requests;
-  const needs = stuckQuestion(f, request, result.states.at(-3)!);
+  const needs = stuckQuestion(f, request, result.states.at(-3)!, suggestions);
   assert.ok(request!.prompt.includes(`Evidence: ${run.directory}`)); assert.match(oneLine(needs), spoken(reason));
   assert.equal(existsSync(join(run.directory, "park.txt")), false); assert.equal(Object.hasOwn(run.delivery, "park"), false);
   asksWritten(run.directory, [request!]);
@@ -6261,7 +6262,7 @@ for (const stage of ["test", "change"] as const) {
       ...(stage === "test" ? { tester: outside, implementer: () => assert.fail("tester scope must pass first") } : { implementer: outside }),
       reviewer: () => assert.fail("an outside path must prevent review"),
     }, human);
-    const run = questioned(f, result, /Paths outside the ticket Scope[^\n]*docs\/other\.md/u, human);
+    const run = questioned(f, result, /Paths outside the ticket Scope[^\n]*docs\/other\.md/u, human, scopeChoices);
     const index = stage === "test" ? 1 : 2;
     assert.deepEqual(JSON.parse(readFileSync(join(run.directory, `scope-${index}.json`), "utf8")), {
       stage, changed: stage === "test" ? ["docs/other.md", "tests/a.test.txt"] : ["README.md", "docs/other.md", "src/a.txt", "tests/a.test.txt"],
@@ -6317,6 +6318,327 @@ for (const repository of [{}, { companions: [] }]) {
   });
 }
 
+/** Scope decisions belong to the owner, even when automatic repairs are available. */
+function scopeMissAsked(request: Ask, stage: "red" | "gate", ...paths: string[]) {
+  assert.match(request.prompt, /May this ticket['’]s scope include .+\?/u);
+  assert.match(request.prompt, new RegExp(`\\b${stage}\\b`, "u"));
+  for (const path of paths) assert.ok(request.prompt.includes(path), `the question names ${path}`);
+  assert.deepEqual(request.suggestions, scopeChoices);
+  assert.equal(request.choices, undefined, "free-text owner answers remain possible");
+  assert.equal(request.recommended, undefined);
+  assert.doesNotMatch(request.prompt, /recommend/iu);
+  assert.ok(request.prompt.includes("Evidence: "));
+}
+
+for (const maxRepairs of [0, 2]) {
+  test(`scope miss: gate asks once before any repair; include delivers with budget ${maxRepairs}`, async context => {
+    const f = fixture(context); const outside = "outside file.txt"; const calls = join(f.root, "scope-gate-calls");
+    let edits = 0;
+    const checks = [command(`require("node:fs").appendFileSync(${JSON.stringify(calls)}, "checked\\n");`)];
+    const human = person(() => {
+      assert.equal(edits, 1, "a scope miss must not spend an implementer call");
+      assert.equal(existsSync(calls), false, "checks wait for scope approval");
+      scopeMissAsked(human.requests[0]!, "gate", outside);
+      return "include";
+    });
+    const result = await execute(input(f, { checks }, { redGreen: false, maxRepairs }), {
+      implementer: request => {
+        edits++; writeFileSync(join(request.cwd, outside), "needed by the greeting\n"); return implement(request);
+      },
+    }, human);
+    const run = ended(f, result, "branch");
+    assert.equal(edits, 1); assert.equal(human.requests.length, 1); assert.equal(run.result.repairs, 0);
+    assert.deepEqual(result.states.slice(result.states.indexOf("gate"), result.states.indexOf("review")), ["gate", "stuck", "gate"]);
+    assert.equal(readFileSync(calls, "utf8"), "checked\n");
+    assert.equal(run.result.checksPassed, true);
+    assert.equal(git(f.repo, "show", `${branch}:${outside}`), "needed by the greeting");
+    const summaries = holding(run.directory, ["## Scope additions", `${outside}: included by the ticket owner after gate`])
+      .filter(name => name.endsWith(".md"));
+    assert.ok(summaries.length > 0, "branch delivery keeps a Markdown summary with the owner-approved scope addition");
+    assert.equal(input(f).ticket.body.includes(outside), false, "the ticket itself did not need a hand edit");
+    untouched(f);
+  });
+}
+
+test("scope miss: revert sends the implementer back exactly once and charges one repair", async context => {
+  const f = fixture(context); const outside = "outside.txt"; let edits = 0;
+  const human = person(() => {
+    assert.equal(edits, 1); scopeMissAsked(human.requests[0]!, "gate", outside); return "revert";
+  });
+  const result = await execute(input(f, {}, { redGreen: false, maxRepairs: 1 }), {
+    implementer: request => {
+      if (++edits === 1) writeFileSync(join(request.cwd, outside), "outside\n");
+      else {
+        assert.equal(edits, 2, "the owner authorized only one revert pass");
+        const feedback = request.prompt.split("Current failure/feedback: ")[1] ?? "";
+        assert.ok(feedback.includes(outside), "the repair instruction names the path to revert");
+        assert.match(feedback, /revert/iu); assert.match(feedback, /scope/iu);
+        rmSync(join(request.cwd, outside));
+      }
+      return implement(request);
+    },
+  }, human);
+  const run = ended(f, result, "branch");
+  assert.equal(edits, 2); assert.equal(human.requests.length, 1); assert.equal(run.result.repairs, 1);
+  assert.deepEqual(result.states.slice(result.states.indexOf("gate"), result.states.indexOf("review")), ["gate", "stuck", "implement", "gate"]);
+  assert.equal(git(f.repo, "ls-tree", "--name-only", branch, "--", outside), "");
+  assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello"); untouched(f);
+});
+
+test("scope miss: an owner inclusion survives a separate run with resume", async context => {
+  const f = fixture(context); const outside = "outside.txt"; let edits = 0;
+  const human = person(() => {
+    assert.equal(edits, 1); scopeMissAsked(human.requests[0]!, "gate", outside); return "include";
+  }, "hand off");
+  const first = await execute(input(f, {}, { redGreen: false, maxRepairs: 0 }), {
+    implementer: request => { edits++; writeFileSync(join(request.cwd, outside), "keep after resume\n"); return implement(request); },
+    reviewer: () => ok("blocked", "Keep this approved-scope candidate for a separate run"),
+  }, human);
+  assert.equal(first.state, "handedOff"); assert.equal(edits, 1);
+  assert.equal(evidence(f).result.repairs, 0);
+  assert.equal(readFileSync(join(f.worktree, outside), "utf8"), "keep after resume\n");
+  const again = { ...f, evidence: join(f.root, "scope-resumed-evidence") };
+  // No checkpoint or primitive data is shared with this new run. It must load
+  // the inclusion from the kept worktree, without an edit to the ticket Scope.
+  const resumed = await execute(input(again, {}, { resume: true, redGreen: false, maxRepairs: 0 }), {
+    investigator: () => assert.fail("resume must not restart planning"),
+    implementer: request => { assert.equal(readFileSync(join(request.cwd, outside), "utf8"), "keep after resume\n"); return implement(request); },
+  });
+  const run = ended(again, resumed, "branch");
+  assert.equal(run.delivery.resumed, true); assert.equal(run.result.checksPassed, true);
+  assert.equal(git(f.repo, "show", `${branch}:${outside}`), "keep after resume");
+  assert.ok(holding(run.directory, ["## Scope additions", `${outside}: included by the ticket owner after gate`])
+    .some(name => name.endsWith(".md")), "the resumed branch summary retains the inclusion's original stage");
+  untouched(f);
+});
+
+test("scope miss: red sleeps for the owner after one tester call without a repair", async context => {
+  const f = fixture(context); const outside = "outside.test.txt"; let tests = 0;
+  const questions: Ask[] = []; const saves = checkpointed();
+  const result = await execute(input(f, {}, { maxRepairs: 2 }), {
+    tester: request => { tests++; writeFileSync(join(request.cwd, outside), "outside\n"); return tester(request); },
+    implementer: () => assert.fail("implementation must wait for the owner's scope decision"),
+  }, person(), { ...saves.options, onHumanSleep: request => { questions.push(request); } });
+  assert.equal(result.state, "stuck"); assert.deepEqual(result.states.slice(-3), ["test", "red", "stuck"]);
+  assert.equal(tests, 1); assert.equal(questions.length, 1);
+  scopeMissAsked(questions[0]!, "red", outside);
+  assert.equal(saves.data()!.task.repairs, 0);
+  assert.deepEqual(saves.data()!.task.evidence, [], "scope is decided before proving red");
+});
+
+test("scope miss: include preserves the repair budget for a subsequent failing check", async context => {
+  const f = fixture(context); const outside = "outside.txt"; let edits = 0;
+  const check = command('require("node:assert/strict").equal(require("node:fs").readFileSync("greeting.txt", "utf8"), "hello\\n", "greeting must be hello");');
+  const human = person(() => {
+    assert.equal(edits, 1); scopeMissAsked(human.requests[0]!, "gate", outside); return "include";
+  });
+  const result = await execute(input(f, { checks: [check], rerunFailedChecks: false }, { redGreen: false, maxRepairs: 1 }), {
+    implementer: request => {
+      if (++edits === 1) {
+        writeFileSync(join(request.cwd, outside), "needed\n"); writeFileSync(join(request.cwd, "greeting.txt"), "wrong\n"); return ok();
+      }
+      assert.equal(edits, 2);
+      assert.match(request.prompt.split("Current failure/feedback: ")[1] ?? "", /verify: tests did not meet its expected result; inspect /u);
+      return implement(request);
+    },
+  }, human);
+  const run = ended(f, result, "branch");
+  assert.equal(edits, 2); assert.equal(human.requests.length, 1); assert.equal(run.result.repairs, 1);
+  assert.deepEqual(result.states.slice(result.states.indexOf("gate"), result.states.indexOf("review")), ["gate", "stuck", "gate", "implement", "gate"]);
+  assert.deepEqual(run.result.checks.filter((check: any) => check.phase === "verify").map((check: any) => check.passed), [false, true]);
+  assert.equal(git(f.repo, "show", `${branch}:${outside}`), "needed"); untouched(f);
+});
+
+for (const answer of ["include", "revert"] as const) {
+  test(`scope miss: red ${answer} returns to the right stage with zero automatic repair budget`, async context => {
+    const f = fixture(context); const outside = "outside.test.txt"; let tests = 0; let edits = 0;
+    const human = person(() => {
+      scopeMissAsked(human.requests[0]!, "red", outside);
+      assert.equal(tests, 1); assert.equal(edits, 0);
+      return answer;
+    });
+    const result = await execute(input(f, {}, { maxRepairs: 0, assume: true }), {
+      tester: request => {
+        if (++tests === 1) writeFileSync(join(request.cwd, outside), "test companion\n");
+        else {
+          assert.equal(answer, "revert");
+          assert.match(request.prompt, /Revert "outside.test.txt".*declined.*scope after red/u);
+          rmSync(join(request.cwd, outside));
+        }
+        return tester(request);
+      },
+      implementer: request => { edits++; return implement(request); },
+    }, human);
+    const run = ended(f, result, "branch");
+    assert.deepEqual([tests, edits, run.result.repairs], [answer === "include" ? 1 : 2, 1, answer === "include" ? 0 : 1]);
+    const start = result.states.indexOf("red");
+    assert.deepEqual(result.states.slice(start, result.states.indexOf("implement")), answer === "include" ? ["red", "stuck", "red"] : ["red", "stuck", "test", "red"]);
+    assert.deepEqual(phases(run), ["red", "verify"]);
+    assert.equal(git(f.repo, "ls-tree", "--name-only", branch, "--", outside), answer === "include" ? outside : "");
+    if (answer === "include") assert.match(readFileSync(join(run.directory, "branch-summary.md"), "utf8"), /outside.test.txt: included by the ticket owner after red/u);
+  });
+}
+
+test("scope miss: the question carries tracked, untracked and binary numstat evidence without a recommendation", async context => {
+  const f = fixture(context); const human = person("hand off");
+  const result = await execute(input(f, {}, { redGreen: false, assume: true }), {
+    implementer: request => {
+      writeFileSync(join(request.cwd, "code.txt"), "new\nsecond\n");
+      writeFileSync(join(request.cwd, "outside.txt"), "one\ntwo\n");
+      writeFileSync(join(request.cwd, "binary.bin"), Buffer.from([0, 1, 0]));
+      return implement(request);
+    },
+    presenter: () => assert.fail("a scope decision must not acquire a presenter's recommendation"),
+  }, human);
+  assert.equal(result.state, "handedOff");
+  const question = human.requests[0]!;
+  scopeMissAsked(question, "gate", "code.txt", "outside.txt", "binary.bin");
+  assert.match(question.prompt, /"code.txt": added 2 lines, removed 1 lines/u);
+  assert.match(question.prompt, /"outside.txt": added 2 lines, removed 0 lines/u);
+  assert.match(question.prompt, /"binary.bin": added binary\/unavailable/u);
+  assert.equal(question.reason, undefined); assert.doesNotMatch(question.page!, /recommended/iu);
+  const run = evidence(f);
+  assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-miss-1.json"), "utf8")), {
+    stage: "gate", files: [{ path: "binary.bin", added: null, removed: null }, { path: "code.txt", added: 2, removed: 1 }, { path: "outside.txt", added: 2, removed: 0 }],
+  });
+  assert.equal(run.result.repairs, 0);
+});
+
+test("scope miss: pull requests and the reviewer retain the owner's exact additions after Scope", async context => {
+  const f = fixture(context); remote(f); const gh = fakeGh(context, f); let prompt = "";
+  const outside = "outside.txt";
+  const result = await execute(input(f, { output: "pr" }, { redGreen: false }), {
+    implementer: request => { writeFileSync(join(request.cwd, outside), "needed\n"); return implement(request); },
+    reviewer: request => { prompt = request.prompt; return review(); },
+  }, person("include"));
+  const run = prDelivered(f, result);
+  const attribution = `${outside}: included by the ticket owner after gate`;
+  assert.match(prompt, /Scope:\n- greeting.txt\n- greeting.test.txt\n## Scope additions\n- outside.txt: included by the ticket owner after gate/u);
+  assert.ok(bodyOf(gh).includes(`## Scope additions\n\n- ${attribution}`));
+  assert.deepEqual(run.delivery.scopeAdditions, [{ path: outside, stage: "gate" }]);
+  assert.equal(git(f.repo, "show", `${branch}:${outside}`), "needed");
+});
+
+for (const stage of ["red", "gate"] as const) {
+  test(`scope miss: hand-off and separate resume preserve the unanswered ${stage} decision`, async context => {
+    const f = fixture(context); const outside = "outside.txt"; let tests = 0; let edits = 0;
+    const agents = {
+      tester: (request: Request) => { tests++; if (stage === "red") writeFileSync(join(request.cwd, outside), "kept\n"); return tester(request); },
+      implementer: (request: Request) => { edits++; if (stage === "gate") writeFileSync(join(request.cwd, outside), "kept\n"); return implement(request); },
+    };
+    const first = await execute(input(f, {}, { assume: true }), agents, person("hand off"));
+    assert.equal(first.state, "handedOff");
+    const before = [tests, edits];
+    const again = next(f, 2); const human = person(() => {
+      assert.deepEqual([tests, edits], before, "resume must ask before another Agent edits");
+      scopeMissAsked(human.requests[0]!, stage, outside);
+      return "include";
+    });
+    const result = await execute(input(again, {}, { resume: true, assume: true }), {
+      investigator: () => assert.fail(), tester: () => assert.fail(),
+      implementer: request => { edits++; return implement(request); },
+    }, human);
+    ended(again, result, "branch");
+    assert.deepEqual(result.states.slice(0, 3), ["prepare", "stuck", stage]);
+    assert.equal(edits, 1); assert.equal(tests, 1);
+    assert.equal(git(f.repo, "show", `${branch}:${outside}`), "kept");
+  });
+}
+
+test("scope miss: inclusion treats glob characters and whitespace as literal filenames", async context => {
+  const f = fixture(context); const literal = ' a\n"b"*.txt '; const sibling = ' a\n"b"other.txt '; let edits = 0;
+  const human = person("include", "continue", () => {
+    scopeMissAsked(human.requests[2]!, "gate", JSON.stringify(sibling).slice(1, -1));
+    assert.equal(human.requests[2]!.prompt.includes(JSON.stringify(literal)), false);
+    return "hand off";
+  });
+  const first = await execute(input(f, {}, { redGreen: false }), {
+    implementer: request => {
+      if (++edits === 1) writeFileSync(join(request.cwd, literal), "literal\n");
+      else writeFileSync(join(request.cwd, sibling), "not authorized\n");
+      return implement(request);
+    },
+    reviewer: () => ok("blocked", "One more pass requested"),
+  }, human);
+  assert.equal(first.state, "handedOff"); assert.equal(edits, 2);
+  const record = JSON.parse(readFileSync(join(gitDirectory(f), "ticket-task-scope.json"), "utf8"));
+  assert.deepEqual(record.additions, [{ path: literal, stage: "gate" }]);
+  assert.deepEqual(JSON.parse(readFileSync(join(evidence(f).directory, "scope-3.json"), "utf8")).outside, [sibling]);
+});
+
+for (const damage of ["addition", "pending"] as const) {
+  test(`scope miss: resume refuses malformed saved ${damage} paths before an Agent runs`, async context => {
+    const f = fixture(context);
+    const first = await execute(input(f, {}, { redGreen: false }), {
+      implementer: request => { writeFileSync(join(request.cwd, "outside.txt"), "needed\n"); return implement(request); },
+      reviewer: () => ok("blocked", "Keep candidate"),
+    }, damage === "addition" ? person("include", "hand off") : person("hand off"));
+    assert.equal(first.state, "handedOff");
+    const file = join(gitDirectory(f), damage === "addition" ? "ticket-task-scope.json" : "ticket-task-resume.json");
+    const record = JSON.parse(readFileSync(file, "utf8"));
+    if (damage === "addition") record.additions[0].path = "../escaped.txt";
+    else record.pendingScope.files[0].path = "../escaped.txt";
+    writeFileSync(file, JSON.stringify(record));
+    const again = next(f, 2); const before = candidate(f.worktree);
+    const result = await execute(input(again, {}, { resume: true, redGreen: false }), {
+      investigator: () => assert.fail(), implementer: () => assert.fail(), reviewer: () => assert.fail(),
+    });
+    refused(again, result, /invalid (scope additions|saved origin)/u);
+    assert.deepEqual(candidate(f.worktree), before);
+  });
+}
+
+test("scope miss: include keeps repair rounds already spent on failed checks", async context => {
+  const f = fixture(context); let edits = 0;
+  const human = person(() => {
+    assert.equal(edits, 2); scopeMissAsked(human.requests[0]!, "gate", "outside.txt"); return "include";
+  }, () => {
+    assert.equal(edits, 2, "include must not refresh the exhausted repair budget");
+    assert.match(human.requests[1]!.prompt, /Repair budget used up \(1 of 1\)/u);
+    return "hand off";
+  });
+  const result = await execute(input(f, { checks: [command("process.exitCode = 1")], rerunFailedChecks: false }, { redGreen: false, maxRepairs: 1 }), {
+    implementer: request => {
+      if (++edits === 2) writeFileSync(join(request.cwd, "outside.txt"), "needed\n");
+      return implement(request);
+    },
+  }, human);
+  assert.equal(result.state, "handedOff"); assert.equal(evidence(f).result.repairs, 1);
+  assert.deepEqual(result.states.slice(result.states.indexOf("gate")), ["gate", "implement", "gate", "stuck", "gate", "stuck", "handedOff"]);
+});
+
+test("scope miss: a sleeping red checkpoint accepts include without another tester call", async context => {
+  const f = fixture(context); const saves = checkpointed(); const assignment = input(f); let tests = 0;
+  const first = await execute(assignment, {
+    tester: request => { tests++; writeFileSync(join(request.cwd, "outside.test.txt"), "needed\n"); return tester(request); },
+    implementer: () => assert.fail(),
+  }, person(), { ...saves.options, onHumanSleep: () => {} });
+  assert.equal(first.state, "stuck");
+  const checkpoint = saves.saved.stuck!; const restored = checkpointed(JSON.parse(JSON.stringify(checkpoint)));
+  const result = await execute(assignment, { tester: () => assert.fail(), investigator: () => assert.fail() }, person(), {
+    ...restored.options, continueAt: { value: checkpoint.value, context: checkpoint.context }, answer: "include",
+  });
+  const run = ended(f, result, "branch");
+  assert.deepEqual(result.states.slice(0, 3), ["stuck", "red", "implement"]);
+  assert.equal(tests, 1); assert.equal(run.result.repairs, 0);
+  assert.equal(git(f.repo, "show", `${branch}:outside.test.txt`), "needed");
+  assert.deepEqual(saves.unsaveable, []); assert.deepEqual(restored.unsaveable, []);
+});
+
+test("scope miss: a long filename keeps the complete inclusion question after its short headline", async context => {
+  const f = fixture(context); const outside = `needs  ${"long-".repeat(30)}.txt`;
+  const human = person(() => {
+    scopeMissAsked(human.requests[0]!, "gate", outside);
+    assert.ok(human.requests[0]!.prompt.includes(`May this ticket's scope include ${JSON.stringify(outside)}?`));
+    return "include";
+  });
+  const result = await execute(input(f, {}, { redGreen: false }), {
+    implementer: request => { writeFileSync(join(request.cwd, outside), "needed\n"); return implement(request); },
+  }, human);
+  ended(f, result, "branch");
+  assert.equal(git(f.repo, "show", `${branch}:${outside}`), "needed");
+});
+
 test("tester scope violations return to the tester before red or implementation", async context => {
   const f = fixture(context); let tests = 0; let edits = 0;
   const result = await execute(input(f, {}, { maxRepairs: 1 }), {
@@ -6343,7 +6665,7 @@ test("implementation scope violations return to the implementer and record both 
       else { assert.match(request.prompt, /Paths outside the ticket Scope after change: "other.txt"/u); rmSync(join(request.cwd, "other.txt")); }
       return implement(request);
     },
-  });
+  }, person("continue"));
   assert.equal(result.state, "delivered"); assert.deepEqual([tests, edits], [1, 2]);
   const run = evidence(f);
   assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-2.json"), "utf8")), { stage: "change", changed: ["greeting.test.txt", "greeting.txt", "other.txt"], outside: ["other.txt"] });
@@ -6358,7 +6680,7 @@ for (const allowed of ["code.txt", "renamed file.txt"]) {
     const human = person("hand off");
     const result = await execute(data, { implementer: request => { git(request.cwd, "mv", "code.txt", "renamed file.txt"); return implement(request); } }, human);
     const outside = allowed === "code.txt" ? "renamed file.txt" : "code.txt";
-    const run = questioned(f, result, /Paths outside the ticket Scope/u, human);
+    const run = questioned(f, result, /Paths outside the ticket Scope/u, human, scopeChoices);
     assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-1.json"), "utf8")), { stage: "change", changed: ["code.txt", "greeting.txt", "renamed file.txt"], outside: [outside] });
   });
 }
@@ -6368,7 +6690,7 @@ test("scope status preserves spaces, newlines, and literal quotes in paths", asy
   const result = await execute(input(f, {}, { redGreen: false, maxRepairs: 0, stuck: "park" }), {
     implementer: request => { writeFileSync(join(request.cwd, name), "outside"); return implement(request); },
   }, human);
-  const run = questioned(f, result, /Paths outside the ticket Scope/u, human);
+  const run = questioned(f, result, /Paths outside the ticket Scope/u, human, scopeChoices);
   assert.deepEqual(JSON.parse(readFileSync(join(run.directory, "scope-1.json"), "utf8")).outside, [name]);
 });
 

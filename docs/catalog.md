@@ -281,7 +281,9 @@ without a final receipt. These workflows do not resume, undo, or roll back work.
 [ticket-task](workflows/ticket-task.md) carries a local ticket from an isolated worktree through
 planning, tests, checks and review to a committed branch, patch, or pull request.
 Its single `stuck` question retains evidence and returns the owner's answer to
-the saved origin; the workflow page documents inputs, budgets, resume and endings.
+the saved origin. Paths outside scope ask for inclusion or reversion immediately,
+without automatic repair rounds; owner inclusions survive resume. The workflow
+page documents inputs, budgets, resume and endings.
 
 ## ChatGPT thread
 
