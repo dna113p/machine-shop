@@ -2,8 +2,9 @@
 
 Carry one local ticket from an isolated Git worktree to a branch, patch, or pull
 request. The Machine commits and, in `pr` mode, pushes its branch and opens a
-pull request. Delivery ends there. It never merges, tags, force-pushes, or edits
-the source checkout's working tree. This root workflow runs from source; the
+pull request. Delivery ends there. It never merges, tags, or edits the source
+checkout's working tree, and it force-pushes only to update a delivered pull
+request on resume, with a lease on the delivered commit. This root workflow runs from source; the
 installer does not copy it.
 
 Required roles are `investigator`, `tester`, `implementer`, and `reviewer`.
@@ -252,11 +253,25 @@ an ancestor of the current base, with the expected title and `Ticket: <id>` line
 The local `branch.<name>.ticketDelivered` record must match its tip; an absent
 or mismatched delivery record refuses resume without changes. Merge commits,
 unrelated history, multiple commits, unresolved siblings, or a changed title
-are refused. In `pr` mode a delivered resume is refused because the pull request
-is brought up to date at its host. Recreation runs setup again; failed setup
-removes only the recreated worktree, retaining the branch and delivery record.
-An unchanged base still runs every gate and records `redelivered: true` when
-the same commit is delivered again. A changed patch requires a fresh review.
+are refused. In `pr` mode resume takes up the delivered pull request and updates
+that same pull request in place: before recreating anything it checks that the
+base is published and asks the host with `gh pr list` for the pull requests of
+the branch in the repository prepare checks. Resume refuses without changes when
+the host lists no pull request, more than one in any state, one that was merged
+(nothing to rebase) or closed, one whose base is another branch than the run's
+base, or one whose head on the host is not the delivered commit because someone
+pushed to it. A host that cannot be reached refuses the same way. Recreation runs
+setup again; failed setup removes only the recreated worktree, retaining the
+branch and delivery record. An unchanged base still runs every gate and records
+`redelivered: true` when the same commit is delivered again; in `pr` mode nothing
+is pushed and the pull request is left as it was. A changed patch requires a
+fresh review, as when a replay conflict is settled as a repair round. A delivered
+pull request is updated by pushing the ticket branch with
+`--force-with-lease=refs/heads/<branch>:<delivered commit>`, naming the delivered
+commit, so a push someone else made in the meantime fails the delivery at
+`deliver` and is never overwritten. No new pull request is opened; the
+`ticketDelivered` record moves to the new commit after the push, and
+`delivery.json` records `pullRequest: "updated"` beside its URL.
 
 Each repository holds one turn from commit through replay, gates and delivery.
 The lock under `.machine-runs/repository-turns/` records repository identity,
@@ -269,7 +284,8 @@ subject and ticket line, including after hooks. Replay accepts only a forward
 base and an equivalent patch; changed patches return through gates and review.
 In `pr` mode the base must be published. The recorded remote URL and base branch
 control push and PR creation, independent of other local Git or `gh` settings.
-Push sends only the ticket branch, without tags or force.
+Push sends only the ticket branch, without tags, and without force except the
+lease on the delivered commit when resume updates a delivered pull request.
 Once that push succeeds, recovery from PR creation or delivery-record failures
 keeps the published commit, even if the base advances. Continuation reacquires
 the repository turn and reruns every gate on that commit before retrying delivery.

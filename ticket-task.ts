@@ -72,6 +72,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     reviewsFrom: 0,
     reviewNotes: [] as { text: string; where: string }[],
     prUrl: "",
+    // The delivered commit a resume found at the head of its open pull request: the one force-push, on this run's own branch, leases it.
+    lease: "",
     // Where prepare found the base published: the remote's URL and the pull request base branch there, its default branch by name when the base names none.
     // The push and the pull request go there, whatever the remote, the local refs, and gh's own configuration are by then.
     checked: "",
@@ -578,7 +580,12 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     }
     const delivered = run("git", ["config", "--local", "--get", `branch.${name}.ticketDelivered`], repository.path);
     if (!delivered.ok || delivered.stdout !== tip) return refuse(`${name} has no delivery record matching its tip`);
-    if (repository.output === "pr") return refuse("the delivered pull request is brought up to date at its host");
+    let pullRequest = "";
+    if (repository.output === "pr") {
+      const found = deliveredPullRequest(name, tip, refuse);
+      if (typeof found !== "string") return found;
+      pullRequest = found;
+    }
     if (!attempt("git", ["worktree", "add", worktree, name], repository.path, undefined,
       "Cannot resume: the worktree could not be recreated; nothing was changed").ok) return { type: "blocked" };
     saved.created = true;
@@ -592,7 +599,40 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     saved.commitHash = saved.taken = tip;
     saved.firstApproved = { baseCommit: saved.baseCommit, commit: tip };
     saved.untested = true;
+    // Delivery updates the pull request found open for the delivered commit: no second one is opened.
+    if (pullRequest) { saved.prUrl = pullRequest; saved.lease = tip; }
     return { type: "redeliver" };
+  }
+
+  /**
+   * In pr mode a delivered commit is taken up only through its one open pull request on the base prepare would check, whose head on the
+   * host is still the delivered commit: the URL of that pull request, or the refusal. Nothing is changed either way.
+   */
+  function deliveredPullRequest(name: string, delivered: string, refuse: (why: string) => Event): string | Event {
+    // The base is read from the remote itself, as prepare reads it, and the host is asked in the repository found there.
+    if (!remoteTip()) return { type: "blocked" };
+    const hosted = hostedRepository(saved.checked);
+    if (!hosted) return refuse(`remote ${repository.remote} does not name a hosted owner/repository, so its pull request cannot be found`);
+    // Every pull request in any state counts: a branch name the host lists more than once is not one pull request to update.
+    const listed = attempt("gh", ["pr", "list", "--repo", hosted, "--head", name, "--state", "all", "--limit", "10",
+      "--json", "number,url,state,baseRefName,headRefOid"], repository.path, publishTimeoutMs,
+    "Cannot resume: the host could not be reached to find the delivered pull request; nothing was changed");
+    if (!listed.ok) return { type: "blocked" };
+    let found: unknown;
+    try { found = JSON.parse(listed.stdout); } catch { found = undefined; }
+    const shaped = (one: unknown): one is { url: string; state: string; baseRefName: string; headRefOid: string } => !!one && typeof one === "object"
+      && ["url", "state", "baseRefName", "headRefOid"].every(key => typeof (one as Record<string, unknown>)[key] === "string");
+    if (!Array.isArray(found) || !found.every(shaped)) return refuse(`the host's list of pull requests for ${name} could not be read`);
+    if (!found.length) return refuse(`the host lists no pull request for ${name} in ${hosted}`);
+    if (found.length > 1) return refuse(`the host lists more than one pull request for ${name} in ${hosted}: ${found.map(one => one.url).join(", ")}`);
+    const [one] = found as [{ url: string; state: string; baseRefName: string; headRefOid: string }];
+    if (one.state === "MERGED") return refuse(`pull request ${one.url} was merged, so there is nothing to rebase`);
+    if (one.state !== "OPEN") return refuse(`pull request ${one.url} is ${one.state === "CLOSED" ? "closed" : `not open but ${one.state}`}`);
+    if (one.baseRefName !== saved.checkedBase) return refuse(`pull request ${one.url} is based on ${one.baseRefName}, not on the run's base ${saved.checkedBase}`);
+    if (one.headRefOid !== delivered) {
+      return refuse(`the head of pull request ${one.url} on the host is ${one.headRefOid}, not the delivered commit ${delivered}: someone pushed to it, and that is never overwritten`);
+    }
+    return one.url;
   }
 
   /** A refusal after recreation removes only the worktree this run made, retaining the recorded delivery. */
@@ -873,10 +913,22 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       // gh must open the pull request in the repository the push went to, whatever GH_REPO or other remotes say.
       const hosted = hostedRepository(saved.checked);
       if (!hosted) throw new Error("Prepared pull request remote no longer names a hosted repository");
-      // The only ref ever pushed is this run's own branch at the approved commit, without force and whatever push.followTags says.
+      // The only ref ever pushed is this run's own branch at the approved commit, whatever push.followTags says, and without force
+      // except when updating a delivered pull request: then only with a lease on the delivered commit, so a push someone else made is never overwritten.
+      // An updated pull request whose commit did not change is not pushed at all.
       // It goes to the URL prepare checked, read once: a remote reconfigured since then, as an Agent can do, is not asked again.
-      if (!attempt("git", ["push", "--no-follow-tags", saved.checked, `${saved.commitHash}:refs/heads/${saved.branch}`], worktree, publishTimeoutMs, undefined, true).ok) return stepFailure("deliver", undefined, "unreachable");
-      saved.pushed = true;
+      if (saved.commitHash !== saved.lease) {
+        const lease = saved.lease ? [`--force-with-lease=refs/heads/${saved.branch}:${saved.lease}`] : [];
+        const sent = attempt("git", ["push", "--no-follow-tags", ...lease, saved.checked, `${saved.commitHash}:refs/heads/${saved.branch}`], worktree, publishTimeoutMs, undefined, true);
+        if (!sent.ok) {
+          if (saved.lease && /\(stale info\)/u.test(sent.detail)) {
+            return stepFailure("deliver", `The branch of pull request ${saved.prUrl} moved on the host after resume found the delivered commit ${saved.lease} at its head, `
+              + `so the push with a lease on that commit was refused and nothing was overwritten; ${saved.branch} holds ${saved.commitHash} locally. Inspect ${join(directory, "git-push.log")}.`);
+          }
+          return stepFailure("deliver", undefined, "unreachable");
+        }
+        saved.pushed = true;
+      }
       if (!saved.prUrl) {
         const body = join(directory, "pull-request.md");
         writeFileSync(body, [
@@ -1205,6 +1257,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       baseCommit: saved.baseCommit || null, commit: saved.commitHash || null, output: repository.output,
       ...(saved.rebasedFrom ? { rebasedFrom: saved.rebasedFrom } : {}),
       ...(finished && saved.redelivered ? { redelivered: true } : {}),
+      // A first delivery opens its pull request; a resumed one updates the one it found, or leaves it as it was when the commit did not change.
+      ...(finished && saved.lease ? { pullRequest: saved.pushed ? "updated" : "unchanged" } : {}),
       ...(saved.assumptions.length ? { assumptions: saved.assumptions } : {}),
       ...(saved.scopeAdditions.length ? { scopeAdditions: saved.scopeAdditions } : {}),
       ...(saved.prUrl ? { prUrl: saved.prUrl } : {}), ...(saved.patches.length ? { patches: saved.patches } : {}),
@@ -1215,6 +1269,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       { delivered: `Delivered ${result}.`, refused: `Refused: ${reasonBrief}`, "handed-off": `Handed off: ${summaryReason(reason, asking(reason))}`, abandoned: `Abandoned: ${reasonBrief}` }[outcome],
       ...(finished && saved.taken ? [saved.redelivered ? "The base has not moved, so the same commit was delivered again unchanged."
         : `The delivered commit ${saved.taken} was replayed onto the new base ${saved.baseCommit}.`] : []),
+      ...(finished && saved.lease ? [saved.pushed ? `The same pull request ${saved.prUrl} was updated in place.`
+        : `The same pull request ${saved.prUrl} was left as it was; nothing was pushed.`] : []),
       ...(saved.decision ? [`Decision: ${saved.decision}.`] : []),
       ...(outcome === "abandoned" ? [`Worktree and ${saved.branch} removed without saving the candidate.`] : []),
       ...(outcome === "handed-off" ? [`Branch: ${saved.branch}.`] : []),
@@ -1762,7 +1818,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   const states = definition.states;
 
   const deliveredMeaning = () => saved.prUrl
-    ? `delivered as pull request #${/\/pull\/(\d+)/u.exec(saved.prUrl)?.[1] ?? saved.prUrl}`
+    ? `delivered as ${saved.lease && saved.pushed ? "updated " : ""}pull request #${/\/pull\/(\d+)/u.exec(saved.prUrl)?.[1] ?? saved.prUrl}`
     : `delivered as ${repository.output === "patch" ? "a patch" : "a branch"}`;
   const stuckMeaning = () => `stuck at ${saved.stoppedIn}, needs you`;
   const reviewMeaning = () => {
