@@ -13,27 +13,27 @@ Names below are source names in `defaults/`. Installation adds the `dev-` prefix
 so these do not replace project-specific names such as `verify`. The twelfth,
 `audit-project`, runs only from this checkout and is absent from `available`.
 
-| Machine | State sequence | Required Agent roles | Maximum Agent calls, default repair budget |
+| Machine | State sequence | Required Agent roles | Maximum Agent calls, default budgets |
 | --- | --- | --- | --- |
 | [verify-checks](../defaults/verify-checks.ts) | local checks -> receipt | none | 0 |
-| [implement-task](../defaults/implement-task.ts) | implement -> checks -> review; bounded repair -> checks -> review | implementer, reviewer | 8 |
-| [fix-bug](../defaults/fix-bug.ts) | regression test -> prove red -> fix -> prove green -> checks -> review; bounded repair | tester, implementer, reviewer | 10 |
-| [refactor](../defaults/refactor.ts) | green baseline -> behavior-preserving change -> checks -> review; bounded repair | implementer, reviewer | 8 |
-| [add-tests](../defaults/add-tests.ts) | green baseline -> focused tests -> checks -> review; bounded repair | tester, reviewer | 8 |
+| [implement-task](../defaults/implement-task.ts) | implement -> checks -> advisory review; bounded repair -> checks -> review | implementer, reviewer | 14 |
+| [fix-bug](../defaults/fix-bug.ts) | regression test -> prove red -> fix -> prove green -> checks -> advisory review; bounded repair | tester, implementer, reviewer | 18 |
+| [refactor](../defaults/refactor.ts) | green baseline -> behavior-preserving change -> checks -> advisory review; bounded repair | implementer, reviewer | 14 |
+| [add-tests](../defaults/add-tests.ts) | green baseline -> focused tests -> checks -> advisory review; bounded repair | tester, reviewer | 14 |
 | [review-code](../defaults/review-code.ts) | read-only review -> unchanged-checkout guard -> findings receipt | reviewer | 2 |
 | [audit-project](../defaults/audit-project.ts) | inventory -> judge -> report -> Human decision -> apply -> discovery | analyst | 2 |
 | [retrospective](../defaults/retrospective.ts) | read evidence -> classify stops -> validate and report; one malformed-report retry | analyst | 2 |
-| [investigate](../defaults/investigate.ts) | investigate -> unchanged guard -> challenge evidence; bounded research revision | investigator, reviewer | 8 |
-| [update-docs](../defaults/update-docs.ts) | docs/examples change -> explicit validation -> source-consistency review; bounded repair | writer, reviewer | 8 |
+| [investigate](../defaults/investigate.ts) | investigate -> unchanged guard -> challenge evidence; advisory challenge delivered | investigator, reviewer | 4 |
+| [update-docs](../defaults/update-docs.ts) | docs/examples change -> explicit validation -> source-consistency advisory review; bounded repair | writer, reviewer | 14 |
 | [upgrade-dependency](../defaults/upgrade-dependency.ts) | green baseline -> compatibility proposal -> Human approval -> upgrade -> checks -> review; bounded repair | analyst, implementer, reviewer | 10 |
 | [prepare-release](../defaults/prepare-release.ts) | checks -> readiness assessment/release-note draft -> Human sign-off -> receipt | reviewer | 2 |
 
 With no repairs, most editing tasks use two Agent calls, bugfix and dependency
 upgrade use three, and investigation uses two. `maxRepairs` defaults to 1 and can
-be 0–3. Each retry returns through the real checks and review, rather than accepting
-an Agent's claim. The table includes one malformed-report send-back per stage entry. These are invocation ceilings, not token/dollar limits. A harness
+be 0–3. Each editing retry returns through the real checks and review, rather than accepting
+an Agent's claim. The five advisory editing defaults have a separate review budget of 1. The table includes one malformed-report send-back per stage entry, one scope recovery per editing stage, and one base verification recovery per run. These are invocation ceilings, not token/dollar limits. A harness
 can make multiple model/tool calls inside one invocation; its own limits still apply.
-Use `maxRepairs: 0` for the cheapest one-pass behavior. Model selection is never
+Use `maxRepairs: 0` and `maxReviewRounds: 0` to disable check and review retries. Model selection is never
 hardcoded; resolve the role bindings from the target project's `machine agents`.
 
 `investigate` covers diagnosis, codebase/architecture questions, technical research,
@@ -42,12 +42,42 @@ security concern; it is not a security certification. For UI, performance, datab
 or domain-specific work, adapt the selected workflow with real project checks.
 Production migrations and publishing are deliberately not generic defaults.
 
+## Advisory review
+
+`implement-task`, `fix-bug`, `refactor`, `add-tests`, and `update-docs` use advisory
+review. Reviewers return `findings: [{severity, kind?, text, where}]`; severity is
+`blocker`, `minor`, or `discussion`. Only blockers of kind `acceptance`,
+`regression`, or `safety` request a revision. `other` and missing kinds are advisory.
+An unstructured `revise` gets one send-back and then becomes a discussion note.
+Review revisions spend `maxReviewRounds`, independently of failed-check repairs.
+Once the review budget is spent, green checks allow `completed`, with standing
+findings retained as `reviewNotes` and `needs`. Required checks still gate success.
+`investigate` delivers one report and one advisory challenge, including objections
+under `## Challenge` when the challenger revises; it never loops on disagreement.
+
+Editing Agents decide reversible questions, report assumptions and scope additions,
+and run only the tests for their changes. The workflow runs required checks.
+Structured mechanical needs are checked by Operations: a named `baseFailing`
+check runs once in a temporary detached worktree at the start commit, with ignored
+dependency directories linked from the candidate. Confirmed failure ends `blocked`
+with the base log and no further Agent call; a refuted or unrunnable claim returns
+the evidence to the Agent once. Scope needs outside the task's `## Scope` bullets
+become scope additions, with one continuation per editing stage. See each workflow
+page for the report shapes and bounds. Reviewers' real blockers and integrity
+failures still stop. `upgrade-dependency` and `prepare-release` keep Human approval.
+
 ## Recovery
 
 Ticket recovery, stop evidence and replay policy are documented in
 [ticket-task](workflows/ticket-task.md#continuing-a-stop).
 
 ### Failed checks
+
+Both serial and grouped check runners capture up to 16 MiB per stream. A 2 MiB
+successful check passes normally. Exceeding the limit records a failed check
+with `overflow: "output exceeded 16 MiB"`, not a spawn error. Captured output is
+retained in the log, and repair feedback names the overflow even if the process
+was killed. All other exit-code, timeout, diagnostic and rerun rules are unchanged.
 
 After every gate has run, the shared check Operation runs each failed gate
 once more by itself. A gate that passes then counts as passed: both attempts
@@ -218,10 +248,15 @@ MCP/CLI `cwd` selects discovery/presets and must be set to that same project.
 
 All editing defaults and release preparation require a clean checkout with a
 commit before execution. Commit or otherwise preserve setup changes deliberately,
-and use an isolated worktree for concurrent edits. These defaults do not create
-worktrees or commit their results. Read-only review and investigation allow a
+and use an isolated worktree for concurrent edits. These defaults do not create candidate
+worktrees or commit their results; base-failure verification uses a temporary detached worktree. Read-only review and investigation allow a
 dirty checkout and verify its tracked/nonignored contents stay unchanged.
 `verify-checks` also works outside Git and accepts existing directories.
+
+`maxReviewRounds` accepts 0–5 and defaults to 1 for the six advisory defaults
+(investigate accepts it but does not loop), and 2 elsewhere. `maxRepairs` accepts
+0–3 and defaults to 1; in the five advisory editing defaults it covers only failed
+checks and a still-red regression, not review disagreements.
 
 `checks` must contain 1–20 uniquely named checks for editing, verification, and
 release workflows. Omit it (or use `[]`) for review/investigation; those workflows
@@ -229,7 +264,7 @@ reject nonempty checks rather than silently ignoring them. Check commands are
 executable/argv arrays with no implicit shell. They run in `workspace` in the
 given order unless a group is declared, even after a failure, so that one repair round
 sees each failing gate; each has a default 60-second timeout (maximum 10 minutes
-per check) and a 1 MiB output buffer per stream. Timeouts, missing executables, and excessive output are
+per check) and a 16 MiB output buffer per stream. Timeouts, missing executables, and excessive output are
 failures, not passes. The direct process is killed on timeout; do not use commands
 that detach work or leave daemons/descendants behind.
 
@@ -335,6 +370,13 @@ receipt at `.machine-runs/machine-shop/<id>/result.json`. The output includes
 `outcome`, `checksPassed`, repairs, invocation count, check exit codes/log paths,
 stage summaries, explicit Human decisions, and its own `report` path. Workers
 receive the exact evidence directory, so reviews need not guess which run to inspect.
+The six advisory defaults also return `reviewNotes` (last structured findings),
+`needs` (standing defects as `{kind: "review", text, paths?}`), `assumptions`
+(`{question, answer, why}`), and `scopeAdditions` (`{path, why}`, deduplicated by path).
+`investigate` adds `investigation` (the delivered Markdown path) and `challenged`
+(boolean). `report` remains the JSON receipt path. Completed work can still have
+review notes and needs; inspect them before using the result.
+
 Keep `.machine-runs/` ignored and local; logs can contain private project data.
 
 | Result | Meaning |

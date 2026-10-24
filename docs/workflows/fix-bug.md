@@ -7,13 +7,45 @@ The bug has to be caught on camera before anyone fixes it. A tester writes a reg
 | | |
 | --- | --- |
 | Agent roles | `tester`, `implementer`, `reviewer` |
-| Agent calls, at most | 10 at the default budget |
+| Agent calls, at most | 18 at the default budgets |
 | Checkout | clean |
 | Source | [fix-bug.ts](../../defaults/fix-bug.ts) |
 
 Malformed Agent reports use [report recovery](../catalog.md#recovery): one
 send-back to the same role with the exact fault, retained in stage evidence.
-The call ceiling includes these send-backs; repair and review budgets are unchanged.
+The call ceiling includes these send-backs and the bounded mechanical recovery calls.
+
+## Advisory review
+
+The Agent decides reversible questions and reports `assumptions` as
+`[{question, answer, why}]` and `scopeAdditions` as `[{path, why}]`. It runs only
+tests for what it changed; the workflow runs every required check.
+
+Review findings are `{severity, kind?, text, where}`. Only a `blocker` whose
+`kind` is `acceptance`, `regression`, or `safety` requests a revision. Missing
+`kind` counts as `other`; other findings are advisory. An unstructured `revise`
+gets one send-back, then stands as a discussion note. `maxReviewRounds` defaults
+to 1 and counts revision cycles separately from failed-check `maxRepairs`.
+When review rounds run out with green checks, the result is `completed`.
+`reviewNotes` holds the last findings; `needs` holds standing defects as
+`{kind: "review", text, paths?}`. These fields, `assumptions`, and `scopeAdditions`
+are included in the receipt even when empty.
+
+A mechanical `blocked` can name `needs: [{kind: "baseFailing", text, check}]`.
+The workflow runs only that configured check, whole and once, in a temporary
+detached worktree at the start commit. Ignored dependency directories are linked
+from the candidate and removed as links during cleanup. A confirmed nonzero
+exit ends `blocked` with the base failure and log path, without another Agent
+call. A passing or unrunnable base check returns its evidence to the Agent once.
+A `needs: [{kind: "scope", text, paths}]` outside the task's `## Scope` bullets
+(or without stated Scope) becomes a scope addition and returns to the Agent.
+Scope recovery is allowed once per editing stage; base verification once per run.
+A repeated mechanical block or a need requiring a person remains `blocked`.
+The candidate is never switched in place. Direct defaults have no setup input;
+a custom caller can supply setup commands through the shared runner's policy.
+
+The regression and fix always use separate Agent calls. There is no `testsFirst`
+input or task-text switch; the red check remains mandatory.
 
 ## Input
 
@@ -26,7 +58,8 @@ Unknown fields are refused.
 | `workspace` | yes | — | Absolute path to the project's Git checkout root, not a subdirectory. |
 | `checks` | yes, 1–20 | — | Commands to run, in order, as `{ name, command, timeoutMs }`. `command` is an argv array with no shell; `timeoutMs` defaults to 60000 and caps at 600000. Every selected check runs even after one fails. |
 | `rerunFailedChecks` | no | `true` | Run each failed gate once more, alone, after all gates have run. A passing rerun is marked `flaky`, with both logs kept and no repair round used. Set `false` to require first-time passes. |
-| `maxRepairs` | no | `1` | How many more rounds a failed check or a `revise` review may get, 0–3. |
+| `maxRepairs` | no | `1` | Additional failed-check repairs, 0–3; independent of review revisions. |
+| `maxReviewRounds` | no | `1` | Additional review revision cycles, 0–5. Green checks permit completion when exhausted. |
 | `regression` | yes | — | The command that reproduces the bug: `{ name, command, timeoutMs, failureExitCode, failureIncludes }`. Before the fix it must exit with `failureExitCode` (1–125) and print `failureIncludes`; after the fix it must exit 0. |
 
 From [examples/bugfix.json](../../examples/bugfix.json):
@@ -85,22 +118,29 @@ flowchart TD
   review(["🤖 <b>review</b> · reviewer<br/>cause fixed, or test disabled?"])
   result["⚙️ <b>reviewResult</b>"]
   budget["⚙️ <b>repairBudget</b>"]
+  reviews["⚙️ <b>reviewBudget</b><br/>maxReviewRounds, default 1"]
   done(("✅ completed"))
   blocked(("⛔ blocked"))
 
   start --> write
   write -->|completed| red
-  write -->|blocked| blocked
+  write -->|blocked| writeBlock["⚙️ inspect mechanical need"]
+  writeBlock -->|scope addition or base claim refuted/unrunnable| write
+  writeBlock -->|confirmed base failure or real blocker| blocked
   red -->|"failed as promised"| fix
   red -->|"did not reproduce"| blocked
   fix -->|completed| green
-  fix -->|blocked| blocked
+  fix -->|blocked| fixBlock["⚙️ inspect mechanical need"]
+  fixBlock -->|scope addition or base claim refuted/unrunnable| fix
+  fixBlock -->|confirmed base failure or real blocker| blocked
   green -->|passed| verify
   green -->|failed| budget
   verify -->|passed| review --> result
   verify -->|failed| budget
   result -->|approved| done
-  result -->|revise| budget
+  result -->|actionable defect| reviews
+  reviews -->|retry| fix
+  reviews -->|exhausted with green checks| done
   result -->|"blocked, or checkout changed"| blocked
   budget -->|retry| fix
   budget -->|exhausted| blocked
@@ -111,7 +151,7 @@ flowchart TD
   classDef good fill:#dcfce7,stroke:#16a34a,color:#0f172a
   classDef bad fill:#fee2e2,stroke:#dc2626,color:#0f172a
   class write,fix,review agent
-  class start,result,budget op
+  class start,result,budget,reviews op
   class red,green,verify gate
   class done good
   class blocked bad
@@ -123,8 +163,8 @@ Every end writes `.machine-runs/machine-shop/<id>/result.json` and returns the
 same JSON: `outcome`, `checksPassed`, repairs, Agent calls, check exit codes and
 log paths, and each stage's summary.
 
-- ✅ **`done`**, `outcome: completed`: red, then green, checks passed, and the reviewer approved.
-- ⛔ **`blocked`**, `outcome: blocked`: the regression did not reproduce, an Agent blocked, or the budget ran out.
+- ✅ **`done`**, `outcome: completed`: red, then green, checks passed, and advisory review finished.
+- ⛔ **`blocked`**, `outcome: blocked`: the regression did not reproduce, an Agent blocked, or the failed-check repair budget ran out.
 
 Read the final state and `outcome`, not only the exit code. The catalog's
 [results](../catalog.md#human-decisions-and-results) section has every field.

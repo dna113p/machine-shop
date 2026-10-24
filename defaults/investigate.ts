@@ -6,12 +6,12 @@ export const agentRoles = { investigator: "Investigates the scoped question with
 
 export default function investigate(p: MachinePrimitives, input: unknown) {
   const { machine, operation, agent } = p;
-  const work = taskRun("investigate", input, { git: "snapshot" });
+  const work = taskRun("investigate", input, { trusted: true, git: "snapshot" });
   return machine({
     initial: "start", output: work.output,
     states: {
       start: operation(work.start, { started: "investigate" }),
-      investigate: agent(() => work.prompt("Investigate this question without editing the checkout. Read actual code and relevant primary sources available within scope. Return evidence, plausible alternatives, uncertainties, a recommendation or diagnosis, and the smallest discriminating next step. Do not claim an unperformed experiment succeeded.", "investigation"), {
+      investigate: agent(() => work.prompt("Investigate this question without editing the checkout. Read actual code and relevant primary sources available within scope. Return evidence, plausible alternatives, uncertainties, a recommendation or diagnosis, and the smallest discriminating next step. Do not claim an unperformed experiment succeeded.", "investigation", { trusted: "investigator" }), {
         completed: { target: "investigateReport", actions: ({ event }: { event: Event }) => work.receive(event) },
         blocked: { target: "investigateReport", actions: ({ event }: { event: Event }) => work.receive(event) },
       }, { using: "investigator", cwd: work.workspace }),
@@ -23,8 +23,8 @@ export default function investigate(p: MachinePrimitives, input: unknown) {
         blocked: { target: "challengeReport", actions: ({ event }: { event: Event }) => work.receive(event) },
       }, { using: "reviewer", cwd: work.workspace }),
       challengeReport: operation(() => work.reported("challenge"), { sendBack: "challenge", approved: "challengeResult", revise: "challengeResult", blocked: "challengeResult" }),
-      challengeResult: operation(work.review, { approved: "success", revise: "repairBudget", blocked: "failure" }),
-      repairBudget: operation(work.repair, { retry: "investigate", exhausted: "failure" }),
+      challengeResult: operation(work.review, { approved: "deliver", revise: "deliver", blocked: "failure" }),
+      deliver: operation(work.deliverInvestigation, { delivered: "success" }),
       ...resultStates(work, p),
     },
   });

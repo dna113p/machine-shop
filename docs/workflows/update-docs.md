@@ -7,13 +7,42 @@ A writer reads the source of truth and checks every command and API name it docu
 | | |
 | --- | --- |
 | Agent roles | `writer`, `reviewer` |
-| Agent calls, at most | 8 at the default budget |
+| Agent calls, at most | 14 at the default budgets |
 | Checkout | clean |
 | Source | [update-docs.ts](../../defaults/update-docs.ts) |
 
 Malformed Agent reports use [report recovery](../catalog.md#recovery): one
 send-back to the same role with the exact fault, retained in stage evidence.
-The call ceiling includes these send-backs; repair and review budgets are unchanged.
+The call ceiling includes these send-backs and the bounded mechanical recovery calls.
+
+## Advisory review
+
+The Agent decides reversible questions and reports `assumptions` as
+`[{question, answer, why}]` and `scopeAdditions` as `[{path, why}]`. It runs only
+tests for what it changed; the workflow runs every required check.
+
+Review findings are `{severity, kind?, text, where}`. Only a `blocker` whose
+`kind` is `acceptance`, `regression`, or `safety` requests a revision. Missing
+`kind` counts as `other`; other findings are advisory. An unstructured `revise`
+gets one send-back, then stands as a discussion note. `maxReviewRounds` defaults
+to 1 and counts revision cycles separately from failed-check `maxRepairs`.
+When review rounds run out with green checks, the result is `completed`.
+`reviewNotes` holds the last findings; `needs` holds standing defects as
+`{kind: "review", text, paths?}`. These fields, `assumptions`, and `scopeAdditions`
+are included in the receipt even when empty.
+
+A mechanical `blocked` can name `needs: [{kind: "baseFailing", text, check}]`.
+The workflow runs only that configured check, whole and once, in a temporary
+detached worktree at the start commit. Ignored dependency directories are linked
+from the candidate and removed as links during cleanup. A confirmed nonzero
+exit ends `blocked` with the base failure and log path, without another Agent
+call. A passing or unrunnable base check returns its evidence to the Agent once.
+A `needs: [{kind: "scope", text, paths}]` outside the task's `## Scope` bullets
+(or without stated Scope) becomes a scope addition and returns to the Agent.
+Scope recovery is allowed once per editing stage; base verification once per run.
+A repeated mechanical block or a need requiring a person remains `blocked`.
+The candidate is never switched in place. Direct defaults have no setup input;
+a custom caller can supply setup commands through the shared runner's policy.
 
 ## Input
 
@@ -26,7 +55,8 @@ Unknown fields are refused.
 | `workspace` | yes | — | Absolute path to the project's Git checkout root, not a subdirectory. |
 | `checks` | yes, 1–20 | — | Commands to run, in order, as `{ name, command, timeoutMs }`. `command` is an argv array with no shell; `timeoutMs` defaults to 60000 and caps at 600000. Every selected check runs even after one fails. |
 | `rerunFailedChecks` | no | `true` | Run each failed gate once more, alone, after all gates have run. A passing rerun is marked `flaky`, with both logs kept and no repair round used. Set `false` to require first-time passes. |
-| `maxRepairs` | no | `1` | How many more rounds a failed check or a `revise` review may get, 0–3. |
+| `maxRepairs` | no | `1` | Additional failed-check repairs, 0–3; independent of review revisions. |
+| `maxReviewRounds` | no | `1` | Additional review revision cycles, 0–5. Green checks permit completion when exhausted. |
 
 From [examples/implementation.json](../../examples/implementation.json):
 
@@ -73,16 +103,21 @@ flowchart TD
   review(["🤖 <b>review</b> · reviewer<br/>do the docs match the code?"])
   result["⚙️ <b>reviewResult</b>"]
   budget["⚙️ <b>repairBudget</b>"]
+  reviews["⚙️ <b>reviewBudget</b><br/>maxReviewRounds, default 1"]
   done(("✅ completed"))
   blocked(("⛔ blocked"))
 
   start --> change
   change -->|completed| verify
-  change -->|blocked| blocked
+  change -->|blocked| changeBlock["⚙️ inspect mechanical need"]
+  changeBlock -->|scope addition or base claim refuted/unrunnable| change
+  changeBlock -->|confirmed base failure or real blocker| blocked
   verify -->|passed| review --> result
   verify -->|failed| budget
   result -->|approved| done
-  result -->|revise| budget
+  result -->|actionable defect| reviews
+  reviews -->|retry| change
+  reviews -->|exhausted with green checks| done
   result -->|"blocked, or checkout changed"| blocked
   budget -->|retry| change
   budget -->|exhausted| blocked
@@ -93,7 +128,7 @@ flowchart TD
   classDef good fill:#dcfce7,stroke:#16a34a,color:#0f172a
   classDef bad fill:#fee2e2,stroke:#dc2626,color:#0f172a
   class change,review agent
-  class start,result,budget op
+  class start,result,budget,reviews op
   class verify gate
   class done good
   class blocked bad
@@ -105,8 +140,8 @@ Every end writes `.machine-runs/machine-shop/<id>/result.json` and returns the
 same JSON: `outcome`, `checksPassed`, repairs, Agent calls, check exit codes and
 log paths, and each stage's summary.
 
-- ✅ **`done`**, `outcome: completed`: checks passed and the reviewer approved.
-- ⛔ **`blocked`**, `outcome: blocked`: an Agent blocked or the budget ran out.
+- ✅ **`done`**, `outcome: completed`: checks passed and advisory review finished.
+- ⛔ **`blocked`**, `outcome: blocked`: an Agent blocked or the failed-check repair budget ran out.
 
 Read the final state and `outcome`, not only the exit code. The catalog's
 [results](../catalog.md#human-decisions-and-results) section has every field.

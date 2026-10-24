@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -247,20 +247,97 @@ test("read-only workflows refuse rerunFailedChecks, since they run no checks", c
   assert.equal(existsSync(join(cwd, ".machine-runs")), false);
 });
 
-test("review feedback causes fresh checks and another review", async context => {
+/** A blocking review finding of one kind; a kind left out stands for `other`. */
+const blocker = (text: string, kind?: string) => ({ severity: "blocker", ...(kind === undefined ? {} : { kind }), text, where: "code.txt:1" });
+const revise = (summary: string, findings: unknown[]) => ({ type: "revise", summary, findings });
+
+test("a regression blocker in review causes one repair, fresh checks and another review", async context => {
   const cwd = repo(context); let edits = 0; let reviews = 0;
   const result = await execute("implement-task", input(cwd), {
     implementer: request => { if (++edits === 2) assert.match(request.prompt, /Handle the empty case/u); return ok(); },
-    reviewer: () => ++reviews === 1 ? ok("revise", "Handle the empty case") : ok("approved"),
+    reviewer: () => ++reviews === 1 ? revise("Handle the empty case", [blocker("Handle the empty case", "regression")]) : ok("approved"),
   });
-  assert.equal(result.state, "done"); assert.equal(edits, 2); assert.equal(reviews, 2);
+  assert.equal(result.state, "done", result.output?.reason); assert.equal(edits, 2); assert.equal(reviews, 2);
   assert.equal(result.output.checks.length, 2);
+  assert.deepEqual([result.output.repairs, result.output.reviewRounds], [0, 1]);
 });
 
-test("repeated review findings cannot create an unbounded loop", async context => {
+test("a review blocker that stands after the one review round ends completed with green checks, its findings in reviewNotes and needs", async context => {
   const cwd = repo(context);
-  const result = await execute("implement-task", input(cwd), { implementer: () => ok(), reviewer: () => ok("revise") });
-  assert.equal(result.state, "blocked"); assert.equal(result.output.agentInvocations, 4);
+  const result = await execute("implement-task", input(cwd), {
+    implementer: () => ok(), reviewer: () => revise("Handle the empty case", [blocker("Handle the empty case", "regression")]),
+  });
+  assert.equal(result.state, "done", result.output?.reason); assert.equal(result.output.outcome, "completed");
+  assert.equal(result.output.checksPassed, true); assert.equal(result.output.agentInvocations, 4);
+  assert.deepEqual([result.output.repairs, result.output.reviewRounds], [0, 1]);
+  assert.ok(Array.isArray(result.output.reviewNotes) && JSON.stringify(result.output.reviewNotes).includes("Handle the empty case"), "the standing finding is in reviewNotes");
+  assert.ok(Array.isArray(result.output.needs) && JSON.stringify(result.output.needs).includes("Handle the empty case"), "the standing finding is in needs");
+  assert.deepEqual(JSON.parse(readFileSync(result.output.report, "utf8")), result.output);
+});
+
+for (const kind of ["other", undefined]) {
+  test(`implement-task: a review whose one blocker is ${kind === undefined ? "without a kind" : `kind ${kind}`} is advisory: the run completes with that finding in reviewNotes, without a repair`, async context => {
+    const cwd = repo(context); let edits = 0; let reviews = 0;
+    const result = await execute("implement-task", input(cwd), {
+      implementer: () => { edits++; writeFileSync(join(cwd, "change.txt"), "change"); return ok(); },
+      reviewer: () => { reviews++; return revise("Rename the helper", [blocker("Rename the helper for clarity", kind)]); },
+    });
+    assert.equal(result.state, "done", result.output?.reason); assert.equal(result.output.outcome, "completed");
+    assert.equal(result.output.checksPassed, true);
+    assert.deepEqual([edits, reviews, result.output.agentInvocations, result.output.repairs, result.output.reviewRounds], [1, 1, 2, 0, 0]);
+    const notes = result.output.reviewNotes as { severity: string; text: string }[];
+    assert.ok(Array.isArray(notes), "the result has reviewNotes");
+    assert.ok(notes.some(note => note.severity === "blocker" && note.text === "Rename the helper for clarity"), JSON.stringify(notes));
+    assert.equal(result.output.reason, "");
+    assert.deepEqual(JSON.parse(readFileSync(result.output.report, "utf8")).reviewNotes, notes);
+  });
+}
+
+for (const kind of ["acceptance", "regression", "safety"]) {
+  for (const second of ["approved", "revise"]) {
+    test(`implement-task: a blocker of kind ${kind} repairs once, then the run ends completed when the second review is ${second}`, async context => {
+      const cwd = repo(context); const prompts: string[] = []; let reviews = 0;
+      const text = `The ${kind} defect at code.txt:1`;
+      const result = await execute("implement-task", input(cwd), {
+        implementer: request => { prompts.push(request.prompt); writeFileSync(join(cwd, "change.txt"), String(prompts.length)); return ok(); },
+        reviewer: () => ++reviews === 1 || second === "revise" ? revise(text, [blocker(text, kind)]) : ok("approved"),
+      });
+      assert.equal(result.state, "done", result.output?.reason); assert.equal(result.output.outcome, "completed");
+      assert.equal(result.output.checksPassed, true);
+      assert.deepEqual([prompts.length, reviews, result.output.agentInvocations, result.output.repairs, result.output.reviewRounds], [2, 2, 4, 0, 1]);
+      assert.ok(prompts[1]!.includes(text), "the repair prompt carries the blocker");
+      if (second === "revise") {
+        assert.ok(JSON.stringify(result.output.reviewNotes ?? []).includes(text), "the standing blocker is in reviewNotes");
+        assert.ok(JSON.stringify(result.output.needs ?? []).includes(text), "the standing blocker is in needs");
+      }
+    });
+  }
+}
+
+test("an unstructured revise goes back to the reviewer once, and a second one stands as advisory notes", async context => {
+  const cwd = repo(context); let edits = 0; const prompts: string[] = [];
+  const result = await execute("implement-task", input(cwd), {
+    implementer: () => { edits++; writeFileSync(join(cwd, "change.txt"), "change"); return ok(); },
+    reviewer: request => { prompts.push(request.prompt); return ok("revise", "Consider the empty case"); },
+  });
+  assert.equal(result.state, "done", result.output?.reason); assert.equal(result.output.outcome, "completed");
+  assert.deepEqual([edits, prompts.length, result.output.repairs, result.output.reviewRounds], [1, 2, 0, 0]);
+  assert.doesNotMatch(prompts[0]!, /Your last report was malformed/u);
+  assert.match(prompts[1]!, /Your last report was malformed/u);
+  assert.ok(JSON.stringify(result.output.reviewNotes ?? []).includes("Consider the empty case"), "the revise stands as a note");
+});
+
+test("an editing report's assumptions and scopeAdditions are carried into the result", async context => {
+  const cwd = repo(context);
+  const assumption = { question: "Which locale?", answer: "en-US, as the fixtures use", why: "Reversible: one constant" };
+  const addition = { path: "docs/guide.md", why: "The guide documents the changed behaviour" };
+  const result = await execute("implement-task", input(cwd), {
+    implementer: () => { writeFileSync(join(cwd, "change.txt"), "change"); return { ...ok(), assumptions: [assumption], scopeAdditions: [addition] }; },
+    reviewer: () => ok("approved"),
+  });
+  assert.equal(result.state, "done", result.output?.reason);
+  assert.deepEqual(result.output.assumptions, [assumption]);
+  assert.deepEqual(result.output.scopeAdditions, [addition]);
 });
 
 test("a reviewer changing the checkout cannot approve stale checks", async context => {
@@ -293,14 +370,29 @@ test("read-only review detects changed untracked content", async context => {
   assert.equal(result.state, "blocked");
 });
 
-test("investigation is evidence-challenged and bounded", async context => {
-  const cwd = repo(context); let investigations = 0; let reviews = 0;
-  const result = await execute("investigate", input(cwd, { checks: [] }), {
-    investigator: request => { if (++investigations === 2) assert.match(request.prompt, /Check the call site/u); return ok(); },
-    reviewer: () => ++reviews === 1 ? ok("revise", "Check the call site") : ok("approved"),
+for (const verdict of ["revise", "approved"]) {
+  test(`investigate delivers the investigator's report in one round when the challenger returns ${verdict}${verdict === "revise" ? ", with the challenge appended" : ""}`, async context => {
+    const cwd = repo(context); let investigations = 0; let reviews = 0;
+    const report = "The cause is the cache key at code.txt:1";
+    const challenge = "Check the call site before blaming the cache";
+    const result = await execute("investigate", input(cwd, { checks: [] }), {
+      investigator: () => { investigations++; return ok("completed", report); },
+      reviewer: () => { reviews++; return verdict === "revise" ? ok("revise", challenge) : ok("approved", "The report is qualified"); },
+    });
+    assert.equal(result.state, "done", result.output?.reason); assert.equal(result.output.outcome, "completed");
+    assert.deepEqual([investigations, reviews, result.output.agentInvocations], [1, 1, 2]);
+    assert.equal(result.output.challenged, verdict === "revise");
+    assert.equal(typeof result.output.investigation, "string", "the result names the delivered report");
+    const delivered = readFileSync(result.output.investigation, "utf8");
+    assert.ok(delivered.includes(report), delivered);
+    const appended = section(delivered, "Challenge");
+    if (verdict === "revise") {
+      assert.ok(appended !== undefined && appended.includes(challenge), delivered);
+      assert.ok(delivered.indexOf(report) < delivered.indexOf("## Challenge"), "the challenge follows the report");
+    } else assert.equal(appended, undefined, delivered);
+    assert.deepEqual(JSON.parse(readFileSync(result.output.report, "utf8")), result.output);
   });
-  assert.equal(result.state, "done"); assert.equal(investigations, 2); assert.equal(reviews, 2);
-});
+}
 
 test("investigation source edits block before a second agent runs", async context => {
   const cwd = repo(context);
@@ -457,13 +549,13 @@ test("a default sends back once per entry into a stage: a later entry gets its o
       if (prompts.length % 2 === 1) return { type: "completed", summary: " " };
       writeFileSync(join(cwd, "change.txt"), String(prompts.length)); return ok();
     },
-    reviewer: () => ++reviews === 1 ? ok("revise", "Handle the empty case") : ok("approved"),
+    reviewer: () => ++reviews === 1 ? revise("Handle the empty case", [blocker("Handle the empty case", "regression")]) : ok("approved"),
   });
   assert.equal(result.state, "done", result.output?.reason);
   assert.deepEqual([prompts.length, reviews], [4, 2]);
   for (const index of [1, 3]) assert.ok(prompts[index]!.includes(sentBack(summaryFault("change"))), `call ${index + 1}`);
   assert.doesNotMatch(prompts[2]!, /Your last report was malformed/u);
-  assert.deepEqual([result.output.repairs, result.output.reviewRounds], [1, 0]);
+  assert.deepEqual([result.output.repairs, result.output.reviewRounds], [0, 1]);
 });
 
 test("the shared send-back helper is part of every task run", context => {
@@ -563,7 +655,7 @@ for (const [label, check] of [
   ["nonzero exit", command("process.exit(2)")],
   ["missing executable", { name: "missing", command: ["/definitely/missing/dev-machine-test"] }],
   ["timeout", command("setInterval(()=>{},100)", { timeoutMs: 25 })],
-  ["excess output", command('process.stdout.write("x".repeat(2*1024*1024))')],
+  ["excess output", command('process.stdout.write("x".repeat(20*1024*1024))')],
 ]) {
   test(`verify-checks records ${label} and fails its run`, async context => {
     const cwd = repo(context);
@@ -780,12 +872,13 @@ test("reopen clears the accepted latch so drift counts again, reopen(true) recor
 });
 
 for (const maxReviewRounds of [0, 5]) {
-  test(`defaults accept maxReviewRounds ${maxReviewRounds} while retaining their existing repair budget`, async context => {
+  test(`implement-task spends maxReviewRounds ${maxReviewRounds} on a standing review blocker, not its repair budget, and then completes`, async context => {
     const result = await execute("implement-task", input(repo(context), { maxRepairs: 1, maxReviewRounds }), {
-      implementer: () => ok(), reviewer: () => ok("revise"),
+      implementer: () => ok(), reviewer: () => revise("Handle the empty case", [blocker("Handle the empty case", "acceptance")]),
     });
-    assert.equal(result.state, "blocked"); assert.equal(result.output.repairs, 1); assert.equal(result.output.reviewRounds, 0);
-    assert.match(result.output.reason, /Repair budget exhausted \(1\)/u);
+    assert.equal(result.state, "done", result.output?.reason); assert.equal(result.output.outcome, "completed");
+    assert.deepEqual([result.output.repairs, result.output.reviewRounds, result.output.agentInvocations], [0, maxReviewRounds, 2 + 2 * maxReviewRounds]);
+    assert.ok(JSON.stringify(result.output.needs ?? []).includes("Handle the empty case"));
   });
 }
 
@@ -1088,4 +1181,257 @@ test("an aborted group kills its children without starting serial reruns or late
   assert.equal(existsSync(marker), false);
   assert.equal(saved.checkRounds.length, 0);
   assert.equal(saved.lastChecksPassed, null);
+});
+
+// Mechanical blocks: a claimed base failure is verified on the start commit, and a scope miss is a scope addition.
+
+/** An editing Agent's claim that a check already fails on the unchanged checkout. */
+const baseFailing = (check = "tests") => ({ type: "blocked", summary: `The ${check} check already fails on the unchanged checkout, before any change of mine`,
+  needs: [{ kind: "baseFailing", text: `${check} fails on the unchanged checkout`, check }] });
+const worktrees = (cwd: string) => git(cwd, "worktree", "list", "--porcelain").split("\n").filter(line => line.startsWith("worktree "));
+
+test("an implementer's blocked saying the checks fail on the unchanged checkout, where they do, ends blocked naming the base failure with no second Agent call", async context => {
+  const cwd = repo(context); const head = git(cwd, "rev-parse", "HEAD"); let calls = 0;
+  // Prints where it ran: the base check runs in a separate checkout of the start commit, not in the candidate.
+  const gate = command('console.log(process.cwd()); process.exit(require("fs").readFileSync("code.txt", "utf8") === "fixed" ? 0 : 1)');
+  const result = await execute("implement-task", input(cwd, { checks: [gate] }), {
+    implementer: () => { calls++; writeFileSync(join(cwd, "code.txt"), "fixed"); return baseFailing(); },
+    reviewer: () => assert.fail("no review after a confirmed base failure"),
+  });
+  assert.equal(result.state, "blocked"); assert.equal(result.output.outcome, "blocked");
+  assert.equal(calls, 1, "no second Agent call");
+  const reason = result.output.reason as string;
+  assert.match(reason, /\bbase\b/iu, reason);
+  assert.match(reason, /unchanged|start commit/iu, reason);
+  assert.ok(reason.includes("tests"), reason);
+  const log = /(\/\S+\.log)\b/u.exec(reason)?.[1];
+  assert.ok(log && existsSync(log), `the reason names the base check's log: ${reason}`);
+  assert.notEqual(readFileSync(log, "utf8").trim(), cwd, "the base check did not run in the candidate checkout");
+  // The candidate is kept as it was, and the temporary checkout is gone.
+  assert.equal(git(cwd, "rev-parse", "HEAD"), head);
+  assert.equal(readFileSync(join(cwd, "code.txt"), "utf8"), "fixed");
+  assert.equal(worktrees(cwd).length, 1, worktrees(cwd).join("\n"));
+});
+
+/** A run whose check passes on the start commit and fails only on what the implementer's first call left, which the second call puts back. */
+async function refuted(context: TestContext, prepare: (cwd: string) => void, gate: Record<string, unknown>) {
+  const cwd = repo(context); prepare(cwd); const prompts: string[] = [];
+  const result = await execute("implement-task", input(cwd, { checks: [gate] }), {
+    implementer: request => {
+      if (prompts.push(request.prompt) === 1) { writeFileSync(join(cwd, "code.txt"), "broken"); return baseFailing(); }
+      writeFileSync(join(cwd, "code.txt"), "old"); writeFileSync(join(cwd, "change.txt"), "change"); return ok();
+    },
+    reviewer: () => ok("approved"),
+  });
+  assert.equal(result.state, "done", result.output?.reason); assert.equal(result.output.outcome, "completed");
+  assert.equal(prompts.length, 2, "the Agent is asked once more");
+  assert.doesNotMatch(prompts[0]!, /Current failure/u);
+  assert.equal(worktrees(cwd).length, 1, worktrees(cwd).join("\n"));
+  return { cwd, result, prompts };
+}
+
+test("an implementer's blocked saying the checks fail on the unchanged checkout, where they pass, asks the Agent once more with the evidence", async context => {
+  const { result, prompts } = await refuted(context, () => {}, command('process.exit(require("fs").readFileSync("code.txt", "utf8") === "old" ? 0 : 1)'));
+  const base = (result.output.checks as (Entry & { phase: string })[]).find(entry => entry.phase === "base");
+  assert.ok(base, "the base check is in the receipt");
+  assert.equal(base.passed, true);
+  assert.ok(prompts[1]!.includes(base.log), "the second prompt points at the base check's log");
+});
+
+test("the base check runs with the candidate's ignored dependency directories linked in", async context => {
+  const { cwd, result } = await refuted(context, cwd => {
+    writeFileSync(join(cwd, ".gitignore"), ".machine-runs/\nnode_modules/\n");
+    git(cwd, "add", "."); git(cwd, "commit", "-qm", "ignore dependencies");
+    mkdirSync(join(cwd, "node_modules", "dep"), { recursive: true });
+    writeFileSync(join(cwd, "node_modules", "dep", "index.js"), "module.exports = 'dep';\n");
+  }, command('require("./node_modules/dep"); process.exit(require("fs").readFileSync("code.txt", "utf8") === "old" ? 0 : 1)'));
+  const base = (result.output.checks as (Entry & { phase: string })[]).find(entry => entry.phase === "base");
+  assert.ok(base, "the base check is in the receipt");
+  assert.equal(base.passed, true, readFileSync(base.log, "utf8"));
+  // Cleaning up the temporary checkout leaves the candidate's dependencies in place.
+  assert.equal(readFileSync(join(cwd, "node_modules", "dep", "index.js"), "utf8"), "module.exports = 'dep';\n");
+});
+
+test("a base check that cannot run on the start commit is not reported as a base failure: the Agent is asked once more", async context => {
+  // The check's executable is an ignored file of the candidate's, absent from a checkout of the start commit.
+  await refuted(context, cwd => {
+    writeFileSync(join(cwd, ".gitignore"), ".machine-runs/\nrun-check.sh\n");
+    git(cwd, "add", "."); git(cwd, "commit", "-qm", "ignore the check script");
+    writeFileSync(join(cwd, "run-check.sh"), '#!/bin/sh\n[ "$(cat code.txt)" = old ]\n', { mode: 0o755 });
+  }, { name: "tests", command: ["./run-check.sh"] });
+});
+
+test("a blocked naming a path outside the task's stated scope is a scope addition, and the Agent continues", async context => {
+  const cwd = repo(context); let calls = 0;
+  const result = await execute("implement-task", input(cwd, { task: "Change code.txt.\n\n## Scope\n\n- code.txt\n" }), {
+    implementer: () => {
+      if (++calls === 1) return { type: "blocked", summary: "The change also needs docs/guide.md, which is outside the scope",
+        needs: [{ kind: "scope", text: "docs/guide.md documents the changed behaviour", paths: ["docs/guide.md"] }] };
+      writeFileSync(join(cwd, "code.txt"), "new"); place(cwd, "docs/guide.md", "Guide\n"); return ok();
+    },
+    reviewer: () => ok("approved"),
+  });
+  assert.equal(result.state, "done", result.output?.reason); assert.equal(result.output.outcome, "completed");
+  assert.equal(calls, 2);
+  assert.ok((result.output.scopeAdditions as { path: string }[] | undefined)?.some(addition => addition.path === "docs/guide.md"), JSON.stringify(result.output.scopeAdditions));
+});
+
+// Prompts match the rule: editing Agents decide reversible questions themselves and run only focused tests; a reviewer blocks only on a blocker.
+
+const ticketCannotRun = "Run the checks you can. If your environment cannot run them, as when a sandbox refuses to start processes, say which and why in your summary and still return completed: the workflow runs every required check itself after you return. Return blocked only for something a person must decide or supply.";
+
+test("the shared prompt sentences say the rule", () => {
+  const sentences = task as unknown as Record<string, unknown>;
+  for (const name of ["cannotRun", "focusedTests", "assumptionsRule", "blockerRule"]) assert.equal(typeof sentences[name], "string", `task.ts exports ${name}`);
+  assert.equal(sentences.cannotRun, ticketCannotRun, "the cannotRun sentence is ticket-task's, word for word");
+  assert.match(sentences.focusedTests as string, /only the tests for what you changed/iu);
+  assert.match(sentences.focusedTests as string, /every required check/iu);
+  for (const word of [/decide/iu, /irreversible/iu, /`?assumptions`?/u, /`?scopeAdditions`?/u, /completed/u]) assert.match(sentences.assumptionsRule as string, word);
+  for (const word of [/acceptance criterion/iu, /regression/iu, /safety/iu, /`?minor`?/u, /`?discussion`?/u]) assert.match(sentences.blockerRule as string, word);
+});
+
+for (const name of ["implement-task", "fix-bug", "refactor", "add-tests", "update-docs", "investigate", "upgrade-dependency", "prepare-release"]) {
+  test(`${name}'s prompts ${["upgrade-dependency", "prepare-release"].includes(name) ? "are unchanged by the rule" : name === "investigate" ? "contain the assumptions instruction" : "contain the focused-tests sentence and the assumptions instruction, and its reviewer's the blocker definition"}`, async context => {
+    const sentences = task as unknown as Record<string, string>;
+    for (const key of ["cannotRun", "focusedTests", "assumptionsRule", "blockerRule"]) assert.equal(typeof sentences[key], "string", `task.ts exports ${key}`);
+    const cwd = repo(context); const run = succeeding(name, cwd); const prompts: Record<string, string[]> = {};
+    const agents = Object.fromEntries(Object.entries(run.agents).map(([role, answer]) => [role, (request: { prompt: string }) => {
+      (prompts[role] ??= []).push(request.prompt); return (answer as (request: { prompt: string }) => unknown)(request);
+    }]));
+    const result = await execute(name, run.data, agents, run.human ? { human: run.human } : {});
+    assert.equal(result.state, "done", result.output?.reason);
+    const editors = { "implement-task": ["implementer"], "fix-bug": ["tester", "implementer"], refactor: ["implementer"], "add-tests": ["tester"], "update-docs": ["writer"] }[name] ?? [];
+    for (const role of editors) for (const prompt of prompts[role]!) {
+      for (const key of ["focusedTests", "assumptionsRule", "cannotRun"]) assert.ok(prompt.includes(sentences[key]!), `${role} prompt has ${key}`);
+      assert.equal(prompt.includes(sentences.blockerRule!), false, `${role} prompt has no blockerRule`);
+    }
+    if (name === "investigate") for (const prompt of prompts.investigator!) assert.ok(prompt.includes(sentences.assumptionsRule!), "investigator prompt has assumptionsRule");
+    if (editors.length) for (const prompt of prompts.reviewer!) assert.ok(prompt.includes(sentences.blockerRule!), "reviewer prompt has blockerRule");
+    if (["upgrade-dependency", "prepare-release"].includes(name)) for (const prompt of Object.values(prompts).flat()) {
+      for (const key of ["focusedTests", "assumptionsRule", "blockerRule"]) assert.equal(prompt.includes(sentences[key]!), false, `no ${key}`);
+    }
+  });
+}
+
+// A loud check is still judged by its exit code.
+
+const overflow = "output exceeded 16 MiB";
+for (const grouped of [false, true]) {
+  const where = grouped ? " in a parallel group" : "";
+  test(`a check that prints 2 MiB and exits 0 passes${where}`, async context => {
+    const cwd = repo(context);
+    const result = await execute("verify-checks", input(cwd, { checks: [command('process.stdout.write("x".repeat(2*1024*1024))', grouped ? { group: "g" } : {})] }));
+    assert.equal(result.state, "done", result.output?.reason);
+    const [entry, ...rest] = result.output.checks as (Entry & { error?: string })[];
+    assert.deepEqual(rest, []);
+    assert.equal(entry!.passed, true); assert.equal(entry!.error, undefined);
+    assert.equal(statSync(entry!.log).size, 2 * 1024 * 1024, "the log holds the whole output");
+  });
+
+  test(`a check that prints 20 MiB is recorded as failed with the overflow reason, not as an error${where}`, async context => {
+    const cwd = repo(context);
+    await assert.rejects(execute("verify-checks", input(cwd, { checks: [command('process.stdout.write("x".repeat(20*1024*1024))', grouped ? { group: "g" } : {})] })), /Required checks failed/u);
+    const [receipt] = receipts(cwd);
+    assert.equal(receipt.checksPassed, false);
+    assert.ok(receipt.checks.length >= 1);
+    for (const entry of receipt.checks as (Entry & { error?: string })[]) {
+      assert.equal(entry.passed, false);
+      assert.equal(entry.error, undefined, "an overflow is a failed check, not an error");
+      assert.ok(JSON.stringify(entry).includes(overflow), JSON.stringify(entry));
+      assert.ok(statSync(entry.log).size > 1024 * 1024, "the log is written from what was captured");
+    }
+    assert.ok(receipt.reason.includes(overflow), receipt.reason);
+  });
+}
+
+test("the repair prompt after a check's output overflows says what happened", async context => {
+  const cwd = repo(context); const prompts: string[] = [];
+  await execute("implement-task", input(cwd, { maxRepairs: 1, checks: [command('process.stdout.write("x".repeat(20*1024*1024))')] }), {
+    implementer: request => { prompts.push(request.prompt); return ok(); }, reviewer: () => ok("approved"),
+  });
+  assert.equal(prompts.length, 2);
+  assert.ok((prompts[1]!.split("Current failure/feedback: ")[1] ?? "").includes(overflow), prompts[1]);
+});
+
+// Additional edge cases for the shared recovery contract.
+for (const field of ["assumptions", "scopeAdditions"]) {
+  test(`a malformed ${field} is sent back before the editing report is accepted`, async context => {
+    const cwd = repo(context); const prompts: string[] = [];
+    const result = await execute("implement-task", input(cwd), {
+      implementer: request => {
+        prompts.push(request.prompt);
+        return prompts.length === 1 ? { ...ok(), [field]: null } : ok();
+      },
+      reviewer: () => ok("approved"),
+    });
+    assert.equal(result.state, "done");
+    assert.equal(prompts.length, 2);
+    assert.ok(prompts[1]!.includes(`${field} must be an array`));
+  });
+}
+
+test("a scope recovery is bounded and preserves the first addition without duplicates", async context => {
+  const cwd = repo(context); let calls = 0;
+  const result = await execute("implement-task", input(cwd), {
+    reviewer: () => assert.fail("a blocked editor does not reach review"),
+    implementer: () => {
+      calls++;
+      return { type: "blocked", summary: "Need another file", needs: [{ kind: "scope", text: "Document this behavior", paths: ["docs/guide.md"] }] };
+    },
+  });
+  assert.equal(result.state, "blocked");
+  assert.equal(calls, 2);
+  assert.deepEqual(result.output.scopeAdditions, [{ path: "docs/guide.md", why: "Document this behavior" }]);
+});
+
+test("a scope claim inside the stated scope is not automatically retried", async context => {
+  const cwd = repo(context); let calls = 0;
+  const result = await execute("implement-task", input(cwd, { task: "Change docs.\n\n## Scope\n- docs/**\n\n## Acceptance\n- Explain the change" }), {
+    reviewer: () => assert.fail("a blocked editor does not reach review"),
+    implementer: () => {
+      calls++;
+      return { type: "blocked", summary: "Need clarification", needs: [{ kind: "scope", text: "Document this behavior", paths: ["docs/guide.md"] }] };
+    },
+  });
+  assert.equal(result.state, "blocked"); assert.equal(calls, 1);
+  assert.deepEqual(result.output.scopeAdditions, []);
+});
+
+test("a confirmed base failure runs only the named check once, regardless of its layered selection", async context => {
+  const cwd = repo(context);
+  const result = await execute("implement-task", input(cwd, { checks: [
+    command("process.exit(1)", { when: ["unrelated/**"], group: "g" }),
+    command("process.exit(0)", { name: "other", group: "g" }),
+  ] }), { implementer: () => baseFailing(), reviewer: () => assert.fail("confirmed base failure does not reach review") });
+  assert.equal(result.state, "blocked");
+  assert.match(result.output.reason, /base: tests fails/u);
+  assert.deepEqual(result.output.checks.map((entry: { name: string; phase: string }) => [entry.name, entry.phase]), [["tests", "base"]]);
+  assert.equal(worktrees(cwd).length, 1);
+});
+
+test("a missing base dependency is unrunnable and returns evidence to the implementer", async context => {
+  const { result, prompts } = await refuted(context, cwd => {
+    writeFileSync(join(cwd, ".gitignore"), ".machine-runs/\nlocal-dependency.js\n");
+    git(cwd, "add", "."); git(cwd, "commit", "-qm", "ignore local dependency");
+    writeFileSync(join(cwd, "local-dependency.js"), "module.exports = true;\n");
+  }, command('require("./local-dependency.js"); process.exit(require("fs").readFileSync("code.txt", "utf8") === "old" ? 0 : 1)'));
+  const base = result.output.checks.find((entry: { phase: string }) => entry.phase === "base");
+  assert.equal(base.passed, false);
+  assert.ok(prompts[1]!.includes(base.log));
+  assert.match(prompts[1]!, /could not run reliably/u);
+});
+
+test("base verification runs configured setup and rejects setup that changes tracked source", context => {
+  const cwd = repo(context);
+  const work = taskRun("custom", input(cwd), { trusted: true, checks: true, git: "clean", setup: [
+    { ...command('require("fs").writeFileSync("code.txt", "setup changed source")'), timeoutMs: 1000 },
+  ] });
+  work.start(); work.receive(baseFailing()); work.reported("change");
+  assert.equal(work.mechanical("change").type, "verifyBase");
+  assert.equal(work.verifyBase().type, "unrunnable");
+  assert.match(work.status().reason, /could not verify/u);
+  assert.equal(readFileSync(join(cwd, "code.txt"), "utf8"), "old");
+  assert.equal(worktrees(cwd).length, 1);
+  work.finish("blocked");
+  assert.deepEqual((work.output()!.checks as { phase: string }[]).map(entry => entry.phase), ["base-setup"]);
 });
