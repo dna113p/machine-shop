@@ -1,8 +1,9 @@
-import { spawnSync, execFileSync } from "node:child_process";
+import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmdirSync, unlinkSync, readlinkSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, posix, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { matchesScope } from "./scope.ts";
 import type { Event, MachinePrimitives } from "@dna113p/machines";
 
 /** Publish one bounded sentence; the definition supplies its stage meaning. */
@@ -184,6 +185,12 @@ export interface Check {
   name: string;
   command: string[];
   timeoutMs: number;
+  when?: string[];
+  focused?: boolean;
+  focusedLimit?: number;
+  group?: string;
+  after?: string[];
+  fastMs?: number;
 }
 interface Regression extends Check { failureExitCode: number; failureIncludes: string }
 interface Assignment {
@@ -195,10 +202,21 @@ interface Assignment {
   maxReviewRounds: number;
   regression?: Regression;
 }
-interface Evidence {
+interface Selection { focused?: string[]; whole?: string }
+interface CheckRound {
+  phase: string;
+  kind: "layered" | "repair" | "whole";
+  why: string;
+  ran: ({ name: string; why: string } & Selection)[];
+  skipped: { name: string; why: string }[];
+  passed: boolean;
+}
+interface Execution { stdout: string; stderr: string; status: number | null; signal: string | null; error?: Error; durationMs: number }
+interface Evidence extends Selection {
   phase: string;
   name: string;
   command: string[];
+  durationMs: number;
   exitCode: number | null;
   signal: string | null;
   error?: string;
@@ -250,6 +268,9 @@ function reportSummary(stage: string, event: Event): string {
 export function taskData() {
   return {
     evidence: [] as Evidence[],
+    startCommit: null as string | null,
+    checkRounds: [] as CheckRound[],
+    repairRound: null as { failed: string[]; durations: Record<string, number> } | null,
     flaky: [] as string[],
     reports: [] as AgentReport[],
     reportRecovery: {} as Record<string, ReportRecovery>,
@@ -286,7 +307,7 @@ export function taskRun(name: string, input: unknown, policy: Policy, saved: Tas
       if (realpathSync(git(workspace, "rev-parse", "--show-toplevel").trim()) !== realpathSync(workspace)) {
         throw new Error("workspace must be the Git checkout root, not a subdirectory");
       }
-      git(workspace, "rev-parse", "--verify", "HEAD");
+      saved.startCommit ??= git(workspace, "rev-parse", "--verify", "HEAD").trim();
       if (policy.git === "clean" && git(workspace, "status", "--porcelain=v1", "--untracked-files=all", "--", ".", ":(exclude).machine-runs").trim() !== "") {
         throw new Error("Start this editing/release workflow in a clean checkout or isolated worktree; existing edits are not overwritten");
       }
@@ -316,12 +337,17 @@ export function taskRun(name: string, input: unknown, policy: Policy, saved: Tas
     return saved.directory;
   }
 
-  function check(command: Check, phase: string, red: boolean | "nonzero" = false): boolean {
+  function check(command: Check, phase: string, red: boolean | "nonzero" = false, selection: Selection = {}): boolean {
     if (!saved.directory) throw new Error("Evidence must be initialized before checks");
+    const began = performance.now();
     const executed = spawnSync(command.command[0]!, command.command.slice(1), {
       cwd: workspace, encoding: "utf8", shell: false, timeout: command.timeoutMs,
       killSignal: "SIGKILL", maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
     });
+    return record(command, phase, { ...executed, stdout: executed.stdout ?? "", stderr: executed.stderr ?? "", durationMs: performance.now() - began }, red, selection);
+  }
+
+  function record(command: Check, phase: string, executed: Execution, red: boolean | "nonzero" = false, selection: Selection = {}): boolean {
     const text = `${executed.stdout ?? ""}${executed.stderr ?? ""}`;
     const regression = assignment.regression;
     const passed = !executed.error && executed.signal === null && (red === "nonzero"
@@ -332,7 +358,7 @@ export function taskRun(name: string, input: unknown, policy: Policy, saved: Tas
     writeFileSync(log, text + (executed.error ? `\n${executed.error.message}\n` : ""), { flag: "wx", mode: 0o600 });
     saved.evidence.push({
       phase, name: command.name, command: command.command, exitCode: executed.status,
-      signal: executed.signal, passed, log,
+      signal: executed.signal, passed, log, durationMs: executed.durationMs, ...selection,
       expected: red === "nonzero" ? "nonzero exit" : red ? `exit ${regression!.failureExitCode} containing ${JSON.stringify(regression!.failureIncludes)}` : "exit 0",
       ...(executed.error ? { error: executed.error.message } : {}),
     });
@@ -361,41 +387,182 @@ export function taskRun(name: string, input: unknown, policy: Policy, saved: Tas
     return { type: passed ? "passed" : "failed" };
   }
 
-  function checks(phase = "verify"): Event {
-    // Every gate runs, so one repair round sees every failure instead of the first one alone.
-    saved.flaky = [];
-    const before = policy.git === "none" ? undefined : fingerprint(workspace);
-    const firstFailures = assignment.checks.flatMap(command => check(command, phase)
-      ? [] : [{ command, entries: [saved.evidence.at(-1)!] }]);
-    // Only failed gates run again, serially, after the entire first pass.
-    const failed = firstFailures.filter(({ command, entries }) => {
-      if (!assignment.rerunFailedChecks) return true;
-      const passed = check(command, phase);
-      const rerun = saved.evidence.at(-1)!;
-      entries.push(rerun);
-      if (passed) {
-        for (const entry of entries) entry.flaky = true;
-        saved.flaky.push(command.name);
-      } else rerun.rerun = true;
-      return !passed;
+  /** Includes committed candidate changes after ticket-task commits, as well as all local changes. */
+  function changedPaths(): string[] | null {
+    if (!saved.startCommit || policy.git === "none") return null;
+    try {
+      return [...new Set((git(workspace, "diff", "--name-only", "-z", "--no-renames", saved.startCommit, "--")
+        + git(workspace, "ls-files", "--others", "--exclude-standard", "-z")).split("\0"))]
+        .filter(path => path && path !== ".machine-runs" && !path.startsWith(".machine-runs/"));
+    } catch { return null; }
+  }
+
+  function focusedFiles(changed: string[], command: Check): Selection {
+    if (!/[*?]/u.test(command.command.at(-1)!)) return { whole: "no trailing glob argument" };
+    try {
+      const files = [...new Set(git(workspace, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split("\0"))]
+        .filter(path => path && !path.startsWith(".machine-runs/") && existsSync(join(workspace, path)));
+      const isTest = (path: string) => /\.test\.[^/]+$/u.test(path);
+      const tests = files.filter(isTest);
+      const production = files.filter(path => !isTest(path));
+      const stem = (path: string) => basename(path, extname(path));
+      const selected = new Set<string>();
+      for (const path of changed) {
+        if (isTest(path)) {
+          const name = stem(path).replace(/\.test$/u, "");
+          if (!production.some(file => stem(file) === name)) return { whole: `changed test file has no production counterpart: ${path}` };
+          if (files.includes(path)) selected.add(path);
+          continue;
+        }
+        for (const test of tests) {
+          if ((dirname(test) === "tests" || dirname(test) === dirname(path)) && stem(test) === `${stem(path)}.test`) selected.add(test);
+          const source = readFileSync(join(workspace, test), "utf8");
+          for (const match of source.matchAll(/(?:\bfrom\s*|\bimport\s*(?:\(\s*)?|\brequire\s*\(\s*)["'](\.[^"']+)["']/gu)) {
+            const target = posix.normalize(posix.join(posix.dirname(test), match[1]!));
+            if (target === path || target === path.slice(0, path.length - extname(path).length)) selected.add(test);
+          }
+        }
+      }
+      if (!selected.size) return { whole: "selected nothing" };
+      if (selected.size > (command.focusedLimit ?? 40)) return { whole: `selected ${selected.size} files, exceeding focusedLimit ${command.focusedLimit ?? 40}` };
+      return { focused: [...selected].sort() };
+    } catch { return { whole: "could not inspect test files" }; }
+  }
+
+  /** Same direct-process limits and exit semantics as the synchronous runner. */
+  function runAsync(command: Check, signal?: AbortSignal): Promise<Execution> {
+    return new Promise(resolve => {
+      signal?.throwIfAborted();
+      const began = performance.now();
+      let error: Error | undefined;
+      const stdout: Buffer[] = [], stderr: Buffer[] = [];
+      const sizes = [0, 0];
+      const child = spawn(command.command[0]!, command.command.slice(1), { cwd: workspace, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+      const kill = (why: string) => { error ??= new Error(why); child.kill("SIGKILL"); };
+      const abort = () => kill("Check aborted");
+      const timer = setTimeout(() => kill("Check timed out"), command.timeoutMs);
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+      [child.stdout, child.stderr].forEach((stream, index) => stream.on("data", (chunk: Buffer) => {
+        const remaining = Math.max(0, 1024 * 1024 - sizes[index]!);
+        (index === 0 ? stdout : stderr).push(chunk.subarray(0, remaining));
+        sizes[index]! += chunk.length;
+        if (sizes[index]! > 1024 * 1024) kill("Check output exceeded maxBuffer");
+      }));
+      child.on("error", failure => { error = failure; child.kill("SIGKILL"); });
+      child.on("close", (status, signalName) => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        resolve({ stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString(), status, signal: signalName,
+          ...(error ? { error } : {}), durationMs: performance.now() - began });
+      });
     });
-    let passed = failed.length === 0;
-    const logs = (entries: Evidence[]) => entries.map(entry => entry.log).join(", ");
-    if (passed) saved.reason = "";
-    else if (failed.length === 1) {
-      const { command, entries } = failed[0]!;
-      saved.reason = `${phase}: ${command.name} did not meet its expected result; inspect ${logs(entries)}`;
-    } else saved.reason = `${phase}: ${failed.length} checks did not meet their expected results: ${failed.map(({ command, entries }) => `${command.name} (inspect ${logs(entries)})`).join(", ")}`;
-    const after = policy.git === "none" ? undefined : fingerprint(workspace);
-    if (before !== after) {
-      passed = false;
-      saved.reason = "A required check changed the checkout; use non-mutating validation commands and inspect the candidate.";
+  }
+
+  function checks(phase = "verify", signal?: AbortSignal): Event | Promise<Event> {
+    signal?.throwIfAborted();
+    if (!saved.directory) throw new Error("Evidence must be initialized before checks");
+    const layered = assignment.checks.some(check => [check.when, check.focused, check.group, check.after, check.fastMs, check.focusedLimit].some(value => value !== undefined));
+    const changed = changedPaths();
+    const whole = phase === "baseline" ? "baseline runs whole" : policy.git === "none" ? "verification without Git runs whole"
+      : changed === null ? "changed paths unavailable; runs whole" : undefined;
+    const previous = phase === "verify" && layered && !whole ? saved.repairRound : null;
+    saved.repairRound = null;
+    const selection = assignment.checks.map(command => {
+      const skip = !whole && command.when && !changed!.some(path => matchesScope(path, command.when!));
+      const detail: Selection = skip ? {} : whole ? { whole } : command.focused ? phase === "reverify" ? { whole: "reverify runs whole" } : focusedFiles(changed!, command) : {};
+      return { command: detail.focused ? { ...command, command: [...command.command.slice(0, -1), ...detail.focused] } : command, detail, skip };
+    });
+    const repairNames = previous ? new Set(assignment.checks.filter(check => previous.failed.includes(check.name)
+      || (!check.when && !check.focused && previous.durations[check.name] !== undefined && previous.durations[check.name]! < (check.fastMs ?? 90000))).map(check => check.name)) : null;
+    const reduced = !!repairNames && selection.some(item => !item.skip && !repairNames.has(item.command.name));
+
+    function round(repair: boolean): Event | Promise<Event> {
+      saved.flaky = [];
+      const before = policy.git === "none" ? undefined : fingerprint(workspace);
+      const chosen = selection.filter(item => !item.skip && (!repair || repairNames!.has(item.command.name)));
+      const receipt: CheckRound = { phase, kind: repair ? "repair" : whole ? "whole" : "layered",
+        why: repair ? "previous verify failed; run failed checks and fast always-checks" : whole ?? "full layered round for paths changed since start",
+        ran: chosen.map(({ command, detail }) => ({ name: command.name, why: repair ? previous!.failed.includes(command.name) ? "failed previous round" : "fast always-check" : whole ?? (command.when ? "changed path matched when" : "always check"), ...detail })),
+        skipped: selection.flatMap(item => item.skip ? [{ name: item.command.name, why: "no changed path matched when" }]
+          : repair && !repairNames!.has(item.command.name) ? [{ name: item.command.name, why: "repair round: neither failed nor a fast always-check" }] : []), passed: false };
+      const entries: Evidence[] = [];
+      const finish = (): Event | Promise<Event> => {
+        signal?.throwIfAborted();
+        const failures = chosen.flatMap((item, index) => entries[index]!.passed ? [] : [{ ...item, entries: [entries[index]!] }]);
+        const failed = failures.filter(({ command, detail, entries }) => {
+          if (!assignment.rerunFailedChecks) return true;
+          const passed = check(command, phase, false, detail);
+          const rerun = saved.evidence.at(-1)!;
+          entries.push(rerun);
+          if (passed) { for (const entry of entries) entry.flaky = true; saved.flaky.push(command.name); }
+          else rerun.rerun = true;
+          return !passed;
+        });
+        let passed = failed.length === 0;
+        const logs = (entries: Evidence[]) => entries.map(entry => entry.log).join(", ");
+        if (passed) saved.reason = "";
+        else if (failed.length === 1) {
+          const { command, entries } = failed[0]!;
+          saved.reason = `${phase}: ${command.name} did not meet its expected result; inspect ${logs(entries)}`;
+        } else saved.reason = `${phase}: ${failed.length} checks did not meet their expected results: ${failed.map(({ command, entries }) => `${command.name} (inspect ${logs(entries)})`).join(", ")}`;
+        const after = policy.git === "none" ? undefined : fingerprint(workspace);
+        if (before !== after) { passed = false; saved.reason = "A required check changed the checkout; use non-mutating validation commands and inspect the candidate."; }
+        receipt.passed = passed;
+        (saved.checkRounds ??= []).push(receipt);
+        if (phase === "verify") {
+          saved.lastChecksPassed = passed;
+          saved.verifiedSnapshot = after ?? null;
+          if (!passed && layered && before === after) saved.repairRound = { failed: failed.map(item => item.command.name),
+            durations: { ...previous?.durations, ...Object.fromEntries(entries.map(entry => [entry.name, entry.durationMs])) } };
+        }
+        if (passed && repair) return round(false);
+        return { type: passed ? "passed" : "failed" };
+      };
+      if (!chosen.some(item => item.command.group)) {
+        for (const { command, detail } of chosen) { check(command, phase, false, detail); entries.push(saved.evidence.at(-1)!); }
+        return finish();
+      }
+      return (async () => {
+        const executed = new Map<string, Execution>();
+        const done = new Set<string>();
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) abort();
+        try {
+          // A skipped first group member still fixes the group's position in the list.
+          for (const item of selection) {
+            if (done.has(item.command.name)) continue;
+            const members = item.command.group ? selection.filter(other => other.command.group === item.command.group) : [item];
+            for (const member of members) done.add(member.command.name);
+            const unit = members.filter(member => chosen.includes(member));
+            const pending = new Map<string, Promise<Execution>>();
+            const run = (member: typeof item): Promise<Execution> => {
+              const existing = pending.get(member.command.name);
+              if (existing) return existing;
+              const dependencies = unit.filter(other => member.command.after?.includes(other.command.name));
+              const result = Promise.all(dependencies.map(run)).then(() => runAsync(member.command, controller.signal));
+              pending.set(member.command.name, result);
+              return result;
+            };
+            // Settle every child before propagating an unexpected failure.
+            const results = await Promise.allSettled(unit.map(member => run(member).catch(error => { controller.abort(); throw error; })));
+            signal?.throwIfAborted();
+            for (const [index, result] of results.entries()) {
+              if (result.status === "rejected") throw result.reason;
+              executed.set(unit[index]!.command.name, result.value);
+            }
+          }
+        } finally { controller.abort(); signal?.removeEventListener("abort", abort); }
+        for (const { command, detail } of chosen) {
+          record(command, phase, executed.get(command.name)!, false, detail);
+          entries.push(saved.evidence.at(-1)!);
+        }
+        return finish();
+      })();
     }
-    if (phase === "verify") {
-      saved.lastChecksPassed = passed;
-      saved.verifiedSnapshot = after ?? null;
-    }
-    return { type: passed ? "passed" : "failed" };
+    return round(reduced);
   }
 
   function regression(red: boolean): Event {
@@ -475,6 +642,7 @@ export function taskRun(name: string, input: unknown, policy: Policy, saved: Tas
   }
 
   function seal(): Event {
+    saved.repairRound = null;
     saved.snapshot = fingerprint(workspace);
     return { type: "sealed" };
   }
@@ -526,6 +694,7 @@ export function taskRun(name: string, input: unknown, policy: Policy, saved: Tas
   }
   /** Undoing a workflow's commit makes the candidate subject to verification and drift checks again. */
   function reopen(failed = false): void {
+    saved.repairRound = null;
     saved.accepted = false;
     if (failed) saved.lastChecksPassed = false;
   }
@@ -552,7 +721,7 @@ export function taskRun(name: string, input: unknown, policy: Policy, saved: Tas
       schemaVersion: 1, workflow: name, outcome, workspace, task: assignment.task,
       startedAt: saved.startedAt, finishedAt: new Date().toISOString(), repairs: saved.renewed + saved.repairs, reviewRounds: saved.renewedReviews + saved.reviewRounds, agentInvocations: saved.reports.length,
       checksPassed: saved.lastChecksPassed, reason: outcome === "completed" ? "" : saved.reason || (outcome === "rejected" ? "Human rejected the candidate" : "Work did not satisfy its completion conditions"),
-      checks: saved.evidence, agents: saved.reports, decisions: saved.decisions, report: join(saved.directory, "result.json"),
+      checks: saved.evidence, checkRounds: saved.checkRounds ?? [], agents: saved.reports, decisions: saved.decisions, report: join(saved.directory, "result.json"),
     };
     writeFileSync(join(saved.directory, "result.json"), JSON.stringify(saved.result, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     console.log(`Machine Shop result: ${join(saved.directory, "result.json")}`);
@@ -591,9 +760,27 @@ function parseAssignment(input: unknown, policy: Policy): Assignment {
   if (data.checks !== undefined && !Array.isArray(data.checks)) throw new Error("checks must be an array");
   if (data.rerunFailedChecks !== undefined && typeof data.rerunFailedChecks !== "boolean") throw new Error("rerunFailedChecks must be a boolean");
   if (!policy.checks && data.rerunFailedChecks !== undefined) throw new Error("This read-only workflow does not support rerunFailedChecks");
-  const checks = ((data.checks ?? []) as unknown[]).map((entry, i) => parseCheck(entry, `checks[${i}]`));
+  const checks = ((data.checks ?? []) as unknown[]).map((entry, i) => parseCheck(entry, `checks[${i}]`, true));
   if (checks.length > 20 || (policy.checks && checks.length === 0)) throw new Error("Provide between 1 and 20 explicit checks for this workflow");
   if (new Set(checks.map(c => c.name)).size !== checks.length) throw new Error("Check names must be unique");
+  const positions = new Map(checks.map((check, index) => [check.name, index]));
+  const unit = (check: Check) => check.group ? checks.findIndex(other => other.group === check.group) : positions.get(check.name)!;
+  for (const check of checks) for (const dependency of check.after ?? []) {
+    const at = positions.get(dependency);
+    if (at === undefined || dependency === check.name || unit(checks[at]!) > unit(check)
+      || (at > positions.get(check.name)! && (!check.group || check.group !== checks[at]!.group))) {
+      throw new Error(`${check.name}.after must name an earlier check in an earlier unit or another member of its group`);
+    }
+  }
+  const visited = new Set<string>(), visiting = new Set<string>();
+  const visit = (check: Check) => {
+    if (visiting.has(check.name)) throw new Error(`${check.name}.after forms a cycle`);
+    if (visited.has(check.name)) return;
+    visiting.add(check.name);
+    for (const dependency of check.after ?? []) visit(checks[positions.get(dependency)!]!);
+    visiting.delete(check.name); visited.add(check.name);
+  };
+  checks.forEach(visit);
   let regression: Regression | undefined;
   if (data.regression !== undefined) {
     const red = object(data.regression, "regression", ["name", "command", "timeoutMs", "failureExitCode", "failureIncludes"]);
@@ -607,13 +794,32 @@ function parseAssignment(input: unknown, policy: Policy): Assignment {
   if (!policy.checks && checks.length > 0) throw new Error("This read-only workflow does not run checks; use verify-checks separately");
   return { task, workspace: resolve(workspace), checks, rerunFailedChecks: data.rerunFailedChecks !== false, maxRepairs, maxReviewRounds, ...(regression ? { regression } : {}) };
 }
-export function parseCheck(value: unknown, name: string): Check {
-  const data = object(value, name, ["name", "command", "timeoutMs"]);
+export function parseCheck(value: unknown, name: string, layered = false): Check {
+  const data = object(value, name, ["name", "command", "timeoutMs", ...(layered ? ["when", "focused", "focusedLimit", "group", "after", "fastMs"] : [])]);
+  const fields: Partial<Check> = {};
+  for (const key of ["when", "after"] as const) if (data[key] !== undefined) {
+    const values = data[key];
+    if (!Array.isArray(values) || values.length > 50 || (key === "when" && !values.length)) throw new Error(`${name}.${key} must be ${key === "when" ? "a non-empty" : "an"} array of at most 50 names or globs`);
+    fields[key] = values.map(value => text(value, `${name}.${key}`));
+  }
+  if (data.focused !== undefined) {
+    if (typeof data.focused !== "boolean") throw new Error(`${name}.focused must be a boolean`);
+    fields.focused = data.focused;
+  }
+  if (data.focusedLimit !== undefined) {
+    if (data.focused !== true) throw new Error(`${name}.focusedLimit requires focused: true`);
+    fields.focusedLimit = integer(data.focusedLimit, `${name}.focusedLimit`, 1, 500);
+  }
+  if (data.group !== undefined) fields.group = text(data.group, `${name}.group`);
+  if (data.fastMs !== undefined) {
+    if (data.when !== undefined || data.focused !== undefined) throw new Error(`${name}.fastMs cannot accompany when or focused`);
+    fields.fastMs = integer(data.fastMs, `${name}.fastMs`, 1, 600000);
+  }
   if (!Array.isArray(data.command) || data.command.length === 0 || data.command.length > 100 || data.command.some(x => typeof x !== "string" || x.includes("\0"))) {
     throw new Error(`${name}.command must be a non-empty executable/argv string array`);
   }
   text(data.command[0], `${name}.command[0]`);
-  return { name: text(data.name, `${name}.name`), command: [...data.command] as string[],
+  return { ...fields, name: text(data.name, `${name}.name`), command: [...data.command] as string[],
     timeoutMs: integer(data.timeoutMs ?? 60_000, `${name}.timeoutMs`, 1, 600_000) };
 }
 export function object(value: unknown, name: string, keys: string[]): Record<string, unknown> {

@@ -24,7 +24,7 @@ Unknown fields are refused.
 | --- | --- | --- | --- |
 | `task` | yes | — | What to do, with enough scope and acceptance criteria to act without your conversation. At most 20,000 characters. |
 | `workspace` | yes | — | Absolute path to the project's Git checkout root, not a subdirectory. |
-| `checks` | yes, 1–20 | — | Commands to run, in order, as `{ name, command, timeoutMs }`. `command` is an argv array with no shell; `timeoutMs` defaults to 60000 and caps at 600000. Every check runs even after one fails. |
+| `checks` | yes, 1–20 | — | Commands to run, in order, as `{ name, command, timeoutMs }`. `command` is an argv array with no shell; `timeoutMs` defaults to 60000 and caps at 600000. Every selected check runs even after one fails. |
 | `rerunFailedChecks` | no | `true` | Run each failed gate once more, alone, after all gates have run. A passing rerun is marked `flaky`, with both logs kept and no repair round used. Set `false` to require first-time passes. |
 | `maxRepairs` | no | `1` | How many more rounds a failed check or a `revise` review may get, 0–3. |
 | `regression` | yes | — | The command that reproduces the bug: `{ name, command, timeoutMs, failureExitCode, failureIncludes }`. Before the fix it must exit with `failureExitCode` (1–125) and print `failureIncludes`; after the fix it must exit 0. |
@@ -45,6 +45,29 @@ From [examples/bugfix.json](../../examples/bugfix.json):
   }
 }
 ```
+
+### Layered check fields
+
+See [Common input](../catalog.md#layered-checks) for Drip's example: build first;
+then types, focused tests, linked-tests, machine-tests, conditional ui and
+remote-ui in one group; package-smoke after all of them.
+
+| Field | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `checks[].when` | no | `always` | 1–50 Scope path globs. Run if any changed path matches; otherwise record skipped (no changed path matched when). |
+| `checks[].focused` | no | `false` | Select named or importing test files and replace a trailing glob argument. Run whole when selection is unsafe or unavailable; delivery reverify always runs whole. |
+| `checks[].focusedLimit` | no | `40` | Maximum selected test files, 1–500; only with focused: true. More files runs the whole check. |
+| `checks[].group` | no | `none` | Checks sharing a group run concurrently, with one log per check. Ungrouped checks remain sequential. |
+| `checks[].after` | no | `[]` | Names that must finish before this check starts; skipped and failed count as finished. Names must be listed earlier in an earlier unit, or belong to the same group; cycles are refused. |
+| `checks[].fastMs` | no | `90000` | Fast always-check threshold in milliseconds, 1–600000. Only without when or focused; used when selecting a repair round. |
+
+Paths are measured from the run's start commit, including committed and local
+changes. Groups run at their first member's position; other checks stay serial.
+[Recovery](../catalog.md#reduced-repair-rounds) runs failed checks and fast
+always-checks after failure, then a full layered round before passing. Receipts
+name every round's run and skipped checks, reasons and focused files.
+
+The regression command runs whole and alone; it does not accept layered fields.
 
 ## Flow
 

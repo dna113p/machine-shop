@@ -73,6 +73,8 @@ A project orchestrator chooses among them with the runtime's
 `machine-project-setup` skill, records the routes in the project's
 `.machines/README.md`, and hands out work with `machine-delegation`.
 
+[Layered checks](docs/catalog.md#layered-checks) select checks and test files from changed paths and run explicit groups concurrently.
+
 Malformed Agent reports get [one send-back with the exact fault](docs/catalog.md#recovery),
 kept in the stage evidence, before the existing stop applies.
 

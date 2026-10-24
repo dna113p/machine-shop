@@ -1824,8 +1824,15 @@ test("a run stopped in plan review continues from its checkpoint with its branch
     const { startedAt, finishedAt, ...receipt } = run.result;
     assert.equal(startedAt, JSON.parse(readFileSync(join(run.directory, "started.json"), "utf8")).startedAt);
     assert.match(finishedAt, /^\d{4}-/u);
+    // Elapsed check times differ between runs, just like the receipt timestamps.
+    // Validate the measurements before normalizing them for the behavioral comparison.
+    const comparableReceipt = { ...receipt, checks: receipt.checks.map(check => {
+      assert.equal(typeof check.durationMs, "number");
+      assert.ok(Number.isFinite(check.durationMs) && check.durationMs >= 0);
+      return { ...check, durationMs: "<duration>" };
+    }) };
     return {
-      run, result: stable(receipt), delivery: stable(run.delivery), output: stable(result.output),
+      run, result: stable(comparableReceipt), delivery: stable(run.delivery), output: stable(result.output),
       files: readdirSync(run.directory).sort(), tree: git(f.repo, "rev-parse", `${branch}^{tree}`),
       message: git(f.repo, "log", "-1", "--format=%s%n%b", branch), stable,
     };
@@ -9085,4 +9092,63 @@ test("handoff renderer: saturated sections stay below 200 kB and retain each sel
     handoffGate(page, name, "failed");
     assert.ok(pageText(page).includes(`DIAGNOSTIC-${name}`));
   }
+});
+
+// Layered checks: repository.checks carry `when`, `focused`, `group` and `after` through to the shared check Operation.
+
+const skippedWhen = "no changed path matched when";
+/** A gate that prints its name and runs only when a changed path matches `when`. */
+const whenGate = (name: string, when: string[]) => ({ name, command: [process.execPath, "-e", `console.log(${JSON.stringify(`${name} ran`)})`], when });
+
+test("a when check that no changed path matches is skipped at the gate, and the evidence page and the pull request body say skipped, not passed", async context => {
+  const f = fixture(context); remote(f); fakeGh(context, f);
+  const result = await execute(input(f, { output: "pr", checks: [command(), whenGate("ui", ["web/**"])] }));
+  const run = prDelivered(f, result);
+  assert.deepEqual(run.result.checks.map((check: any) => [check.phase, check.name, check.passed]), [["red", "tests", true], ["verify", "tests", true]]);
+  assert.deepEqual(run.result.checkRounds.filter((round: any) => round.phase === "verify").map((round: any) => [round.ran.map((entry: any) => entry.name), round.skipped]),
+    [[["tests"], [{ name: "ui", why: skippedWhen }]]]);
+  assert.equal(readFileSync(join(run.directory, "pull-request.md"), "utf8"),
+    `Add a greeting\n\n## Summary\n\nWrite hello to greeting.txt.\n\n## Checks\n\n- tests: passed\n- ui: skipped (${skippedWhen})\n\n## Review\n\nGreeting matches the ticket\n\nTicket: PROJ-12\n`);
+  const page = handoffArtifact(f).page;
+  handoffGate(page, "tests", "passed"); handoffGate(page, "ui", "skipped");
+  assert.ok(pageText(page).includes(skippedWhen), "the evidence page says why ui was skipped");
+});
+
+test("a reverify after the ticket commit still runs a when check the ticket's change matches, since changed paths count from the commit the run started from", async context => {
+  const f = fixture(context);
+  const result = await execute(input(f, { checks: [command(), whenGate("greeting-lint", ["greeting.txt"]), whenGate("ui", ["web/**"])] }), {
+    // The base moves under review, so the committed candidate is replayed onto its tip and verified again as `reverify`.
+    reviewer: () => { advance(f); return review(); },
+  });
+  assert.equal(result.state, "delivered");
+  const run = evidence(f);
+  assert.deepEqual(run.result.checks.map((check: any) => [check.phase, check.name, check.passed]), [
+    ["red", "tests", true], ["verify", "tests", true], ["verify", "greeting-lint", true], ["reverify", "tests", true], ["reverify", "greeting-lint", true],
+  ]);
+  assert.match(readFileSync(run.result.checks[4].log, "utf8"), /greeting-lint ran/u);
+  assert.deepEqual(run.result.checkRounds.filter((round: any) => round.phase === "reverify").map((round: any) => [round.ran.map((entry: any) => entry.name), round.skipped]),
+    [[["tests", "greeting-lint"], [{ name: "ui", why: skippedWhen }]]]);
+});
+
+test("the red proof runs a focused tests check whole, and the gate focuses it to the changed test file", async context => {
+  const f = fixture(context);
+  const argv = [...command().command, "*.test.txt"];
+  const result = await execute(input(f, { checks: [{ name: "tests", command: argv, focused: true }] }));
+  assert.equal(result.state, "delivered");
+  const [red, verify, ...others] = evidence(f).result.checks;
+  assert.deepEqual(others, []);
+  assert.deepEqual([red.phase, red.passed, red.command, red.focused], ["red", true, argv, undefined], "redCheck keeps its meaning and runs whole");
+  assert.deepEqual([verify.phase, verify.passed, verify.command, verify.focused], ["verify", true, [...argv.slice(0, -1), "greeting.test.txt"], ["greeting.test.txt"]]);
+});
+
+test("repository.checks accept the layered fields while repository.setup refuses them", context => {
+  const f = fixture(context);
+  assert.doesNotThrow(() => mod.default(runtime, input(f, { checks: [
+    command(undefined, { focused: true }), command(undefined, { name: "ui", when: ["web/**"], group: "g" }),
+    command(undefined, { name: "lint", group: "g", after: ["tests"] }), command(undefined, { name: "types", fastMs: 1000 }),
+  ] })));
+  for (const field of [{ when: ["web/**"] }, { focused: true }, { group: "g" }, { after: ["tests"] }, { fastMs: 1000 }]) {
+    assert.throws(() => mod.default(runtime, input(f, { setup: [command(undefined, { name: "install", ...field })] })), new RegExp(Object.keys(field)[0]!, "u"));
+  }
+  assert.deepEqual(readdirSync(f.root), ["widgets"]);
 });

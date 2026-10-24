@@ -383,7 +383,7 @@ test("the audit stays in its checkout and uses that checkout's current catalog",
   const found = await launcher.listMachines({ cwd: f.project, home: f.home });
   assert.deepEqual(found.map(item => item.name), ["dev-verify-checks"]);
   assert.ok(found.every(item => !item.error), JSON.stringify(found));
-  assert.deepEqual(readdirSync(join(f.project, ".machines/_machine-shop")).sort(), ["manifest.json", "task.ts"]);
+  assert.deepEqual(readdirSync(join(f.project, ".machines/_machine-shop")).sort(), ["manifest.json", "scope.ts", "task.ts"]);
   pageTables(run.page);
 });
 
@@ -607,7 +607,7 @@ test("selectively installed retrospective runs detached and agrees with audit on
   const f = fixture(context);
   const { install } = await import(pathToFileURL(join(f.shop, "scripts/install.mjs")).href);
   install({ target: f.project, workflows: ["retrospective"] });
-  assert.deepEqual(readdirSync(join(f.project, ".machines/_machine-shop")).sort(), ["evidence.ts", "manifest.json", "task.ts"]);
+  assert.deepEqual(readdirSync(join(f.project, ".machines/_machine-shop")).sort(), ["evidence.ts", "manifest.json", "scope.ts", "task.ts"]);
   assert.equal(existsSync(join(f.project, ".machines/dev-audit-project.ts")), false);
   const folder = join(f.project, ".machine-runs/machine-shop/detached-stop");
   mkdirSync(folder, { recursive: true });

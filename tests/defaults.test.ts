@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -788,3 +788,304 @@ for (const maxReviewRounds of [0, 5]) {
     assert.match(result.output.reason, /Repair budget exhausted \(1\)/u);
   });
 }
+
+// Layered checks: `when`, `focused`, `group` and `after` choose and order the checks a round runs.
+
+/** A gate that prints its name, so a log shows which check wrote it. */
+const named = (name: string, extra = {}) => ({ name, command: [process.execPath, "-e", `console.log(${JSON.stringify(`${name} ran`)})`], ...extra });
+/** Write a file under the checkout, creating its directories. */
+function place(cwd: string, path: string, content = "export {};\n") {
+  mkdirSync(join(cwd, path, ".."), { recursive: true });
+  writeFileSync(join(cwd, path), content);
+}
+type Round = { phase: string; kind: string; why: string; ran: { name: string; focused?: string[]; whole?: string }[]; skipped: { name: string; why: string }[]; passed: boolean };
+const skippedWhen = "no changed path matched when";
+
+test("a check with when runs only when a changed path matches it, and is recorded as skipped, not passed, otherwise", async context => {
+  const checks = [named("build"), named("tests"), named("ui", { when: ["web/**"] })];
+  for (const [changed, ran] of [["src/app.ts", ["build", "tests"]], ["web/page.html", ["build", "tests", "ui"]]] as const) {
+    const cwd = repo(context);
+    const result = await execute("implement-task", input(cwd, { checks }), {
+      implementer: () => { place(cwd, changed); if (changed.startsWith("web/")) git(cwd, "add", changed); return ok(); },
+      reviewer: () => ok("approved"),
+    });
+    assert.equal(result.state, "done", result.output?.reason); assert.equal(result.output.checksPassed, true);
+    // A skipped check is not evidence that it passed.
+    assert.deepEqual(result.output.checks.map((c: Entry) => [c.name, c.passed]), ran.map(name => [name, true]), changed);
+    for (const entry of result.output.checks as Entry[]) assert.match(readFileSync(entry.log, "utf8"), new RegExp(`${entry.name} ran`, "u"));
+    const rounds = result.output.checkRounds as Round[];
+    assert.ok(Array.isArray(rounds), "the receipt records each check round");
+    assert.equal(rounds.length, 1); assert.equal(rounds[0]!.phase, "verify"); assert.equal(rounds[0]!.passed, true);
+    assert.deepEqual(rounds[0]!.ran.map(entry => entry.name), ran, changed);
+    assert.deepEqual(rounds[0]!.skipped, ran.length === 3 ? [] : [{ name: "ui", why: skippedWhen }], changed);
+    assert.deepEqual(JSON.parse(readFileSync(result.output.report, "utf8")).checkRounds, rounds, "result.json says the same");
+  }
+});
+
+/** One round of a focused test check on a copy of tests/fixtures/focused, after one of its files changes. */
+async function focusedRound(context: TestContext, changed: string, check: Record<string, unknown> = {}, phase = "verify") {
+  const cwd = repo(context);
+  cpSync(resolve("tests/fixtures/focused"), cwd, { recursive: true });
+  git(cwd, "add", "."); git(cwd, "commit", "-qm", "focused fixture");
+  const argv = [process.execPath, "-e", "console.log(JSON.stringify(process.argv.slice(1)))", "tests/*.test.ts"];
+  const saved = task.taskData();
+  const work = taskRun("focused-test", input(cwd, { checks: [{ name: "tests", command: argv, focused: true, ...check }] }), { checks: true, git: "clean" }, saved);
+  work.start();
+  writeFileSync(join(cwd, changed), `${readFileSync(join(cwd, changed), "utf8")}// changed\n`);
+  assert.equal((await work.checks(phase)).type, "passed");
+  const entry = saved.evidence.at(-1) as unknown as Entry & { phase: string; command: string[]; focused?: string[]; whole?: string };
+  const round = ((saved as unknown as { checkRounds: Round[] }).checkRounds ?? []).at(-1);
+  assert.ok(round, "the round is recorded");
+  assert.equal(round.phase, phase);
+  return { entry, round, ran: JSON.parse(readFileSync(entry.log, "utf8")) as string[], argv };
+}
+
+test("a focused test check runs the test named after a changed file and every test that imports it, in place of its trailing glob", async context => {
+  const { entry, round, ran, argv } = await focusedRound(context, "src/pairing.ts");
+  const selected = ["tests/pairing.test.ts", "tests/uses-pairing.test.ts"];
+  assert.deepEqual([...ran].sort(), selected, "tests/other.test.ts neither is named after nor imports src/pairing.ts");
+  assert.deepEqual(entry.command.slice(0, 3), argv.slice(0, 3)); assert.deepEqual(entry.command.slice(3).sort(), selected);
+  assert.deepEqual([...(entry.focused ?? [])].sort(), selected); assert.equal(entry.whole, undefined);
+  assert.deepEqual(round.ran.map(item => [item.name, [...(item.focused ?? [])].sort()]), [["tests", selected]], "the receipt says which files the check was focused to");
+});
+
+for (const [label, changed, check, phase, why] of [
+  ["a changed file that nothing names or imports", "src/lonely.ts", {}, "verify", /nothing|no test/iu],
+  ["a command with no trailing glob argument", "src/pairing.ts", { command: [process.execPath, "-e", "console.log(JSON.stringify(process.argv.slice(1)))"] }, "verify", /glob/iu],
+  ["more selected files than focusedLimit", "src/pairing.ts", { focusedLimit: 1 }, "verify", /focusedLimit|limit/iu],
+  ["a changed test file with no production counterpart", "tests/other.test.ts", {}, "verify", /counterpart|production|test file/iu],
+  ["a reverify round", "src/pairing.ts", {}, "reverify", /reverify/iu],
+] as const) {
+  test(`a focused test check runs whole, and says why, for ${label}`, async context => {
+    const { entry, round, ran, argv } = await focusedRound(context, changed, check, phase);
+    const whole = "command" in check ? check.command : argv;
+    assert.deepEqual(entry.command, whole, "the check ran with its own argv");
+    assert.deepEqual(ran, whole.slice(3));
+    assert.equal(entry.focused, undefined);
+    assert.equal(typeof entry.whole, "string"); assert.match(entry.whole!, why);
+    assert.deepEqual(round.ran.map(item => [item.name, item.focused, item.whole]), [["tests", undefined, entry.whole]], "the receipt says why it ran whole");
+  });
+}
+
+test("checks in one group run concurrently, after waits for the checks it names, and a check without a group still waits its turn", async context => {
+  const cwd = repo(context);
+  const timed = (name: string, ms: number, extra = {}) => ({ name, ...extra, command: [process.execPath, "-e",
+    `console.log("start " + Date.now()); setTimeout(() => console.log("end " + Date.now()), ${ms});`] });
+  const checks = [timed("a", 1500, { group: "slow" }), timed("b", 1500, { group: "slow" }), timed("c", 10, { group: "slow", after: ["a"] }), timed("d", 10)];
+  const began = Date.now();
+  const result = await execute("verify-checks", input(cwd, { checks }));
+  const elapsed = Date.now() - began;
+  assert.equal(result.state, "done", result.output?.reason);
+  assert.ok(elapsed < 3000, `two 1500 ms checks in one group finished in ${elapsed} ms, less than the 3000 ms they take one after another`);
+  // One log per check, numbered in list order.
+  const entries = result.output.checks as Entry[];
+  assert.deepEqual(entries.map(entry => [entry.name, entry.passed, entry.log.split("/").at(-1)]), [["a", true, "1.log"], ["b", true, "2.log"], ["c", true, "3.log"], ["d", true, "4.log"]]);
+  const times = Object.fromEntries(entries.map(entry => {
+    const log = readFileSync(entry.log, "utf8");
+    return [entry.name, { start: Number(/start (\d+)/u.exec(log)![1]), end: Number(/end (\d+)/u.exec(log)![1]) }];
+  }));
+  assert.ok(times.b!.start < times.a!.end && times.a!.start < times.b!.end, "a and b overlap");
+  assert.ok(times.c!.start >= times.a!.end, "c starts after a, which it names in after, has finished");
+  assert.ok(times.d!.start >= Math.max(times.a!.end, times.b!.end, times.c!.end), "d, outside the group, starts after the group has finished");
+});
+
+/** The layered list the repair-round tests share: two always-checks, one of them not fast, a failing target, and a when check. */
+function layered(context: TestContext) {
+  const gates = { fast: counted(context, "fast", 0), slow: counted(context, "slow", 0), target: counted(context, "target", 2), ui: counted(context, "ui", 0) };
+  const checks = [gates.fast.gate, { ...gates.slow.gate, fastMs: 1 }, gates.target.gate, { ...gates.ui.gate, when: ["src/**"] }];
+  return { gates, checks, runs: () => Object.fromEntries(Object.entries(gates).map(([name, gate]) => [name, gate.runs()])) };
+}
+
+test("a repair round after a failed check runs that check and the fast always-checks only, then the full layered round before it passes", async context => {
+  const cwd = repo(context); const { checks, runs } = layered(context); let edits = 0;
+  const result = await execute("implement-task", input(cwd, { checks }), {
+    implementer: () => { place(cwd, `src/change-${++edits}.ts`); return ok(); },
+    reviewer: () => ok("approved"),
+  });
+  assert.equal(result.state, "done", result.output?.reason); assert.equal(result.output.checksPassed, true);
+  assert.deepEqual([edits, result.output.repairs], [2, 1]);
+  assert.deepEqual(result.output.checks.map((c: Entry) => [c.name, c.passed]), [
+    // The first round: every check, then the failed target once more by itself.
+    ["fast", true], ["slow", true], ["target", false], ["ui", true], ["target", false],
+    // The repair round: the failed check and the always-check that finished under its fastMs; not slow (fastMs 1) nor ui (when).
+    ["fast", true], ["target", true],
+    // It passed, so the full layered round runs at once, and its result is the outcome.
+    ["fast", true], ["slow", true], ["target", true], ["ui", true],
+  ]);
+  assert.deepEqual(runs(), { fast: 3, slow: 2, target: 4, ui: 2 });
+  const rounds = result.output.checkRounds as Round[];
+  assert.deepEqual(rounds.map(round => [round.phase, round.kind, round.passed]), [["verify", "layered", false], ["verify", "repair", true], ["verify", "layered", true]]);
+  assert.deepEqual(rounds.map(round => round.ran.map(entry => entry.name)), [["fast", "slow", "target", "ui"], ["fast", "target"], ["fast", "slow", "target", "ui"]]);
+  for (const round of rounds) assert.ok(typeof round.why === "string" && round.why.trim(), "each round says why it ran what it ran");
+  assert.deepEqual(JSON.parse(readFileSync(result.output.report, "utf8")).checkRounds, rounds);
+});
+
+for (const between of ["reverify", "seal"] as const) {
+  test(`after a failed verify round, ${between === "reverify" ? "the delivery reverify" : "a verify round after the candidate is sealed for review"} runs the full layered round, not a reduced one`, async context => {
+    const cwd = repo(context); const { checks } = layered(context);
+    const saved = task.taskData();
+    const work = taskRun("repair-round", input(cwd, { checks }), { checks: true, git: "clean" }, saved);
+    work.start(); place(cwd, "src/change.ts");
+    assert.equal((await work.checks()).type, "failed");
+    const from = saved.evidence.length;
+    if (between === "seal") work.seal();
+    const phase = between === "reverify" ? "reverify" : "verify";
+    assert.equal((await work.checks(phase)).type, "passed");
+    assert.deepEqual(saved.evidence.slice(from).map(entry => [entry.phase, entry.name, entry.passed]),
+      ["fast", "slow", "target", "ui"].map(name => [phase, name, true]));
+    const rounds = (saved as unknown as { checkRounds: Round[] }).checkRounds;
+    assert.deepEqual(rounds.map(round => [round.phase, round.kind]), [["verify", "layered"], [phase, "layered"]]);
+  });
+}
+
+test("a baseline and verify-checks run every check whole, when checks included, even with nothing changed", async context => {
+  const checks = [named("tests"), named("ui", { when: ["web/**"] })];
+  const cwd = repo(context);
+  const result = await execute("add-tests", input(cwd, { checks }), {
+    tester: () => { place(cwd, "tests/new.test.ts"); return ok(); }, reviewer: () => ok("approved"),
+  });
+  assert.equal(result.state, "done", result.output?.reason);
+  assert.deepEqual(result.output.checks.map((c: Entry & { phase: string }) => [c.phase, c.name]), [["baseline", "tests"], ["baseline", "ui"], ["verify", "tests"]]);
+  const rounds = result.output.checkRounds as Round[];
+  assert.deepEqual(rounds.map(round => [round.phase, round.ran.map(entry => entry.name), round.skipped.map(entry => entry.name)]),
+    [["baseline", ["tests", "ui"], []], ["verify", ["tests"], ["ui"]]]);
+  const other = repo(context);
+  const verified = await execute("verify-checks", input(other, { checks }));
+  assert.equal(verified.state, "done");
+  assert.deepEqual(verified.output.checks.map((c: Entry) => c.name), ["tests", "ui"]);
+  assert.deepEqual((verified.output.checkRounds as Round[]).map(round => round.skipped), [[]]);
+});
+
+test("the layered fields are accepted on checks, and each misuse is refused by its own field before execution", context => {
+  const cwd = repo(context);
+  const valid = [named("build"), named("types", { group: "all" }), named("tests", { group: "all", focused: true, focusedLimit: 10 }),
+    named("ui", { group: "all", when: ["web/**", "src/server.ts"] }), named("lint", { fastMs: 5000 }), named("smoke", { after: ["types", "tests", "ui"] })];
+  assert.doesNotThrow(() => modules["implement-task"].default(runtime, input(cwd, { checks: valid })));
+  for (const [label, checks, field] of [
+    ["after naming no check", [named("a", { after: ["nope"] })], /after/u],
+    ["after naming the check itself", [named("a", { after: ["a"] })], /after/u],
+    ["after naming a later check outside the group", [named("a", { after: ["b"] }), named("b")], /after/u],
+    ["after in a cycle", [named("a", { group: "g", after: ["b"] }), named("b", { group: "g", after: ["a"] })], /after|cycle/u],
+    ["after that is not an array", [named("a"), named("b", { after: "a" })], /after/u],
+    ["when that is not an array", [named("a", { when: "web/**" })], /when/u],
+    ["an empty when", [named("a", { when: [] })], /when/u],
+    ["a non-boolean focused", [named("a", { focused: "yes" })], /focused/u],
+    ["focusedLimit without focused", [named("a", { focusedLimit: 5 })], /focusedLimit/u],
+    ["fastMs beside when", [named("a", { when: ["src/**"], fastMs: 1000 })], /fastMs/u],
+    ["fastMs beside focused", [named("a", { focused: true, fastMs: 1000 })], /fastMs/u],
+    ["an empty group", [named("a", { group: "" })], /group/u],
+  ] as const) {
+    assert.throws(() => modules["implement-task"].default(runtime, input(cwd, { checks })),
+      (error: Error) => field.test(error.message) && !error.message.startsWith("Unknown "), label);
+  }
+  // The regression command runs whole and alone: the fields are not part of it.
+  assert.throws(() => modules["fix-bug"].default(runtime, input(cwd, { regression: { ...regression(), when: ["src/**"] } })), /when/u);
+  assert.equal(existsSync(join(cwd, ".machine-runs")), false);
+});
+
+const layeredFields = ["when", "focused", "focusedLimit", "group", "after", "fastMs"];
+
+test("docs/catalog.md's Common input documents the layered fields with Drip's check list as its example", context => {
+  const common = section(readFileSync(resolve("docs/catalog.md"), "utf8"), "Common input");
+  assert.ok(common !== undefined, "docs/catalog.md has no Common input section");
+  for (const field of layeredFields) assert.ok(common.includes(`\`${field}\``), `Common input names ${field}`);
+  const block = [...common.matchAll(/```json\n([\s\S]*?)```/gu)].map(match => match[1]!).find(text => text.includes("package-smoke"));
+  assert.ok(block, "Common input has a JSON example with Drip's checks");
+  const parsed = JSON.parse(block);
+  const checks = (Array.isArray(parsed) ? parsed : parsed.checks) as { name: string; when?: string[]; focused?: boolean; group?: string; after?: string[] }[];
+  assert.deepEqual(checks.map(check => check.name), ["build", "types", "tests", "linked-tests", "machine-tests", "ui", "remote-ui", "package-smoke"]);
+  const byName = Object.fromEntries(checks.map(check => [check.name, check]));
+  assert.equal(byName.build!.group, undefined, "build runs first, by itself");
+  const members = ["types", "tests", "linked-tests", "machine-tests", "ui", "remote-ui"];
+  const group = byName.types!.group;
+  assert.ok(group, "the middle checks share a group");
+  for (const name of members) assert.equal(byName[name]!.group, group, `${name} is in the group`);
+  assert.equal(byName.tests!.focused, true);
+  assert.deepEqual(byName.ui!.when, ["web/**", "src/server.ts"]);
+  assert.ok(Array.isArray(byName["remote-ui"]!.when) && byName["remote-ui"]!.when.length > 0, "remote-ui runs only when its sources change");
+  for (const name of members) assert.ok(byName["package-smoke"]!.after?.includes(name), `package-smoke runs after ${name}`);
+  const data = Array.isArray(parsed) ? input(repo(context), { checks }) : parsed;
+  assert.doesNotThrow(() => modules["implement-task"].default(runtime, data), "the example is valid input");
+});
+
+test("docs/catalog.md's Recovery section describes the reduced repair round and the full layered round after it", () => {
+  const recovery = section(readFileSync(resolve("docs/catalog.md"), "utf8"), "Recovery");
+  assert.ok(recovery !== undefined, "docs/catalog.md has no Recovery section");
+  const prose = recovery.replace(/\s+/gu, " ");
+  for (const field of ["fastMs", "when", "focused"]) assert.ok(prose.includes(`\`${field}\``), `Recovery names ${field}`);
+  assert.match(prose, /\bfull (?:layered )?round\b/iu, "the section says the full round runs after a reduced one passes");
+});
+
+for (const page of ["verify-checks", "implement-task", "fix-bug", "refactor", "add-tests", "update-docs", "upgrade-dependency", "prepare-release", "ticket-task"]) {
+  test(`docs/workflows/${page}.md documents each layered check field`, () => {
+    const lines = readFileSync(resolve("docs/workflows", `${page}.md`), "utf8").split("\n");
+    const prefix = page === "ticket-task" ? "repository\\.checks\\[\\]\\." : "(?:checks\\[\\]\\.)?";
+    for (const field of layeredFields) {
+      const row = lines.find(line => new RegExp(`^\\| \`${prefix}${field}\` \\|`, "u").test(line));
+      assert.ok(row, `no input table row for ${field}`);
+      if (field === "focusedLimit") assert.match(row, /\b40\b/u, "the row gives the default");
+      if (field === "fastMs") assert.match(row, /\b90000\b|\b90 ?s\b/u, "the row gives the default");
+    }
+  });
+}
+
+test("a skipped first group member keeps the group's position and satisfies after", async context => {
+  const cwd = repo(context);
+  const markers = mkdtempSync(join(tmpdir(), "layered-markers-"));
+  context.after(() => rmSync(markers, { recursive: true, force: true }));
+  const command = (name: string, requires?: string) => [process.execPath, "-e",
+    `const fs = require('node:fs'); ${requires ? `if (!fs.existsSync(${JSON.stringify(join(markers, requires))})) process.exit(7);` : ""} fs.writeFileSync(${JSON.stringify(join(markers, name))}, 'done');`];
+  const saved = task.taskData();
+  const work = taskRun("group-position", input(cwd, { checks: [
+    { name: "skip", command: command("skip"), group: "g", when: ["web/**"] },
+    { name: "serial", command: command("serial", "member") },
+    { name: "member", command: command("member"), group: "g", after: ["skip"] },
+  ] }), { checks: true, git: "clean" }, saved);
+  work.start(); place(cwd, "src/change.ts");
+  assert.equal((await work.checks()).type, "passed", work.status().reason);
+  assert.equal(existsSync(join(markers, "skip")), false);
+  assert.equal(existsSync(join(markers, "serial")), true);
+  assert.deepEqual(saved.checkRounds[0]!.skipped, [{ name: "skip", why: skippedWhen }]);
+  assert.deepEqual(saved.evidence.map(check => check.name), ["serial", "member"], "logs retain declaration order, even when the group runs first");
+});
+
+test("focused failed checks rerun alone with the exact selected argv and retain start paths after commit", async context => {
+  const cwd = repo(context);
+  cpSync(resolve("tests/fixtures/focused"), cwd, { recursive: true });
+  git(cwd, "add", "."); git(cwd, "commit", "-qm", "fixture");
+  const target = counted(context, "tests", 1);
+  const saved = task.taskData();
+  const argv = [...target.gate.command, "tests/*.test.ts"];
+  const work = taskRun("focused-rerun", input(cwd, { checks: [{ ...target.gate, command: argv, focused: true, when: ["src/**"] }] }), { checks: true, git: "clean" }, saved);
+  work.start(); place(cwd, "src/pairing.ts", "export const pairing = 2;\n");
+  assert.equal((await work.checks()).type, "passed");
+  assert.deepEqual(saved.evidence.map(entry => [entry.command.slice(-2), entry.focused, entry.flaky]), [0, 1].map(() => [
+    ["tests/pairing.test.ts", "tests/uses-pairing.test.ts"], ["tests/pairing.test.ts", "tests/uses-pairing.test.ts"], true,
+  ]));
+  git(cwd, "add", "."); git(cwd, "commit", "-qm", "candidate");
+  assert.equal((await work.checks("reverify")).type, "passed");
+  assert.deepEqual(saved.evidence.at(-1)!.command, argv);
+  assert.equal(saved.evidence.at(-1)!.whole, "reverify runs whole");
+  assert.deepEqual(saved.checkRounds.at(-1)!.skipped, []);
+});
+
+test("an aborted group kills its children without starting serial reruns or later units", async context => {
+  const cwd = repo(context);
+  const markers = mkdtempSync(join(tmpdir(), "layered-abort-"));
+  context.after(() => rmSync(markers, { recursive: true, force: true }));
+  const marker = join(markers, "late");
+  const saved = task.taskData();
+  const work = taskRun("abort-group", input(cwd, { checks: [
+    { name: "a", group: "g", command: [process.execPath, "-e", `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'late'), 2000)`] },
+    { name: "b", group: "g", command: [process.execPath, "-e", "setTimeout(() => {}, 2000)"] },
+    { name: "serial", command: [process.execPath, "-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'serial')`] },
+  ] }), { checks: true, git: "none" }, saved);
+  work.start();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 100);
+  try { await assert.rejects(work.checks("verify", controller.signal) as Promise<unknown>, /abort/iu); }
+  finally { clearTimeout(timer); }
+  assert.equal(existsSync(marker), false);
+  assert.equal(saved.checkRounds.length, 0);
+  assert.equal(saved.lastChecksPassed, null);
+});
