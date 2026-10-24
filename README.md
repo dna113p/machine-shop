@@ -87,7 +87,8 @@ machine run defaults/audit-project.ts --input-file /absolute/audit-input.json
 ```
 
 The [audit](docs/workflows/audit-project.md) inventories the project, proposes
-routes, gates and role bindings, and waits for accept or skip. `apply: true`
+routes, gates and role bindings, flags recorded checks over two minutes without
+`when` globs or `focused`, and waits for accept or skip. `apply: true`
 authorizes applying immediately. It is also setup for a project with no catalog.
 It stays in Machine Shop so it can use the current defaults and installer; it is
 absent from the installer’s selections. Evidence and the decision page live under

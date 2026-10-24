@@ -204,6 +204,10 @@ capabilities, runtime versions and recent run outcomes/stops. One analyst propos
 selective installs, safe refreshes, routing and gate findings. A schema fault gets
 one send-back; a second ends refused. Without `apply: true`, Human acceptance gates
 all setup writes. Skip retains the page without changing the checkout.
+Recorded whole verify checks over two minutes without `when` globs or `focused`
+produce deterministic slow always-check findings with suggested directory globs;
+an unmeasured gate list gets one note explaining how Machine Shop records durations.
+The audit reads recorded results and never runs checks to measure them.
 
 The audit reads the catalog and installer relative to its own checkout. The installer
 copies selected defaults and their transitive helpers, records each file’s hash and

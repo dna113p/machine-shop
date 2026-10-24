@@ -911,6 +911,167 @@ test("the project's own gates.json supplies gates, and a finding may cite an inv
   assert.match(run.page, /gates\.json:lint/u, "the finding is on the page");
 });
 
+type SlowChecks = { checks: { name: string; durationMs: number; minutes: number; globs: string[]; reason: string }[]; note: string | null };
+/** The slow-checks fixture over the base project: a gate list with ui and lint, a web/ directory and the script ui calls. */
+function slowFixture(context: TestContext, ui: Record<string, unknown> = {}) {
+  const f = fixture(context);
+  cpSync(resolve("tests/fixtures/slow-checks"), f.project, { recursive: true });
+  const gates = JSON.parse(readFileSync(join(f.project, ".machines/gates.json"), "utf8"));
+  gates.checks = gates.checks.map((check: { name: string }) => check.name === "ui" ? { ...check, ...ui } : check);
+  writeFileSync(join(f.project, ".machines/gates.json"), JSON.stringify(gates));
+  const pkg = JSON.parse(readFileSync(join(f.project, "package.json"), "utf8"));
+  pkg.scripts["test:ui"] = "playwright test web/e2e";
+  writeFileSync(join(f.project, "package.json"), JSON.stringify(pkg));
+  return f;
+}
+/** A Machine Shop run that recorded each check's whole verify-phase duration, as task.ts writes result.json. */
+function recordDurations(f: Fixture, durations: Record<string, number>) {
+  const at = Date.now() - 60_000;
+  const folder = join(f.project, ".machine-runs/machine-shop/recorded"); mkdirSync(folder, { recursive: true });
+  writeFileSync(join(folder, "started.json"), JSON.stringify({ workflow: "ticket-task", startedAt: new Date(at - 400_000).toISOString() }));
+  writeFileSync(join(folder, "result.json"), JSON.stringify({ outcome: "completed", finishedAt: new Date(at).toISOString(), reason: "",
+    checks: Object.entries(durations).map(([name, durationMs], index) => ({ phase: "verify", name, command: ["npm", "run", name === "ui" ? "test:ui" : name],
+      durationMs, exitCode: 0, signal: null, passed: true, expected: "exit 0", log: join(folder, `${index + 1}.log`) })) }));
+}
+const slowReason = /`ui` takes 6 minutes on every round; give it `when` globs for the paths it covers, or mark the test check `focused`/u;
+
+test("a recorded six-minute ui check with no when globs is a finding that names ui and proposes globs from its command", async context => {
+  const f = slowFixture(context);
+  recordDurations(f, { ui: 360_000, lint: 4_000 });
+  const before = tree(f.project);
+  const run = await execute(f, analyst(f), {}, { human: () => "skip" });
+  assert.equal(run.result.status, "done");
+  const slow = run.inventory.slowChecks as SlowChecks | undefined;
+  assert.ok(slow, "the inventory records slow always-checks");
+  assert.equal(slow.checks.length, 1, "only the check over two minutes is a finding; lint took four seconds");
+  const [ui] = slow.checks;
+  assert.equal(ui!.name, "ui", "a check whose name matches no gate class is still examined");
+  assert.equal(ui!.durationMs, 360_000);
+  assert.equal(ui!.minutes, 6);
+  assert.deepEqual(ui!.globs, ["web/**"], "globs come from the existing top-level directory the called script names");
+  assert.match(ui!.reason, slowReason);
+  assert.equal(slow.note, null, "recorded durations need no note");
+  pageTables(run.page);
+  const shown = [...run.page.matchAll(/<table\b[^>]*>[\s\S]*?<\/table>/giu)].map(match => match[0]).find(table => slowReason.test(table));
+  assert.ok(shown, "the page shows the finding in a table");
+  assert.match(shown, /<td>ui<\/td>/u);
+  assert.match(shown, /web\/\*\*/u, "the page shows the proposed globs");
+  assert.deepEqual(tree(f.project), before, "the audit reads recorded durations and changes nothing in the checkout");
+});
+
+test("the same six-minute ui check with when globs produces no finding", async context => {
+  const f = slowFixture(context, { when: ["web/**"] });
+  recordDurations(f, { ui: 360_000, lint: 4_000 });
+  const run = await execute(f, analyst(f), {}, { human: () => "skip" });
+  assert.equal(run.result.status, "done");
+  const slow = run.inventory.slowChecks as SlowChecks | undefined;
+  assert.ok(slow, "the inventory records slow always-checks");
+  assert.deepEqual(slow.checks, [], "a check with when globs runs only when its paths change");
+  assert.equal(slow.note, null, "durations are recorded, so there is no note");
+  assert.doesNotMatch(run.page, /takes [\d.]+ minutes on every round/u);
+  pageTables(run.page);
+});
+
+test("a gate list with no recorded durations produces a single note naming how to record them, not a finding", async context => {
+  const f = slowFixture(context);
+  const run = await execute(f, analyst(f), {}, { human: () => "skip" });
+  assert.equal(run.result.status, "done");
+  const slow = run.inventory.slowChecks as SlowChecks | undefined;
+  assert.ok(slow, "the inventory records slow always-checks");
+  assert.deepEqual(slow.checks, [], "an unmeasured check is not a finding");
+  assert.equal(typeof slow.note, "string", "one note");
+  assert.match(slow.note!, /Machine Shop workflow/u, "the note names a Machine Shop workflow, which records durations");
+  assert.match(slow.note!, /dev-verify-checks/u);
+  assert.match(slow.note!, /durationMs/u);
+  assert.match(slow.note!, /\.machine-runs\/machine-shop\/\*\/result\.json/u);
+  assert.doesNotMatch(slow.note!, /npm run verify/u, "npm run verify records no per-check durations");
+  assert.equal(run.page.split(cellText(slow.note!)).length - 1, 1, "the page shows the note once");
+  assert.doesNotMatch(run.page, /takes [\d.]+ minutes on every round/u);
+  pageTables(run.page);
+});
+/** The page escapes HTML, so match the note as rendered. */
+const cellText = (value: string) => value.replace(/[&<>"']/gu, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]!);
+
+test("focused checks are exempt even when their recorded whole execution is slow", async context => {
+  const f = slowFixture(context, { focused: true });
+  recordDurations(f, { ui: 360_000 });
+  const run = await execute(f, analyst(f), {}, { human: () => "skip" });
+  assert.deepEqual(run.inventory.slowChecks, { checks: [], note: null });
+});
+
+for (const scenario of ["focused execution", "old run", "future run", "other phase", "negative duration", "missing checks", "malformed ending", "malformed JSON", "symlinked result", "symlinked run"] as const) {
+  test(`slow checks ignore ${scenario}`, async context => {
+    const f = slowFixture(context);
+    recordDurations(f, { ui: 360_000 });
+    const folder = join(f.project, ".machine-runs/machine-shop/recorded");
+    const path = join(folder, "result.json");
+    const result = JSON.parse(readFileSync(path, "utf8"));
+    if (scenario === "focused execution") result.checks[0].focused = ["web/e2e/app.spec.js"];
+    if (scenario === "old run") result.finishedAt = new Date(Date.now() - 8 * 86400000).toISOString();
+    if (scenario === "future run") result.finishedAt = new Date(Date.now() + 86400000).toISOString();
+    if (scenario === "other phase") result.checks[0].phase = "reverify";
+    if (scenario === "negative duration") result.checks[0].durationMs = -1;
+    if (scenario === "missing checks") delete result.checks;
+    if (scenario === "malformed ending") delete result.outcome;
+    writeFileSync(path, scenario === "malformed JSON" ? "{" : JSON.stringify(result));
+    if (scenario === "symlinked result") {
+      const outside = join(f.base, "result.json"); cpSync(path, outside); rmSync(path); symlinkSync(outside, path);
+    }
+    if (scenario === "symlinked run") {
+      const outside = join(f.base, "recorded"); cpSync(folder, outside, { recursive: true });
+      rmSync(folder, { recursive: true }); symlinkSync(outside, folder, "dir");
+    }
+    const run = await execute(f, analyst(f), {}, { human: () => "skip" });
+    const slow = run.inventory.slowChecks as SlowChecks;
+    assert.deepEqual(slow.checks, []);
+    assert.match(slow.note!, /No check durations/u);
+  });
+}
+
+test("the newest whole verify duration wins across runs and within a run, at a strict two-minute threshold", async context => {
+  const f = slowFixture(context);
+  recordDurations(f, { ui: 360_000 });
+  const root = join(f.project, ".machine-runs/machine-shop");
+  // Sorting names visits the newer run first, so selection must use finishedAt.
+  const newer = join(root, "a-newer"); cpSync(join(root, "recorded"), newer, { recursive: true });
+  const path = join(newer, "result.json");
+  const result = JSON.parse(readFileSync(path, "utf8"));
+  result.finishedAt = new Date(Date.now() - 30_000).toISOString();
+  result.checks.push({ ...result.checks[0], durationMs: 120_000 });
+  result.checks.push({ ...result.checks[0], durationMs: 600_000, focused: [] });
+  writeFileSync(path, JSON.stringify(result));
+  const run = await execute(f, analyst(f), {}, { human: () => "skip" });
+  assert.deepEqual(run.inventory.slowChecks, { checks: [], note: null });
+});
+
+for (const command of [["npm", "test"], ["npm", "run", "test:ui"], ["pnpm", "run", "test:ui"], ["yarn", "run", "test:ui"]]) {
+  test(`glob suggestions for ${command.join(" ")} exclude runner verbs and script names`, async context => {
+    const f = slowFixture(context, { command });
+    for (const dir of ["npm", "pnpm", "yarn", "run", "test", "test:ui"]) mkdirSync(join(f.project, dir), { recursive: true });
+    const pkgPath = join(f.project, "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+    pkg.scripts.test = pkg.scripts["test:ui"] = "node --version";
+    writeFileSync(pkgPath, JSON.stringify(pkg));
+    recordDurations(f, { ui: 360_000 });
+    const run = await execute(f, analyst(f), {}, { human: () => "skip" });
+    const slow = run.inventory.slowChecks as SlowChecks;
+    assert.equal(slow.checks.length, 1);
+    assert.deepEqual(slow.checks[0]!.globs, []);
+    assert.match(slow.checks[0]!.reason, /No globs proposed/u);
+  });
+}
+
+test("glob suggestions normalize forwarded paths, deduplicate directories and exclude symlinks and hidden directories", async context => {
+  const f = slowFixture(context, { command: ["npm", "run", "test:ui", "--", '--root="./assets/icons"', "./web/e2e", "linked/spec", ".cache/spec", "node_modules/spec"] });
+  mkdirSync(join(f.project, "assets")); mkdirSync(join(f.project, ".cache"));
+  symlinkSync(join(f.project, "web"), join(f.project, "linked"), "dir");
+  recordDurations(f, { ui: 120_001 });
+  const run = await execute(f, analyst(f), {}, { human: () => "skip" });
+  const slow = run.inventory.slowChecks as SlowChecks;
+  assert.equal(slow.checks.length, 1, "even just over two minutes is a finding");
+  assert.deepEqual(slow.checks[0]!.globs, ["assets/**", "web/**"]);
+});
+
 test("an instruction file the inventory records as null is evidence that it is missing, and a rejected finding is named with each item the inventory does not hold", async context => {
   const f = fixture(context);
   assert.equal(existsSync(join(f.project, ".machines/gates.json")), false, "the fixture declares no gate list");
