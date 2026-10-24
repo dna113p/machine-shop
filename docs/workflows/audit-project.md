@@ -171,6 +171,27 @@ mean no recognized command, not proof the project has no checks. No project scri
 is executed. Capability descriptions and sources are evidence; the inventory does
 not invent measured preset rankings.
 
+The inventory also computes slow always-check findings for every valid check in
+`.machines/gates.json`, including names such as `ui` that match no gate class.
+A check taking **more than two minutes** without nonempty `when` globs or
+`focused: true` gets a finding in `slowChecks.checks` and its own page table.
+The audit reads only `checks[].durationMs` from
+`.machine-runs/machine-shop/*/result.json`; it never runs checks to measure them.
+It selects the most recent whole `verify` entry by the run's `finishedAt` within
+the audit window, taking the last whole entry within a run. Focused executions
+are excluded; whole repair executions count. Missing, malformed or symlinked
+duration evidence is ignored. Verify receipts are not a duration source.
+
+Suggested `when` globs use existing, non-symlinked top-level directories named
+in the command or its called package script (`npm`, `pnpm` or `yarn run`, or
+`npm test`), including forwarded arguments. Package runner verbs and script
+names, dot-directories and `node_modules` are excluded. Suggestions remain empty
+when no directory is supported by that evidence. The audit never applies them.
+If a gate list has no usable recorded durations, `slowChecks.note` and the page
+show one note to run the project's checks through a Machine Shop workflow
+(a ticket or `dev-verify-checks`), which records `durationMs` for the next audit.
+A project without a valid gate list gets neither a finding nor that note.
+
 The shared evidence helper supplies both audit and retrospective; audit uses it to supply outcomes
 (including successful endings), stops by stage, stop ids, owner answers and
 unreadable evidence. Audit includes all Machine Shop workflows in the window;

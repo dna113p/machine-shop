@@ -10,12 +10,15 @@ import { displayArgv, inspectProjectAgent, parseProjectAgentInput, type ProjectA
 export const gateClasses = ["lint", "types", "tests", "build", "live"] as const;
 export type GateClass = typeof gateClasses[number];
 export interface Gate { class: GateClass; name: string; command: string[] }
+export interface SlowCheck { name: string; durationMs: number; minutes: number; run: string; globs: string[]; reason: string }
+interface AuditCheck { name: string; command: string[]; when: boolean; focused: boolean }
 export interface Preset { name: string; source: string; description: string; harness?: string; model?: string }
 export interface Default { name: string; status: "absent" | "current" | "stale" | "modified" | "unknown"; roles: string[]; catalogRoles: string[]; refreshHelpers: string[]; installable: boolean }
 export interface Inventory {
   project: string; since: string; until: string;
   instructions: Record<string, string | null>; scripts: Record<string, string>; ci: Record<string, string>;
   gates: { found: Gate[]; missing: GateClass[] };
+  slowChecks?: { checks: SlowCheck[]; note: string | null };
   presets: Preset[]; bindings: { source: string | null; roles: Record<string, string | null> };
   runtime: { pinned: string | null; installed: string }; catalogVersion: string;
   defaults: Default[]; custom: string[]; snapshot: string;
@@ -81,9 +84,77 @@ export function catalogSnapshot(project: string) {
   visit(root);
   return hash(JSON.stringify(values));
 }
+
+/** Only whole verify executions measure the always-check cost; never execute a check here. */
+function recordedDurations(project: string, own: string, since: number, until: number) {
+  const durations = new Map<string, { durationMs: number; run: string; at: number }>();
+  const root = join(project, ".machine-runs/machine-shop");
+  let runs: string[];
+  try {
+    safePath(project, root);
+    runs = readdirSync(root).sort();
+  } catch { return durations; }
+  for (const run of runs) {
+    const folder = join(root, run);
+    if (folder === own) continue;
+    try {
+      safePath(project, folder);
+      if (!lstatSync(folder).isDirectory()) continue;
+      const result: unknown = JSON.parse(readOptional(project, join(folder, "result.json")) ?? "null");
+      if (!object(result) || !text(result.outcome) || typeof result.reason !== "string"
+        || !text(result.finishedAt) || !Array.isArray(result.checks)) continue;
+      const at = Date.parse(result.finishedAt);
+      if (!Number.isFinite(at) || at < since || at > until) continue;
+      for (const check of result.checks) {
+        if (!object(check) || check.phase !== "verify" || !text(check.name) || Array.isArray(check.focused)
+          || typeof check.durationMs !== "number" || !Number.isFinite(check.durationMs) || check.durationMs < 0) continue;
+        // Last whole entry wins within a run, including whole repair executions.
+        if (at >= (durations.get(check.name)?.at ?? -Infinity)) durations.set(check.name, { durationMs: check.durationMs, run, at });
+      }
+    } catch { /* Unreadable evidence is reported by readEvidence. */ }
+  }
+  return durations;
+}
+
+function proposeGlobs(project: string, command: string[], scripts: Record<string, string>) {
+  let tokens = command;
+  if (["npm", "pnpm", "yarn"].includes(command[0]!)) {
+    const scriptIndex = command[1] === "run" ? 2 : command[0] === "npm" && command[1] === "test" ? 1 : -1;
+    // Package runner verbs and script names are not paths.
+    const script = Object.hasOwn(scripts, command[scriptIndex]!) ? scripts[command[scriptIndex]!]! : "";
+    tokens = scriptIndex < 0 ? [] : [...script.split(/\s+/u), ...command.slice(scriptIndex + 1)];
+  }
+  const globs = new Set<string>();
+  for (const token of tokens) {
+    const directory = token.replace(/["']/gu, "").replace(/^--[^=]+=/u, "").replace(/^\.\//u, "").split("/")[0]!;
+    if (!directory || directory.startsWith(".") || directory === "node_modules") continue;
+    try {
+      const stat = lstatSync(join(project, directory));
+      if (stat.isDirectory() && !stat.isSymbolicLink()) globs.add(`${directory}/**`);
+    } catch { /* Only existing top-level directories support a proposal. */ }
+  }
+  return [...globs].sort();
+}
+
+function slowChecks(project: string, checks: AuditCheck[], scripts: Record<string, string>, own: string, since: number, until: number): NonNullable<Inventory["slowChecks"]> {
+  const durations = recordedDurations(project, own, since, until);
+  return {
+    checks: checks.flatMap(check => {
+      const recorded = durations.get(check.name);
+      if (!recorded || recorded.durationMs <= 120_000 || check.when || check.focused) return [];
+      const minutes = Math.round(recorded.durationMs / 6000) / 10;
+      const globs = proposeGlobs(project, check.command, scripts);
+      return [{ name: check.name, durationMs: recorded.durationMs, minutes, run: recorded.run, globs,
+        reason: `\`${check.name}\` takes ${minutes} minutes on every round; give it \`when\` globs for the paths it covers, or mark the test check \`focused\`. ${globs.length ? `Proposed \`when\`: ${JSON.stringify(globs)}.` : "No globs proposed: the command names no top-level directory."}` }];
+    }),
+    note: checks.length && !checks.some(check => durations.has(check.name))
+      ? "No check durations are recorded for the checks in `.machines/gates.json`. Run the project's checks through a Machine Shop workflow (a ticket or dev-verify-checks); it records each check's `durationMs` in `.machine-runs/machine-shop/*/result.json` for the next audit."
+      : null,
+  };
+}
 export async function inventoryProject(project: string, catalog: Catalog, own: string, since: number, until: number, projectAgent?: ProjectAgentInput): Promise<Inventory> {
   if (!lstatSync(project).isDirectory()) throw new Error("project must be an existing directory");
-  // The project's own gate list (.machines/gates.json, which the task helper runs) is read as an instruction file and as gates.
+  // The project's own gate list is read as an instruction file and as gates, never executed.
   const instructions = Object.fromEntries(["AGENTS.md", "CLAUDE.md", ".machines/README.md", ".machines/gates.json"].map(key => [key, readOptional(project, join(project, key))]));
   const pkg = JSON.parse(readOptional(project, join(project, "package.json")) ?? "{}");
   const scripts: Record<string, string> = Object.fromEntries(Object.entries(pkg.scripts ?? {}).filter(([, value]) => typeof value === "string")) as Record<string, string>;
@@ -91,9 +162,12 @@ export async function inventoryProject(project: string, catalog: Catalog, own: s
   const found = Object.keys(scripts).sort().flatMap(name => gateClasses.filter(kind => matchers[kind].test(name)).map(kind => ({ class: kind, name, command: ["npm", "run", name] })));
   // A gate list names its checks; a name is classed as a script name is, and its command is kept as written (placeholders included).
   let gateList: unknown = null;
+  const checks: AuditCheck[] = [];
   try { gateList = instructions[".machines/gates.json"] === null ? null : JSON.parse(instructions[".machines/gates.json"]!); } catch { gateList = null; }
   if (object(gateList) && Array.isArray(gateList.checks)) for (const check of gateList.checks) {
     if (!object(check) || !text(check.name) || !Array.isArray(check.command) || !check.command.length || check.command.some(part => !text(part))) continue;
+    checks.push({ name: check.name, command: check.command as string[], focused: check.focused === true,
+      when: Array.isArray(check.when) && check.when.length > 0 && check.when.every(part => typeof part === "string" && part.trim().length > 0) });
     const named = `${check.name}`.toLowerCase();
     const kind = gateClasses.find(kind => matchers[kind].test(named)) ?? (/(?:smoke|package|install)/u.test(named) ? "live" : undefined);
     if (kind) found.push({ class: kind, name: `.machines/gates.json:${check.name}`, command: check.command as string[] });
@@ -162,6 +236,7 @@ export async function inventoryProject(project: string, catalog: Catalog, own: s
   const presets = await launcher.listAgentPresets({ cwd: project });
   return { project, since: new Date(since).toISOString(), until: new Date(until).toISOString(), instructions, scripts, ci,
     gates: { found, missing: gateClasses.filter(kind => !found.some(gate => gate.class === kind)) }, presets,
+    slowChecks: slowChecks(project, checks, scripts, own, since, until),
     bindings: { source: readOptional(project, join(directory, "agents.ts")), roles: Object.fromEntries([...new Set(defaults.flatMap(item => item.roles))].map(role => [role, presets.find(preset => preset.name === role)?.source ?? null])) },
     runtime: { pinned: pkg.dependencies?.["@dna113p/machines"] ?? pkg.devDependencies?.["@dna113p/machines"] ?? null, installed: version },
     catalogVersion: catalog.version, provenanceVersion: baseline.version, helpers, defaults, custom, snapshot: catalogSnapshot(project), runs: readEvidence([project], own, since, until, true),
@@ -254,6 +329,8 @@ function table(headers: string[], rows: unknown[][], preserveRows = false) {
   return start + body + end;
 }
 export function auditPage(inventory: Inventory, proposal: Proposal, decision: string) {
+  // Older inventories and callers may predate duration observations.
+  const slow = inventory.slowChecks ?? { checks: [], note: null };
   const agent = inventory.projectAgent;
   const observed = agent?.observation;
   const projectAgent = !agent ? "" : `<h2>Shared project agent</h2><p>${cell(agent.status)}. Read-only observation; no enforcement or subsequent repair is established.</p>
@@ -271,6 +348,7 @@ ${agent.findings.length && !agent.nextActions.length ? "<p>No setup route suppli
 <h2>Drift</h2>${table(["Machine", "Status", "Action", "Reason"], [...proposal.defaults.map(item => [item.name, inventory.defaults.find(entry => entry.name === item.name)!.status, item.action, item.reason]), ...inventory.custom.map(name => [name, "project-specific", "leave", "Owner policy"])])}
 <h2>Proposed routing map</h2>${table(["Task", "Machine", "Role bindings and evidence"], proposal.routes.map(route => [route.task, route.machine, Object.entries(route.roles).map(([role, binding]) => `${role} = ${binding.preset}: ${binding.reason} (${binding.evidence.join(", ")})`).join("; ")]))}
 <h2>Gates</h2>${table(["Class", "Commands", "Status"], gateClasses.map(kind => [kind, proposal.gates.found.filter(gate => gate.class === kind).map(gate => gate.command.join(" ")).join("; ") || "No command", proposal.gates.missing.includes(kind) ? "missing" : "found; not executed"]))}
+${slow.checks.length ? `<h2>Slow always-checks</h2>${table(["Check", "Minutes", "Proposed when", "Finding"], slow.checks.map(check => [check.name, check.minutes, check.globs.join(", ") || "None", check.reason]))}` : slow.note ? `<h2>Slow always-checks</h2><p>${cell(slow.note)}</p>` : ""}
 ${projectAgent}
 <h2>Run evidence</h2><p>${cell(inventory.since)} through ${cell(inventory.until)}</p>
 ${table(["Helper", "Provenance"], inventory.helpers.map(helper => [helper.name, helper.status]))}

@@ -1,0 +1,7 @@
+{
+  "description": "A gate list whose ui check runs on every round.",
+  "checks": [
+    { "name": "lint", "command": ["npm", "run", "lint"] },
+    { "name": "ui", "command": ["npm", "run", "test:ui"] }
+  ]
+}
