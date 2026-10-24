@@ -4,9 +4,9 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { defineEndings, type Event, type MachinePrimitives } from "@dna113p/machines";
 import { evidenceHuman, evidenceLog, writeStuckEvidence, repositoryTurn, taskNow, taskStatus, writeHandoff, taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
 import { brief, opening, excerpt, evidenceFacts, evidencePage, handoffPage, type EvidenceBlock } from "./defaults/_machine-shop/brief.ts";
-import { outsideScope } from "./defaults/_machine-shop/scope.ts";
+import { forbiddenPatterns, matchesForbidden, outsideScope } from "./defaults/_machine-shop/scope.ts";
 
-export const description = "Carry one local ticket for one Git repository from an isolated worktree through falsification, planning, plan review, implementation, checks, and review to a delivered branch, patch, or pull request; a stuck run sleeps on a Human question.";
+export const description = "Deliver one local ticket from an isolated worktree with trusted implementation and advisory review by default, careful planning on request, or auto review after delivery; blocked decisions sleep on a Human question.";
 export const agentRoles = {
   investigator: "Tries to falsify the ticket, then plans its implementation without editing",
   tester: "Writes failing tests for the ticket's acceptance criteria before implementation",
@@ -83,6 +83,12 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     repairing: "change" as PlanningStage | "test" | "change",
     scopeChecks: 0,
     scopeAdditions: [] as ScopeAddition[],
+    decided: [] as { question: string; answer: string; why: string }[],
+    softScope: [] as { path: string; why: string }[],
+    needs: [] as string[],
+    mechanicalRetry: false,
+    postReviewFault: "",
+    postReview: null as { verdict: string; blockers: string[]; posted?: boolean } | null,
     pendingScope: null as ScopeMiss | null,
     provedRed: false,
     planningReport: { type: "sound" } as Event,
@@ -102,10 +108,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     handoffFiles: null as { path: string; added: number | null; removed: number | null }[] | null,
     task: taskData(),
   });
-  const { ticket, repository, prefix, worktree, evidenceRoot, resume, redGreen, assume, work, branch: named } = parseTicket(input, saved.task);
+  const { level, ticket, repository, prefix, worktree, evidenceRoot, resume, redGreen, assume, work, branch: named } = parseTicket(input, saved.task);
+  const careful = level === "careful";
+  const hardScope = [...forbiddenPatterns(ticket.sections.forbidden), ...repository.forbidden];
+  const allAssumptions = () => [...saved.assumptions, ...saved.decided];
+  const allAdditions = () => [...saved.scopeAdditions, ...saved.softScope.filter(item => !saved.scopeAdditions.some(owner => owner.path === item.path))];
   const allowedScope = [...ticket.sections.scope, ...repository.companions];
-  const scopeAdditionLines = () => saved.scopeAdditions.map(({ path, stage }) => `${path}: included by the ticket owner after ${stage}`);
-  const scopeAdditionSection = () => saved.scopeAdditions.length ? ["## Scope additions", scopeAdditionLines().map(line => `- ${line}`).join("\n")] : [];
+  const scopeAdditionLines = () => [
+    ...saved.scopeAdditions.map(({ path, stage }) => `${path}: included by the ticket owner after ${stage}`),
+    ...saved.softScope.filter(item => !saved.scopeAdditions.some(owner => owner.path === item.path)).map(({ path, why }) => `${path}: ${why}`),
+  ];
+  const scopeAdditionSection = () => allAdditions().length || !careful ? ["## Scope additions", scopeAdditionLines().map(line => `- ${line}`).join("\n") || "None."] : [];
   // Owner additions are literal filenames, never patterns or directory prefixes.
   const outsideEffectiveScope = (paths: string[]) => outsideScope(paths.filter(path => !saved.scopeAdditions.some(addition => addition.path === path)), allowedScope);
   const scopePrompt = (heading = "Scope:") => [
@@ -113,6 +126,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     ...scopeAdditionSection(),
     ...(repository.companions.length ? ["Also in scope for every ticket here:", ...repository.companions.map(text => `- ${text}`)] : []),
   ];
+  const assumptionSection = () => allAssumptions().length || !careful ? ["## Assumptions", allAssumptions().map(({ question, answer, why }) => `- ${flat(question)} Assumed: ${flat(answer)} (${flat(why)})`).join("\n") || "None."] : [];
+  const reviewNoteSection = () => saved.reviewNotes.length || !careful ? ["## Review notes", saved.reviewNotes.map(note => `- ${flat(note.text)}${flat(note.where) ? ` (${flat(note.where)})` : ""}`).join("\n") || "None."] : [];
+  const needsSection = () => saved.needs.length ? ["## Needs you", saved.needs.map(need => `- ${need}`).join("\n")] : [];
+  const decisionSections = () => [...assumptionSection(), ...scopeAdditionSection(), ...reviewNoteSection(), ...needsSection()];
+  const addSoftScope = (path: string, why: string, reported = false) => {
+    const previous = saved.softScope.find(item => item.path === path);
+    if (!previous) saved.softScope.push({ path, why });
+    else if (reported) previous.why = why;
+  };
   let turn: ReturnType<typeof repositoryTurn> | undefined;
   let turnHeld = false;
   const lifetime = new AbortController();
@@ -148,10 +170,11 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   };
   // A continued run keeps its saved branch; resume may adopt the worktree's branch.
   saved.branch ||= named;
-  const assumptionsPrompt = () => saved.assumptionsJson ? ["Assumptions:", saved.assumptionsJson] : [];
+  const assumptionsPrompt = () => careful ? (saved.assumptionsJson ? ["Assumptions:", saved.assumptionsJson] : [])
+    : allAssumptions().length ? ["Assumptions:", JSON.stringify(allAssumptions(), null, 2)] : [];
   // Answers remain in every later stage's prompt, including after a sleeping run continues.
   const prompt = (instruction: string, stage?: string) => [
-    work.prompt(instruction, stage),
+    work.prompt(instruction, stage, { allowCommit: !careful && stage === "change" }),
     ...(saved.previousEvidence ? [`Earlier run's evidence: ${saved.previousEvidence}`] : []),
     ...(saved.answers.length ? ["Answers from the ticket owner:", ...saved.answers] : []),
   ].join("\n\n");
@@ -170,14 +193,19 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       if (/[RC]/u.test(entry.slice(0, 2))) paths.push(entries[++index]!);
     }
     const changed = [...new Set(paths)].filter(path => path !== ".machine-runs" && !path.startsWith(".machine-runs/")).sort();
-    const outside = outsideEffectiveScope(changed);
-    writeFileSync(join(work.open(), `scope-${++saved.scopeChecks}.json`), JSON.stringify({ stage, changed, outside }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    const additions = outsideEffectiveScope(changed);
+    const outside = careful ? additions : changed.filter(path => matchesForbidden(path, hardScope)
+      && !saved.scopeAdditions.some(addition => addition.path === path));
+    if (!careful) for (const path of additions.filter(path => !outside.includes(path))) addSoftScope(path, "Changed to complete the ticket.");
+    writeFileSync(join(work.open(), `scope-${++saved.scopeChecks}.json`), JSON.stringify({ stage, changed, outside,
+      ...(!careful ? { forbidden: hardScope, additions: saved.softScope } : {}) }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     if (outside.length) {
       const files = diffFiles();
       saved.pendingScope = { stage: stage === "test" ? "red" : "gate", files: outside.map(path =>
         files?.find(file => file.path === path) ?? { path, added: null, removed: null }) };
       writeFileSync(join(work.open(), `scope-miss-${saved.scopeChecks}.json`), JSON.stringify(saved.pendingScope, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-      work.block(`Paths outside the ticket Scope after ${stage}: ${outside.map(path => JSON.stringify(path)).join(", ")}. Scope: ${allowedScope.join(", ")}.`);
+      work.block(careful ? `Paths outside the ticket Scope after ${stage}: ${outside.map(path => JSON.stringify(path)).join(", ")}. Scope: ${allowedScope.join(", ")}.`
+        : `Forbidden paths changed after ${stage}: ${outside.map(path => JSON.stringify(path)).join(", ")}. Forbidden patterns: ${hardScope.join(", ")}.`);
       return { type: "scopeMiss" };
     }
     saved.pendingScope = null;
@@ -917,6 +945,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       // except when updating a delivered pull request: then only with a lease on the delivered commit, so a push someone else made is never overwritten.
       // An updated pull request whose commit did not change is not pushed at all.
       // It goes to the URL prepare checked, read once: a remote reconfigured since then, as an Agent can do, is not asked again.
+      // A resumed PR with standing findings must be a real draft before its new candidate is pushed.
+      if (!careful && saved.prUrl && saved.needs.length
+        && !attempt("gh", ["pr", "ready", saved.prUrl, "--undo", "--repo", hosted], worktree, publishTimeoutMs, undefined, true).ok) return stepFailure("deliver");
       if (saved.commitHash !== saved.lease) {
         const lease = saved.lease ? [`--force-with-lease=refs/heads/${saved.branch}:${saved.lease}`] : [];
         const sent = attempt("git", ["push", "--no-follow-tags", ...lease, saved.checked, `${saved.commitHash}:refs/heads/${saved.branch}`], worktree, publishTimeoutMs, undefined, true);
@@ -929,25 +960,30 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         }
         saved.pushed = true;
       }
-      if (!saved.prUrl) {
+      if (!saved.prUrl || (!careful && saved.needs.length)) {
         const body = join(directory, "pull-request.md");
         writeFileSync(body, [
           ticket.title,
           ...(ticket.summary ? ["## Summary", ticket.summary] : []),
-          ...(saved.assumptions.length ? ["## Assumptions", saved.assumptions.map(({ question, answer, why }) => `- ${flat(question)} Assumed: ${flat(answer)} (${flat(why)})`).join("\n")] : []),
+          ...assumptionSection(),
           ...scopeAdditionSection(),
           "## Checks", repository.checks.map(name => `- ${name}: ${checkDescription(name)}`).join("\n"),
           // The helper has already taken the summary out of a JSON report; one that is still an object is evidence, not text for a reader.
           "## Review", jsonObject(saved.reviewSummary) ? "The reviewer approved this change without a written summary; its report is kept with the run evidence." : saved.reviewSummary,
-          ...(saved.reviewNotes.length ? ["## Review notes", saved.reviewNotes.map(note => `- ${flat(note.text)}${flat(note.where) ? ` (${flat(note.where)})` : ""}`).join("\n")] : []),
+          ...reviewNoteSection(),
+          ...needsSection(),
           `Ticket: ${ticket.id}`,
         ].join("\n\n") + "\n", { mode: 0o600 });
         // The base is always named, and is the one prepare compared with the remote, not one read again from refs or configuration that may have changed since.
-        const opened = attempt("gh", ["pr", "create", "--repo", hosted, ...(repository.draft ? ["--draft"] : []), "--base", saved.checkedBase,
-          "--head", saved.branch, "--title", ticket.title, "--body-file", body], worktree, publishTimeoutMs, undefined, true);
-        if (!opened.ok) return stepFailure("deliver", undefined, "unreachable");
-        saved.prUrl = opened.stdout.split(/\s+/u).findLast(word => /^https?:\/\/\S+$/u.test(word)) ?? "";
-        if (!saved.prUrl) return stepFailure("deliver", `gh pr create printed no pull request URL; inspect ${saved.branch} on ${repository.remote}.`);
+        if (saved.prUrl) {
+          if (!attempt("gh", ["pr", "edit", saved.prUrl, "--repo", hosted, "--body-file", body], worktree, publishTimeoutMs, undefined, true).ok) return stepFailure("deliver");
+        } else {
+          const opened = attempt("gh", ["pr", "create", "--repo", hosted, ...(repository.draft || saved.needs.length ? ["--draft"] : []), "--base", saved.checkedBase,
+            "--head", saved.branch, "--title", ticket.title, "--body-file", body], worktree, publishTimeoutMs, undefined, true);
+          if (!opened.ok) return stepFailure("deliver", undefined, "unreachable");
+          saved.prUrl = opened.stdout.split(/\s+/u).findLast(word => /^https?:\/\/\S+$/u.test(word)) ?? "";
+          if (!saved.prUrl) return stepFailure("deliver", `gh pr create printed no pull request URL; inspect ${saved.branch} on ${repository.remote}.`);
+        }
       }
     }
     if (!attempt("git", ["config", "--local", `branch.${saved.branch}.ticketDelivered`, saved.commitHash], repository.path, undefined, undefined, true).ok) return stepFailure("deliver");
@@ -1119,8 +1155,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     };
     const page = handoffPage({
       title: ticket.title, breadcrumb: `${repository.name}: ${repository.path} · Ticket: ${ticket.id} · Branch: ${saved.branch}${saved.prUrl ? ` · Pull request: ${saved.prUrl}` : saved.patches.length ? ` · Patch: ${saved.patches.join(", ")}` : ""}`,
-      outcome, done: saved.passedStages.map(stage => stageWords[stage] ?? stage), decided: saved.assumptions.length ? evidenceText(saved.assumptions) : "No assumptions taken.",
-      needs: needs || "Nothing needed.", files: facts.files ?? null, gates, review: reviewBlocks,
+      outcome, done: saved.passedStages.map(stage => stageWords[stage] ?? stage), decided: allAssumptions().length ? evidenceText(allAssumptions()) : "No assumptions taken.",
+      needs: needs || saved.needs.join("\n") || "Nothing needed.", files: facts.files ?? null, gates, review: reviewBlocks,
       evidence: [{ title: "Stage and candidate location", text: `${facts.stage}\nWorktree: ${worktree}` },
         ...(saved.held ? [{ title: "Ending", text: saved.held.summary }] : []),
         // Keep the question's gate metadata as well as its other evidence. The table,
@@ -1251,6 +1287,26 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     return { type: "removed" };
   }
 
+  function writeDelivery(outcome: string, reason = "", finished = true) {
+    const directory = work.open();
+    writeFileSync(join(directory, "delivery.json"), JSON.stringify({
+      schemaVersion: 1, outcome, ...(finished ? {} : { reason }), ...(saved.decision ? { decision: saved.decision } : {}),
+      ticket: ticket.id, repository: { name: repository.name, path: repository.path }, branch: saved.branch,
+      baseCommit: saved.baseCommit || null, commit: saved.commitHash || null, output: repository.output,
+      ...(saved.rebasedFrom ? { rebasedFrom: saved.rebasedFrom } : {}),
+      ...(finished && saved.redelivered ? { redelivered: true } : {}),
+      // A first delivery opens its pull request; a resumed one updates the one it found, or leaves it as it was when the commit did not change.
+      ...(finished && saved.lease ? { pullRequest: saved.pushed ? "updated" : "unchanged" } : {}),
+      ...(allAssumptions().length ? { assumptions: allAssumptions() } : {}),
+      ...(allAdditions().length ? { scopeAdditions: allAdditions() } : {}),
+      ...(!careful ? { level } : {}),
+      ...(saved.needs.length ? { draft: true, needs: saved.needs } : {}),
+      ...(saved.postReview ? { review: saved.postReview } : {}),
+      ...(saved.prUrl ? { prUrl: saved.prUrl } : {}), ...(saved.patches.length ? { patches: saved.patches } : {}),
+      worktree, ...(saved.adopted ? { resumed: true } : {}), worktreeCreated: saved.created, worktreeRemoved: saved.removed, reviewNotes: saved.reviewNotes,
+    }, null, 2) + "\n", { flag: level === "auto" ? "w" : "wx", mode: 0o600 });
+  }
+
   function conclude(wanted: "completed" | "refused" | "handed-off" | "abandoned"): Event {
     snapshotFiles();
     const result = `${saved.branch} at ${saved.commitHash}${saved.prUrl ? `, pull request ${saved.prUrl}` : ""}${saved.patches.length ? `, patch ${saved.patches.join(", ")}` : ""}`;
@@ -1266,19 +1322,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const outcome = finished ? "delivered" : wanted === "completed" ? "refused" : wanted;
     const directory = work.open();
     const reason = finished ? "" : String(work.output()?.reason);
-    writeFileSync(join(directory, "delivery.json"), JSON.stringify({
-      schemaVersion: 1, outcome, ...(finished ? {} : { reason }), ...(saved.decision ? { decision: saved.decision } : {}),
-      ticket: ticket.id, repository: { name: repository.name, path: repository.path }, branch: saved.branch,
-      baseCommit: saved.baseCommit || null, commit: saved.commitHash || null, output: repository.output,
-      ...(saved.rebasedFrom ? { rebasedFrom: saved.rebasedFrom } : {}),
-      ...(finished && saved.redelivered ? { redelivered: true } : {}),
-      // A first delivery opens its pull request; a resumed one updates the one it found, or leaves it as it was when the commit did not change.
-      ...(finished && saved.lease ? { pullRequest: saved.pushed ? "updated" : "unchanged" } : {}),
-      ...(saved.assumptions.length ? { assumptions: saved.assumptions } : {}),
-      ...(saved.scopeAdditions.length ? { scopeAdditions: saved.scopeAdditions } : {}),
-      ...(saved.prUrl ? { prUrl: saved.prUrl } : {}), ...(saved.patches.length ? { patches: saved.patches } : {}),
-      worktree, ...(saved.adopted ? { resumed: true } : {}), worktreeCreated: saved.created, worktreeRemoved: saved.removed, reviewNotes: saved.reviewNotes,
-    }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    writeDelivery(outcome, reason, finished);
     const reasonBrief = flat(reason).replace(/^(.{600}).+$/u, "$1…").replace(/[^.!?…]$/u, "$&.");
     saved.held = { action: "hold", summary: [
       { delivered: `Delivered ${result}.`, refused: `Refused: ${reasonBrief}`, "handed-off": `Handed off: ${summaryReason(reason, asking(reason))}`, abandoned: `Abandoned: ${reasonBrief}` }[outcome],
@@ -1286,15 +1330,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         : `The delivered commit ${saved.taken} was replayed onto the new base ${saved.baseCommit}.`] : []),
       ...(finished && saved.lease ? [saved.pushed ? `The same pull request ${saved.prUrl} was updated in place.`
         : `The same pull request ${saved.prUrl} was left as it was; nothing was pushed.`] : []),
+      ...(saved.needs.length ? [`Needs you: ${saved.needs.length} standing review item(s); see the delivery summary.`] : []),
       ...(saved.decision ? [`Decision: ${saved.decision}.`] : []),
       ...(outcome === "abandoned" ? [`Worktree and ${saved.branch} removed without saving the candidate.`] : []),
       ...(outcome === "handed-off" ? [`Branch: ${saved.branch}.`] : []),
       ...((saved.created || saved.adopted) && !saved.removed ? [`Worktree kept at ${worktree}${finished ? `; it could not be removed: inspect ${directory}/git-worktree.log.` : "."}`] : []),
       `Evidence: ${directory}`,
     ].join(" ") };
-    if (finished && repository.output === "branch" && saved.scopeAdditions.length) {
+    if (finished && ((repository.output === "branch" && saved.scopeAdditions.length) || !careful)) {
       const summary = join(directory, "branch-summary.md");
-      writeFileSync(summary, [ticket.title, saved.held.summary, ...scopeAdditionSection()].join("\n\n") + "\n", { mode: 0o600 });
+      writeFileSync(summary, [ticket.title, saved.held.summary, ...(careful ? scopeAdditionSection() : decisionSections()),
+        ...(saved.postReview ? ["## Review", saved.reviewSummary, JSON.stringify(saved.reviews.at(-1), null, 2)] : [])].join("\n\n") + "\n", { mode: 0o600 });
       saved.held.summary = saved.held.summary.replace(`Evidence: ${directory}`, `Summary: ${summary}. Evidence: ${directory}`);
     }
     publishHandoff({ delivered: "Delivered the checked changes.", refused: "Refused the ticket.", "handed-off": "Handed off the ticket.", abandoned: "Abandoned the ticket." }[outcome], reason);
@@ -1422,17 +1468,21 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   function validateReview(event: Event): Event {
     recordReview({ event });
     // Keep the helper's read-only guard, but judge the report here instead of trusting its event type.
-    if (work.unchanged().type === "changed") return stopAt("review");
+    if (work.unchanged().type === "changed") {
+      if (level !== "auto") return stopAt("review");
+      saved.postReviewFault = work.status().reason;
+      return { type: "valid" };
+    }
     const result = work.sendBack("review", event, () => {
       if (saved.reviewSummaryFault) throw new Error(saved.reviewSummaryFault);
-      const fault = event.type === "blocked" ? undefined : reviewField(event, ticket.sections.acceptance);
+      const fault = event.type === "blocked" ? undefined : reviewField(event, ticket.sections.acceptance, !careful);
       if (fault) throw new Error(fault);
       return event as ReviewReport;
     });
     if (result.type !== "valid") saved.malformedReviews.push(saved.reviews.length - 1);
     if (result.type === "sendBack") return reportFault("review", result);
     if (result.type === "valid") work.resetReport("review");
-    if (result.type === "invalid") { saved.standingReview = reviewFeedback(event); reportFault("review", result); return stopAt("review"); }
+    if (result.type === "invalid") { saved.standingReview = reviewFeedback(event); reportFault("review", result); return careful ? stopAt("review") : { type: "valid" }; }
     return { type: "valid" };
   }
   function reviewFeedback(event: Event): string {
@@ -1519,6 +1569,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
 
   const resumeFile = () => join(git(worktree, "rev-parse", "--absolute-git-dir"), "ticket-task-resume.json");
   const destination = (answer = ""): Origin => {
+    if (!careful && ["falsify", "plan", "planReview", "test", "red"].includes(saved.origin)) return "implement";
     if (saved.pendingScope && scopeDecisionOf(answer) === "include") return saved.pendingScope.stage;
     switch (saved.origin) {
       case "falsify": return /scope\s+(?:has\s+)?chang(?:e|ed|es|ing)/iu.test(answer) ? "falsify" : saved.ownerQuestions ? "plan" : "falsify";
@@ -1539,7 +1590,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ...saved.wouldAssume,
     ] : undefined;
     writeFileSync(resumeFile(), JSON.stringify({ ticket: ticket.id, branch: saved.branch, origin,
-      pendingScope: saved.pendingScope, pendingFalsify, answers: saved.answers, plan: saved.plan, reason: work.status().reason, evidence: work.open() }) + "\n", { mode: 0o600 });
+      pendingScope: saved.pendingScope, pendingFalsify, answers: saved.answers, plan: saved.plan, reason: work.status().reason, evidence: work.open(),
+      ...(!careful ? { trusted: { assumptions: saved.decided, scopeAdditions: saved.softScope, openQuestions: saved.ownerQuestions } } : {}) }) + "\n", { mode: 0o600 });
   }
   function stopAt(origin: Origin): Event {
     releaseTurn();
@@ -1575,9 +1627,10 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         return;
       }
     }
-    if (saved.origin === "falsify" && saved.ownerQuestions && destination(reply) === "plan") {
-      saved.assumptions = saved.ownerQuestions.map(question => ({ question: question.text, answer: reply,
-        options: [...new Set([...(question.options ?? []), reply])], why: "The ticket owner supplied this answer." }));
+    if (saved.ownerQuestions && ((!careful && destination(reply) === "implement")
+      || (saved.origin === "falsify" && destination(reply) === "plan"))) {
+      saved.assumptions = [...(careful ? [] : saved.assumptions), ...saved.ownerQuestions.map(question => ({ question: question.text, answer: reply,
+        options: [...new Set([...(question.options ?? []), reply])], why: "The ticket owner supplied this answer." }))];
       saved.assumptionsJson = JSON.stringify(saved.assumptions, null, 2) + "\n";
       writeFileSync(join(git(worktree, "rev-parse", "--absolute-git-dir"), "ticket-task-assumptions.json"), saved.assumptionsJson, { mode: 0o600 });
       writeFileSync(join(work.open(), "assumptions.json"), saved.assumptionsJson, { mode: 0o600 });
@@ -1640,6 +1693,23 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         return conclude("refused");
       }
       saved.answers = record.answers; saved.plan = record.plan; saved.previousEvidence = record.evidence; work.block(record.reason);
+      if (!careful && record.trusted !== undefined) {
+        const trusted = record.trusted;
+        const fault = !recordValue(trusted) ? "trusted resume metadata must be an object" : implementerField({
+          type: "completed", assumptions: trusted.assumptions, scopeAdditions: trusted.scopeAdditions, openQuestions: [],
+        });
+        const questions = recordValue(trusted) ? trusted.openQuestions : undefined;
+        if (fault || (questions !== null && (!Array.isArray(questions) || questions.some(question =>
+          !recordValue(question) || typeof question.text !== "string" || !question.text.trim()
+          || (question.options !== undefined && questionField([{ ...question, assumable: false }])))))) {
+          work.block(`Cannot resume: invalid trusted metadata in ${resumeFile()}: ${fault ?? "openQuestions"}.`);
+          return conclude("refused");
+        }
+        saved.decided = trusted.assumptions;
+        saved.softScope = trusted.scopeAdditions;
+        saved.ownerQuestions = questions;
+        if (saved.ownerQuestions?.length) { work.seal(); return stopAt("implement"); }
+      }
       if (record.pendingScope) {
         saved.pendingScope = record.pendingScope;
         work.seal();
@@ -1665,6 +1735,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   }
   async function gate(): Promise<Event> {
     saved.repairing = "change";
+    if (!careful && !takeCommitted()) return stopAt("gate");
     const scopeResult = unsettled() ?? scope("change");
     if (scopeResult.type === "scopeMiss") return stopAt("gate");
     const result = scopeResult.type === "passed" ? await work.checks("verify", lifetime.signal) : scopeResult;
@@ -1702,6 +1773,139 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (result.type === "failed" && work.repair().type === "retry") return { type: "implement" };
     return stopAt("rebase");
   }
+  /** Normalize only commits made on this ticket's branch, retaining the full working tree. */
+  function takeCommitted(): boolean {
+    const head = git(worktree, "rev-parse", "HEAD");
+    if (run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree).stdout !== `refs/heads/${saved.branch}`
+      || !run("git", ["merge-base", "--is-ancestor", saved.baseCommit, head], worktree).ok) {
+      work.block("The implementer moved HEAD away from the ticket branch or its base; the candidate needs inspection.");
+      return false;
+    }
+    if (head !== saved.baseCommit) {
+      appendFileSync(join(work.open(), "implementer-commits.jsonl"), JSON.stringify({ base: saved.baseCommit, head }) + "\n", { mode: 0o600 });
+      git(worktree, "reset", "--quiet", "--mixed", saved.baseCommit);
+      work.reopen();
+    }
+    return true;
+  }
+
+  function trustedImplementation(event: Event): Event {
+    const result = work.sendBack("change", event, () => {
+      work.summary("change", event);
+      const fault = implementerField(event);
+      if (fault) throw new Error(fault);
+      return event as ImplementerReport;
+    });
+    if (result.type !== "valid") {
+      const fault = reportFault("change", result);
+      return fault.type === "blocked" ? stopAt("implement") : fault;
+    }
+    work.resetReport("change");
+    work.capture("change", event);
+    const report = result.report;
+    if (report.type === "blocked") {
+      const needs = report.needs!;
+      work.block(needs.text);
+      if (needs.kind === "decision") {
+        saved.ownerQuestions = [{ text: needs.text, where: "" }];
+        return stopAt("implement");
+      }
+      if (saved.mechanicalRetry) return stopAt("implement");
+      saved.mechanicalRetry = true;
+      if (needs.kind === "scope") {
+        for (const path of needs.paths!) addSoftScope(path, needs.text, true);
+      } else {
+        if (!takeCommitted()) return stopAt("implement");
+        const tip = run("git", ["rev-parse", "--verify", `${repository.base ?? "HEAD"}^{commit}`], repository.path);
+        if (!tip.ok) return stopAt("implement");
+        const moved = moveOnto(tip.stdout);
+        if (!["prepared", "resumed", "conflicted"].includes(moved.type)) return stopAt("implement");
+      }
+      return { type: "reask" };
+    }
+    for (const assumption of report.assumptions!) {
+      const previous = saved.decided.find(item => item.question === assumption.question);
+      if (previous) Object.assign(previous, assumption);
+      else saved.decided.push(assumption);
+    }
+    for (const addition of report.scopeAdditions!) addSoftScope(addition.path, addition.why, true);
+    if (report.openQuestions!.length) {
+      saved.ownerQuestions = report.openQuestions!.map(question => ({ ...question, where: "" }));
+      work.block(`Ticket owner must settle ${questionCount()}:\n${questionLines()}`);
+      return stopAt("implement");
+    }
+    passed("change");
+    return { type: "completed" };
+  }
+
+  function trustedFindings(): string[] {
+    if (saved.postReviewFault) return [saved.postReviewFault];
+    const report = saved.reviews.at(-1) as ReviewReport | undefined;
+    if (!report || saved.malformedReviews.includes(saved.reviews.length - 1)) return [work.status().reason || "The reviewer did not return a valid report."];
+    if (report.type === "blocked") return [saved.reviewSummary];
+    const blockers = report.findings.filter(finding => finding.severity === "blocker" && finding.kind !== "other");
+    return [
+      ...report.criteria.flatMap((criterion, index) => criterion.met ? [] : [`Unmet criterion: ${ticket.sections.acceptance[index]} (${criterion.evidence})`]),
+      ...blockers.map(finding => `${finding.kind}: ${finding.text} (${finding.where})`),
+    ];
+  }
+  function keepAdvisoryNotes() {
+    const report = saved.reviews.at(-1);
+    if (!Array.isArray(report?.findings)) return;
+    for (const finding of report.findings) {
+      if (typeof finding?.text !== "string" || typeof finding.where !== "string") continue;
+      if (finding.severity === "blocker" && finding.kind !== "other") continue;
+      if (!saved.reviewNotes.some(note => note.text === finding.text && note.where === finding.where)) {
+        saved.reviewNotes.push({ text: finding.text, where: finding.where });
+      }
+    }
+  }
+  function trustedJudge(): Event {
+    if (work.unchanged().type === "changed") return stopAt("review");
+    keepAdvisoryNotes();
+    const findings = trustedFindings();
+    if (findings.length) {
+      work.block(findings.join("\n"));
+      if (saved.reviews.at(-1)?.type !== "blocked" && !saved.malformedReviews.includes(saved.reviews.length - 1)
+        && work.reviewRound().type === "retry") return { type: "retry" };
+      // Gate sealed the exact passing candidate; commit() still verifies that fingerprint.
+      saved.needs = findings;
+    } else saved.needs = [];
+    passed("review");
+    return { type: "approved" };
+  }
+  function postReview(): Event {
+    keepAdvisoryNotes();
+    const blockers = trustedFindings();
+    const report = saved.reviews.at(-1);
+    saved.postReview = { verdict: report?.type ?? "blocked", blockers };
+    const body = ["## Review", saved.reviewSummary, JSON.stringify(report, null, 2), ...needsSection()].join("\n\n") + "\n";
+    const file = join(work.open(), "post-review.md");
+    writeFileSync(file, body, { mode: 0o600 });
+    if (saved.prUrl) {
+      const posted = run("gh", ["pr", "comment", saved.prUrl, "--body-file", file], worktree, publishTimeoutMs);
+      saved.postReview.posted = posted.ok;
+      if (!posted.ok) writeFileSync(join(work.open(), "post-review.log"), `${posted.stdout}\n${posted.detail}\n`, { mode: 0o600 });
+    }
+    return conclude("completed");
+  }
+
+  const reviewState = () => checkedAgent(() => prompt([
+        "Review the current diff and verification evidence. Do not edit any file. Check acceptance criteria, regressions, scope, and whether tests actually establish the intended behavior.",
+        ...(level === "auto" ? [`The candidate is already delivered at ${saved.commitHash}. Review git diff ${saved.baseCommit} ${saved.commitHash}, including its tests, rather than the now-clean working tree. Findings are posted after delivery; do not change the branch or commit.`] : []),
+        ...scopePrompt(careful ? "Scope:" : "Scope and companions are guidance; Forbidden is the wall:"),
+        ...(!careful ? ["Forbidden:", ...ticket.sections.forbidden, ...repository.forbidden, "Every blocker must carry kind: acceptance, regression, safety, or other. Its text must name the unmet acceptance criterion, regression, or safety defect; other findings are advisory."] : []),
+        ...movedPrompt(),
+        ...assumptionsPrompt(),
+        ...(saved.assumptions.length ? ["An assumption you disagree with is a discussion finding for the ticket owner."] : []),
+        ...(saved.provedRed ? ["The tests were written before the implementation and the Machine saw them fail; check that the implementation makes them pass for the right reason and that no test was weakened."] : []),
+        "Acceptance criteria:", ...ticket.sections.acceptance.map((text, index) => `${index + 1}. ${text}`),
+        "Return one criteria entry per acceptance criterion, in order, with its text exactly as given, a boolean met, and evidence as a file:line or command.",
+        "Tag findings: blocker = must change before delivery; discussion = a question only the ticket owner can settle; minor = worth noting, not worth a round.",
+        "On a second or later review, say what is new versus the previous report in newSinceLastRound, or none if nothing is new. Read previous review-<n>.json reports alongside the stage reports in the evidence directory.",
+        "For blocked, only the summary is required. For approved or revise, include the full structured report below.",
+        'End with one line: MACHINES_EVENT {"type":"approved"|"revise"|"blocked","summary":"<one paragraph>","criteria":[{"text":"<criterion as given>","met":true|false,"evidence":"<file:line or command>"}],"findings":[{"severity":"blocker"|"discussion"|"minor","text":"<finding>","where":"<file:line>"}],"newSinceLastRound":"none"|"<what changed in this round\'s findings>"}',
+      ].join("\n"), "review"), ["approved", "revise", "blocked"], "reviewer", validateReview, { valid: level === "auto" ? "postReview" : "judge", reask: "review", stuck: level === "auto" ? "postReview" : "stuck" });
   const definition = {
     entry: ({ self }) => { self.subscribe({ error: stopTurn }); },
     // An invoked lifecycle actor also starts on checkpoint continuation, when entry actions do not.
@@ -1768,20 +1972,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           cannotRun,
         ].join("\n"), "change");
       }, ["completed", "blocked"], "implementer", event => editing("change", event), { completed: "gate", reask: "implement", stuck: "stuck" }),
-      review: checkedAgent(() => prompt([
-        "Review the current diff and verification evidence. Do not edit any file. Check acceptance criteria, regressions, scope, and whether tests actually establish the intended behavior.",
-        ...scopePrompt(),
-        ...movedPrompt(),
-        ...assumptionsPrompt(),
-        ...(saved.assumptions.length ? ["An assumption you disagree with is a discussion finding for the ticket owner."] : []),
-        ...(saved.provedRed ? ["The tests were written before the implementation and the Machine saw them fail; check that the implementation makes them pass for the right reason and that no test was weakened."] : []),
-        "Acceptance criteria:", ...ticket.sections.acceptance.map((text, index) => `${index + 1}. ${text}`),
-        "Return one criteria entry per acceptance criterion, in order, with its text exactly as given, a boolean met, and evidence as a file:line or command.",
-        "Tag findings: blocker = must change before delivery; discussion = a question only the ticket owner can settle; minor = worth noting, not worth a round.",
-        "On a second or later review, say what is new versus the previous report in newSinceLastRound, or none if nothing is new. Read previous review-<n>.json reports alongside the stage reports in the evidence directory.",
-        "For blocked, only the summary is required. For approved or revise, include the full structured report below.",
-        'End with one line: MACHINES_EVENT {"type":"approved"|"revise"|"blocked","summary":"<one paragraph>","criteria":[{"text":"<criterion as given>","met":true|false,"evidence":"<file:line or command>"}],"findings":[{"severity":"blocker"|"discussion"|"minor","text":"<finding>","where":"<file:line>"}],"newSinceLastRound":"none"|"<what changed in this round\'s findings>"}',
-      ].join("\n"), "review"), ["approved", "revise", "blocked"], "reviewer", validateReview, { valid: "judge", reask: "review", stuck: "stuck" }),
+      review: reviewState(),
       red: operation(() => {
         saved.repairing = "test";
         const result = scope("test").type === "passed" ? work.redCheck(repository.redCheck) : { type: "failed" };
@@ -1830,7 +2021,57 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       delivered: final(endings.delivered), refused: final(endings.refused), handedOff: final(endings.handedOff), abandoned: final(endings.abandoned),
     },
   } satisfies Parameters<typeof machine>[0];
-  const states = definition.states;
+  const carefulStates = definition.states;
+  const trustedStates = {
+    prepare: operation(() => {
+      const result = prepareRun();
+      return { ...result, type: ["falsify", "plan", "planReview", "test", "red"].includes(result.type) ? "implement" : result.type };
+    }, { implement: "implement", gate: "gate", rebase: "rebase", stuck: "stuck", refused: "refused" }),
+    implement: checkedAgent(() => prompt([
+      "Own the ticket from investigation through implementation and tests. Investigate before changing. Decide open questions yourself unless irreversible: deleting or migrating data, publishing, changing a protocol or contract, or touching a Forbidden path.",
+      "Scope and companions are guidance, not a wall. Forbidden is the wall. Record paths added outside Scope and companions, with why each is needed. Write the tests the change needs; run focused tests only, the workflow runs the rest. Leave changes uncommitted or commit on this ticket branch; either is accepted.",
+      ...scopePrompt(), "Forbidden:", ...ticket.sections.forbidden.map(text => `- ${text}`), ...repository.forbidden.map(text => `- ${text}`),
+      ...movedPrompt(), ...assumptionsPrompt(),
+      "Acceptance criteria:", ...ticket.sections.acceptance.map(text => `- ${text}`),
+      'Return completed with summary, assumptions: [{question, answer, why}], scopeAdditions: [{path, why}], and openQuestions: [{text, options, recommended, why}] (irreversible only). Use empty arrays when none. Return blocked with summary and needs: {kind: "baseBehind"|"baseFailing"|"scope"|"decision", text, paths?: string[]}. decision names the irreversible decision; scope names the required paths.',
+      cannotRun,
+    ].join("\n"), "change"), ["completed", "blocked"], "implementer", trustedImplementation,
+    { completed: "gate", reask: "implement", stuck: "stuck" }),
+    gate: operation(gate, { passed: level === "auto" ? "commit" : "review", retry: "implement", stuck: "stuck" }),
+    review: reviewState(),
+    judge: operation(trustedJudge, { approved: "commit", retry: "implement", stuck: "stuck" }),
+    commit: carefulStates.commit,
+    rebase: carefulStates.rebase,
+    deliver: operation(async () => {
+      if (!turnHeld) {
+        work.block("Delivery was interrupted; continue to check the current base and run every gate again before delivery.");
+        return stopAt("deliver");
+      }
+      return inTurn(() => {
+        if (deliver().type !== "delivered") return stopAt("deliver");
+        if (level !== "auto") return conclude("completed");
+        writeDelivery("delivered");
+        writeFileSync(join(work.open(), "branch-summary.md"), [ticket.title, ...decisionSections()].join("\n\n") + "\n", { mode: 0o600 });
+        work.seal();
+        return { type: "review" };
+      }, [])();
+    }, { review: "review", delivered: "delivered", kept: "delivered", refused: "refused", stuck: "stuck" }),
+    postReview: operation(postReview, { delivered: "delivered", kept: "delivered", refused: "refused" }),
+    stuck: evidenceHuman((prompt, on, options) => {
+      if (!saved.pendingScope) return human(prompt, on, options);
+      const { recommended: _recommended, reason: _reason, present: _present, presentWith: _presentWith, presentIn: _presentIn, choices: _choices, discussion: _discussion, ...rest } = options ?? {};
+      return human(prompt, on, { ...rest, suggestions: scopeDecisions });
+    }, stuckPrompt, { submitted: [
+      { guard: ({ event }: { event: Event }) => typeof event.value === "string" && !event.value.trim(), target: "stuck", reenter: true, actions: () => { stopAt(saved.origin); } },
+      { guard: ({ event }: { event: Event }) => decisionOf(event.value) === "hand off", target: "handedOff", actions: endDecision },
+      { guard: ({ event }: { event: Event }) => decisionOf(event.value) === "discard", target: "abandoned", actions: endDecision },
+      ...(["prepare", "implement", "gate", "rebase"] as const).map(target => ({
+        guard: ({ event }: { event: Event }) => destination(String(event.value)) === target, target, actions: continueWork,
+      })),
+    ] }, { present: "presenter", suggestions: decisions }, () => questionEvidence()),
+    delivered: carefulStates.delivered, refused: carefulStates.refused, handedOff: carefulStates.handedOff, abandoned: carefulStates.abandoned,
+  };
+  const states = careful ? carefulStates : trustedStates;
 
   const deliveredMeaning = () => saved.prUrl
     ? `delivered as ${saved.lease && saved.pushed ? "updated " : ""}pull request #${/\/pull\/(\d+)/u.exec(saved.prUrl)?.[1] ?? saved.prUrl}`
@@ -1848,9 +2089,9 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     implement: "implementing; gates not yet run", gate: () => `running ${repository.checks.join(", ")}`,
     review: reviewMeaning, judge: "checking the review findings", stuck: stuckMeaning,
     commit: "committing the checked changes", rebase: "checking the current base and replaying changes",
-    deliver: "delivering the checked changes", delivered: deliveredMeaning,
+    deliver: "delivering the checked changes", delivered: deliveredMeaning, postReview: "recording the review after delivery",
     refused: "refused; see the recorded reason", handedOff: "handed off; work kept", abandoned: "abandoned",
-  } satisfies Record<keyof typeof states, string | (() => string)>;
+  } satisfies Record<keyof typeof carefulStates | keyof typeof trustedStates, string | (() => string)>;
   function publishState(name: keyof typeof states) {
     const meaning = meanings[name];
     setNow(typeof meaning === "function" ? meaning() : meaning);
@@ -1911,13 +2152,43 @@ function questionField(questions: unknown): string | undefined {
   return undefined;
 }
 
+type ImplementerReport = Event & {
+  assumptions?: { question: string; answer: string; why: string }[];
+  scopeAdditions?: { path: string; why: string }[];
+  openQuestions?: { text: string; options: string[]; recommended: string; why: string }[];
+  needs?: { kind: "baseBehind" | "baseFailing" | "scope" | "decision"; text: string; paths?: string[] };
+};
+function implementerField(report: Event): string | undefined {
+  const nonempty = (value: unknown): value is string => typeof value === "string" && !!value.trim();
+  if (report.type === "blocked") {
+    const needs = report.needs;
+    if (!recordValue(needs) || !["baseBehind", "baseFailing", "scope", "decision"].includes(String(needs.kind)) || !nonempty(needs.text)) {
+      return "needs must name a kind (baseBehind, baseFailing, scope, decision) and non-empty text";
+    }
+    if (needs.kind === "scope" && (!Array.isArray(needs.paths) || !needs.paths.length || !needs.paths.every(literalPath))) return "needs.paths must be a non-empty array of relative paths";
+    return undefined;
+  }
+  for (const [name, keys] of [["assumptions", ["question", "answer", "why"]], ["scopeAdditions", ["path", "why"]], ["openQuestions", ["text", "recommended", "why"]]] as const) {
+    const entries = report[name];
+    if (!Array.isArray(entries)) return `${name} must be an array`;
+    for (const [index, entry] of entries.entries()) {
+      if (!recordValue(entry)) return `${name}[${index}] must be an object`;
+      for (const key of keys) if (!nonempty(entry[key])) return `${name}[${index}].${key} must be a non-empty string`;
+      if (name === "scopeAdditions" && !literalPath(entry.path)) return `${name}[${index}].path must be a relative path`;
+      if (name === "openQuestions" && (!Array.isArray(entry.options) || !entry.options.length
+        || !entry.options.every(nonempty) || !entry.options.includes(String(entry.recommended)))) return `${name}[${index}].options must include the recommended answer`;
+    }
+  }
+  return undefined;
+}
+
 type ReviewReport = Event & {
   criteria: { text: string; met: boolean; evidence: string }[];
-  findings: { severity: "blocker" | "discussion" | "minor"; text: string; where: string }[];
+  findings: { severity: "blocker" | "discussion" | "minor"; kind?: "acceptance" | "regression" | "safety" | "other"; text: string; where: string }[];
   newSinceLastRound: string;
 };
 /** Return the first malformed field, before any verdict is used. */
-function reviewField(report: Event, acceptance: string[]): string | undefined {
+function reviewField(report: Event, acceptance: string[], kinds = false): string | undefined {
   const entry = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
   if (!Array.isArray(report.criteria)) return "criteria must be an array";
   if (report.criteria.length !== acceptance.length) return "criteria count must match the acceptance list";
@@ -1932,6 +2203,8 @@ function reviewField(report: Event, acceptance: string[]): string | undefined {
   for (const [index, finding] of report.findings.entries()) {
     if (!entry(finding)) return `findings[${index}] must be an object`;
     if (typeof finding.severity !== "string" || !["blocker", "discussion", "minor"].includes(finding.severity)) return `findings[${index}].severity must be blocker, discussion, or minor`;
+    if (kinds && finding.severity === "blocker" && (typeof finding.text !== "string" || !finding.text.trim())) return `findings[${index}].text must name the defect`;
+    if (kinds && finding.severity === "blocker" && !["acceptance", "regression", "safety", "other"].includes(String(finding.kind))) return `findings[${index}].kind must be acceptance, regression, safety, or other`;
     if (typeof finding.text !== "string") return `findings[${index}].text must be a string`;
     if (typeof finding.where !== "string") return `findings[${index}].where must be a string`;
   }
@@ -1994,7 +2267,7 @@ export function ticketSections(body: string) {
 
 function parseTicket(input: unknown, saved: TaskData) {
   const value: unknown = typeof input === "string" ? JSON.parse(input) : input;
-  const data = object(value, "input", ["ticket", "repository", "worktreeRoot", "evidenceRoot", "maxRepairs", "maxReviewRounds", "resume", "stuck", "redGreen", "assume"]);
+  const data = object(value, "input", ["ticket", "repository", "worktreeRoot", "evidenceRoot", "maxRepairs", "maxReviewRounds", "resume", "stuck", "redGreen", "assume", "level"]);
   // Trackers attach their own fields (source, metadata) to a ticket; only id, title, and body are read.
   const ticket = object(data.ticket, "ticket", Object.keys(data.ticket ?? {}));
   const id = text(ticket.id, "ticket.id");
@@ -2007,14 +2280,18 @@ function parseTicket(input: unknown, saved: TaskData) {
   if (data.resume !== undefined && typeof data.resume !== "boolean") throw new Error("resume must be a boolean");
   if (data.redGreen !== undefined && typeof data.redGreen !== "boolean") throw new Error("redGreen must be a boolean");
   if (data.assume !== undefined && typeof data.assume !== "boolean") throw new Error("assume must be a boolean");
-  const redGreen = data.redGreen !== false;
+  const level = data.level === undefined ? "trusted" : data.level;
+  if (level !== "careful" && level !== "trusted" && level !== "auto") throw new Error('level must be "careful", "trusted", or "auto"');
+  const redGreen = level === "careful" && data.redGreen !== false;
 
   const stuck = data.stuck === undefined ? "park" : data.stuck;
   if (stuck !== "ask" && stuck !== "park") throw new Error('stuck must be "ask" or "park"');
 
-  const repo = object(data.repository, "repository", ["name", "path", "base", "setup", "checks", "rerunFailedChecks", "output", "remote", "draft", "redCheck", "companions"]);
+  const repo = object(data.repository, "repository", ["name", "path", "base", "setup", "checks", "rerunFailedChecks", "output", "remote", "draft", "redCheck", "companions", "forbidden"]);
   if (repo.companions !== undefined && !Array.isArray(repo.companions)) throw new Error("repository.companions must be an array of non-empty strings");
   const companions = ((repo.companions ?? []) as unknown[]).map((entry, i) => text(entry, `repository.companions[${i}]`));
+  if (repo.forbidden !== undefined && !Array.isArray(repo.forbidden)) throw new Error("repository.forbidden must be an array of non-empty strings");
+  const forbidden = ((repo.forbidden ?? []) as unknown[]).map((entry, i) => text(entry, `repository.forbidden[${i}]`));
   if (repo.rerunFailedChecks !== undefined && typeof repo.rerunFailedChecks !== "boolean") throw new Error("repository.rerunFailedChecks must be a boolean");
   const redCheck = repo.redCheck === undefined ? "tests" : text(repo.redCheck, "repository.redCheck");
   const name = text(repo.name, "repository.name");
@@ -2035,7 +2312,7 @@ function parseTicket(input: unknown, saved: TaskData) {
   separate(path, worktree, evidenceRoot);
   const work = taskRun("ticket-task", {
     task: [`Ticket ${id}: ${title}`, ...(ticket.body?.trim() ? [ticket.body] : [])].join("\n\n"),
-    workspace: worktree, checks: repo.checks, maxRepairs: data.maxRepairs ?? 3, maxReviewRounds: data.maxReviewRounds,
+    workspace: worktree, checks: repo.checks, maxRepairs: data.maxRepairs ?? 3, maxReviewRounds: level === "careful" ? data.maxReviewRounds : 1,
     rerunFailedChecks: repo.rerunFailedChecks,
   }, { checks: true, git: "clean", evidenceRoot }, saved);
   const checks = (repo.checks as { name: string }[]).map(c => c.name);
@@ -2044,8 +2321,8 @@ function parseTicket(input: unknown, saved: TaskData) {
   const titled = titleSlug(title);
   return {
     ticket: { id, slug, title, summary: firstParagraph(ticket.body ?? ""), sections: ticketSections(ticket.body ?? "") }, prefix, branch: titled ? `${prefix}-${titled}` : prefix,
-    worktree, evidenceRoot, work, resume: data.resume === true, redGreen, assume: data.assume === true, stuck,
-    repository: { name, path, base, setup, output, remote, draft: repo.draft !== false, redCheck, checks, companions },
+    level, worktree, evidenceRoot, work, resume: data.resume === true, redGreen, assume: level === "careful" && data.assume === true, stuck,
+    repository: { name, path, base, setup, output, remote, draft: repo.draft !== false, redCheck, checks, companions, forbidden },
   };
 }
 /** A ticket id as branch and worktree names carry it. */

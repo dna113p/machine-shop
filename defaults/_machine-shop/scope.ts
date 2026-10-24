@@ -20,3 +20,18 @@ export function matchesScope(path: string, patterns: string[]): boolean {
 export function outsideScope(paths: string[], patterns: string[]): string[] {
   return paths.filter(path => !matchesScope(path, patterns));
 }
+
+/** Only path-like Forbidden entries are mechanical rules; prose remains prompt guidance. */
+export function forbiddenPatterns(bullets: string[]): string[] {
+  return [...new Set(bullets.flatMap(bullet => {
+    const spans = [...bullet.matchAll(/`([^`]+)`/gu)].map(match => match[1]!);
+    if (spans.length) return spans.filter(value => /[/.*]/u.test(value));
+    const value = bullet.trim();
+    return !/\s/u.test(value) && /[/.*]/u.test(value) ? [value] : [];
+  }))];
+}
+
+/** A bare filename protects that file at every depth; qualified globs stay rooted. */
+export function matchesForbidden(path: string, patterns: string[]): boolean {
+  return patterns.some(pattern => matchesScope(path, [pattern, ...(!pattern.includes("/") ? [`**/${pattern}`] : [])]));
+}

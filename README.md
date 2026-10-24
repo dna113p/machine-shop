@@ -136,11 +136,12 @@ checkout, so commit setup changes first.
 ## Ticket delivery
 
 [ticket-task](docs/workflows/ticket-task.md) carries a local ticket from an isolated worktree through
-planning, tests, checks and review to a committed branch, patch, or pull request.
-Its single `stuck` question retains evidence and returns the owner's answer to
-the saved origin. Paths outside scope ask for inclusion or reversion immediately,
-without automatic repair rounds; owner inclusions survive resume. The workflow
-page documents inputs, budgets, resume and endings.
+implementation, tests, checks and advisory review to a committed branch, patch,
+or pull request. `trusted` is the default: Scope guides changes while Forbidden
+paths stop them. Request `careful` for the original planning and hard-Scope map,
+or `auto` for review after delivery. Deliveries list assumptions, scope additions,
+review notes and any needs; standing review defects with green checks force a
+draft. The workflow page documents inputs, budgets, resume and endings.
 
 ## ChatGPT thread
 

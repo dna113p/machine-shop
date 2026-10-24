@@ -3,7 +3,7 @@ import { execFileSync, fork } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, delimiter, join, relative, resolve } from "node:path";
+import { basename, delimiter, dirname, join, relative, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
@@ -50,6 +50,7 @@ function fixture(context: TestContext) {
 }
 type Fixture = ReturnType<typeof fixture>;
 const input = (f: Fixture, repository = {}, extra = {}) => ({
+  level: "careful",
   ticket: { id: "PROJ-12", title: "Add a greeting", body: "## Goal\nWrite hello to greeting.txt.\n\n## Scope\n- greeting.txt\n- greeting.test.txt\n\n## Acceptance\n- greeting.txt contains hello\n\n## Forbidden\n- nothing beyond the scope above", source: "tk", metadata: { priority: 2 } },
   repository: { name: "widgets", path: f.repo, checks: [command()], output: "branch", ...repository },
   worktreeRoot: join(f.root, "worktrees"), evidenceRoot: f.evidence, stuck: "ask", ...extra,
@@ -98,6 +99,12 @@ function fakeGh(context: TestContext, f: Fixture, exitCode = 0) {
     // A bare exit: tests that make `pr create` fail rewrite the script's first `exit 0`.
     "  exit",
     "fi",
+    // A comment on a pull request keeps its own record, one NUL-separated file per call, so `pr create`'s arguments stay as they were.
+    'if [ "$1" = pr ] && [ "$2" = comment ]; then',
+    `  printf '%s\\0' "$@" > "${bin}/comment-$(ls "${bin}" | grep -c '^comment-')"`,
+    `  echo ${url}#issuecomment-1`,
+    "  exit",
+    "fi",
     `printf '%s\\n' "$@" > "${bin}/args"`,
     `echo "Creating pull request for ${branch}"`,
     `echo ${url}`,
@@ -116,6 +123,9 @@ function fakeGh(context: TestContext, f: Fixture, exitCode = 0) {
     },
     /** The arguments of every `gh pr list`, in order. */
     lists: () => existsSync(join(bin, "list.log")) ? readFileSync(join(bin, "list.log"), "utf8").trimEnd().split("\n") : [],
+    /** The arguments of every `gh pr comment`, in order, each kept whole. */
+    comments: () => readdirSync(bin).filter(name => /^comment-\d+$/u.test(name)).sort((a, b) => Number(a.slice(8)) - Number(b.slice(8)))
+      .map(name => readFileSync(join(bin, name), "utf8").split("\0").slice(0, -1)),
   });
 }
 const tester = (request: { cwd: string }) => {
@@ -9151,4 +9161,508 @@ test("repository.checks accept the layered fields while repository.setup refuses
     assert.throws(() => mod.default(runtime, input(f, { setup: [command(undefined, { name: "install", ...field })] })), new RegExp(Object.keys(field)[0]!, "u"));
   }
   assert.deepEqual(readdirSync(f.root), ["widgets"]);
+});
+
+// Levels. `careful` is the map every test above runs; `trusted` and `auto` run one implementer and one advisory review over the same operations.
+/** What one trusted implementer decided by itself, as its report gives it. */
+const decided = { question: "Does the greeting end with a line break?", answer: "Yes, with one line break", why: "Every text file in this repository ends with one." };
+/** A path the implementer changed outside Scope, and why, as its report gives it. */
+const noted = { path: "notes.txt", why: "The greeting's wording is explained beside it." };
+/** A trusted implementer's report: completed with what it decided, the paths it added, and the irreversible questions it left open. */
+const implemented = (extra = {}) => ({ type: "completed", summary: "Wrote hello to greeting.txt", assumptions: [], scopeAdditions: [], openQuestions: [], ...extra });
+const trustedImplement = (request: { cwd: string }) => { implement(request); return implemented(); };
+/** A blocker the trusted reviewer tags with the kind that decides whether it sends the run back. */
+const blocker = (kind: "acceptance" | "regression" | "safety" | "other", text: string) => ({ severity: "blocker", kind, text, where: "greeting.txt:1" });
+/** What a Markdown text says under its own `## <heading>` line, up to the next level-two heading; undefined without that heading. */
+const underHeading = (text: string, heading: string) => text.split(new RegExp(`^## ${literal(heading)}\\n`, "mu"))[1]?.split(/^## /mu)[0];
+/** The operations a trusted run goes through, in order; judge and the endings are left out. */
+const trustedFlow = ["prepare", "implement", "gate", "review", "commit", "rebase", "deliver"];
+const planningAndRed = ["falsify", "plan", "planReview", "test", "red"];
+/** The text a delivery carries its sections in: the pull request body, or the branch summary in the evidence. */
+const deliveredText = (output: string, gh: () => string[] | undefined, directory: string) => output === "pr" ? bodyOf(gh) : readFileSync(join(directory, "branch-summary.md"), "utf8");
+
+test("level: trusted is the default and needs only the implementer and the reviewer; careful keeps its planning and red states; any other level is refused", context => {
+  const f = fixture(context);
+  // The input with no level at all, whatever level the shared helper sets.
+  const unset: Record<string, unknown> = { ...input(f) }; delete unset.level;
+  const required = (data: unknown) => runtime.requiredAgentNames(mod.default(runtime, data));
+  const states = (data: unknown) => Object.keys(mod.default(runtime, data).states);
+  for (const data of [unset, input(f, {}, { level: "trusted" }), input(f, { output: "pr" }, { level: "auto" })]) {
+    assert.deepEqual(required(data), ["implementer", "reviewer"]);
+    for (const gone of planningAndRed) assert.equal(states(data).includes(gone), false, gone);
+    for (const state of ["prepare", "implement", "gate", "review", "commit", "rebase", "deliver", "stuck"]) assert.ok(states(data).includes(state), state);
+  }
+  const careful = input(f, {}, { level: "careful" });
+  assert.deepEqual(required(careful), ["implementer", "investigator", "reviewer", "tester"]);
+  for (const state of planningAndRed) assert.ok(states(careful).includes(state), state);
+  for (const level of ["fast", "", 1, null, true]) {
+    assert.throws(() => mod.default(runtime, input(f, {}, { level })), /level/u, JSON.stringify(level));
+  }
+  assert.deepEqual(readdirSync(f.root), ["widgets"]); untouched(f);
+});
+
+test("trusted and auto ignore the careful-only knobs: a redCheck naming no check, redGreen, assume, and maxReviewRounds are accepted", context => {
+  const f = fixture(context);
+  assert.throws(() => mod.default(runtime, input(f, { redCheck: "absent" }, { level: "careful" })), /repository\.redCheck/u);
+  for (const level of ["trusted", "auto"]) {
+    assert.doesNotThrow(() => mod.default(runtime, input(f, { redCheck: "absent" }, { level, redGreen: true, assume: true, maxReviewRounds: 5 })), level);
+  }
+  assert.deepEqual(readdirSync(f.root), ["widgets"]); untouched(f);
+});
+
+for (const forbidden of ["secrets/**", [""], [1], ["   "], null, {}]) {
+  test(`repository.forbidden rejects ${JSON.stringify(forbidden)} at parse before effects`, context => {
+    const f = fixture(context);
+    assert.throws(() => mod.default(runtime, input(f, { forbidden }, { level: "trusted" })), /repository\.forbidden/u);
+    assert.deepEqual(readdirSync(f.root), ["widgets"]); untouched(f);
+  });
+}
+
+test("repository.forbidden takes Scope-style globs", context => {
+  const f = fixture(context);
+  assert.doesNotThrow(() => mod.default(runtime, input(f, { forbidden: ["secrets/**", "land.mjs"] }, { level: "trusted" })));
+  assert.deepEqual(readdirSync(f.root), ["widgets"]); untouched(f);
+});
+
+test("trusted: one implementer and one review carry the ticket from prepare to a pull request that lists what the implementer decided and added", async context => {
+  const f = fixture(context); remote(f); const gh = fakeGh(context, f); const prompts: string[] = [];
+  const result = await execute(input(f, { output: "pr" }, { level: "trusted" }), {
+    investigator: () => assert.fail("trusted has no falsify or plan"), tester: () => assert.fail("trusted has no tester"),
+    implementer: request => {
+      prompts.push(request.prompt); implement(request);
+      writeFileSync(join(request.cwd, "notes.txt"), "Hello is the greeting the ticket asks for.\n");
+      return implemented({ assumptions: [decided], scopeAdditions: [noted] });
+    },
+  });
+  const run = prDelivered(f, result);
+  assert.deepEqual(result.states.filter(state => trustedFlow.includes(state)), trustedFlow);
+  for (const state of [...planningAndRed, "stuck"]) assert.equal(result.states.includes(state), false, state);
+  assert.deepEqual(route(result.states), ["implement", "review"]);
+  // Scope is guidance and Forbidden the wall; the implementer decides what is not irreversible.
+  assert.equal(prompts.length, 1); const [prompt] = prompts as [string];
+  assert.doesNotMatch(prompt, /the only paths you may change/u);
+  assert.match(prompt, /irreversible/iu); assert.match(prompt, /Forbidden/u);
+  for (const line of ["- greeting.txt", "- nothing beyond the scope above", `- ${criterion}`]) assert.ok(prompt.includes(line), line);
+  const body = bodyOf(gh);
+  const assumptions = underHeading(body, "Assumptions"); assert.ok(assumptions, body);
+  for (const part of [decided.question, decided.answer]) assert.ok(assumptions.includes(part), part);
+  const additions = underHeading(body, "Scope additions"); assert.ok(additions, body);
+  for (const part of [noted.path, noted.why]) assert.ok(additions.includes(part), part);
+  assert.equal(underHeading(body, "Needs you"), undefined);
+  assert.ok(JSON.stringify(run.delivery.assumptions).includes(decided.question));
+  assert.ok(JSON.stringify(run.delivery.scopeAdditions).includes(noted.path));
+  assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "greeting.txt\nnotes.txt");
+  untouched(f);
+});
+
+test("trusted: a changed path outside Scope that is not Forbidden does not stop the run, is delivered, and is listed under Scope additions", async context => {
+  const f = fixture(context);
+  // The ticket's Forbidden section is the prose "nothing beyond the scope above": text for the Agents, not a wall.
+  const result = await execute(input(f, {}, { level: "trusted" }), {
+    implementer: request => {
+      implement(request); mkdirSync(join(request.cwd, "docs"));
+      writeFileSync(join(request.cwd, "docs/greeting.md"), "The greeting is hello.\n");
+      return implemented();
+    },
+  });
+  const run = ended(f, result, "branch");
+  assert.equal(result.states.includes("stuck"), false);
+  const additions = underHeading(readFileSync(join(run.directory, "branch-summary.md"), "utf8"), "Scope additions");
+  assert.ok(additions?.includes("docs/greeting.md"), additions);
+  assert.ok(JSON.stringify(run.delivery.scopeAdditions).includes("docs/greeting.md"));
+  assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), "docs/greeting.md\ngreeting.txt");
+});
+
+for (const [where, path, setUp] of [
+  ["a backticked path in the ticket's Forbidden", "secrets/key.txt", (data: ReturnType<typeof input>) => { data.ticket.body += "\n- Any change to `secrets/**`"; }],
+  ["a Forbidden bullet that is itself a glob", "vendor/lib.js", (data: ReturnType<typeof input>) => { data.ticket.body += "\n- vendor/**"; }],
+  ["the repository's forbidden list", "generated/out.js", (data: ReturnType<typeof input>) => { (data.repository as Record<string, unknown>).forbidden = ["generated/*.js"]; }],
+] as const) {
+  test(`trusted: a changed path matched by ${where} stops the run with the stuck question, which recommends nothing`, async context => {
+    const f = fixture(context); const human = person("hand off");
+    const data = input(f, {}, { level: "trusted" }); setUp(data);
+    const result = await execute(data, {
+      implementer: request => {
+        implement(request); mkdirSync(join(request.cwd, dirname(path)), { recursive: true });
+        writeFileSync(join(request.cwd, path), "must not change\n");
+        return implemented();
+      },
+      reviewer: () => assert.fail("a Forbidden path stops the run before review"),
+    }, human);
+    assert.equal(result.state, "handedOff"); assert.deepEqual(result.states.slice(-3), ["gate", "stuck", "handedOff"]);
+    assert.equal(human.requests.length, 1); const [request] = human.requests as [Ask];
+    assert.ok(request.prompt.includes(path), request.prompt);
+    assert.equal(request.recommended, undefined); assert.doesNotMatch(request.prompt, /recommend/iu);
+    const run = held(f, result, /^Handed off: /u);
+    assert.ok(run.delivery.reason.includes(path), run.delivery.reason); assert.equal(run.delivery.commit, null);
+    assert.equal(git(f.repo, "rev-parse", branch), f.head);
+  });
+}
+
+test("trusted: a reviewer revise whose only blocker has kind other delivers at once, with the finding under Review notes", async context => {
+  const f = fixture(context); remote(f); const gh = fakeGh(context, f); let edits = 0;
+  const finding = blocker("other", "Name the file greeting.md for consistency");
+  const result = await execute(input(f, { output: "pr", draft: false }, { level: "trusted" }), {
+    implementer: request => { edits++; return trustedImplement(request); },
+    reviewer: () => review("revise", "Works; one naming point", { findings: [finding] }),
+  });
+  const run = prDelivered(f, result); assert.equal(edits, 1);
+  assert.deepEqual(route(result.states), ["implement", "review"]);
+  const body = bodyOf(gh);
+  assert.ok(underHeading(body, "Review notes")?.includes(finding.text), body);
+  assert.equal(underHeading(body, "Needs you"), undefined);
+  assert.equal(gh()!.includes("--draft"), false, "nothing needs the owner, so draft: false holds");
+  assert.notEqual(run.delivery.draft, true);
+});
+
+for (const [output, second] of [["pr", "revise"], ["branch", "revise"], ["pr", "approved"]] as const) {
+  test(`trusted: a blocker of kind acceptance goes back to implement once; a second ${second} delivers ${second === "revise" ? "a draft with Needs you" : "as usual"} (${output})`, async context => {
+    const f = fixture(context); remote(f); const gh = fakeGh(context, f); const prompts: string[] = []; let reviews = 0;
+    const finding = blocker("acceptance", "greeting.txt must say hello, not hullo");
+    // maxReviewRounds is a careful knob: trusted allows one round whatever it says.
+    const result = await execute(input(f, { output, draft: false }, { level: "trusted", maxReviewRounds: 4 }), {
+      implementer: request => { prompts.push(request.prompt); return trustedImplement(request); },
+      reviewer: () => ++reviews === 2 && second === "approved" ? review("approved", "The criterion is met now")
+        : review("revise", "An acceptance criterion is unmet", { findings: [finding] }),
+    });
+    assert.equal(result.state, "delivered"); assert.deepEqual([prompts.length, reviews], [2, 2]);
+    assert.deepEqual(route(result.states), ["implement", "review", "implement", "review"]);
+    assert.ok(prompts[1]!.includes(finding.text), "the second implementer prompt carries the blocker");
+    const run = ended(f, result, output);
+    assert.equal(run.result.outcome, "completed");
+    const text = deliveredText(output, gh, run.directory);
+    if (second === "approved") {
+      assert.equal(underHeading(text, "Needs you"), undefined);
+      assert.notEqual(run.delivery.draft, true);
+      assert.equal(gh()!.includes("--draft"), false);
+      return;
+    }
+    // Green never sleeps: the spent review budget delivers a draft that names what the owner must look at.
+    assert.ok(underHeading(text, "Needs you")?.includes(finding.text), text);
+    assert.equal(run.delivery.draft, true);
+    assert.ok(Array.isArray(run.delivery.needs) && JSON.stringify(run.delivery.needs).includes(finding.text), JSON.stringify(run.delivery.needs));
+    if (output === "pr") assert.ok(gh()!.includes("--draft"), "a pull request that needs the owner is a real draft even with draft: false");
+  });
+}
+
+for (const kind of ["regression", "safety"] as const) {
+  test(`trusted: a blocker of kind ${kind} also goes back to implement once`, async context => {
+    const f = fixture(context); let edits = 0;
+    const finding = blocker(kind, `A ${kind} in greeting.txt`);
+    const result = await execute(input(f, {}, { level: "trusted" }), {
+      implementer: request => { edits++; return trustedImplement(request); },
+      reviewer: () => review("revise", `A ${kind} blocker`, { findings: [finding] }),
+    });
+    const run = ended(f, result, "branch"); assert.equal(edits, 2);
+    assert.equal(run.delivery.draft, true);
+  });
+}
+
+test("trusted: checks that still fail after the repairs stop the run with the stuck question at gate", async context => {
+  const f = fixture(context); const human = person("hand off"); let edits = 0;
+  const result = await execute(input(f, { checks: [command("process.exit(1)")] }, { level: "trusted" }), {
+    implementer: request => { edits++; return trustedImplement(request); }, reviewer: () => assert.fail("failing checks never reach review"),
+  }, human);
+  const run = handedOff(f, result, /Repair budget exhausted \(3\)/u, human);
+  assert.equal(edits, 4); assert.deepEqual(result.states.slice(-3), ["gate", "stuck", "handedOff"]);
+  for (const state of ["review", "commit", "deliver"]) assert.equal(result.states.includes(state), false, state);
+  assert.notEqual(run.delivery.draft, true);
+});
+
+for (const leftover of [false, true]) {
+  test(`trusted: an implementer that committed on the ticket branch${leftover ? " and left a test uncommitted" : ""} is taken as the candidate and the run completes`, async context => {
+    const f = fixture(context);
+    const result = await execute(input(f, {}, { level: "trusted" }), {
+      implementer: request => {
+        implement(request); git(request.cwd, "add", "greeting.txt"); git(request.cwd, "commit", "-qm", "agent commit");
+        if (leftover) writeFileSync(join(request.cwd, "greeting.test.txt"), 'require("node:assert/strict").ok(require("node:fs").existsSync("greeting.txt"));\n');
+        return implemented();
+      },
+    });
+    const run = ended(f, result, "branch");
+    assert.equal(result.states.includes("stuck"), false);
+    assert.equal(run.result.outcome, "completed");
+    // The workflow still makes the one ticket commit, with the ticket's own message.
+    assert.equal(git(f.repo, "rev-list", "--count", `main..${branch}`), "1");
+    assert.equal(git(f.repo, "log", "-1", "--format=%s", branch), "Add a greeting");
+    assert.equal(git(f.repo, "show", `${branch}:greeting.txt`), "hello");
+    assert.equal(git(f.repo, "show", "--name-only", "--format=", branch), leftover ? "greeting.test.txt\ngreeting.txt" : "greeting.txt");
+    assert.equal(run.delivery.commit, git(f.repo, "rev-parse", branch));
+  });
+}
+
+for (const kind of ["baseBehind", "baseFailing"] as const) {
+  test(`trusted: a blocked implementer whose needs is ${kind} is moved onto the current base and asked once more`, async context => {
+    const f = fixture(context); let edits = 0;
+    const result = await execute(input(f, {}, { level: "trusted" }), {
+      implementer: request => {
+        if (++edits === 1) {
+          writeFileSync(join(f.repo, "base.txt"), "landed meanwhile\n"); git(f.repo, "add", "base.txt"); git(f.repo, "commit", "-qm", "base moved");
+          return { type: "blocked", summary: "The base must move first", needs: { kind, text: kind === "baseBehind" ? "The base is behind main" : "tests fail on the unchanged base" } };
+        }
+        assert.ok(existsSync(join(request.cwd, "base.txt")), "the worktree is on the current base before the implementer is asked again");
+        return trustedImplement(request);
+      },
+    });
+    ended(f, result, "branch"); assert.equal(edits, 2);
+    assert.equal(result.states.includes("stuck"), false);
+    assert.equal(git(f.repo, "rev-parse", `${branch}^`), git(f.repo, "rev-parse", "main"));
+  });
+}
+
+test("trusted: a second mechanical blocked from the implementer reaches the stuck question", async context => {
+  const f = fixture(context); const human = person("hand off"); let edits = 0;
+  const result = await execute(input(f, {}, { level: "trusted" }), {
+    implementer: () => { edits++; return { type: "blocked", summary: "The base is behind", needs: { kind: "baseBehind", text: "The base is behind main" } }; },
+    reviewer: () => assert.fail("nothing to review"),
+  }, human);
+  assert.equal(result.state, "handedOff"); assert.equal(edits, 2);
+  assert.deepEqual(result.states.slice(-3), ["implement", "stuck", "handedOff"]);
+  assert.equal(human.requests.length, 1);
+});
+
+test("trusted: a blocked implementer whose needs names a check script outside Scope gets it as a scope addition and is asked once more", async context => {
+  const f = fixture(context); let edits = 0;
+  const result = await execute(input(f, {}, { level: "trusted" }), {
+    implementer: request => {
+      if (++edits === 1) {
+        return { type: "blocked", summary: "The check script must change", needs: { kind: "scope", text: "scripts/check.sh is outside Scope", paths: ["scripts/check.sh"] } };
+      }
+      implement(request); mkdirSync(join(request.cwd, "scripts"));
+      writeFileSync(join(request.cwd, "scripts/check.sh"), "#!/bin/sh\n");
+      return implemented();
+    },
+  });
+  const run = ended(f, result, "branch"); assert.equal(edits, 2);
+  assert.equal(result.states.includes("stuck"), false);
+  assert.ok(underHeading(readFileSync(join(run.directory, "branch-summary.md"), "utf8"), "Scope additions")?.includes("scripts/check.sh"));
+});
+
+test("trusted: a blocked implementer whose needs is an irreversible decision reaches the stuck question", async context => {
+  const f = fixture(context); const human = person("hand off"); let edits = 0;
+  const result = await execute(input(f, {}, { level: "trusted" }), {
+    implementer: () => {
+      edits++;
+      return { type: "blocked", summary: "Deleting the stored greetings cannot be undone", needs: { kind: "decision", text: "Delete the stored greetings? This cannot be undone." } };
+    },
+    reviewer: () => assert.fail("nothing to review"),
+  }, human);
+  assert.equal(result.state, "handedOff"); assert.equal(edits, 1);
+  assert.deepEqual(result.states.slice(-3), ["implement", "stuck", "handedOff"]);
+  assert.equal(human.requests.length, 1); assert.match(human.requests[0]!.prompt, /stored greetings/u);
+  assert.equal(held(f, result, /^Handed off: /u).delivery.commit, null);
+});
+
+test("trusted: an irreversible open question from the implementer reaches the stuck question with its options and the recommended one", async context => {
+  const f = fixture(context); const human = person("hand off"); let edits = 0;
+  const question = { text: "Drop the legacy greeting table?", options: ["Keep the table", "Drop the table"], recommended: "Keep the table", why: "Dropping it deletes stored data." };
+  const result = await execute(input(f, {}, { level: "trusted" }), {
+    implementer: request => { edits++; implement(request); return implemented({ openQuestions: [question] }); },
+    reviewer: () => assert.fail("an open question stops the run before review"),
+  }, human);
+  assert.equal(result.state, "handedOff"); assert.equal(edits, 1);
+  assert.deepEqual(result.states.slice(-3), ["implement", "stuck", "handedOff"]);
+  const [request] = human.requests as [Ask];
+  for (const part of [question.text, ...question.options]) assert.ok(request.prompt.includes(part), part);
+  assert.match(request.prompt, /recommended/iu);
+});
+
+for (const again of ["valid", "malformed"] as const) {
+  test(`trusted: a malformed implementer report is sent back once with its fault${again === "malformed" ? ", and a second one stops the run" : ""}`, async context => {
+    const f = fixture(context); const human = person("hand off"); const prompts: string[] = [];
+    const result = await execute(input(f, {}, { level: "trusted" }), {
+      implementer: request => {
+        prompts.push(request.prompt); implement(request);
+        return prompts.length === 2 && again === "valid" ? implemented() : implemented({ assumptions: "none" });
+      },
+    }, human);
+    assert.equal(prompts.length, 2);
+    assert.match(prompts[1]!, /Your last report was malformed: [^\n]*assumptions/u);
+    if (again === "valid") { ended(f, result, "branch"); assert.equal(human.requests.length, 0); return; }
+    assert.equal(result.state, "handedOff"); assert.equal(human.requests.length, 1);
+    assert.match(held(f, result, /^Handed off: /u).delivery.reason, /malformed/u);
+  });
+}
+
+test("auto: the pull request is delivered before the review, and the review is posted on it as a comment and recorded without stopping the run", async context => {
+  const f = fixture(context); remote(f); const gh = fakeGh(context, f); let edits = 0;
+  const finding = blocker("acceptance", "greeting.txt must say hello, not hullo");
+  const result = await execute(input(f, { output: "pr" }, { level: "auto" }), {
+    implementer: request => { edits++; return trustedImplement(request); },
+    reviewer: () => {
+      assert.ok(gh(), "the pull request is open before the reviewer runs");
+      return review("revise", "An acceptance criterion is unmet", { findings: [finding] });
+    },
+  });
+  assert.equal(result.state, "delivered"); assert.equal(edits, 1);
+  assert.deepEqual(result.states.filter(state => trustedFlow.includes(state)), ["prepare", "implement", "gate", "commit", "rebase", "deliver", "review"]);
+  for (const state of [...planningAndRed, "stuck"]) assert.equal(result.states.includes(state), false, state);
+  const run = held(f, result, /^Delivered/u);
+  assert.deepEqual([run.delivery.outcome, run.delivery.prUrl, run.result.outcome], ["delivered", url, "completed"]);
+  const comments = gh.comments(); assert.equal(comments.length, 1);
+  const [args] = comments as [string[]];
+  assert.deepEqual(args.slice(0, 2), ["pr", "comment"]); assert.ok(args.includes(url), args.join(" "));
+  const body = args.includes("--body-file") ? readFileSync(args[args.indexOf("--body-file") + 1]!, "utf8") : args[args.indexOf("--body") + 1]!;
+  for (const part of ["An acceptance criterion is unmet", finding.text]) assert.ok(body.includes(part), part);
+  assert.equal(run.delivery.review?.verdict, "revise");
+  assert.ok(JSON.stringify(run.delivery.review.blockers).includes(finding.text), JSON.stringify(run.delivery.review));
+});
+
+test("auto: a branch delivery is recorded before the review, and the review is appended to the branch summary", async context => {
+  const f = fixture(context); let edits = 0;
+  const finding = blocker("safety", "greeting.txt is world-writable");
+  const result = await execute(input(f, {}, { level: "auto" }), {
+    implementer: request => { edits++; return trustedImplement(request); },
+    reviewer: () => {
+      assert.equal(git(f.repo, "config", "--local", "--get", `branch.${branch}.ticketDelivered`), git(f.repo, "rev-parse", branch), "the branch is delivered before the reviewer runs");
+      return review("revise", "A safety defect remains", { findings: [finding] });
+    },
+  });
+  assert.equal(result.state, "delivered"); assert.equal(edits, 1);
+  assert.ok(result.states.indexOf("deliver") < result.states.lastIndexOf("review"));
+  const run = held(f, result, /^Delivered/u);
+  const appended = underHeading(readFileSync(join(run.directory, "branch-summary.md"), "utf8"), "Review");
+  assert.ok(appended, "the branch summary has a Review section");
+  for (const part of ["A safety defect remains", finding.text]) assert.ok(appended.includes(part), part);
+  assert.equal(run.delivery.review?.verdict, "revise");
+  assert.ok(JSON.stringify(run.delivery.review.blockers).includes(finding.text));
+});
+
+test("the workflow page documents the levels with trusted as the default, the careful-only knobs, repository.forbidden, and the trusted flow", () => {
+  const page = readFileSync(resolve("docs/workflows/ticket-task.md"), "utf8"); const lines = page.split("\n");
+  const row = (field: string) => lines.find(line => line.startsWith(`| \`${field}\` |`));
+  const level = row("level"); assert.ok(level, "no input table row for level");
+  assert.match(level.split("|")[3]!, /trusted/u, "the row gives trusted as the default");
+  for (const name of ["careful", "auto"]) assert.ok(level.includes(name), name);
+  for (const field of ["redGreen", "assume", "maxReviewRounds"]) assert.match(row(field) ?? "", /`careful`/u, `${field} is marked careful-only`);
+  assert.ok(row("repository.forbidden"), "no input table row for repository.forbidden");
+  for (const name of ["careful", "trusted", "auto"]) assert.ok(lines.some(line => line.startsWith(`| \`${name}\` |`)), `the level table has a row for ${name}`);
+  const [diagram, ...others] = [...page.matchAll(/```mermaid\n([\s\S]*?)```/gu)];
+  assert.deepEqual(others, []); assert.match(diagram![1]!, /subgraph[^\n]*trusted/iu, "the one diagram carries the trusted flow");
+  const ticket = sectionOf(readFileSync(resolve("docs/catalog.md"), "utf8"), "Ticket delivery"); assert.ok(ticket);
+  assert.match(ticket.replace(/\s+/gu, " "), /`trusted`[^.]*\bdefault\b|\bdefault\b[^.]*`trusted`/iu, "the catalog says trusted is the default");
+});
+
+test("trusted: an explicit owner inclusion authorizes only the Forbidden paths named in the question", async context => {
+  const f = fixture(context); let edits = 0;
+  const human = person("include");
+  const result = await execute(input(f, { forbidden: ["notes.txt"] }, { level: "trusted" }), {
+    implementer: request => {
+      edits++; implement(request); writeFileSync(join(request.cwd, "notes.txt"), "Needed by the ticket\n");
+      return implemented();
+    },
+  }, human);
+  const run = ended(f, result, "branch");
+  assert.equal(edits, 1); assert.equal(human.requests.length, 1);
+  assert.deepEqual(run.delivery.scopeAdditions, [{ path: "notes.txt", stage: "gate" }]);
+});
+
+for (const malformed of [false, true]) test(`trusted: ${malformed ? "a twice-malformed" : "a blocked"} review with green checks delivers a draft`, async context => {
+  const f = fixture(context); let reviews = 0;
+  const result = await execute(input(f, {}, { level: "trusted" }), {
+    implementer: trustedImplement,
+    reviewer: () => { reviews++; return malformed ? review("revise", "Unreadable criteria", { criteria: null }) : ok("blocked", "Cannot establish the safety of the change"); },
+  });
+  const run = ended(f, result, "branch");
+  assert.equal(reviews, malformed ? 2 : 1); assert.equal(run.delivery.draft, true);
+  assert.ok(run.delivery.needs.length); assert.equal(result.states.includes("stuck"), false);
+  assert.ok(underHeading(readFileSync(join(run.directory, "branch-summary.md"), "utf8"), "Needs you"));
+  assert.match(readFileSync(join(run.directory, "handoff.html"), "utf8"), malformed ? /malformed/u : /safety/u);
+});
+
+test("trusted: discussions and minor findings are advisory, and the reviewer sees scope additions", async context => {
+  const f = fixture(context);
+  const result = await execute(input(f, {}, { level: "trusted" }), {
+    implementer: request => {
+      assert.doesNotMatch(request.prompt, /Do not commit/u);
+      implement(request); writeFileSync(join(request.cwd, noted.path), "note\n"); return implemented({ scopeAdditions: [noted] });
+    },
+    reviewer: request => {
+      assert.ok(request.prompt.includes(noted.why));
+      return review("revise", "Only advisory points", { findings: [
+        { severity: "discussion", text: "Consider a different greeting", where: "greeting.txt:1" },
+        { severity: "minor", text: "Use a clearer filename", where: "greeting.txt:1" },
+      ] });
+    },
+  });
+  const run = ended(f, result, "branch");
+  assert.deepEqual(route(result.states), ["implement", "review"]);
+  assert.equal(run.delivery.needs, undefined);
+  assert.equal(run.delivery.reviewNotes.length, 2);
+});
+
+test("trusted: irreversible questions and decisions survive hand-off and separate resume", async context => {
+  const f = fixture(context);
+  const question = { text: "Delete old greetings?", options: ["Keep", "Delete"], recommended: "Keep", why: "Deletion cannot be undone." };
+  await execute(input(f, {}, { level: "trusted" }), {
+    implementer: request => { implement(request); return implemented({ assumptions: [decided], openQuestions: [question] }); },
+  }, person("hand off"));
+  const next = { ...f, evidence: join(f.root, "evidence-2") };
+  const owner = person("Keep");
+  const result = await execute(input(next, {}, { level: "trusted", resume: true }), {
+    implementer: request => {
+      assert.ok(request.prompt.includes(decided.answer)); assert.ok(request.prompt.includes("Keep"));
+      return trustedImplement(request);
+    },
+  }, owner);
+  const run = ended(next, result, "branch");
+  assert.equal(owner.requests.length, 1); assert.ok(owner.requests[0]!.prompt.includes(question.text));
+  assert.ok(run.delivery.assumptions.some((item: any) => item.question === question.text && item.answer === "Keep"));
+  assert.ok(run.delivery.assumptions.some((item: any) => item.question === decided.question));
+});
+
+test("auto: a failed review comment is recorded without reversing delivery", async context => {
+  const f = fixture(context); remote(f); const gh = fakeGh(context, f);
+  const script = join(f.root, "bin", "gh");
+  writeFileSync(script, readFileSync(script, "utf8").replace('if [ "$1" = pr ] && [ "$2" = comment ]; then', 'if [ "$1" = pr ] && [ "$2" = comment ]; then\n  echo "comment unavailable" >&2; exit 1'));
+  const result = await execute(input(f, { output: "pr" }, { level: "auto" }), { implementer: trustedImplement });
+  assert.equal(result.state, "delivered");
+  const run = held(f, result, /^Delivered/u);
+  assert.ok(gh()); assert.equal(run.delivery.review.posted, false);
+  assert.match(readFileSync(join(run.directory, "post-review.log"), "utf8"), /comment unavailable/u);
+  assert.equal(result.states.includes("stuck"), false);
+});
+
+test("auto: a malformed review is retried once after the delivery record exists, then recorded as blockers", async context => {
+  const f = fixture(context); let reviews = 0;
+  const result = await execute(input(f, {}, { level: "auto" }), {
+    implementer: trustedImplement,
+    reviewer: () => {
+      reviews++;
+      const root = join(f.evidence, ".machine-runs/machine-shop");
+      assert.equal(JSON.parse(readFileSync(join(root, readdirSync(root)[0]!, "delivery.json"), "utf8")).outcome, "delivered");
+      return review("revise", "A report without criteria", { criteria: null });
+    },
+  });
+  assert.equal(result.state, "delivered");
+  const run = held(f, result, /^Delivered/u);
+  assert.equal(reviews, 2); assert.ok(run.delivery.review.blockers.length);
+  assert.equal(result.states.includes("stuck"), false);
+});
+
+test("trusted: a resumed pull request with standing defects becomes a real draft before pushing the new candidate", async context => {
+  const f = fixture(context);
+  const { gh, delivered, bare, hostHolds } = await deliveredPr(context, f, { draft: false });
+  advance(f, "greeting.txt", "hi\n"); publish(f);
+  const script = join(f.root, "bin/gh");
+  const ready = join(f.root, "ready-head");
+  writeFileSync(script, readFileSync(script, "utf8").replace("#!/bin/sh", [
+    "#!/bin/sh",
+    'if [ "$1" = pr ] && [ "$2" = ready ]; then',
+    `  printf '%s\\n' "$@" > "${ready}.args"`,
+    `  git --git-dir="${bare}" rev-parse "${branch}" > "${ready}"`,
+    "  exit",
+    "fi",
+  ].join("\n")));
+  const again = next(f, 2);
+  const result = await execute(input(again, { output: "pr", draft: false }, { level: "trusted", resume: true }), {
+    implementer: request => { writeFileSync(join(request.cwd, "greeting.txt"), "hello\nhi\n"); return implemented(); },
+    reviewer: () => review("revise", "A safety defect remains", { findings: [blocker("safety", "A safety defect in greeting.txt")] }),
+  });
+  const run = ended(again, result, "pr");
+  assert.equal(readFileSync(ready, "utf8").trim(), delivered, "the pull request was made draft before the new head was pushed");
+  assert.ok(readFileSync(`${ready}.args`, "utf8").includes("--undo"));
+  assert.deepEqual(gh()!.slice(0, 2), ["pr", "edit"]);
+  assert.ok(underHeading(bodyOf(gh), "Needs you")?.includes("safety defect"));
+  assert.equal(run.delivery.draft, true); assert.notEqual(hostHolds(), delivered);
 });
