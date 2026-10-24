@@ -54,6 +54,29 @@ decisions use the deterministic question alone so no presenter recommends an ans
 | `stuck` | no | `"park"` | `stuck` no longer changes anything: both `"park"` and `"ask"` sleep on the same Human question. |
 | `resume` | no | `false` | Pick up the worktree a hand-off or block left, or a delivered commit whose worktree is gone. |
 
+### Layered check fields
+
+See [Common input](../catalog.md#layered-checks) for Drip's example: build first;
+then types, focused tests, linked-tests, machine-tests, conditional ui and
+remote-ui in one group; package-smoke after all of them.
+
+| Field | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `repository.checks[].when` | no | `always` | 1–50 Scope path globs. Run if any changed path matches; otherwise record skipped (no changed path matched when). |
+| `repository.checks[].focused` | no | `false` | Select named or importing test files and replace a trailing glob argument. Run whole when selection is unsafe or unavailable; delivery reverify always runs whole. |
+| `repository.checks[].focusedLimit` | no | `40` | Maximum selected test files, 1–500; only with focused: true. More files runs the whole check. |
+| `repository.checks[].group` | no | `none` | Checks sharing a group run concurrently, with one log per check. Ungrouped checks remain sequential. |
+| `repository.checks[].after` | no | `[]` | Names that must finish before this check starts; skipped and failed count as finished. Names must be listed earlier in an earlier unit, or belong to the same group; cycles are refused. |
+| `repository.checks[].fastMs` | no | `90000` | Fast always-check threshold in milliseconds, 1–600000. Only without when or focused; used when selecting a repair round. |
+
+Paths are measured from the run's start commit, including committed and local
+changes. Groups run at their first member's position; other checks stay serial.
+[Recovery](../catalog.md#reduced-repair-rounds) runs failed checks and fast
+always-checks after failure, then a full layered round before passing. Receipts
+name every round's run and skipped checks, reasons and focused files.
+
+The red proof runs whole. Setup commands refuse layered fields. Delivery reverify applies `when` but always runs focused checks whole.
+
 ## Flow
 
 There are 14 working states: six Agents, seven Operations, and one Human.

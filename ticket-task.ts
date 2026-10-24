@@ -137,11 +137,11 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     turnHeld = true;
   };
   // Keep the turn only on transitions that remain in the delivery stretch.
-  const inTurn = (run: () => Event, keep: readonly string[]) => async () => {
+  const inTurn = (run: () => Event | Promise<Event>, keep: readonly string[]) => async () => {
     try {
       await takeTurn();
       lifetime.signal.throwIfAborted();
-      const result = run();
+      const result = await run();
       if (!keep.includes(result.type)) releaseTurn();
       return result;
     } catch (error) { releaseTurn(); throw error; }
@@ -689,7 +689,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     work.reopen();
   }
 
-  function rebase(): Event {
+  async function rebase(): Promise<Event> {
     const resolved = run("git", ["rev-parse", "--verify", "--quiet", `${repository.base ?? "HEAD"}^{commit}`], repository.path);
     let tip = resolved.stdout;
     const original = saved.baseCommit;
@@ -734,7 +734,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       if (saved.untested) {
         if (!resolved.ok) return withdraw("the current base no longer resolves");
         setNow(`running ${repository.checks.join(", ")}`);
-        if (work.checks().type !== "passed" || !work.accept()) {
+        if ((await work.checks("verify", lifetime.signal)).type !== "passed" || !work.accept()) {
           undo(original); work.reopen(true); saved.repairing = "change";
           saved.reviewsFrom = saved.reviews.length; saved.taken = "";
           return { type: "failed" };
@@ -880,7 +880,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       return { type: "review" };
     }
     setNow(`running ${repository.checks.join(", ")}`);
-    if (work.checks(saved.untested ? "verify" : "reverify").type !== "passed" || (saved.untested && !work.accept())) {
+    if ((await work.checks(saved.untested ? "verify" : "reverify", lifetime.signal)).type !== "passed" || (saved.untested && !work.accept())) {
       const stopped = undoOnTip("reverify gates failed");
       work.reopen(true);
       if (stopped) return stopped;
@@ -936,7 +936,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           ...(ticket.summary ? ["## Summary", ticket.summary] : []),
           ...(saved.assumptions.length ? ["## Assumptions", saved.assumptions.map(({ question, answer, why }) => `- ${flat(question)} Assumed: ${flat(answer)} (${flat(why)})`).join("\n")] : []),
           ...scopeAdditionSection(),
-          "## Checks", repository.checks.map(name => `- ${name}: passed${(saved.task.flaky ?? []).includes(name) ? " (flaky: failed once, passed when run again alone)" : ""}`).join("\n"),
+          "## Checks", repository.checks.map(name => `- ${name}: ${checkDescription(name)}`).join("\n"),
           // The helper has already taken the summary out of a JSON report; one that is still an object is evidence, not text for a reader.
           "## Review", jsonObject(saved.reviewSummary) ? "The reviewer approved this change without a written summary; its report is kept with the run evidence." : saved.reviewSummary,
           ...(saved.reviewNotes.length ? ["## Review notes", saved.reviewNotes.map(note => `- ${flat(note.text)}${flat(note.where) ? ` (${flat(note.where)})` : ""}`).join("\n")] : []),
@@ -983,6 +983,16 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       return files;
     } catch { return undefined; }
   }
+  function latestCheckRound() {
+    return (saved.task.checkRounds ?? []).filter(round => round.phase === "verify" || round.phase === "reverify").at(-1);
+  }
+  function checkDescription(name: string): string {
+    const round = latestCheckRound();
+    const skipped = round?.skipped.find(check => check.name === name);
+    if (skipped) return `skipped (${skipped.why})`;
+    const ran = round?.ran.find(check => check.name === name);
+    return `passed${(saved.task.flaky ?? []).includes(name) ? " (flaky: failed once, passed when run again alone)" : ""}${ran?.focused ? ` (focused: ${ran.focused.join(", ")})` : ran?.whole ? ` (whole: ${ran.whole})` : ""}`;
+  }
   function runFacts() {
     const { reason, ...rounds } = work.status();
     const review = saved.reviews.slice(saved.reviewsFrom).at(-1);
@@ -995,7 +1005,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       latest.set(key, check);
     }
     const checks = [...latest.values()]
-      .map(({ name, phase, exitCode, passed, log, flaky }) => ({ name, phase, exitCode, passed, log, flaky,
+      .map(({ name, phase, exitCode, passed, log, flaky, focused, whole }) => ({ name, phase, exitCode, passed, log, flaky, focused, whole,
         ...(!passed ? { tail: evidenceLog(log) } : {}),
       }));
     return {
@@ -1006,7 +1016,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       stage: saved.stoppedIn,
       reason,
       rounds: { ...rounds, extraRound: saved.extraRound, extraReviewRounds: saved.extraReviewRounds },
-      checks, lastChecksPassed: saved.task.lastChecksPassed,
+      checks, checkRounds: saved.task.checkRounds ?? [], lastChecksPassed: saved.task.lastChecksPassed,
       review: review ? { verdict: review.type, criteria: review.criteria, summary: review.summary, findings: review.findings, newSinceLastRound: review.newSinceLastRound } : null,
       recentReports: saved.task.reports.slice(-6),
       reports: {
@@ -1061,6 +1071,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ...facts.checks.filter(check => !check.passed).map(({ tail, ...check }) => ({
         title: `Failing gate: ${check.name}`, text: evidenceText(check), tail,
       })),
+      { title: "Check rounds", text: evidenceText(facts.checkRounds) },
       { title: "Passing checks", text: evidenceText(facts.checks.filter(check => check.passed)) },
       ...(facts.review ? [{ title: "Review", text: evidenceText(facts.review) }, {
         title: "Unmet criteria and open findings", text: evidenceText({
@@ -1089,11 +1100,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     ] : [];
     const verification = (check: (typeof facts.checks)[number]) => check.phase === "verify" || check.phase === "reverify";
     const checks = new Map(facts.checks.filter(verification).map(check => [check.name, check]));
-    const gate = (name: string, check?: (typeof facts.checks)[number]) => ({
-      name, outcome: !check ? "skipped" as const : check.passed ? "passed" as const : "failed" as const, tail: check?.tail,
-    });
+    const round = facts.checkRounds.filter(round => round.phase === "verify" || round.phase === "reverify").at(-1);
+    const gate = (name: string, check?: (typeof facts.checks)[number]) => {
+      const skipped = round?.skipped.find(entry => entry.name === name);
+      const ran = round?.ran.find(entry => entry.name === name);
+      return { name, outcome: skipped || !check ? "skipped" as const : check.passed ? "passed" as const : "failed" as const,
+        tail: skipped ? `skipped (${skipped.why})` : ran?.focused ? `focused: ${ran.focused.join(", ")}` : check?.tail };
+    };
     const gates = [
-      ...(checks.size ? [...new Set([...repository.checks, ...checks.keys()])].map(name => gate(name, checks.get(name))) : []),
+      ...(checks.size || round ? [...new Set([...repository.checks, ...checks.keys()])].map(name => gate(name, checks.get(name))) : []),
       ...facts.checks.filter(check => !verification(check))
         .map(check => gate(`${check.phase === "red" ? "red proof" : check.phase}: ${check.name}`, check)),
     ];
@@ -1648,15 +1663,15 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     work.start();
     return { type: "falsify" };
   }
-  function gate(): Event {
+  async function gate(): Promise<Event> {
     saved.repairing = "change";
     const scopeResult = unsettled() ?? scope("change");
     if (scopeResult.type === "scopeMiss") return stopAt("gate");
-    const result = scopeResult.type === "passed" ? work.checks() : scopeResult;
+    const result = scopeResult.type === "passed" ? await work.checks("verify", lifetime.signal) : scopeResult;
     if (result.type === "passed") { passed("verify"); work.seal(); return { type: "passed" }; }
     return work.repair().type === "retry" ? { type: "retry" } : stopAt("gate");
   }
-  function replay(): Event {
+  async function replay(): Promise<Event> {
     // Publishing makes the commit immutable: retry PR creation or recording on
     // that same commit, even if the base advanced while the owner was away.
     // A failed gate must keep it too; undo/rebase would require a force push.
@@ -1665,17 +1680,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         work.block("The published candidate changed locally; restore the pushed commit and clean worktree before continuing delivery.");
         return stopAt("rebase");
       }
-      if (work.checks("reverify").type !== "passed") return stopAt("rebase");
+      if ((await work.checks("reverify", lifetime.signal)).type !== "passed") return stopAt("rebase");
       saved.recheckBase = false;
       return { type: "deliver" };
     }
     // A conflict or failed setup left an uncommitted candidate. It must pass the normal checks and review again.
     if (!saved.commitHash) return { type: "implement" };
-    const result = rebase();
+    const result = await rebase();
     if (["current", "rebased"].includes(result.type)) {
       // A successful replay already ran every gate. An unchanged base still needs fresh gates after an owner answer.
       if (saved.recheckBase && result.type === "current") {
-        if (work.checks("reverify").type !== "passed") { undo(saved.baseCommit); return stopAt("rebase"); }
+        if ((await work.checks("reverify", lifetime.signal)).type !== "passed") { undo(saved.baseCommit); return stopAt("rebase"); }
       }
       saved.recheckBase = false;
       return { type: "deliver" };

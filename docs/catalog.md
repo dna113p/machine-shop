@@ -68,6 +68,21 @@ Ticket pull requests list a recovered gate as
 "passed (flaky: failed once, passed when run again alone)".
 Setup commands, red checks, and regression checks are unchanged.
 
+### Reduced repair rounds
+
+For a list using any layered field, the verify round immediately after a failed
+verify runs the failed checks plus fast always-checks: those with no `when` and
+no `focused` that previously finished under `fastMs` (default 90000 milliseconds).
+The receipt names omitted checks and why. If this reduced round passes, the same
+Operation immediately runs the full layered round before passing. If all selected
+checks already qualify, it is a full round. Delivery `reverify` always runs the
+full layered selection, with focused checks whole.
+
+Review sealing, reopening after rebase, and non-verify rounds clear this repair
+selection. Lists without any new fields retain their existing full-round behavior.
+Each failed check still reruns alone after the entire round, using the same focused
+argv if applicable; first-pass durations determine whether always-checks are fast.
+
 ### Malformed Agent reports
 
 `sendBack`, exported by [`defaults/_machine-shop/task.ts`](../defaults/_machine-shop/task.ts),
@@ -212,9 +227,9 @@ dirty checkout and verify its tracked/nonignored contents stay unchanged.
 release workflows. Omit it (or use `[]`) for review/investigation; those workflows
 reject nonempty checks rather than silently ignoring them. Check commands are
 executable/argv arrays with no implicit shell. They run in `workspace` in the
-given order, every one of them even after a failure, so that one repair round
+given order unless a group is declared, even after a failure, so that one repair round
 sees each failing gate; each has a default 60-second timeout (maximum 10 minutes
-per check) and a 1 MiB output buffer. Timeouts, missing executables, and excessive output are
+per check) and a 1 MiB output buffer per stream. Timeouts, missing executables, and excessive output are
 failures, not passes. The direct process is killed on timeout; do not use commands
 that detach work or leave daemons/descendants behind.
 
@@ -224,6 +239,62 @@ build outputs in the project's ignore rules. Commands are trusted executable wor
 not a sandbox or permission boundary; do not put secrets in their arguments.
 Language is not fixed: commands can invoke the project's existing Python, Go,
 Rust, .NET, frontend, or other toolchain. No project command is guessed for you.
+
+### Layered checks
+
+Each check accepts these optional fields. They also work unchanged in
+`ticket-task`'s `repository.checks`; setup and regression commands refuse them.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `when` | `always` | 1–50 Scope path globs. Run if any changed path matches; otherwise record skipped (no changed path matched when). |
+| `focused` | `false` | Select named or importing test files and replace a trailing glob argument. Run whole when selection is unsafe or unavailable; delivery reverify always runs whole. |
+| `focusedLimit` | `40` | Maximum selected test files, 1–500; only with focused: true. More files runs the whole check. |
+| `group` | `none` | Checks sharing a group run concurrently, with one log per check. Ungrouped checks remain sequential. |
+| `after` | `[]` | Names that must finish before this check starts; skipped and failed count as finished. Names must be listed earlier in an earlier unit, or belong to the same group; cycles are refused. |
+| `fastMs` | `90000` | Fast always-check threshold in milliseconds, 1–600000. Only without when or focused; used when selecting a repair round. |
+
+Changed paths include committed, staged, unstaged and untracked files since the
+commit recorded at run start, excluding `.machine-runs/`. A rebase may therefore
+include upstream changes and run extra checks. Unknown paths, baseline phases
+in add-tests/refactor/upgrade-dependency, and verify-checks run every check whole.
+`reverify` still applies `when`, but never focuses test files.
+
+A focused check selects existing `tests/<name>.test.*` and
+`<dir>/<name>.test.*` for changed `<dir>/<name>.<ext>`, plus `*.test.*` files
+with relative static imports, dynamic imports or require calls resolving to it
+(exactly or without its extension). A changed test selects itself if a production
+file with the same stem exists. Otherwise the check runs whole. It also runs
+whole if nothing is selected, the selection exceeds `focusedLimit`, or argv has
+no trailing glob (`*` or `?`). A change selecting nothing does not force a whole
+run if other changed files select tests. Commands such as `npm test` that hide
+the glob in package.json run whole. Evidence records the reason and actual argv.
+
+Each group is a unit at its first member's position, even with non-adjacent
+members. Units run sequentially. Within a group, `after` waits for its named
+checks; outside it, dependencies must be listed earlier and be in earlier units. Ungrouped checks
+never overlap. Keep group members adjacent to make execution order easy to read.
+
+Drip's list illustrates build first, six checks in parallel, then package-smoke.
+Adapt these argv and remote source paths to the project's actual commands:
+
+```json
+[
+  { "name": "build", "command": ["npm", "run", "build"] },
+  { "name": "types", "command": ["npm", "run", "typecheck"], "group": "validation" },
+  { "name": "tests", "command": ["node", "--test", "tests/*.test.ts"], "focused": true, "group": "validation" },
+  { "name": "linked-tests", "command": ["npm", "run", "test:linked"], "group": "validation" },
+  { "name": "machine-tests", "command": ["npm", "run", "test:machines"], "group": "validation" },
+  { "name": "ui", "command": ["npm", "run", "test:ui"], "when": ["web/**", "src/server.ts"], "group": "validation" },
+  { "name": "remote-ui", "command": ["npm", "run", "test:remote-ui"], "when": ["remote/**", "src/remote/**"], "group": "validation" },
+  { "name": "package-smoke", "command": ["npm", "run", "smoke:package"], "after": ["build", "types", "tests", "linked-tests", "machine-tests", "ui", "remote-ui"] }
+]
+```
+
+The receipt and `result.json` include `checkRounds`: phase, kind, reason, checks
+run (with selection reasons, focused files or whole-run reasons), skipped checks
+and their reasons, and the round's result. A skipped check is not passing check
+evidence. Individual attempts keep their duration, actual argv and separate log.
 
 ## Bug reproduction
 

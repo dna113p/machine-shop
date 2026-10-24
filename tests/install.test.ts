@@ -37,9 +37,9 @@ test("selective installation records each copied file's hash and version in the 
   const { project } = fixture(context);
   const result = install({ target: project, workflows: ["retrospective"] });
   const support = join(project, ".machines/_machine-shop");
-  assert.deepEqual(readdirSync(support).sort(), ["evidence.ts", "manifest.json", "task.ts"]);
+  assert.deepEqual(readdirSync(support).sort(), ["evidence.ts", "manifest.json", "scope.ts", "task.ts"]);
   const manifest = JSON.parse(readFileSync(join(support, "manifest.json"), "utf8"));
-  assert.deepEqual(Object.keys(manifest.files).sort(), ["_machine-shop/evidence.ts", "_machine-shop/task.ts", "dev-retrospective.ts"]);
+  assert.deepEqual(Object.keys(manifest.files).sort(), ["_machine-shop/evidence.ts", "_machine-shop/scope.ts", "_machine-shop/task.ts", "dev-retrospective.ts"]);
   const version = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
   for (const file of result.files) {
     const key = file.destination.slice(join(project, ".machines").length + 1);
@@ -50,7 +50,7 @@ test("selective installation records each copied file's hash and version in the 
 test("dry-run creates no catalog or files", context => {
   const { project } = fixture(context);
   const plan = install({ target: project, workflows: ["verify-checks"], dryRun: true });
-  assert.equal(plan.files.length, 2); assert.equal(plan.dryRun, true);
+  assert.equal(plan.files.length, 3); assert.equal(plan.dryRun, true);
   assert.deepEqual(readdirSync(project), []);
 });
 
