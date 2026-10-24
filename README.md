@@ -49,14 +49,14 @@ project on request:
 | Default | Purpose |
 | --- | --- |
 | [`verify-checks`](docs/workflows/verify-checks.md) | Run explicit project checks without a model |
-| [`implement-task`](docs/workflows/implement-task.md) | Implement a feature, verify it, and review it |
-| [`fix-bug`](docs/workflows/fix-bug.md) | Prove a regression red, fix it, prove green, and review |
-| [`refactor`](docs/workflows/refactor.md) | Preserve behavior against a passing baseline |
-| [`add-tests`](docs/workflows/add-tests.md) | Add meaningful tests without changing production behavior |
+| [`implement-task`](docs/workflows/implement-task.md) | Implement a feature, verify it, and give it advisory review |
+| [`fix-bug`](docs/workflows/fix-bug.md) | Prove a regression red, fix it, prove green, and give it advisory review |
+| [`refactor`](docs/workflows/refactor.md) | Preserve behavior against a passing baseline; advisory review |
+| [`add-tests`](docs/workflows/add-tests.md) | Add meaningful tests without changing production behavior; advisory review |
 | [`review-code`](docs/workflows/review-code.md) | Return evidence-backed review findings without edits |
 | [`retrospective`](docs/workflows/retrospective.md) | Report recurring ticket stops and automation candidates from run evidence; changes only its own evidence folder |
-| [`investigate`](docs/workflows/investigate.md) | Investigate and challenge a diagnosis or technical choice |
-| [`update-docs`](docs/workflows/update-docs.md) | Update docs/examples and validate against the source |
+| [`investigate`](docs/workflows/investigate.md) | Investigate and challenge a diagnosis or technical choice; advisory review |
+| [`update-docs`](docs/workflows/update-docs.md) | Update docs/examples and validate against the source; advisory review |
 | [`upgrade-dependency`](docs/workflows/upgrade-dependency.md) | Assess compatibility, get approval, upgrade, and verify |
 | [`prepare-release`](docs/workflows/prepare-release.md) | Check a candidate and obtain sign-off; never publish |
 
