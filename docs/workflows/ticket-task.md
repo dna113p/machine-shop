@@ -7,9 +7,56 @@ checkout's working tree, and it force-pushes only to update a delivered pull
 request on resume, with a lease on the delivered commit. This root workflow runs from source; the
 installer does not copy it.
 
-Required roles are `investigator`, `tester`, `implementer`, and `reviewer`.
+Required roles are `implementer` and `reviewer`. `careful` also requires
+`investigator` and `tester`.
 The optional `presenter` can explain the sole Human question at `stuck`. Scope
 decisions use the deterministic question alone so no presenter recommends an answer.
+
+## Levels
+
+| Level | Behavior |
+| --- | --- |
+| `trusted` | Default. One implementer investigates, decides reversible questions, implements and tests; checks gate delivery and one advisory review can request one revision. |
+| `careful` | The original planning, plan review, tester and red-check flow, with hard Scope and its existing review policy. |
+| `auto` | The trusted flow delivers before review; the report becomes a pull request comment or branch summary appendix. |
+
+Select `level` in the input. Repository configuration can choose `auto` through
+its caller; this workflow does not infer it from repository files.
+
+In trusted and auto runs, Scope and companions guide the implementer. Only
+path-like Forbidden entries and `repository.forbidden` stop the scope gate.
+A Forbidden bullet must itself be a path or glob, or contain a backticked path
+with `/`, `.` or `*`. Prose such as “nothing beyond the scope above” stays
+in the Agent prompts. Bare filenames match at any depth. Outside-Scope changes
+are recorded with the implementer's reason, or a mechanical explanation when
+unreported. A Forbidden hit asks the existing scope question without a
+recommendation; the owner's explicit `include` authorizes those exact paths.
+
+The implementer reports `assumptions: [{question, answer, why}]`,
+`scopeAdditions: [{path, why}]` and irreversible-only
+`openQuestions: [{text, options, recommended, why}]`. It may commit on the ticket
+branch; the workflow takes that tree, verifies it and makes one ticket commit.
+A blocked report gives `needs: {kind, text, paths?}`: `baseBehind` or `baseFailing`
+moves the candidate onto the current base and retries once; `scope` records
+its paths and retries once. A second mechanical block, malformed reports after
+one send-back, or an irreversible `decision` needs the owner.
+
+Reviews tag every blocker with `kind: acceptance|regression|safety|other`, naming
+the unmet criterion, regression or safety defect. Those defects get at most one
+implementation revision. All other findings, discussions and minor notes go
+into delivery. When review cannot finish or its budget is spent with passing
+checks, delivery succeeds as a draft with `## Needs you`. In PR mode this forces
+GitHub's real draft flag even if `repository.draft` is false. Failed checks still
+use `maxRepairs` and then stop; green never bypasses the verified-tree guard.
+
+Every trusted delivery carries `## Assumptions`, `## Scope additions`,
+`## Review notes`, and `## Needs you` when needed. `delivery.json` records the
+level, assumptions, additions, and standing `needs` with `draft: true`.
+Auto records its post-delivery review verdict and blockers there too. A failed
+comment post is recorded as `review.posted: false` with its log; branch and patch
+outputs append the report to `branch-summary.md`. Auto review never undoes a
+delivery. Merging before review and reopening tickets belong to the landing
+step and Dispatch and are outside this workflow.
 
 ## Input
 
@@ -31,12 +78,14 @@ decisions use the deterministic question alone so no presenter recommends an ans
 
 | Field | Required | Default | Meaning |
 | --- | --- | --- | --- |
+| `level` | no | `"trusted"` | `careful`, `trusted`, or `auto`; selects the state map. |
 | `ticket.id` | yes | — | Becomes the branch `ticket/<id>-<title>` and the worktree name. |
 | `ticket.title` | yes | — | The commit subject and pull request title. |
 | `ticket.body` | yes | — | Markdown with `## Goal`, `## Scope` (paths or globs the change may touch), `## Acceptance` (testable criteria), and `## Forbidden`. A missing section blocks before any Agent runs. |
 | `repository.name` | yes | — | One path segment, used in the worktree name. |
 | `repository.path` | yes | — | Absolute path to the source checkout root. |
 | `repository.companions` | no | `[]` | Array of non-empty strings using the same paths and glob syntax as Scope, for example `["tests/**", "README.md"]`. These paths are in scope for every ticket, in addition to its own Scope. Both scope gates allow them, and all six Agent prompts list them after Scope. |
+| `repository.forbidden` | no | `[]` | Non-empty Scope-style path globs that trusted and auto scope gates enforce alongside ticket Forbidden paths. |
 | `repository.base` | no | its HEAD | Branch or ref to start from and rebase onto. In `pr` mode, if this local base is behind the remote base branch, use that branch's published tip instead. No local base or remote-tracking ref moves; `base.json` in the prepare evidence records the local ref and commit, remote, remote branch, and tip used. |
 | `repository.setup` | no | none | Commands run in the new worktree before any Agent, such as `npm ci`. Same shape as `checks`. |
 | `repository.checks` | yes, 1–20 | — | The gates, as `{ name, command, timeoutMs }` with `command` an argv array. |
@@ -48,9 +97,9 @@ decisions use the deterministic question alone so no presenter recommends an ans
 | `worktreeRoot` | yes | — | Absolute directory for the worktree, outside the repository. |
 | `evidenceRoot` | yes | — | Absolute directory for run evidence, outside the repository and worktree. |
 | `maxRepairs` | no | `3` | Rounds for a failed green gate or delivery replay conflict, 0–3. Scope misses ask the owner immediately and consume no automatic repair rounds. |
-| `maxReviewRounds` | no | `2` | Rounds for a `revise` review, 0–5. |
-| `redGreen` | no | `true` | Write failing tests first. `false` skips the tester and the red check. |
-| `assume` | no | `false` | Record recommended answers to maintainer-level questions whose wrong guess costs at most a review comment, instead of stopping. Non-assumable questions still need the owner. |
+| `maxReviewRounds` | no | `2` | `careful` only; trusted and auto ignore this knob. Rounds for a `revise` review, 0–5. |
+| `redGreen` | no | `true` | `careful` only; trusted and auto ignore this knob. Write failing tests first. `false` skips the tester and the red check. |
+| `assume` | no | `false` | `careful` only; trusted and auto ignore this knob. Record recommended answers to maintainer-level questions whose wrong guess costs at most a review comment, instead of stopping. Non-assumable questions still need the owner. |
 | `stuck` | no | `"park"` | `stuck` no longer changes anything: both `"park"` and `"ask"` sleep on the same Human question. |
 | `resume` | no | `false` | Pick up the worktree a hand-off or block left, or a delivered commit whose worktree is gone. |
 
@@ -79,7 +128,7 @@ The red proof runs whole. Setup commands refuse layered fields. Delivery reverif
 
 ## Flow
 
-There are 14 working states: six Agents, seven Operations, and one Human.
+The careful map has 14 working states: six Agents, seven Operations, and one Human.
 The four endings are additional. Each Agent validates and records its report
 inside its own state, allowing one send-back with the exact fault. This applies
 to falsify, plan, plan review, test, implement, and review reports. A second
@@ -90,6 +139,7 @@ than trusting the reviewer's verdict word.
 
 ```mermaid
 flowchart TD
+  subgraph careful[careful]
   prepare["prepare: worktree, setup, resume"] --> falsify([falsify])
   prepare -->|failure| stuck{"stuck: owner answer"}
   prepare -->|missing sections or unsafe adoption| refused((refused))
@@ -119,7 +169,24 @@ flowchart TD
   stuck -->|revert scope paths| test & implement
   stuck -->|hand off| handedOff((handedOff))
   stuck -->|discard| abandoned((abandoned))
+  end
+  subgraph trusted[trusted and auto]
+    tprepare[prepare] --> timplement([implement]) --> tgate[gate]
+    tgate -->|trusted, green| treview([review]) --> tjudge[judge]
+    tjudge -->|advisory or budget spent, green| tcommit[commit]
+    tjudge -->|defect, once| timplement
+    tgate -->|failed, repair budget| timplement
+    tgate -->|Forbidden or failed after repairs| tstuck{stuck}
+    timplement -->|irreversible question| tstuck
+    tstuck -->|continue by origin| tprepare & timplement & tgate & trebase
+    tgate -->|auto, green| tcommit
+    tcommit --> trebase[rebase] --> tdeliver[deliver]
+    tdeliver -->|trusted| tdone((delivered))
+    tdeliver -->|auto| tafter([review after delivery]) --> tpost[postReview] --> tdone
+  end
 ```
+
+The following planning and review-budget details describe `careful`.
 
 `falsify` asks whether the ticket is wrong, already done, impossible, or
 underspecified. A path covered by a companion is already in scope and never
@@ -196,8 +263,8 @@ through rebase, retaining a known pull request URL so creation is not repeated.
 A process restored directly at delivery also stops at `stuck`: its earlier
 repository turn no longer protects replay.
 A previously reviewed candidate may reuse its review after replay, but a rebase
-continuation reruns every gate even when the base is unchanged. An unreviewed
-candidate cannot reach commit.
+continuation reruns every gate even when the base is unchanged. In `careful` and `trusted`, an unreviewed
+candidate cannot reach commit. `auto` reviews after delivery.
 
 `hand off` ends directly at `handedOff`, retaining the worktree and branch.
 `discard` ends directly at `abandoned`, removing this run's worktree and branch.
@@ -355,7 +422,7 @@ export { endings } from "../machine-shop/ticket-task.ts";
 ```
 
 Keep `agentRoles.presenter` in its object form, `{ description, optional: true }`;
-the four working roles remain required strings. Machines refuses a presenter
+the working roles remain strings; the selected map determines which are required. Machines refuses a presenter
 declared as a required role. To enable explanations, add `--agent presenter=small`
 to your launch command, using a small, read-only model preset listed by
 `machine agents`. Leaving it unbound is supported; no umbrella binding is needed.
