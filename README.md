@@ -142,7 +142,9 @@ or pull request. `trusted` is the default: Scope guides changes while Forbidden
 paths stop them. Request `careful` for the original planning and hard-Scope map,
 or `auto` for review after delivery. Deliveries list assumptions, scope additions,
 review notes and any needs; standing review defects with green checks force a
-draft. The workflow page documents inputs, budgets, resume and endings.
+draft. A run that returns to the implementer continues its earlier session with
+only what is new, while the reviewer always starts fresh. The workflow page
+documents inputs, budgets, resume, sessions and endings.
 
 ## ChatGPT thread
 

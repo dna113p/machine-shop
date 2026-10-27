@@ -58,6 +58,34 @@ outputs append the report to `branch-summary.md`. Auto review never undoes a
 delivery. Merging before review and reopening tickets belong to the landing
 step and Dispatch and are outside this workflow.
 
+## Implementer sessions
+
+When a run returns to the implementer, after a failed check, a review blocker,
+a send-back of a malformed report, a mechanical retry, a rebase conflict, or the
+owner's answer, the implementer call continues the native session the earlier
+implementer call kept. It is sent only what is new since its last report: the
+failure or findings, the owner's new answers, a base move or conflicts to
+settle, and where the evidence is. It keeps what it learned while investigating
+and is not handed the whole ticket again. Every level does this.
+
+The reviewer, and in `careful` the investigator and tester, never continue a
+session: each starts fresh from the full prompt, so a review sees only the change
+and its evidence.
+
+Both implement states name the Machines Agent session `implementer` and give
+the runtime the follow-up beside the full prompt. When a call cannot continue, it gets the same full prompt as before and nothing
+fails. That happens on the first call, in a separate `resume` run, when a runner
+keeps no sessions, or when the session is gone. The Claude Code and Codex
+runners keep sessions.
+
+`delivery.json` counts implementer reports as
+`implementerSessions: {continue, continued, fresh}`, so a replay can compare
+runs. `continue` is the input switch. A report counts as `continued` when it
+answers a follow-up, which asks it to add `"continued": true`. Every other
+report counts as `fresh`. The runtime's own `session` evidence for each call says
+why a call started fresh. Set `continueImplementer: false` to start every
+implementer call fresh, for that comparison.
+
 ## Input
 
 ```json
@@ -102,6 +130,7 @@ step and Dispatch and are outside this workflow.
 | `assume` | no | `false` | `careful` only; trusted and auto ignore this knob. Record recommended answers to maintainer-level questions whose wrong guess costs at most a review comment, instead of stopping. Non-assumable questions still need the owner. |
 | `stuck` | no | `"park"` | `stuck` no longer changes anything: both `"park"` and `"ask"` sleep on the same Human question. |
 | `resume` | no | `false` | Pick up the worktree a hand-off or block left, or a delivered commit whose worktree is gone. |
+| `continueImplementer` | no | `true` | Send a returning implementer call into the earlier implementer session with only what is new. `false` starts every implementer call fresh with the full prompt. See [Implementer sessions](#implementer-sessions). |
 
 ### Layered check fields
 
@@ -393,7 +422,8 @@ rebases or resets it. An already-created pull request is reused.
 
 Every ending returns `{ "action": "hold", "summary": "…" }`.
 `delivery.json` records the ticket, repository, branch, base, commit, output,
-worktree retention/removal, resume details, decisions and review notes.
+worktree retention/removal, resume details, decisions, review notes and
+`implementerSessions`.
 `result.json` retains helper outcomes, gates, budgets and Agent reports.
 Delivery records `branch.<name>.ticketDelivered` before cleanup. PR delivery
 does not wait for a merge or delete the pushed branch.
