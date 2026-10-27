@@ -137,8 +137,9 @@ type Ask = {
   prompt: string; choices?: readonly string[]; suggestions?: readonly string[];
   headline?: string; recommended?: string; effects?: Record<string, string>; discards?: readonly string[]; reason?: string; page?: string;
 };
-type Request = { prompt: string; cwd: string; outcomes: readonly string[] };
-type Runner = (request: Request) => unknown;
+type Request = { prompt: string; cwd: string; outcomes: readonly string[]; session?: { resume?: { id: string; prompt: string } } };
+type Reporter = (update: { type: string; [field: string]: unknown }) => void;
+type Runner = (request: Request, report?: Reporter) => unknown;
 // Quotes, a backslash, and line breaks show whether a prompt carries the plan as it was written or as JSON.
 const plan = 'Write "hello" to greeting.txt:\n1. Cover it in greeting.test.txt with a path\\name check.\n2. Add greeting.txt.';
 /** The read-only states ahead of the work, the role each uses, and what its Agent answers unless a test replaces it by the state's name. */
@@ -176,10 +177,10 @@ async function execute(assignment: unknown, agents: Record<string, Runner> = {},
     investigator: () => assert.fail(`the investigator has no work in ${states.at(-1)}`), ...agents,
   };
   // The runtime starts a runner before it reports the state that asked, so each waits a turn to learn which one it serves.
-  const staged = (role: string) => async (request: Request) => {
+  const staged = (role: string) => async (request: Request, report?: Reporter) => {
     await Promise.resolve();
     const state = states.at(-1)!;
-    if (!isPlanning(state)) return working[role]!(request);
+    if (!isPlanning(state)) return working[role]!(request, report);
     const stage = planning[state]!;
     assert.equal(role, stage.role, `${state} uses the ${stage.role} role`);
     return (agents[state] ?? (role === "investigator" ? agents.investigator : undefined) ?? stage.answer)(request);
@@ -1222,6 +1223,8 @@ for (const output of ["branch", "patch", "pr"]) {
     assert.doesNotMatch(result.output.summary, /Worktree kept/u);
     assert.deepEqual(run.delivery, {
       schemaVersion: 1, outcome: "delivered", ticket: "PROJ-12", repository: { name: "widgets", path: f.repo }, branch, baseCommit: f.head, commit, output,
+      // The fake implementer keeps no session, so its one call started fresh.
+      implementerSessions: { continue: true, continued: 0, fresh: 1 },
       ...(output === "pr" ? { prUrl: url } : {}), ...(output === "patch" ? { patches: [join(run.directory, "0001-Add-a-greeting.patch")] } : {}),
       worktree: f.worktree, worktreeCreated: true, worktreeRemoved: true, reviewNotes: [],
     });
@@ -9665,4 +9668,144 @@ test("trusted: a resumed pull request with standing defects becomes a real draft
   assert.deepEqual(gh()!.slice(0, 2), ["pr", "edit"]);
   assert.ok(underHeading(bodyOf(gh), "Needs you")?.includes("safety defect"));
   assert.equal(run.delivery.draft, true); assert.notEqual(hostHolds(), delivered);
+});
+
+// Implementer sessions. A run that returns to the implementer continues the implementer's own native session and sends only what is new.
+/**
+ * An implementer runner that keeps one native session per fresh call, as the Claude Code and Codex runners do, and reports it.
+ * A resumed call answers as an Agent that followed its follow-up, adding `continued: true`. `sent` is what the Agent read.
+ */
+function sessionImplementer(answer: (request: Request, call: number) => object) {
+  const calls: { session: Request["session"]; prompt: string; sent: string }[] = [];
+  let sessions = 0;
+  const runner = (request: Request, report?: Reporter) => {
+    const resume = request.session?.resume;
+    if (request.session !== undefined) {
+      report?.(resume ? { type: "session", status: "continued", id: resume.id } : { type: "session", status: "fresh", id: `implementer-${++sessions}` });
+    }
+    calls.push({ session: request.session, prompt: request.prompt, sent: resume?.prompt ?? request.prompt });
+    return { ...answer(request, calls.length), ...(resume ? { continued: true } : {}) };
+  };
+  return Object.assign(runner, { calls });
+}
+/** Every request a role's runner received, so a test can say that none of them asked to continue a session. */
+function recorded(answer: Runner) {
+  const requests: Request[] = [];
+  return Object.assign((request: Request, report?: Reporter) => { requests.push(request); return answer(request, report); }, { requests });
+}
+const greeting = (text: string) => (request: { cwd: string }) => writeFileSync(join(request.cwd, "greeting.txt"), text);
+/** A check that passes only once greeting.txt says exactly hello. */
+const saysHello = command('process.exit(require("fs").existsSync("greeting.txt") && require("fs").readFileSync("greeting.txt", "utf8") === "hello\\n" ? 0 : 1)');
+/** What a follow-up must not carry: the ticket's own text, which the session already holds. */
+function onlyNew(sent: string) {
+  for (const whole of [criterion, "Acceptance criteria:", "Write hello to greeting.txt.", "Forbidden:"]) assert.equal(sent.includes(whole), false, `the follow-up repeats ${whole}`);
+  assert.match(sent, /^This continues your implementer session/u);
+}
+
+for (const level of ["trusted", "careful"] as const) {
+  test(`${level}: after a failed check the next implementer call continues the earlier implementer session with only the failure, and the reviewer starts fresh`, async context => {
+    const f = fixture(context);
+    const implementer = sessionImplementer((request, call) => {
+      greeting(call === 1 ? "hullo\n" : "hello\n")(request);
+      return level === "trusted" ? implemented() : ok();
+    });
+    const reviewer = recorded(() => review("approved", "Greeting matches the ticket"));
+    const tester = recorded(request => { writeFileSync(join((request as Request).cwd, "greeting.test.txt"), "\n"); return ok("completed", "The check reads greeting.txt"); });
+    const result = await execute(input(f, { checks: [saysHello] }, { level }), { implementer, reviewer, tester });
+    const run = ended(f, result, "branch");
+    assert.equal(implementer.calls.length, 2);
+    const [first, second] = implementer.calls as [typeof implementer.calls[0], typeof implementer.calls[0]];
+    assert.deepEqual(first.session, {}, "the first call starts the session");
+    assert.equal(second.session?.resume?.id, "implementer-1", "the repair continues the first call's session");
+    onlyNew(second.sent);
+    assert.match(second.sent, /Current failure\/feedback: /u);
+    // The runtime still holds the full prompt for a call that cannot continue.
+    assert.ok(second.prompt.includes(criterion));
+    assert.ok(reviewer.requests.length >= 1);
+    for (const request of [...reviewer.requests, ...tester.requests]) assert.equal(request.session, undefined, "only the implementer continues a session");
+    assert.deepEqual(run.delivery.implementerSessions, { continue: true, continued: 1, fresh: 1 });
+  });
+}
+
+test("trusted: after a review blocker the next implementer call continues its session with the blocker, not the ticket", async context => {
+  const f = fixture(context); let reviews = 0;
+  const finding = blocker("acceptance", "greeting.txt must say hello, not hullo");
+  const implementer = sessionImplementer(request => { implement(request); return implemented(); });
+  const reviewer = recorded(() => ++reviews === 1 ? review("revise", "An acceptance criterion is unmet", { findings: [finding] }) : review("approved", "The criterion is met now"));
+  const result = await execute(input(f, {}, { level: "trusted" }), { implementer, reviewer });
+  const run = ended(f, result, "branch");
+  assert.deepEqual(route(result.states), ["implement", "review", "implement", "review"]);
+  const [, second] = implementer.calls;
+  assert.equal(second?.session?.resume?.id, "implementer-1");
+  onlyNew(second!.sent); assert.ok(second!.sent.includes(finding.text), second!.sent);
+  for (const request of reviewer.requests) assert.equal(request.session, undefined, "a reviewer never continues a session");
+  assert.deepEqual(run.delivery.implementerSessions, { continue: true, continued: 1, fresh: 1 });
+});
+
+test("trusted: after the owner answers, the next implementer call continues its session with the answer", async context => {
+  const f = fixture(context); const owner = person("Keep the table");
+  const question = { text: "Drop the legacy greeting table?", options: ["Keep the table", "Drop the table"], recommended: "Keep the table", why: "Dropping it deletes stored data." };
+  const implementer = sessionImplementer((request, call) => { implement(request); return implemented(call === 1 ? { openQuestions: [question] } : {}); });
+  const result = await execute(input(f, {}, { level: "trusted" }), { implementer }, owner);
+  const run = ended(f, result, "branch");
+  assert.equal(owner.requests.length, 1);
+  const [, second] = implementer.calls;
+  assert.equal(second?.session?.resume?.id, "implementer-1");
+  onlyNew(second!.sent);
+  assert.match(second!.sent, /Answers from the ticket owner:\n+Keep the table/u);
+  assert.deepEqual(run.delivery.implementerSessions, { continue: true, continued: 1, fresh: 1 });
+});
+
+test("trusted: a report sent back as malformed is answered in the same session, with the fault as the only news", async context => {
+  const f = fixture(context);
+  const implementer = sessionImplementer((request, call) => { implement(request); return implemented(call === 1 ? { assumptions: "none" } : {}); });
+  const result = await execute(input(f, {}, { level: "trusted" }), { implementer });
+  const run = ended(f, result, "branch");
+  const [, second] = implementer.calls;
+  assert.equal(second?.session?.resume?.id, "implementer-1");
+  onlyNew(second!.sent); assert.match(second!.sent, /Your last report was malformed: [^\n]*assumptions/u);
+  assert.deepEqual(run.delivery.implementerSessions, { continue: true, continued: 1, fresh: 1 });
+});
+
+test("trusted: an implementer whose runner keeps no session gets today's full prompt on every call and counts as fresh", async context => {
+  const f = fixture(context); const prompts: string[] = []; const sessions: Request["session"][] = [];
+  const result = await execute(input(f, { checks: [saysHello] }, { level: "trusted" }), {
+    implementer: request => {
+      prompts.push(request.prompt); sessions.push(request.session);
+      greeting(prompts.length === 1 ? "hullo\n" : "hello\n")(request);
+      return implemented();
+    },
+  });
+  const run = ended(f, result, "branch");
+  assert.deepEqual(sessions, [{}, {}], "nothing was kept, so nothing is resumed");
+  for (const prompt of prompts) {
+    assert.doesNotMatch(prompt, /continues your implementer session/u);
+    for (const line of [`- ${criterion}`, "Forbidden:", "Write hello to greeting.txt."]) assert.ok(prompt.includes(line), line);
+  }
+  assert.match(prompts[1]!, /Current failure\/feedback: /u);
+  assert.deepEqual(run.delivery.implementerSessions, { continue: true, continued: 0, fresh: 2 });
+});
+
+test("continueImplementer: false names no session, so every implementer call starts fresh with the full prompt", async context => {
+  const f = fixture(context);
+  const implementer = sessionImplementer((request, call) => { greeting(call === 1 ? "hullo\n" : "hello\n")(request); return implemented(); });
+  const result = await execute(input(f, { checks: [saysHello] }, { level: "trusted", continueImplementer: false }), { implementer });
+  const run = ended(f, result, "branch");
+  assert.deepEqual(implementer.calls.map(call => call.session), [undefined, undefined]);
+  for (const call of implementer.calls) assert.ok(call.sent.includes(criterion));
+  assert.deepEqual(run.delivery.implementerSessions, { continue: false, continued: 0, fresh: 2 });
+});
+
+test("continueImplementer must be a boolean", context => {
+  const f = fixture(context);
+  for (const value of ["no", 0, null]) assert.throws(() => mod.default(runtime, input(f, {}, { continueImplementer: value })), /continueImplementer/u, JSON.stringify(value));
+  assert.deepEqual(readdirSync(f.root), ["widgets"]); untouched(f);
+});
+
+test("the workflow page documents implementer sessions, their switch, and their counts", () => {
+  const page = readFileSync(resolve("docs/workflows/ticket-task.md"), "utf8");
+  const row = page.split("\n").find(line => line.startsWith("| `continueImplementer` |")); assert.ok(row, "no input table row for continueImplementer");
+  assert.match(row.split("|")[3]!, /true/u, "continuing is on by default");
+  const section = underHeading(page, "Implementer sessions"); assert.ok(section, "no Implementer sessions section");
+  for (const part of ["implementerSessions", "reviewer", "full prompt", "continued"]) assert.ok(section.includes(part), part);
 });
