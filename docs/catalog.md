@@ -471,7 +471,8 @@ repair budgets, stale verification, source-integrity guards, malformed inputs,
 command errors, and result retrieval. `npm run smoke:install` covers selective
 installation, conflicts, relocation, discovery, and the real CLI. Ticket delivery
 is tested the same way for each output mode, with a local bare repository as the
-remote and a recording `gh` stand-in; no network or real `gh` is used. The
+remote and recording `gh` and `tea` stand-ins for GitHub and Gitea; no network,
+real `gh` or real `tea` is used. The
 ChatGPT thread is tested with a fake `chatgpt-web` runner and an injected
 continue function; no browser, rig-bridge, or ChatGPT account is used. These tests
 do not prove that a live model follows the instructions or solves a software task.

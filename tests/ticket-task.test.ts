@@ -9809,3 +9809,335 @@ test("the workflow page documents implementer sessions, their switch, and their 
   const section = underHeading(page, "Implementer sessions"); assert.ok(section, "no Implementer sessions section");
   for (const part of ["implementerSessions", "reviewer", "full prompt", "continued"]) assert.ok(section.includes(part), part);
 });
+
+// Gitea. A pr-mode repository whose policy names Gitea is delivered with tea against the repository the push went to, and never with gh.
+const giteaUrl = "https://example.invalid/acme/widgets/pulls/7";
+/** The one tea login for the fixture's host, as `tea login list --output json` describes it: never a token. */
+const fixtureLogin = { name: "fixture", url: "https://example.invalid", ssh_host: "example.invalid", user: "fixture", default: "true" };
+/** The arguments tea is given to name the login and the repository on that host. */
+const teaRepo = ["--login", "fixture", "--repo", "acme/widgets"];
+/** A pull request as `tea pr list --output json --fields index,state,url,base,head` describes it: open on main for this run's branch. */
+const giteaPull = (extra: object = {}) => ({ index: "7", state: "open", url: giteaUrl, base: "main", head: branch, ...extra });
+/**
+ * A recording tea first on PATH, beside a gh that records any call and fails: a Gitea run must never fall back to gh.
+ * Each tea call is kept whole, one NUL-separated file per call, with the commit the remote's ticket branch held when it was made.
+ */
+function fakeTea(context: TestContext, f: Fixture) {
+  const bin = join(f.root, "tea-bin"); mkdirSync(bin); const bare = join(f.root, "remote.git");
+  writeFileSync(join(bin, "gh"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${bin}/gh-calls"\necho "gh must not run for a Gitea repository" >&2\nexit 1\n`, { mode: 0o755 });
+  writeFileSync(join(bin, "tea"), [
+    "#!/bin/sh",
+    `n=$(ls "${bin}" | grep -c '^call-[0-9]*$')`,
+    `printf '%s\\0' "$@" > "${bin}/call-$n"`,
+    `git --git-dir="${bare}" rev-parse --verify -q "refs/heads/${branch}" > "${bin}/call-$n.head" 2>/dev/null`,
+    'if [ "$1" = login ] && [ "$2" = list ]; then',
+    `  if [ -f "${bin}/login-fails" ]; then echo "tea: cannot read its configuration" >&2; exit 1; fi`,
+    `  cat "${bin}/logins.json"; exit 0`,
+    "fi",
+    'if [ "$1" = pr ] && [ "$2" = list ]; then',
+    `  if [ -f "${bin}/list-fails" ]; then echo "Get \\"https://example.invalid/api/v1/repos/acme/widgets/pulls\\": dial tcp: lookup example.invalid: no such host" >&2; exit 1; fi`,
+    '  page=1; prev=""; for a in "$@"; do [ "$prev" = --page ] && page=$a; prev=$a; done',
+    `  if [ "$page" = 1 ] && [ -f "${bin}/prs.json" ]; then cat "${bin}/prs.json"; else echo '[]'; fi`,
+    "  exit 0",
+    "fi",
+    'if [ "$1" = pr ] && [ "$2" = create ]; then',
+    `  if [ -f "${bin}/create-fails" ]; then echo "error connecting to example.invalid" >&2; exit 1; fi`,
+    `  printf '# #7 Add a greeting (open)\\n@fixture created now\\t**main** <- **${branch}**\\n\\nhttps://example.invalid/acme/widgets/issues/1\\n\\n${giteaUrl}\\n'`,
+    "  exit 0",
+    "fi",
+    'if [ "$1" = comments ] && [ "$2" = add ]; then echo "comment added"; exit 0; fi',
+    'if [ "$1" = pr ] && [ "$2" = edit ]; then exit 0; fi',
+    'echo "unexpected tea call: $*" >&2; exit 1',
+  ].join("\n") + "\n", { mode: 0o755 });
+  writeFileSync(join(bin, "logins.json"), JSON.stringify([fixtureLogin]) + "\n");
+  const path = process.env.PATH;
+  process.env.PATH = `${bin}${delimiter}${path}`;
+  context.after(() => { process.env.PATH = path; });
+  const calls = () => readdirSync(bin).filter(name => /^call-\d+$/u.test(name)).sort((a, b) => Number(a.slice(5)) - Number(b.slice(5)))
+    .map(name => ({ args: readFileSync(join(bin, name), "utf8").split("\0").slice(0, -1), head: readFileSync(join(bin, `${name}.head`), "utf8").trim() }));
+  return {
+    /** Every tea call, in order, with the commit the remote's ticket branch held then. */
+    calls,
+    /** The arguments of every tea call that starts with these words. */
+    of: (...words: string[]) => calls().map(call => call.args).filter(args => words.every((word, index) => args[index] === word)),
+    /** Every gh call, which must stay empty. */
+    gh: () => existsSync(join(bin, "gh-calls")) ? readFileSync(join(bin, "gh-calls"), "utf8").trimEnd().split("\n") : [],
+    /** What `tea pr list` answers on its first page from now on, or a host that cannot be reached. */
+    listing: (prs: readonly object[] | "unreachable") => {
+      if (prs === "unreachable") writeFileSync(join(bin, "list-fails"), "");
+      else writeFileSync(join(bin, "prs.json"), JSON.stringify(prs) + "\n");
+    },
+    /** The tea logins this machine has, or a tea that cannot list them. */
+    logins: (logins: readonly object[] | "unreadable") => {
+      if (logins === "unreadable") writeFileSync(join(bin, "login-fails"), "");
+      else writeFileSync(join(bin, "logins.json"), JSON.stringify(logins) + "\n");
+    },
+    /** Forget the calls made so far, as a later run starts with none. */
+    forget: () => { for (const name of readdirSync(bin).filter(name => /^call-\d+(?:\.head)?$/u.test(name))) rmSync(join(bin, name)); },
+    bin,
+  };
+}
+type Tea = ReturnType<typeof fakeTea>;
+const gitea = (repository: object = {}) => ({ output: "pr", host: "gitea", ...repository });
+/** The pull request body tea was given with --description-file. */
+const teaBody = (args: string[]) => readFileSync(args[args.indexOf("--description-file") + 1]!, "utf8");
+/** Gitea ran no gh, and tea was never asked to merge, close, approve, or review. */
+function onlyTea(tea: Tea) {
+  assert.deepEqual(tea.gh(), [], "no gh call");
+  for (const { args } of tea.calls()) {
+    assert.ok(["login list", "pr list", "pr create", "pr edit", "comments add"].includes(args.slice(0, 2).join(" ")), args.join(" "));
+    if (args[0] !== "login") assert.deepEqual(args.slice(2, 6), teaRepo, `tea is told the login and repository: ${args.join(" ")}`);
+  }
+}
+
+test("repository.host names github or gitea and nothing else; github is the default", context => {
+  const f = fixture(context);
+  for (const host of ["gitlab", "GitHub", "", null, 1]) assert.throws(() => mod.default(runtime, input(f, { output: "pr", host })), /repository\.host must be "github" or "gitea"/u);
+  for (const host of [undefined, "github", "gitea"]) mod.default(runtime, input(f, { output: "pr", host }));
+});
+
+test("gitea: a first pr delivery pushes the branch, opens one draft pull request with tea against the run's base, records its URL, and runs no gh", async context => {
+  const f = fixture(context); const pushed = remote(f); const tea = fakeTea(context, f);
+  const result = await execute(input(f, gitea()));
+  assert.equal(result.state, "delivered"); assert.deepEqual(result.states.slice(-2), ["deliver", "delivered"]);
+  const commit = git(f.repo, "rev-parse", branch); untouched(f);
+  const run = held(f, result, new RegExp(`^Delivered ${branch} at ${commit}, pull request ${giteaUrl}`, "u"));
+  assert.equal(pushed(), `refs/heads/${branch} ${commit}`);
+  const body = join(run.directory, "pull-request.md");
+  const created = tea.of("pr", "create"); assert.equal(created.length, 1);
+  assert.deepEqual(created[0], ["pr", "create", ...teaRepo, "--draft", "--base", "main", "--head", branch, "--title", "Add a greeting", "--description-file", body]);
+  assert.equal(readFileSync(body, "utf8"), "Add a greeting\n\n## Summary\n\nWrite hello to greeting.txt.\n\n## Checks\n\n- tests: passed\n\n## Review\n\nGreeting matches the ticket\n\nTicket: PROJ-12\n");
+  // The host is asked before the push, so a host tea cannot reach would have left the remote as it was.
+  const calls = tea.calls(); const create = calls.findIndex(call => call.args[1] === "create");
+  assert.ok(calls.slice(0, create).some(call => call.args.join(" ").startsWith("pr list") && call.head === ""), "tea reached the host before anything was pushed");
+  assert.equal(calls[create]!.head, commit);
+  assert.deepEqual([run.delivery.outcome, run.delivery.prUrl, run.delivery.host, run.delivery.commit], ["delivered", giteaUrl, "gitea", commit]);
+  onlyTea(tea); assert.deepEqual(tea.of("pr", "edit"), []);
+});
+
+test("gitea: the pull request base is the one prepare checked, and draft: false opens a regular pull request", async context => {
+  const f = fixture(context); remote(f); const tea = fakeTea(context, f);
+  git(f.repo, "branch", "release"); git(f.repo, "push", "-q", "origin", "release");
+  const result = await execute(input(f, gitea({ base: "release", draft: false })));
+  assert.equal(result.state, "delivered");
+  assert.deepEqual(tea.of("pr", "create")[0]!.slice(0, 10), ["pr", "create", ...teaRepo, "--base", "release", "--head", branch]);
+  onlyTea(tea);
+});
+
+test("gitea: an ssh remote with a port is reached through the tea login whose server is that host", async context => {
+  const f = fixture(context); const bare = join(f.root, "remote.git"); const tea = fakeTea(context, f);
+  git(f.root, "init", "-q", "--bare", "-b", "main", bare);
+  const ssh = "ssh://git@git.example.invalid:222/dj/op-web.git";
+  git(f.repo, "remote", "add", "origin", ssh); git(f.repo, "config", `url.${bare}.insteadOf`, ssh); git(f.repo, "push", "-q", "origin", "main");
+  tea.logins([fixtureLogin, { name: "op", url: "https://git.example.invalid", ssh_host: "git.example.invalid", user: "dj", default: "false" }]);
+  const result = await execute(input(f, gitea()));
+  assert.equal(result.state, "delivered"); assert.equal(evidence(f).delivery.prUrl, giteaUrl);
+  assert.deepEqual(tea.of("pr", "create")[0]!.slice(2, 6), ["--login", "op", "--repo", "dj/op-web"]);
+  assert.deepEqual(tea.gh(), []);
+});
+
+for (const [label, arrange, reason] of [
+  ["the host cannot be reached", (tea: Tea) => tea.listing("unreachable"), /could not be reached with tea before pushing; nothing was pushed/u],
+  ["no tea login names the host", (tea: Tea) => tea.logins([{ ...fixtureLogin, url: "https://elsewhere.invalid", ssh_host: "elsewhere.invalid" }]), /no tea login names example\.invalid/u],
+  ["two tea logins name the host", (tea: Tea) => tea.logins([fixtureLogin, { ...fixtureLogin, name: "second" }]), /more than one tea login names example\.invalid: fixture, second/u],
+  ["tea cannot list its logins", (tea: Tea) => tea.logins("unreadable"), /tea could not list its logins/u],
+] as const) {
+  test(`gitea: when ${label}, deliver stops with evidence before the push, the remote is unchanged, and gh is never tried`, async context => {
+    const f = fixture(context); const pushed = remote(f); const tea = fakeTea(context, f); const human = person("hand off");
+    arrange(tea);
+    const result = await execute(input(f, gitea()), {}, human);
+    const run = steppedOff(f, result, "deliver", "stuck", reason, human, 1); untouched(f);
+    assert.equal(pushed(), "", "nothing reached the remote"); assert.equal(run.delivery.prUrl, undefined); assert.equal(deliveredAs(f), "");
+    assert.deepEqual(tea.of("pr", "create"), []); assert.deepEqual(tea.gh(), []);
+    const log = /inspect (\S+\.log)/u.exec(run.delivery.reason)?.[1]; assert.ok(log && existsSync(log) && log.startsWith(run.directory), run.delivery.reason);
+    assert.doesNotMatch(readFileSync(log, "utf8"), /token/iu);
+  });
+}
+
+test("gitea trusted: a pull request that needs the owner is a WIP draft even with draft: false", async context => {
+  const f = fixture(context); remote(f); const tea = fakeTea(context, f);
+  const finding = blocker("acceptance", "greeting.txt must say hello, not hullo");
+  const result = await execute(input(f, gitea({ draft: false }), { level: "trusted" }), {
+    implementer: trustedImplement, reviewer: () => review("revise", "An acceptance criterion is unmet", { findings: [finding] }),
+  });
+  assert.equal(result.state, "delivered"); const run = evidence(f);
+  const [created] = tea.of("pr", "create"); assert.ok(created!.includes("--draft"), created!.join(" "));
+  assert.ok(underHeading(teaBody(created!), "Needs you")?.includes(finding.text));
+  assert.equal(run.delivery.draft, true); onlyTea(tea);
+});
+
+/** A ticket delivered on Gitea as pull request 7 by a trusted run, with the host listing that one pull request for its branch afterwards. */
+async function deliveredGitea(context: TestContext, f: Fixture, data: unknown, agents: Record<string, Runner> = {}) {
+  remote(f); const tea = fakeTea(context, f); const bare = join(f.root, "remote.git");
+  const delivered = await deliverFirst(f, data, agents);
+  assert.equal(deliveredAs(f), delivered); assert.equal(evidence(f).delivery.prUrl, giteaUrl);
+  tea.forget(); tea.listing([giteaPull()]);
+  const hostHolds = () => git(bare, "rev-parse", `refs/heads/${branch}`);
+  const remoteRefs = () => git(bare, "for-each-ref", "--format=%(refname) %(objectname)");
+  return { tea, bare, delivered, hostHolds, remoteRefs };
+}
+/** The host was asked for every page of the repository's pull requests, until one came back empty; nothing else was read. */
+function askedGitea(tea: Tea) {
+  const lists = tea.of("pr", "list").filter(args => args.includes("all"));
+  assert.deepEqual(lists.map(args => args[args.indexOf("--page") + 1]), ["1", "2"]);
+  for (const args of lists) assert.deepEqual(args, ["pr", "list", ...teaRepo, "--state", "all", "--limit", "50", "--page", args[args.indexOf("--page") + 1]!, "--output", "json", "--fields", "index,state,url,base,head"]);
+}
+
+test("gitea: with resume, a delivered pull request whose base moved is rebased, verified, and updated in place with a lease, without opening another", async context => {
+  const f = fixture(context); const started = f.head;
+  const { tea, delivered, hostHolds } = await deliveredGitea(context, f, input(f, gitea()));
+  const tip = advance(f); publish(f);
+  const calls = recordGit(context, f); const again = next(f, 2);
+  const result = await execute(input(again, gitea(), { resume: true }), nobody);
+  assert.equal(result.state, "delivered"); assert.deepEqual(result.states, ["prepare", "rebase", "deliver", "delivered"]);
+  askedGitea(tea);
+  const commit = onTip(f, tip); assert.notEqual(commit, delivered); untouched(f);
+  const run = held(again, result, new RegExp(`^Delivered ${branch} at ${commit}, pull request ${giteaUrl}`, "u"));
+  leased(calls(), delivered); assert.deepEqual([tea.of("pr", "create"), tea.of("pr", "edit")], [[], []]);
+  assert.ok(calls().some(call => call.startsWith("ls-remote") && call.includes("refs/pull/7/head") && call.includes(`refs/heads/${branch}`)), "the head is read on the host");
+  assert.deepEqual([hostHolds(), deliveredAs(f)], [commit, commit]);
+  assert.deepEqual([run.delivery.prUrl, run.delivery.pullRequest, run.delivery.baseCommit, run.delivery.resumed, run.delivery.host], [giteaUrl, "updated", tip, true, "gitea"]);
+  assert.equal(rebasedFrom(f, run, started), delivered);
+  onlyTea(tea);
+});
+
+test("gitea: with resume, a delivered pull request whose base has not moved is verified on the same commit, records redelivered, and pushes nothing", async context => {
+  const f = fixture(context);
+  const { tea, delivered, remoteRefs } = await deliveredGitea(context, f, input(f, gitea()));
+  const before = [everything(f), remoteRefs()]; const calls = recordGit(context, f); const again = next(f, 2);
+  const result = await execute(input(again, gitea(), { resume: true }), nobody);
+  assert.equal(result.state, "delivered"); askedGitea(tea);
+  const run = held(again, result, new RegExp(`^Delivered ${branch} at ${delivered}, pull request ${giteaUrl}`, "u"));
+  assert.deepEqual([run.delivery.redelivered, run.delivery.prUrl, run.delivery.pullRequest], [true, giteaUrl, "unchanged"]);
+  assert.deepEqual(calls().filter(call => /^push(?:\s|$)/u.test(call)), []);
+  assert.deepEqual([tea.of("pr", "create"), tea.of("pr", "edit")], [[], []]);
+  assert.deepEqual([everything(f), remoteRefs()], before); onlyTea(tea);
+});
+
+const giteaRefusals: [label: string, arrange: (f: Fixture, tea: Tea, delivered: string, bare: string) => void, reasons: RegExp[]][] = [
+  ["its pull request was merged", (_f, tea) => tea.listing([giteaPull({ state: "merged" })]), [/\bmerged\b/iu, /\bnothing to rebase\b/iu]],
+  ["its pull request was closed", (_f, tea) => tea.listing([giteaPull({ state: "closed" })]), [/\bclosed\b/iu]],
+  ["the host lists no pull request for its branch", (_f, tea) => tea.listing([giteaPull({ head: "ticket/proj-13-other" })]), [/\bno pull request\b/iu]],
+  ["the host lists more than one pull request for its branch", (_f, tea) => tea.listing([
+    giteaPull(), giteaPull({ index: "6", url: giteaUrl.replace(/\/7$/u, "/6"), state: "closed" }),
+  ]), [/\bmore than one\b/iu]],
+  ["someone pushed to its branch, so the head on the host is not the recorded commit", (f, _tea, delivered, bare) => {
+    git(f.repo, "push", "-q", bare, `${byHand(f, delivered)}:refs/heads/${branch}`);
+  }, [/\bhead\b/iu, /\bpushed\b/iu]],
+  ["the host's own head of its pull request is not the recorded commit", (f, _tea, delivered, bare) => {
+    git(f.repo, "push", "-q", bare, `${byHand(f, delivered)}:refs/pull/7/head`);
+  }, [/\bhead\b/iu, /\bpushed\b/iu]],
+  ["its pull request is based on another branch", (_f, tea) => tea.listing([giteaPull({ base: "release" })]), [/\bbase\b/iu, /\brelease\b/u]],
+  ["the host cannot be reached", (_f, tea) => tea.listing("unreachable"), [/\bcould not be reached\b/iu]],
+  ["no tea login names the host", (_f, tea) => tea.logins([]), [/\bno tea login names example\.invalid\b/u]],
+];
+for (const [label, arrange, reasons] of giteaRefusals) {
+  test(`gitea: with resume, a delivered ticket is refused when ${label}, and nothing changes locally or on the remote`, async context => {
+    const f = fixture(context); const { tea, delivered, bare, remoteRefs } = await deliveredGitea(context, f, input(f, gitea()));
+    advance(f); publish(f); arrange(f, tea, delivered, bare);
+    const before = [everything(f), remoteRefs()]; const calls = recordGit(context, f); const again = next(f, 2);
+    const result = await execute(input(again, gitea({ setup: [command("process.exit(1)", { name: "install" })] }), { resume: true }), nobody);
+    assert.deepEqual(result.states, ["prepare", "refused"]); untouched(f);
+    const run = refused(again, result, /^Cannot resume: /u);
+    for (const reason of reasons) assert.match(run.delivery.reason, reason);
+    assert.deepEqual([everything(f), remoteRefs()], before); assert.deepEqual([git(f.repo, "rev-parse", branch), deliveredAs(f)], [delivered, delivered]);
+    assert.deepEqual(calls().filter(call => /^(?:push|worktree add)(?:\s|$)/u.test(call)), []);
+    assert.deepEqual([tea.of("pr", "create"), tea.of("pr", "edit")], [[], []]); assert.deepEqual(tea.gh(), []);
+    assert.deepEqual([run.delivery.commit, run.delivery.worktreeCreated, run.result.checks.length, run.result.agentInvocations], [null, false, 0, 0]);
+  });
+}
+
+test("gitea: a pull request listed past the first page is found, and only the one for this branch counts", async context => {
+  const f = fixture(context); const { tea, delivered } = await deliveredGitea(context, f, input(f, gitea()));
+  // The first page holds other branches' pull requests; this run's is on the second.
+  const script = join(tea.bin, "tea");
+  writeFileSync(script, readFileSync(script, "utf8").replace(`if [ "$page" = 1 ] && [ -f "${tea.bin}/prs.json" ]`,
+    `if [ "$page" = 1 ]; then echo '${JSON.stringify([giteaPull({ index: "3", url: giteaUrl.replace(/\/7$/u, "/3"), head: "feature" })])}'; elif [ "$page" = 2 ] && [ -f "${tea.bin}/prs.json" ]`));
+  const again = next(f, 2);
+  const result = await execute(input(again, gitea(), { resume: true }), nobody);
+  assert.equal(result.state, "delivered"); assert.equal(held(again, result, /^Delivered/u).delivery.prUrl, giteaUrl);
+  assert.deepEqual(tea.of("pr", "list").filter(args => args.includes("all")).map(args => args[args.indexOf("--page") + 1]), ["1", "2", "3"]);
+  assert.equal(deliveredAs(f), delivered); onlyTea(tea);
+});
+
+test("gitea trusted: a resumed pull request with standing defects is marked WIP before the new candidate is pushed, and a later trusted run whose review passes clears it", async context => {
+  const f = fixture(context);
+  const unmet = blocker("acceptance", "greeting.txt must say hello, not hullo");
+  const { tea, delivered, hostHolds } = await deliveredGitea(context, f, input(f, gitea({ draft: false }), { level: "trusted" }), {
+    implementer: trustedImplement, reviewer: () => review("revise", "An acceptance criterion is unmet", { findings: [unmet] }),
+  });
+  // The first run already opened it as a draft: it needed the owner.
+  assert.equal(evidence(f).delivery.draft, true);
+  // The base gains a greeting of its own, so the resumed candidate conflicts and is reviewed afresh.
+  advance(f, "greeting.txt", "hi\n"); publish(f);
+  const second = next(f, 2);
+  const standing = await execute(input(second, gitea({ draft: false }), { level: "trusted", resume: true }), {
+    implementer: request => { writeFileSync(join(request.cwd, "greeting.txt"), "hello\nhi\n"); return implemented(); },
+    reviewer: () => review("revise", "A safety defect remains", { findings: [blocker("safety", "A safety defect in greeting.txt")] }),
+  });
+  assert.equal(standing.state, "delivered"); const run = evidence(second);
+  const draft = tea.calls().find(call => call.args[0] === "pr" && call.args[1] === "edit" && call.args.includes("--draft"));
+  assert.deepEqual(draft?.args, ["pr", "edit", ...teaRepo, "--draft", "7"]);
+  assert.equal(draft!.head, delivered, "the pull request was marked WIP before the new head was pushed");
+  const [body] = tea.of("pr", "edit").filter(args => args.includes("--description-file"));
+  assert.ok(underHeading(teaBody(body!), "Needs you")?.includes("safety defect")); assert.equal(body!.includes("--ready"), false);
+  assert.equal(run.delivery.draft, true); const standingHead = hostHolds(); assert.notEqual(standingHead, delivered);
+  // A later trusted run moves onto a newer base, is reviewed, and nothing remains for the owner: the WIP prefix goes, and the body says so.
+  tea.forget(); advance(f, "greeting.txt", "hey\n"); publish(f);
+  const third = next(f, 3);
+  const cleared = await execute(input(third, gitea({ draft: false }), { level: "trusted", resume: true }), {
+    implementer: request => { writeFileSync(join(request.cwd, "greeting.txt"), "hello\nhey\n"); return implemented(); },
+    reviewer: () => review("approved", "The greeting is right"),
+  });
+  assert.equal(cleared.state, "delivered"); const last = evidence(third);
+  const edits = tea.of("pr", "edit"); assert.equal(edits.length, 1, edits.map(args => args.join(" ")).join("; "));
+  assert.deepEqual(edits[0], ["pr", "edit", ...teaRepo, "--description-file", join(last.directory, "pull-request.md"), "--ready", "7"]);
+  assert.equal(underHeading(teaBody(edits[0]!), "Needs you"), undefined);
+  assert.deepEqual([last.delivery.draft, last.delivery.prUrl, last.delivery.pullRequest], [undefined, giteaUrl, "updated"]);
+  assert.notEqual(hostHolds(), standingHead); assert.deepEqual(tea.of("pr", "create"), []); onlyTea(tea);
+});
+
+test("gitea trusted: a redelivery that is not reviewed again keeps the draft", async context => {
+  const f = fixture(context);
+  const unmet = blocker("acceptance", "greeting.txt must say hello, not hullo");
+  const { tea } = await deliveredGitea(context, f, input(f, gitea({ draft: false }), { level: "trusted" }), {
+    implementer: trustedImplement, reviewer: () => review("revise", "An acceptance criterion is unmet", { findings: [unmet] }),
+  });
+  advance(f); publish(f); const again = next(f, 2);
+  const result = await execute(input(again, gitea({ draft: false }), { level: "trusted", resume: true }), nobody);
+  assert.equal(result.state, "delivered"); assert.equal(evidence(again).delivery.pullRequest, "updated");
+  assert.deepEqual(tea.of("pr", "edit"), []); onlyTea(tea);
+});
+
+test("gitea trusted: policy that asks for drafts keeps the draft after a later review passes", async context => {
+  const f = fixture(context);
+  const { tea } = await deliveredGitea(context, f, input(f, gitea(), { level: "trusted" }), { implementer: trustedImplement });
+  advance(f, "greeting.txt", "hi\n"); publish(f); const again = next(f, 2); let reviews = 0;
+  const result = await execute(input(again, gitea(), { level: "trusted", resume: true }), {
+    implementer: request => { writeFileSync(join(request.cwd, "greeting.txt"), "hello\nhi\n"); return implemented(); },
+    reviewer: () => { reviews++; return review(); },
+  });
+  assert.equal(result.state, "delivered"); assert.equal(reviews, 1); assert.equal(evidence(again).delivery.pullRequest, "updated");
+  assert.deepEqual(tea.of("pr", "edit"), []); onlyTea(tea);
+});
+
+test("gitea auto: the review after delivery is posted as a comment on the pull request with tea", async context => {
+  const f = fixture(context); remote(f); const tea = fakeTea(context, f);
+  const result = await execute(input(f, gitea(), { level: "auto" }), { implementer: trustedImplement });
+  assert.equal(result.state, "delivered"); const run = held(f, result, /^Delivered/u);
+  const comments = tea.of("comments", "add"); assert.equal(comments.length, 1);
+  const [comment] = comments as [string[]];
+  assert.deepEqual([...comment.slice(0, 7), comment.at(-1)], ["comments", "add", ...teaRepo, "--description", "7"]);
+  assert.equal(comment[7], readFileSync(join(run.directory, "post-review.md"), "utf8"));
+  assert.equal(run.delivery.review.posted, true); onlyTea(tea);
+});
+
+test("gitea auto: a comment tea cannot post is recorded without reversing delivery", async context => {
+  const f = fixture(context); remote(f); const tea = fakeTea(context, f);
+  const script = join(tea.bin, "tea");
+  writeFileSync(script, readFileSync(script, "utf8").replace('then echo "comment added"; exit 0; fi', 'then echo "comment unavailable" >&2; exit 1; fi'));
+  const result = await execute(input(f, gitea(), { level: "auto" }), { implementer: trustedImplement });
+  assert.equal(result.state, "delivered"); const run = held(f, result, /^Delivered/u);
+  assert.equal(run.delivery.review.posted, false);
+  assert.match(readFileSync(join(run.directory, "post-review.log"), "utf8"), /comment unavailable/u); assert.deepEqual(tea.gh(), []);
+});

@@ -46,7 +46,8 @@ the unmet criterion, regression or safety defect. Those defects get at most one
 implementation revision. All other findings, discussions and minor notes go
 into delivery. When review cannot finish or its budget is spent with passing
 checks, delivery succeeds as a draft with `## Needs you`. In PR mode this forces
-GitHub's real draft flag even if `repository.draft` is false. Failed checks still
+a real draft even if `repository.draft` is false: GitHub's draft flag, or on
+Gitea the `WIP: ` title prefix. Failed checks still
 use `maxRepairs` and then stop; green never bypasses the verified-tree guard.
 
 Every trusted delivery carries `## Assumptions`, `## Scope additions`,
@@ -122,6 +123,7 @@ implementer call fresh, for that comparison.
 | `repository.output` | yes | — | `branch`, `patch`, or `pr`. |
 | `repository.remote` | no | `"origin"` | Where `pr` mode pushes. |
 | `repository.draft` | no | `true` | Whether `pr` mode opens a draft. |
+| `repository.host` | no | `"github"` | The host of a `pr`-mode repository: `github`, reached with `gh`, or `gitea`, reached with `tea`. See [Gitea](#gitea). Branch and patch modes ignore it. |
 | `worktreeRoot` | yes | — | Absolute directory for the worktree, outside the repository. |
 | `evidenceRoot` | yes | — | Absolute directory for run evidence, outside the repository and worktree. |
 | `maxRepairs` | no | `3` | Rounds for a failed green gate or delivery replay conflict, 0–3. Scope misses ask the owner immediately and consume no automatic repair rounds. |
@@ -374,8 +376,8 @@ or mismatched delivery record refuses resume without changes. Merge commits,
 unrelated history, multiple commits, unresolved siblings, or a changed title
 are refused. In `pr` mode resume takes up the delivered pull request and updates
 that same pull request in place: before recreating anything it checks that the
-base is published and asks the host with `gh pr list` for the pull requests of
-the branch in the repository prepare checks. Resume refuses without changes when
+base is published and asks the host with `gh pr list`, or on Gitea `tea pr list`,
+for the pull requests of the branch in the repository prepare checks. Resume refuses without changes when
 the host lists no pull request, more than one in any state, one that was merged
 (nothing to rebase) or closed, one whose base is another branch than the run's
 base, or one whose head on the host is not the delivered commit because someone
@@ -402,7 +404,7 @@ Commit checks the verified checkout fingerprint, expected tree, branch, HEAD,
 subject and ticket line, including after hooks. Replay accepts only a forward
 base and an equivalent patch; changed patches return through gates and review.
 In `pr` mode the base must be published. The recorded remote URL and base branch
-control push and PR creation, independent of other local Git or `gh` settings.
+control push and PR creation, independent of other local Git, `gh` or `tea` settings.
 Push sends only the ticket branch, without tags, and without force except the
 lease on the delivered commit when resume updates a delivered pull request.
 Once that push succeeds, recovery from PR creation or delivery-record failures
@@ -410,6 +412,45 @@ keeps the published commit, even if the base advances. Continuation reacquires
 the repository turn and reruns every gate on that commit before retrying delivery.
 A failed gate keeps the published commit for another continuation; it never
 rebases or resets it. An already-created pull request is reused.
+
+### Gitea
+
+A `pr`-mode repository whose policy sets `repository.host` to `"gitea"`
+delivers with `tea` and never runs `gh` or falls back to GitHub. The host comes
+from the caller's repository configuration, never from the ticket or the
+remote's URL. The push is the same Git push to the URL prepare checked; every
+`tea` call names `--login` and `--repo <owner>/<repo>` for that URL, so neither
+tea's default login nor the checkout's remotes choose the server.
+
+- **Login.** Exactly one login in `tea login list` must name the pushed host,
+  by its server URL or SSH host; `ssh://git@host:222/owner/repo.git` matches a
+  login for `https://host`. None or several block with `tea-login.log`, which
+  lists logins, servers and users but no token.
+- **Reachability.** Before anything is pushed, `deliver` lists one open pull
+  request with `tea`. A login or host tea cannot reach blocks `deliver` with the
+  log, and the remote is left as it was.
+- **Opening.** `tea pr create --base <checked base> --head <branch> --title
+  --description-file`, with `--draft` when `repository.draft` is true or the
+  delivery carries needs. Gitea marks a draft with a `WIP: ` title prefix. The
+  URL tea prints is recorded as `prUrl` in `delivery.json`, beside
+  `host: "gitea"`.
+- **Updating.** A body update is `tea pr edit <number> --description-file`. A
+  resumed trusted run with standing needs marks the pull request with
+  `tea pr edit <number> --draft` before pushing. A later trusted run whose own
+  review leaves no needs, with `repository.draft` false, clears the prefix with
+  `--ready` and rewrites the body. A redelivery that is not reviewed again keeps
+  the pull request as it was.
+- **Run comment.** `auto` posts its review with `tea comments add <number>
+  --description`, recorded in `review.posted` as on GitHub.
+- **Delivered resume.** `tea pr list --state all` is read page by page, 50 at a
+  time, up to 5,000 pull requests; only entries whose head is the ticket branch
+  count. tea does not report head commits, so `git ls-remote` reads
+  `refs/pull/<number>/head` and the branch on the pushed URL, and every ref
+  present must hold the delivered commit. The refusals match GitHub: none,
+  several, merged, closed, another base, a moved head, or an unreachable host
+  or missing login.
+
+Neither host's pull requests are merged, closed or approved by this workflow.
 
 ## Results
 
