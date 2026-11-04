@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { appendFileSync, closeSync, existsSync, lstatSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { defineEndings, type Event, type MachinePrimitives } from "@dna113p/machines";
 import { evidenceHuman, evidenceLog, writeStuckEvidence, repositoryTurn, taskNow, taskStatus, writeHandoff, taskRun, taskData, type TaskData, parseCheck, object, text, jsonObject } from "./defaults/_machine-shop/task.ts";
 import { brief, opening, excerpt, evidenceFacts, evidencePage, handoffPage, type EvidenceBlock } from "./defaults/_machine-shop/brief.ts";
@@ -21,6 +22,11 @@ export const endings = defineEndings({
 });
 
 const publishTimeoutMs = 120_000;
+// tea lists pull requests a page at a time; a repository with more than this many is not searched for a delivered one.
+const teaPageSize = 50;
+const teaPages = 100;
+/** The number of a Gitea pull request from its URL, as tea is given it. */
+const pullIndex = (url: string) => /\/pulls\/(\d+)\/?$/u.exec(url)?.[1];
 // A sandboxed harness may be unable to start the project's checks at all. That is not a blocker: the checks are the workflow's to run.
 const cannotRun = "Run the checks you can. If your environment cannot run them, as when a sandbox refuses to start processes, say which and why in your summary and still return completed: the workflow runs every required check itself after you return. Return blocked only for something a person must decide or supply.";
 const trustedReturn = 'Return completed with summary, assumptions: [{question, answer, why}], scopeAdditions: [{path, why}], and openQuestions: [{text, options, recommended, why}] (irreversible only). Use empty arrays when none. Return blocked with summary and needs: {kind: "baseBehind"|"baseFailing"|"scope"|"decision", text, paths?: string[]}. decision names the irreversible decision; scope names the required paths.';
@@ -116,6 +122,8 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
   });
   const { level, ticket, repository, prefix, worktree, evidenceRoot, resume, redGreen, assume, continueImplementer, work, branch: named } = parseTicket(input, saved.task);
   const careful = level === "careful";
+  // In pr mode a Gitea repository is reached with tea, never with gh; GitHub stays the default.
+  const gitea = repository.output === "pr" && repository.host === "gitea";
   const hardScope = [...forbiddenPatterns(ticket.sections.forbidden), ...repository.forbidden];
   const allAssumptions = () => [...saved.assumptions, ...saved.decided];
   const allAdditions = () => [...saved.scopeAdditions, ...saved.softScope.filter(item => !saved.scopeAdditions.some(owner => owner.path === item.path))];
@@ -651,6 +659,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     if (!remoteTip()) return { type: "blocked" };
     const hosted = hostedRepository(saved.checked);
     if (!hosted) return refuse(`remote ${repository.remote} does not name a hosted owner/repository, so its pull request cannot be found`);
+    if (gitea) return deliveredGiteaPullRequest(hosted, name, delivered, refuse);
     // Every pull request in any state counts: a branch name the host lists more than once is not one pull request to update.
     const listed = attempt("gh", ["pr", "list", "--repo", hosted, "--head", name, "--state", "all", "--limit", "10",
       "--json", "number,url,state,baseRefName,headRefOid"], repository.path, publishTimeoutMs,
@@ -671,6 +680,81 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       return refuse(`the head of pull request ${one.url} on the host is ${one.headRefOid}, not the delivered commit ${delivered}: someone pushed to it, and that is never overwritten`);
     }
     return one.url;
+  }
+
+  /**
+   * The Gitea form of deliveredPullRequest, with the same refusals. tea lists pull requests a page at a time and does not say which commit
+   * heads one, so every page is read, and the head is read from the remote the push goes to: both the pull request's own ref and its branch
+   * must hold the delivered commit.
+   */
+  function deliveredGiteaPullRequest(hosted: string, name: string, delivered: string, refuse: (why: string) => Event): string | Event {
+    const unreachable = "Cannot resume: the host could not be reached to find the delivered pull request; nothing was changed";
+    const tea = teaTarget(hosted, "Cannot resume: ", "; nothing was changed.");
+    if (!tea) return { type: "blocked" };
+    type Listed = { index: string; url: string; state: string; base: string; head: string };
+    const shaped = (one: unknown): one is Listed => !!one && typeof one === "object"
+      && ["index", "url", "state", "base", "head"].every(key => typeof (one as Record<string, unknown>)[key] === "string");
+    const all: Listed[] = [];
+    for (let page = 1; ; page++) {
+      if (page > teaPages) return refuse(`the host lists more than ${teaPages * teaPageSize} pull requests in ${hosted}, so those for ${name} could not be read`);
+      const listed = attempt("tea", ["pr", "list", ...tea, "--state", "all", "--limit", String(teaPageSize), "--page", String(page),
+        "--output", "json", "--fields", "index,state,url,base,head"], repository.path, publishTimeoutMs, unreachable, true);
+      if (!listed.ok) return { type: "blocked" };
+      let found: unknown;
+      try { found = JSON.parse(listed.stdout || "[]"); } catch { found = undefined; }
+      if (!Array.isArray(found) || !found.every(shaped)) return refuse(`the host's list of pull requests for ${name} could not be read`);
+      if (!found.length) break;
+      all.push(...found);
+    }
+    // Every pull request in any state counts: a branch name the host lists more than once is not one pull request to update.
+    const found = all.filter(one => one.head === name);
+    if (!found.length) return refuse(`the host lists no pull request for ${name} in ${hosted}`);
+    if (found.length > 1) return refuse(`the host lists more than one pull request for ${name} in ${hosted}: ${found.map(one => one.url).join(", ")}`);
+    const [one] = found as [Listed];
+    if (one.state === "merged") return refuse(`pull request ${one.url} was merged, so there is nothing to rebase`);
+    if (one.state !== "open") return refuse(`pull request ${one.url} is ${one.state === "closed" ? "closed" : `not open but ${one.state}`}`);
+    if (one.base !== saved.checkedBase) return refuse(`pull request ${one.url} is based on ${one.base}, not on the run's base ${saved.checkedBase}`);
+    if (!/^\d+$/u.test(one.index) || pullIndex(one.url) !== one.index) return refuse(`the host's list of pull requests for ${name} could not be read`);
+    const refs = [`refs/pull/${one.index}/head`, `refs/heads/${name}`];
+    const heads = attempt("git", ["ls-remote", saved.checked, ...refs], repository.path, publishTimeoutMs, unreachable, true);
+    if (!heads.ok) return { type: "blocked" };
+    const held = heads.stdout.split("\n").map(line => line.split("\t")).filter(([, at]) => refs.includes(at ?? "")).map(([id]) => id!);
+    if (!held.length) return refuse(`the host holds no head for pull request ${one.url}`);
+    const head = held.find(id => id !== delivered);
+    if (head) return refuse(`the head of pull request ${one.url} on the host is ${head}, not the delivered commit ${delivered}: someone pushed to it, and that is never overwritten`);
+    return one.url;
+  }
+
+  /**
+   * The tea arguments that name the login for the host the push goes to and the repository there; undefined after blocking with evidence.
+   * Exactly one tea login may name that host: tea is never left to choose its default login, which may be another server's.
+   * The login list names logins, servers and users, never a token.
+   */
+  function teaTarget(hosted: string, lead = "", tail = ""): string[] | undefined {
+    const found = teaLogin(hosted);
+    if ("args" in found) return found.args;
+    const log = join(work.open(), "tea-login.log");
+    writeFileSync(log, `tea login list --output json\n${found.output}\n`, { mode: 0o600 });
+    work.block(`${lead}${found.why}; inspect ${log}${tail}`);
+    return undefined;
+  }
+  function teaLogin(hosted: string): { args: string[] } | { why: string; output: string } {
+    const [host, ...path] = hosted.split("/");
+    const listed = run("tea", ["login", "list", "--output", "json"], repository.path, publishTimeoutMs);
+    if (!listed.ok) return { why: "tea could not list its logins", output: `${listed.stdout}\n${listed.detail}` };
+    let logins: unknown;
+    try { logins = JSON.parse(listed.stdout || "[]"); } catch { logins = undefined; }
+    if (!Array.isArray(logins)) return { why: "tea's list of logins could not be read", output: listed.stdout };
+    const hostOf = (value: unknown) => {
+      if (typeof value !== "string" || !value) return "";
+      try { return new URL(/^[a-z]+:\/\//iu.test(value) ? value : `ssh://${value}`).hostname.toLowerCase(); } catch { return ""; }
+    };
+    const named = logins.filter((login): login is { name: string } => !!login && typeof login === "object" && typeof login.name === "string" && login.name !== ""
+      && (hostOf(login.url) === host!.toLowerCase() || hostOf(login.ssh_host) === host!.toLowerCase()));
+    if (named.length !== 1) {
+      return { why: named.length ? `more than one tea login names ${host}: ${named.map(login => login.name).join(", ")}` : `no tea login names ${host}; add one with tea login add`, output: listed.stdout };
+    }
+    return { args: ["--login", named[0]!.name, "--repo", path.join("/")] };
   }
 
   /** A refusal after recreation removes only the worktree this run made, retaining the recorded delivery. */
@@ -955,9 +1039,20 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       // except when updating a delivered pull request: then only with a lease on the delivered commit, so a push someone else made is never overwritten.
       // An updated pull request whose commit did not change is not pushed at all.
       // It goes to the URL prepare checked, read once: a remote reconfigured since then, as an Agent can do, is not asked again.
-      // A resumed PR with standing findings must be a real draft before its new candidate is pushed.
+      // Gitea is asked before anything is pushed: a login or host tea cannot reach leaves the remote as it was.
+      const tea = gitea ? teaTarget(hosted, "", `; nothing was pushed to ${repository.remote}.`) : undefined;
+      if (gitea && !tea) return stepFailure("deliver", undefined, "unreachable");
+      const index = tea && saved.prUrl ? pullIndex(saved.prUrl) : undefined;
+      if (tea && saved.prUrl && !index) return stepFailure("deliver", `Pull request ${saved.prUrl} does not end in its number, so tea cannot be told which one to update; nothing was pushed.`);
+      if (tea && !attempt("tea", ["pr", "list", ...tea, "--state", "open", "--limit", "1", "--output", "json", "--fields", "index"], worktree, publishTimeoutMs,
+        `Gitea at ${hosted.split("/")[0]} could not be reached with tea before pushing; nothing was pushed to ${repository.remote}`, true).ok) return stepFailure("deliver", undefined, "unreachable");
+      // A resumed PR with standing findings must be a real draft before its new candidate is pushed. Gitea's draft is a WIP: title prefix.
       if (!careful && saved.prUrl && saved.needs.length
-        && !attempt("gh", ["pr", "ready", saved.prUrl, "--undo", "--repo", hosted], worktree, publishTimeoutMs, undefined, true).ok) return stepFailure("deliver");
+        && !(tea ? attempt("tea", ["pr", "edit", ...tea, "--draft", index!], worktree, publishTimeoutMs, undefined, true)
+          : attempt("gh", ["pr", "ready", saved.prUrl, "--undo", "--repo", hosted], worktree, publishTimeoutMs, undefined, true)).ok) return stepFailure("deliver");
+      // On Gitea a later trusted run whose own review leaves nothing for the owner clears the draft that standing findings forced,
+      // unless policy asks for drafts; a redelivery that was not reviewed again keeps the pull request as it was.
+      const ready = !!tea && level === "trusted" && !!saved.lease && !saved.needs.length && !repository.draft && saved.passedStages.includes("review");
       if (saved.commitHash !== saved.lease) {
         const lease = saved.lease ? [`--force-with-lease=refs/heads/${saved.branch}:${saved.lease}`] : [];
         const sent = attempt("git", ["push", "--no-follow-tags", ...lease, saved.checked, `${saved.commitHash}:refs/heads/${saved.branch}`], worktree, publishTimeoutMs, undefined, true);
@@ -970,7 +1065,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
         }
         saved.pushed = true;
       }
-      if (!saved.prUrl || (!careful && saved.needs.length)) {
+      if (!saved.prUrl || (!careful && saved.needs.length) || ready) {
         const body = join(directory, "pull-request.md");
         writeFileSync(body, [
           ticket.title,
@@ -985,8 +1080,17 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
           `Ticket: ${ticket.id}`,
         ].join("\n\n") + "\n", { mode: 0o600 });
         // The base is always named, and is the one prepare compared with the remote, not one read again from refs or configuration that may have changed since.
-        if (saved.prUrl) {
+        if (saved.prUrl && tea) {
+          if (!attempt("tea", ["pr", "edit", ...tea, "--description-file", body, ...(ready ? ["--ready"] : []), index!], worktree, publishTimeoutMs, undefined, true).ok) return stepFailure("deliver");
+        } else if (saved.prUrl) {
           if (!attempt("gh", ["pr", "edit", saved.prUrl, "--repo", hosted, "--body-file", body], worktree, publishTimeoutMs, undefined, true).ok) return stepFailure("deliver");
+        } else if (tea) {
+          const opened = attempt("tea", ["pr", "create", ...tea, ...(repository.draft || saved.needs.length ? ["--draft"] : []), "--base", saved.checkedBase,
+            "--head", saved.branch, "--title", ticket.title, "--description-file", body], worktree, publishTimeoutMs, undefined, true);
+          if (!opened.ok) return stepFailure("deliver", undefined, "unreachable");
+          // tea prints the pull request it opened, its URL last; terminal colour codes are not part of a word.
+          saved.prUrl = stripVTControlCharacters(opened.stdout).split(/\s+/u).findLast(word => /^https?:\/\/\S+\/pulls\/\d+$/u.test(word)) ?? "";
+          if (!saved.prUrl) return stepFailure("deliver", `tea pr create printed no pull request URL; inspect ${saved.branch} on ${repository.remote}.`);
         } else {
           const opened = attempt("gh", ["pr", "create", "--repo", hosted, ...(repository.draft || saved.needs.length ? ["--draft"] : []), "--base", saved.checkedBase,
             "--head", saved.branch, "--title", ticket.title, "--body-file", body], worktree, publishTimeoutMs, undefined, true);
@@ -1314,7 +1418,7 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
       ...(saved.postReview ? { review: saved.postReview } : {}),
       // A replay compares runs by how many implementer calls continued their session and how many started fresh.
       implementerSessions: { continue: continueImplementer, ...saved.implementerSessions },
-      ...(saved.prUrl ? { prUrl: saved.prUrl } : {}), ...(saved.patches.length ? { patches: saved.patches } : {}),
+      ...(saved.prUrl ? { prUrl: saved.prUrl } : {}), ...(gitea ? { host: "gitea" } : {}), ...(saved.patches.length ? { patches: saved.patches } : {}),
       worktree, ...(saved.adopted ? { resumed: true } : {}), worktreeCreated: saved.created, worktreeRemoved: saved.removed, reviewNotes: saved.reviewNotes,
     }, null, 2) + "\n", { flag: level === "auto" ? "w" : "wx", mode: 0o600 });
   }
@@ -1927,11 +2031,20 @@ export default function ticketTask(p: MachinePrimitives, input: unknown) {
     const file = join(work.open(), "post-review.md");
     writeFileSync(file, body, { mode: 0o600 });
     if (saved.prUrl) {
-      const posted = run("gh", ["pr", "comment", saved.prUrl, "--body-file", file], worktree, publishTimeoutMs);
+      const posted = gitea ? teaComment(saved.prUrl, body) : run("gh", ["pr", "comment", saved.prUrl, "--body-file", file], worktree, publishTimeoutMs);
       saved.postReview.posted = posted.ok;
       if (!posted.ok) writeFileSync(join(work.open(), "post-review.log"), `${posted.stdout}\n${posted.detail}\n`, { mode: 0o600 });
     }
     return conclude("completed");
+  }
+
+  /** The run comment on a Gitea pull request: tea takes the body as an argument, as it reads no file for a comment. */
+  function teaComment(url: string, body: string) {
+    const hosted = hostedRepository(saved.checked); const index = pullIndex(url);
+    const found = hosted ? teaLogin(hosted) : { why: `remote ${repository.remote} does not name a hosted repository`, output: "" };
+    if (!("args" in found)) return { ok: false, stdout: found.output, detail: found.why };
+    if (!index) return { ok: false, stdout: "", detail: `pull request ${url} does not end in its number` };
+    return run("tea", ["comments", "add", ...found.args, "--description", body, index], worktree, publishTimeoutMs);
   }
 
   const reviewState = () => checkedAgent(() => prompt([
@@ -2328,7 +2441,7 @@ function parseTicket(input: unknown, saved: TaskData) {
   const stuck = data.stuck === undefined ? "park" : data.stuck;
   if (stuck !== "ask" && stuck !== "park") throw new Error('stuck must be "ask" or "park"');
 
-  const repo = object(data.repository, "repository", ["name", "path", "base", "setup", "checks", "rerunFailedChecks", "output", "remote", "draft", "redCheck", "companions", "forbidden"]);
+  const repo = object(data.repository, "repository", ["name", "path", "base", "setup", "checks", "rerunFailedChecks", "output", "remote", "draft", "host", "redCheck", "companions", "forbidden"]);
   if (repo.companions !== undefined && !Array.isArray(repo.companions)) throw new Error("repository.companions must be an array of non-empty strings");
   const companions = ((repo.companions ?? []) as unknown[]).map((entry, i) => text(entry, `repository.companions[${i}]`));
   if (repo.forbidden !== undefined && !Array.isArray(repo.forbidden)) throw new Error("repository.forbidden must be an array of non-empty strings");
@@ -2343,6 +2456,9 @@ function parseTicket(input: unknown, saved: TaskData) {
   const remote = repo.remote === undefined ? "origin" : text(repo.remote, "repository.remote");
   if (base?.startsWith("-") || remote.startsWith("-")) throw new Error("repository.base and repository.remote must not start with '-'");
   if (repo.draft !== undefined && typeof repo.draft !== "boolean") throw new Error("repository.draft must be a boolean");
+  // The host is the caller's policy for the repository: a ticket cannot name it, and nothing is guessed from the remote's URL.
+  const host = repo.host === undefined ? "github" : repo.host;
+  if (host !== "github" && host !== "gitea") throw new Error('repository.host must be "github" or "gitea"');
   if (repo.setup !== undefined && !Array.isArray(repo.setup)) throw new Error("repository.setup must be an array");
   const setup = ((repo.setup ?? []) as unknown[]).map((entry, i) => parseCheck(entry, `repository.setup[${i}]`));
   if (setup.length > 20 || new Set(setup.map(c => c.name)).size !== setup.length) throw new Error("repository.setup takes at most 20 uniquely named commands");
@@ -2364,7 +2480,7 @@ function parseTicket(input: unknown, saved: TaskData) {
     ticket: { id, slug, title, summary: firstParagraph(ticket.body ?? ""), sections: ticketSections(ticket.body ?? "") }, prefix, branch: titled ? `${prefix}-${titled}` : prefix,
     level, worktree, evidenceRoot, work, resume: data.resume === true, redGreen, assume: level === "careful" && data.assume === true, stuck,
     continueImplementer: data.continueImplementer !== false,
-    repository: { name, path, base, setup, output, remote, draft: repo.draft !== false, redCheck, checks, companions, forbidden },
+    repository: { name, path, base, setup, output, remote, draft: repo.draft !== false, host: host as "github" | "gitea", redCheck, checks, companions, forbidden },
   };
 }
 /** A ticket id as branch and worktree names carry it. */
